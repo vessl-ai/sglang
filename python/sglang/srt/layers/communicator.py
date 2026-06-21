@@ -883,10 +883,22 @@ class CommunicateSimpleFn:
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_attention_tp_group()),
-            hidden_states,
-        )
+        local_hidden_states = hidden_states
+        # Belt-and-suspenders for the TBO empty-child case: the all-gather output
+        # buffer must be exactly local_rows * attn_tp_size rows. get_local_dp_buffer
+        # is sized from the (possibly stale) _local_dp_buffer_len, which desyncs the
+        # collective and CUDA-IMAs when a TBO-split child has 0 rows. Derive the
+        # output shape directly from the actual local input instead so a 0-row
+        # child issues a legal 0-count all-gather in lockstep across all ranks
+        # (every rank still participates — never skip, which would deadlock).
+        if local_hidden_states.shape[0] == 0:
+            hidden_states = torch.empty(
+                (0, *local_hidden_states.shape[1:]),
+                dtype=local_hidden_states.dtype,
+                device=local_hidden_states.device,
+            )
+        else:
+            hidden_states = get_local_dp_buffer(get_attention_tp_group())
         attn_tp_all_gather_into_tensor(
             hidden_states,
             local_hidden_states,

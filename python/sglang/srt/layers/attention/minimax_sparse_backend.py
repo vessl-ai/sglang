@@ -476,9 +476,35 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     forward_batch,
                 )
 
+        # Empty decode child (TBO split can produce a 0-row child at small bs;
+        # the splitter off-ramp in compute_split_seq_index avoids this, but a
+        # 0-row child may still reach here for idle/uneven DP ranks). The MSA
+        # decode kernels (flash_decode_with_topk_idx / fmha_sm100) and the
+        # page-table indexing over forward_batch.req_pool_indices/seq_lens are
+        # undefined on 0 rows, so short-circuit with correctly-shaped empty
+        # outputs — mirroring the idle path's q.new_zeros(0, ...) contract — so
+        # the downstream TP-attn all-gather still sees a consistent 0-row tensor.
+        if q.shape[0] == 0:
+            num_idx_heads = idx_q.shape[1]
+            idx_o = (
+                None
+                if disable_value
+                else q.new_zeros(0, num_idx_heads * self.idx_head_dim)
+            )
+            o = q.new_zeros(0, layer.tp_q_head_num * layer.v_head_dim)
+            return (
+                None if idx_o is None else idx_o.reshape(0, -1).contiguous(),
+                o.reshape(0, -1).contiguous(),
+            )
+
         # The MSA decode page table + plan are built once per forward in
         # init_forward_metadata_out_graph (eager, outside graph capture) and shared
         # across all sparse layers; here we just consume the cached metadata.
+        # The plan is built over the full padded batch and masks dummy/padded
+        # decode rows via seq_len==0 / kv_segment_lens==0 (see msa.py
+        # update_msa_decode_cg_meta), so non-empty children index the page table
+        # consistently without an explicit per-row trim (unlike forward_extend,
+        # whose variable-length prefill plan requires the cu_seqlens trim).
         msa_kv_indices = msa_plan = None
         if self._use_msa_decode and attn_fn is None:
             if self._msa_dec_meta is not None:

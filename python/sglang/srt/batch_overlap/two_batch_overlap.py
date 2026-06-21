@@ -86,7 +86,17 @@ def compute_split_seq_index(
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
-        return (num_tokens // token_num_per_seq) // 2
+        split_seq_index = (num_tokens // token_num_per_seq) // 2
+        # Small-batch off-ramp: when the split would put 0 seqs into one
+        # child (num_seqs < 2), the empty child desyncs the TP-attn all-gather
+        # (CUDA IMA under concurrency) and TBO has no overlap benefit anyway.
+        # Returning None disables TBO for this forward — already a supported
+        # off-ramp (TboDPAttentionPreparer.prepare_all_gather treats
+        # `split_seq_index is None` as local_can_run_tbo=False, aggregated via
+        # min() across all DP ranks so the decision is lockstep-identical).
+        if split_seq_index == 0:
+            return None
+        return split_seq_index
     elif forward_mode.is_idle() or forward_mode.is_prebuilt():
         assert num_tokens == 0
         return 0
