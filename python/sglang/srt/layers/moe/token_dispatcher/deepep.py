@@ -68,6 +68,132 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑥ EPLB barrier-timing recorder (env-gated, OFF by default).
+#   Set SGLANG_TBO_BARRIER_DBG=1 to enable. When OFF this is a single bool check
+#   per dispatch_b/combine_b call => the comm-gap measurement is byte-for-byte
+#   the same code path as without this patch (no events, no syncs, no records).
+#
+#   When ON it times the per-layer DeepEP-LL all-to-all sync points
+#   (dispatch_b / combine_b `event.current_stream_wait()` / `hook()`), the exact
+#   moment a rank is forced to synchronize on the collective. The gap between
+#   arrival and return, per (layer, kind, rank), is the barrier-skew signal:
+#   if the slowest rank gates the layer, its wait is short (it arrives last) and
+#   the fast ranks wait long; correlating per-rank wait with the per-rank token
+#   skew (masked_m) tells us whether the per-layer skew BINDS the all-to-all.
+#
+#   ★cuda-graph caveat (M3-MSA lesson): torch.cuda.Event(enable_timing=True)
+#   inside a captured graph is disallowed/fragile. We therefore record ONLY when
+#   NOT capturing (eager forwards) -> the observe pass must run decode eager
+#   (--disable-cuda-graph) or rely on the uncaptured warmup forwards. We never
+#   .synchronize() in the hot path: event pairs are appended to a deque and the
+#   elapsed_time() is resolved lazily at flush. masked_m (this rank's per-local-
+#   expert token count) is summarized into 0-d GPU tensors (.max()/.sum()) at
+#   record-time and the .item() is also deferred to flush.
+# ─────────────────────────────────────────────────────────────────────────────
+_TBO_BARRIER_DBG = get_bool_env_var("SGLANG_TBO_BARRIER_DBG")
+
+
+class _TboBarrierTimer:
+    """Singleton. Eager-only per-layer DeepEP-LL barrier-wait + token-skew recorder."""
+
+    def __init__(self):
+        import os
+
+        self.enabled = _TBO_BARRIER_DBG
+        self.rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+        # pending: list of (layer, kind, t_enter, t_exit, masked_max, masked_sum)
+        self._pending = []
+        self._flush_every = int(os.environ.get("SGLANG_TBO_BARRIER_FLUSH", "2000"))
+        self._out_dir = os.environ.get("SGLANG_TBO_BARRIER_DIR", "/tmp/tbo_barrier")
+        self._n = 0
+        if self.enabled:
+            try:
+                os.makedirs(self._out_dir, exist_ok=True)
+            except Exception:
+                pass
+            import atexit
+
+            atexit.register(self.flush)
+            logger.info(
+                "[tbo-barrier] recorder ENABLED rank=%s dir=%s flush_every=%s",
+                self.rank,
+                self._out_dir,
+                self._flush_every,
+            )
+
+    def _layer_idx(self):
+        try:
+            return get_global_expert_distribution_recorder()._current_layer_idx.value
+        except Exception:
+            return -1
+
+    def begin(self):
+        # returns an enter-event if we are recording this call, else None
+        if not self.enabled:
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return None  # cannot time inside a captured graph
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        return ev
+
+    def end(self, kind, t_enter, masked_m=None):
+        if t_enter is None:
+            return
+        t_exit = torch.cuda.Event(enable_timing=True)
+        t_exit.record()
+        masked_max = masked_sum = None
+        if masked_m is not None:
+            try:
+                masked_max = masked_m.max()
+                masked_sum = masked_m.sum()
+            except Exception:
+                masked_max = masked_sum = None
+        self._pending.append(
+            (self._layer_idx(), kind, t_enter, t_exit, masked_max, masked_sum)
+        )
+        self._n += 1
+        if len(self._pending) >= self._flush_every:
+            self.flush()
+
+    def flush(self):
+        if not self._pending:
+            return
+        import json
+
+        torch.cuda.synchronize()  # flush-time ONLY (never hot path)
+        rows = []
+        for layer, kind, t_enter, t_exit, m_max, m_sum in self._pending:
+            try:
+                wait_ms = t_enter.elapsed_time(t_exit)
+            except Exception:
+                continue
+            row = {"layer": layer, "kind": kind, "wait_ms": wait_ms, "rank": self.rank}
+            if m_max is not None:
+                row["masked_max"] = int(m_max.item())
+                row["masked_sum"] = int(m_sum.item())
+            rows.append(row)
+        self._pending = []
+        path = f"{self._out_dir}/rank_{self.rank}.jsonl"
+        try:
+            with open(path, "a") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+        except Exception as e:
+            logger.warning("[tbo-barrier] flush failed: %s", e)
+
+
+_tbo_barrier_timer: Optional["_TboBarrierTimer"] = None
+
+
+def get_tbo_barrier_timer() -> "_TboBarrierTimer":
+    global _tbo_barrier_timer
+    if _tbo_barrier_timer is None:
+        _tbo_barrier_timer = _TboBarrierTimer()
+    return _tbo_barrier_timer
+
+
 def _deepep_precompile_tp_barrier() -> None:
     # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
@@ -675,7 +801,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
+        _bt = get_tbo_barrier_timer()
+        _t_enter = _bt.begin()
         hook() if self.return_recv_hook else event.current_stream_wait()
+        _bt.end("dispatch", _t_enter, masked_m=masked_m)
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
             masked_m
@@ -757,7 +886,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
 
+        _bt = get_tbo_barrier_timer()
+        _t_enter = _bt.begin()
         hook() if self.return_recv_hook else event.current_stream_wait()
+        _bt.end("combine", _t_enter)
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
