@@ -60,6 +60,53 @@ else:
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
+# ── R4 ② feeder fix: contiguous-grouped MXFP8 activation-SF TMA-M alignment ──
+# Default ON. On Blackwell (SM100) the contiguous path feeds an already-int32
+# UE8M0-packed activation SF straight to deep_gemm. deep_gemm's host
+# transform_sf_into_required_layout takes the (INT,1,gran_k) SM100 branch which
+# only *checks* the layout and assumes the caller already TMA-M-aligned it — but
+# ep_scatter writes a flat-M (M=all_tokens) UN-padded buffer, so the kernel
+# TMA-loads SFA at the assumed-padded M-stride and de-scales with the wrong
+# stride => deterministic garbage. The masked path never hit this because its
+# int32 SF arrives TMA-aligned from the DeepEP-LL dispatch quant. Fix = pad the
+# token (M) axis of the packed int SF to deep_gemm's TMA-aligned size, keeping
+# the MN-major (column-major) layout, before the contiguous GEMM.
+_CONTIG_MXFP8_SF_FIX = get_bool_env_var(
+    "SGLANG_CONTIG_MXFP8_SF_FIX", default="true"
+)
+_CONTIG_SF_DEBUG = get_bool_env_var("SGLANG_CONTIG_SF_DEBUG")
+_CONTIG_SF_DEBUG_DONE = False
+
+
+def _tma_align_packed_ue8m0_sf(sf: torch.Tensor) -> torch.Tensor:
+    """Pad the M (token) axis of an already-int32 UE8M0-packed scale tensor to
+    deep_gemm's TMA-aligned size, preserving the MN-major (column-major, M-minor)
+    layout the contiguous-grouped kernel expects. Mirrors what the WORKING masked
+    path's already-aligned SF carries (DeepEP-LL dispatch quant emits it
+    TMA-aligned); the DeepEP-normal ep_scatter path does not.
+
+    sf: logical shape [M, K_packed], int32. ep_scatter produces it as
+    [K_packed, M].transpose(0,1) => physically M-contiguous (stride (1, M)).
+    Returns a [M, K_packed] view whose underlying buffer has the M (leading,
+    column-major) dim padded to a multiple of 16 bytes / 4 int32 = 4 elements,
+    so the K-stride is TMA 16-byte aligned.
+    """
+    assert sf.dim() == 2 and sf.dtype == torch.int32
+    m, k_packed = sf.shape
+    from deep_gemm.utils.layout import get_tma_aligned_size
+
+    aligned_m = get_tma_aligned_size(m, sf.element_size())
+    if aligned_m == m and sf.stride() == (1, m):
+        # already M-contiguous and M already TMA-aligned -> nothing to do
+        return sf
+    # Build a column-major [aligned_m, k_packed] buffer (M-minor / stride (1, aligned_m)),
+    # copy the real rows, return the [:m] view that retains the padded K-stride.
+    padded = torch.zeros(
+        (k_packed, aligned_m), device=sf.device, dtype=torch.int32
+    ).transpose(0, 1)
+    padded[:m].copy_(sf)
+    return padded[:m]
+
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
@@ -199,6 +246,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
+        # ── R4 ② feeder fix: wire the contiguous-grouped MXFP8 recipe ──
+        # M3-MXFP8 has use_mxfp8=True but is_fp4_experts=False, so the recipe above
+        # stays (None,None) and deep_gemm falls back to get_default_recipe, which
+        # mis-reads the gran_k of the UE8M0-packed activation/weight SF and trips
+        # the layout.hpp:98 shape assert (sf.size(-1) != ceil_div(k, gran_k*4)).
+        # The activation SF was quantised by ep_scatter at quant_block_size=128
+        # (gran_k=128); the weight SF is MXFP8 block_shape[1] (=32). Pass them
+        # explicitly so deep_gemm interprets the contiguous SF with the right
+        # granularity. (Mirrors the masked path's per-dispatch recipe machinery.)
+        if (
+            _CONTIG_MXFP8_SF_FIX
+            and quant_info.use_mxfp8
+            and not quant_info.is_fp4_experts
+            and recipe_a is None
+        ):
+            wt_gran_k = (
+                quant_info.block_shape[1] if quant_info.block_shape else 32
+            )
+            recipe_a = (1, scale_block_size)  # activation gran_k = ep_scatter 128
+            recipe_b = (1, wt_gran_k)  # weight gran_k = MXFP8 block (=32)
 
         w13_weight_fp8 = (
             quant_info.w13_weight,
@@ -213,6 +280,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
+
+        hidden_states_scale = self._contig_sf_reconcile(
+            hidden_states_scale, "gateup_act"
+        )
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (hidden_states, hidden_states_scale),
@@ -294,6 +365,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
+        down_input_scale = self._contig_sf_reconcile(down_input_scale, "down_act")
+
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
@@ -304,6 +377,53 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         return down_output
+
+    @staticmethod
+    def _contig_sf_reconcile(sf: torch.Tensor, tag: str) -> torch.Tensor:
+        """Instrument + (env-gated) fix the contiguous-grouped MXFP8 activation SF
+        TMA-M alignment. See _tma_align_packed_ue8m0_sf for the mechanism."""
+        global _CONTIG_SF_DEBUG_DONE
+        # Only the UE8M0 int32 (Blackwell MXFP8) contiguous path needs this; the
+        # fp32 path is fully aligned host-side by deep_gemm.
+        is_ue8m0_int = (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and sf is not None
+            and sf.dtype == torch.int32
+            and sf.dim() == 2
+        )
+        if _CONTIG_SF_DEBUG and not _CONTIG_SF_DEBUG_DONE and sf is not None:
+            try:
+                from deep_gemm.utils.layout import get_tma_aligned_size
+
+                m = sf.shape[0]
+                aligned_m = (
+                    get_tma_aligned_size(m, sf.element_size())
+                    if sf.dtype == torch.int32
+                    else m
+                )
+                import logging as _lg
+
+                _lg.getLogger(__name__).warning(
+                    "[CONTIG_SF_DEBUG %s] shape=%s stride=%s dtype=%s "
+                    "M=%d aligned_M=%d pad_delta=%d ue8m0=%s need_tma_aligned=%s "
+                    "FIX=%s",
+                    tag,
+                    tuple(sf.shape),
+                    tuple(sf.stride()),
+                    sf.dtype,
+                    m,
+                    aligned_m,
+                    aligned_m - m,
+                    deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
+                    _CONTIG_MXFP8_SF_FIX,
+                )
+                _CONTIG_SF_DEBUG_DONE = True
+            except Exception:  # pragma: no cover - instrumentation must never break
+                pass
+        if _CONTIG_MXFP8_SF_FIX and is_ue8m0_int:
+            return _tma_align_packed_ue8m0_sf(sf)
+        return sf
 
     def _run_bf16_contiguous_gemm(
         self,
