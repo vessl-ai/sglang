@@ -563,6 +563,18 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
+        # Expose the standard pool refs that stock wrappers (e.g. TboAttnBackend,
+        # which reads ``primary.token_to_kv_pool`` / ``primary.req_to_token_pool``)
+        # expect on an attention backend. The hybrid backend never set them, so
+        # --enable-two-batch-overlap crashed at TboAttnBackend.__init__ with an
+        # AttributeError. The dense backend holds the real model_runner pool refs;
+        # fall back to the sparse backend's kv_pool if the dense backend lacks one.
+        self.token_to_kv_pool = getattr(
+            dense_backend,
+            "token_to_kv_pool",
+            getattr(sparse_backend, "kv_pool", None),
+        )
+        self.req_to_token_pool = getattr(dense_backend, "req_to_token_pool", None)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.
