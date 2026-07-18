@@ -327,9 +327,23 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
+    # NIXL prefill->decode KV-transfer pipeline depth: how many chunks'
+    # xfer handles a transfer_worker may keep OUTSTANDING (posted but not
+    # yet DONE) at once. Default 1 == stock behavior (fully drain each
+    # chunk before posting the next). N>1 posts the next chunk's RDMA
+    # WRITEs while the previous chunk's are still in flight, keeping the
+    # fabric busy when transfers are orchestration-/latency-limited.
+    SGLANG_NIXL_INFLIGHT_CHUNKS = EnvInt(1)
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # VES-2493: cap the fraction of the decode KV pool held by in-transfer
+    # (pre-allocated, awaiting-KV) reservations. 0.0 = disabled (upstream
+    # behavior). When > 0, DecodePreallocQueue.pop_preallocated stops admitting
+    # new requests once in-transfer reservations reach this fraction of
+    # max_total_num_tokens, leaving headroom for the running batch and
+    # preventing the PD decode prealloc self-lock wedge.
+    SGLANG_DECODE_INTRANSFER_KV_CAP = EnvFloat(0.0)
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.

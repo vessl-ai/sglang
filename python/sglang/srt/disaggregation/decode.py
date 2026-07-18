@@ -863,6 +863,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 - len(self.transfer_queue.queue),
             )
 
+        # In-transfer KV self-lock cap (VES-2493, env-gated, default 0.0 = OFF).
+        # Snapshot the tokens already held by in-transfer requests (those in the
+        # transfer queue, awaiting KV from prefill) and grow it as we admit more
+        # below, so the cap also accounts for requests admitted in *this* tick
+        # (transfer_queue is only extended after this loop, so
+        # num_tokens_pre_allocated does not yet reflect same-tick admits).
+        intransfer_kv_cap = envs.SGLANG_DECODE_INTRANSFER_KV_CAP.get()
+        intransfer_reserved_tokens = self.num_tokens_pre_allocated
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -881,6 +890,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             if hisparse_req_budget <= 0:
+                break
+
+            # Stop admitting once in-transfer (dead, awaiting-KV) reservations
+            # already hold `intransfer_kv_cap` fraction of the pool, so the
+            # running batch keeps headroom. The total-pool gate below otherwise
+            # fills the pool to ~0.98 with dead reservations -> prefill can't
+            # hand off -> PD self-lock wedge (VES-2493). This break MUST stay
+            # HERE, before _match_prefix_and_lock / _pre_alloc, so no radix lock
+            # or KV slot is acquired for this request: breaking *after* a
+            # physical alloc/adder side-effect leaks req_pool_idx and SIGQUITs
+            # all TP ranks (project_sglang_post_adder_defer_unsafe_hicache).
+            if (
+                intransfer_kv_cap > 0.0
+                and intransfer_reserved_tokens
+                >= intransfer_kv_cap * self.max_total_num_tokens
+            ):
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1119,6 +1144,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            # Account for this tick's reservation in the in-transfer cap above.
+            # extend_range.end == kv_committed_len == fill_len (set in
+            # _pre_alloc) and matches num_tokens_pre_allocated once this req
+            # enters the transfer queue.
+            intransfer_reserved_tokens += decode_req.req.extend_range.end
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
 
         self.queue = [

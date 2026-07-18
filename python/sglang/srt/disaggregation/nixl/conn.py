@@ -631,6 +631,12 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        # Keep Failed sticky until the sender clears the room.
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            return
+        super().update_status(bootstrap_room, status)
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -1000,8 +1006,147 @@ class NixlKVManager(CommonKVManager):
         # Never cache on self -- multiple workers would race the ring.
         staging_strategy = None
 
+        # Pipeline depth: how many chunks' NIXL xfer handles may be
+        # OUTSTANDING (posted, not yet DONE) at once. Default 1 reproduces
+        # the stock "fully drain each chunk before posting the next"
+        # behavior byte-for-byte. N>1 posts the next chunk's RDMA WRITEs
+        # while the previous chunk's are still in flight.
+        inflight_limit = max(1, envs.SGLANG_NIXL_INFLIGHT_CHUNKS.get())
+
+        # FIFO list of in-flight chunks: (room, handles, kv_chunk). We only
+        # ever finalize from the FRONT, which preserves per-room completion
+        # ordering: add_transfer_request routes every chunk of a room to
+        # this same worker (room % num_queues), so a room's chunks are a
+        # subsequence of this worker's dequeue order and its last chunk is
+        # always enqueued last. Finalizing front-first therefore guarantees
+        # that a room's last chunk (which frees the source KV via Success)
+        # is finalized only after all of that room's earlier chunks are DONE
+        # -- exactly the invariant the stock drain-each-chunk loop provides.
+        outstanding: List[Tuple[int, List[Any], TransferKVChunk]] = []
+
+        def _poll_all_done(room, handles):
+            # Verbatim extraction of the stock busy-poll inner loop: scan
+            # every handle each pass, raise on ERR, return True iff all DONE.
+            all_done = True
+            for handle in handles:
+                state = self.agent.check_xfer_state(handle)
+                if state == "ERR":
+                    raise RuntimeError(
+                        f"NIXL transfer encountered ERR room={room}"
+                    )
+                if state != "DONE":
+                    all_done = False
+            return all_done
+
+        def _finalize(room, kv_chunk):
+            # Exact stock post-DONE actions (previously lines after the
+            # busy-poll block). Guard: a sibling chunk of this room may have
+            # already marked it Failed; update_status(Transferring=3) would
+            # resurrect a Failed(=0) room via max(), so skip. Stock never
+            # hits this because with drain-each-chunk a Failed room has no
+            # in-flight sibling and its later chunks are dropped at dequeue
+            # by the check_status==Failed skip.
+            if self.check_status(room) == KVPoll.Failed:
+                return
+            if kv_chunk.is_last_chunk:
+                self.update_status(room, KVPoll.Success)
+                # Drop per-room state on Success (parity with mooncake
+                # transfer_worker; staging prefetch sets are NIXL-only).
+                self.transfer_infos.pop(room, None)
+                self.req_to_decode_prefix_len.pop(room, None)
+                if self.enable_staging and self._staging_ctx is not None:
+                    self._staging_ctx.prefetched_rooms.discard(room)
+                    self._staging_ctx.prefetch_requested = {
+                        k
+                        for k in self._staging_ctx.prefetch_requested
+                        if k[0] != room
+                    }
+            else:
+                self.update_status(room, KVPoll.Transferring)
+
+        def _fail(room, e):
+            # Exact stock exception handling (previously the except block).
+            if isinstance(e, _NIXL_TRANSPORT_ERRORS):
+                logger.warning(f"NIXL transport error for room {room}: {e}")
+            else:
+                logger.exception(
+                    f"Unexpected transfer worker error for room {room}"
+                )
+            self.exceptions[room] = e
+            self.record_failure(room, str(e))
+            self.update_status(room, KVPoll.Failed)
+            # Abandon any other in-flight chunks of this room (their WRITEs
+            # may still be in flight -- stock likewise abandons the raising
+            # chunk's handles). Prevents re-polling / resurrecting a Failed
+            # room in _finalize.
+            outstanding[:] = [t for t in outstanding if t[0] != room]
+
+        def _drain(block_until_progress):
+            # Finalize completed chunks from the FRONT. Non-blocking pass
+            # (block_until_progress=False): finalize every consecutively
+            # completed head chunk, then return at the first still-in-flight
+            # head. Blocking pass (True): keep polling the head until it
+            # finalizes or errors (frees exactly one pipeline slot), then
+            # return -- this is the only place the worker blocks on
+            # transfers, and it never blocks on the queue while chunks are
+            # in flight (no-deadlock requirement).
+            while outstanding:
+                room, handles, kv_chunk = outstanding[0]
+                try:
+                    done = _poll_all_done(room, handles)
+                except Exception as e:
+                    _fail(room, e)
+                    if block_until_progress:
+                        return
+                    continue
+                if done:
+                    outstanding.pop(0)
+                    _finalize(room, kv_chunk)
+                    if block_until_progress:
+                        return
+                    continue
+                # Head chunk still in flight.
+                if not block_until_progress:
+                    return
+                # De-storm: yield ~50us instead of sleep(0). With up to
+                # QUEUE_SIZE(48) workers busy-polling, sleep(0) is a pure
+                # GIL-spin that starves the shared STRICT-sync nixl_agent
+                # lock + its 8 progress threads (the real "orchestration
+                # limit" that num_threads=32 could not move). A tiny real
+                # sleep frees the GIL so progress threads drain WRs.
+                time.sleep(0.00005)
+
+        def _get_next(block):
+            # Dequeue one chunk from the FastQueue. block=True mirrors the
+            # stock blocking queue.get(); block=False returns None when the
+            # queue is momentarily empty so the worker can keep draining
+            # in-flight chunks instead of parking in get() (which would
+            # strand their Success bookkeeping if traffic pauses). Uses the
+            # queue's own condition/buffer to avoid touching FastQueue.
+            with queue._cond:
+                if block:
+                    while not queue._buf:
+                        queue._cond.wait()
+                elif not queue._buf:
+                    return None
+                return queue._buf.popleft()
+
         while True:
-            kv_chunk: TransferKVChunk = queue.get()
+            # (a) Opportunistically finalize any completed in-flight chunks.
+            _drain(block_until_progress=False)
+
+            # (b) If the pipeline is full, block until a slot frees.
+            if len(outstanding) >= inflight_limit:
+                _drain(block_until_progress=True)
+
+            # (c) Fetch the next chunk. Block only when nothing is in flight
+            #     (== stock). While chunks are outstanding, never park in
+            #     get(): if the queue is empty, keep blocking-draining them.
+            kv_chunk: TransferKVChunk = _get_next(block=(len(outstanding) == 0))
+            if kv_chunk is None:
+                _drain(block_until_progress=True)
+                continue
+
             room = kv_chunk.room
             handles: List[Any] = []
             try:
@@ -1178,50 +1323,23 @@ class NixlKVManager(CommonKVManager):
                         handles.append(aux_xfer_handle)
 
                 if staging_deferred:
-                    # Chunk has been re-enqueued; do not advance status.
+                    # Chunk has been re-enqueued; do not advance status and
+                    # do not track it -- it will be reprocessed fresh.
                     continue
-
-                while handles:
-                    all_done = True
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        if state != "DONE":
-                            all_done = False
-                    if all_done:
-                        break
-                    time.sleep(0)
-
-                if kv_chunk.is_last_chunk:
-                    self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
-                else:
-                    self.update_status(room, KVPoll.Transferring)
             except Exception as e:
-                # Catch all exceptions to prevent silently killing this
-                # worker thread, but still propagate via failure_exception().
-                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
-                    logger.warning(f"NIXL transport error for room {room}: {e}")
-                else:
-                    logger.exception(
-                        f"Unexpected transfer worker error for room {room}"
-                    )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
+                # Catch all exceptions during chunk assembly / posting to
+                # prevent silently killing this worker thread, but still
+                # propagate via failure_exception(). Any handles already
+                # posted for this chunk are abandoned (stock parity).
+                _fail(room, e)
+                continue
+
+            # Chunk fully posted: track it. Its post-DONE bookkeeping
+            # (is_last_chunk Success / non-last Transferring, per-room state
+            # drop, add_transfer_request accounting) fires in _finalize only
+            # after THIS chunk's handles are all DONE, and only when it
+            # reaches the FIFO front (after all earlier same-room chunks).
+            outstanding.append((room, handles, kv_chunk))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2316,6 +2434,40 @@ class NixlKVManager(CommonKVManager):
             return False
         return self.transfer_statuses[room].is_done()
 
+    def _handle_abort_notification(self, msg: List[bytes]) -> bool:
+        if not msg or msg[0] != b"ABORT":
+            return False
+
+        try:
+            room_to_be_aborted = int(msg[1].decode("ascii"))
+        except Exception as e:
+            logger.debug(f"Ignoring malformed abort notification: {e}")
+            return True
+
+        if (
+            room_to_be_aborted in self.request_status
+            and self.check_status(room_to_be_aborted) != KVPoll.Success
+        ):
+            self.record_failure(
+                room_to_be_aborted,
+                "Aborted by decode-side abort notification.",
+            )
+            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"marked as Failed"
+            )
+        else:
+            logger.debug(
+                f"Received abort notification for room {room_to_be_aborted}, "
+                f"ignoring (already completed or unknown)"
+            )
+
+        # TODO: Define real ACK/deferred-release semantics if decode-side buffer
+        # release needs to wait for prefill-side NIXL transfer quiescence.
+
+        return True
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -2343,6 +2495,9 @@ class NixlKVManager(CommonKVManager):
                         )
 
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                    continue
+
+                if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
                 assert (
