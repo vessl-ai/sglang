@@ -260,6 +260,7 @@ class Envs:
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)

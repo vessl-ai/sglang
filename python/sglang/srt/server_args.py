@@ -4399,7 +4399,10 @@ class ServerArgs:
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
                 self.optimistic_prefill_retries = 0
-            elif self.enable_hierarchical_cache:
+            elif (
+                self.enable_hierarchical_cache
+                and not envs.SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE.get()
+            ):
                 logger.warning("Optimistic prefill does not support hierarchical cache")
                 self.optimistic_prefill_retries = 0
             elif getattr(self, "uses_mamba_radix_cache", False):
