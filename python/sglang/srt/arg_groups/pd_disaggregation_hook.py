@@ -39,10 +39,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if server_args.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
+                # Only tested on MiniMax-M2.7 (fp8, EAGLE3 topk1).
+                logger.warning(
+                    "EXPERIMENTAL: decode radix cache + speculative decoding "
+                    f"(--speculative-algorithm {server_args.speculative_algorithm}) "
+                    "enabled together. Only tested on MiniMax-M2.7."
                 )
             from sglang.srt.arg_groups.overrides import resolved_view
 
