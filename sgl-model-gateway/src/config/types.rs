@@ -270,6 +270,9 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
+    #[serde(rename = "least_load")]
+    LeastLoad,
+
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
@@ -345,6 +348,7 @@ impl PolicyConfig {
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::LeastLoad => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",

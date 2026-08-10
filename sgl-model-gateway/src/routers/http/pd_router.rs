@@ -569,6 +569,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -652,12 +653,24 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
+        // For non-streaming: use guard for automatic load management.
+        // For streaming: increment at dispatch (the same instant select read load()),
+        // then move the guards into the response body so load stays counted for the
+        // whole stream. This closes the select->first-token window where streaming load
+        // was invisible and bursts herded onto the same still-zero worker (preemptive-load).
         let _prefill_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Streaming dispatch guards: +1 now, moved into the body on the success path,
+        // dropped (decrement) in place on any error early-return.
+        let mut stream_guards: Option<(WorkerLoadGuard, WorkerLoadGuard)> =
+            context.is_stream.then(|| {
+                (
+                    WorkerLoadGuard::new(prefill.clone(), headers),
+                    WorkerLoadGuard::new(decode.clone(), headers),
+                )
+            });
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -870,6 +883,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        stream_guards.take(),
                     )
                 } else {
                     // Non-streaming response
@@ -1108,8 +1122,9 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
+        _prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        attached_guards: Option<(WorkerLoadGuard, WorkerLoadGuard)>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1198,11 +1213,6 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
-
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
@@ -1210,7 +1220,14 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        // Attach the guards created at dispatch time (preemptive-load). When None
+        // (the synthetic-error SSE from handle_decode_error_response, or any caller that
+        // does not track load) the response carries no guard — the dispatch guard for
+        // that path was already dropped at its error branch.
+        match attached_guards {
+            Some(guards) => AttachedBody::wrap_response(response, guards),
+            None => response,
+        }
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1998,6 +2015,10 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                Some((
+                    WorkerLoadGuard::new(prefill_ref.clone(), None),
+                    WorkerLoadGuard::new(decode_ref.clone(), None),
+                )),
             );
 
             // Guards are now attached to response body, so load should be 1
