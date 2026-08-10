@@ -1652,7 +1652,9 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            # ★ httpmwfix: _IncludedRouter(중첩 라우터)는 .path 없음 → AttributeError로
+            # track_http_status_code 미들웨어 크래시(engine 죽음). getattr 가드.
+            return getattr(route, "path", request.url.path), True
 
     return request.url.path, False
 
