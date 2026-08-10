@@ -329,6 +329,7 @@ class Envs:
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
+    SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE = EnvBool(False)
 
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
