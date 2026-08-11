@@ -2969,7 +2969,9 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.weight.dtype,
+                # _SGL_K3_ATTN_FP8: o_proj is FP8, so take the activation dtype
+                # from o_norm, which is never quantized.
+                dtype=layer.self_attn.o_norm.weight.dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
@@ -3335,3 +3337,38 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
 
 EntryClass = [KimiK3ForConditionalGeneration]
+
+
+# ---- injected: EPLB expert-location hook ----
+def _k3_expert_location_cfg(cls, config):
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+    tc = getattr(config, "text_config", None) or config
+
+    def g(*names, default=None):
+        for n in names:
+            v = getattr(tc, n, None)
+            if v is None:
+                v = getattr(config, n, None)
+            if v is not None:
+                return v
+        return default
+
+    n_layers = g("num_hidden_layers")
+    n_experts = g("num_experts", "n_routed_experts")
+    n_groups = g("n_group")
+    assert n_layers is not None and n_experts is not None, (
+        f"EPLB hook: missing fields (layers={n_layers}, experts={n_experts})"
+    )
+    return ModelConfigForExpertLocation(
+        num_layers=int(n_layers),
+        num_logical_experts=int(n_experts),
+        num_groups=int(n_groups) if n_groups else None,
+    )
+
+
+for _cls_name in ("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM"):
+    _cls = globals().get(_cls_name)
+    if _cls is not None and not hasattr(_cls, "get_model_config_for_expert_location"):
+        _cls.get_model_config_for_expert_location = classmethod(_k3_expert_location_cfg)
+# ---- end injected ----
