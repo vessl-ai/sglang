@@ -676,6 +676,11 @@ class Function(BaseModel):
         data = handler(self)
         if self.defer_loading is None:
             data.pop("defer_loading", None)
+        # Do not materialize fields the caller never sent. Reviving them makes
+        # the tool-declaration JSON longer and shifts prompt_tokens.
+        for _f in ("strict", "description", "parameters"):
+            if _f not in self.model_fields_set:
+                data.pop(_f, None)
         return data
 
 
@@ -685,6 +690,13 @@ class Tool(BaseModel):
     type: str = Field(default="function", examples=["function"])
     function: Function
     defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
 
     @model_validator(mode="after")
     def _propagate_defer_loading(self) -> Tool:

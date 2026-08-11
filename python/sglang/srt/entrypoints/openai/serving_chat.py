@@ -109,10 +109,10 @@ def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
     """Parse OpenAI tool call arguments for chat templates."""
     try:
         parsed_arguments = orjson.loads(arguments)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(
-            "Assistant tool call function.arguments must be valid JSON."
-        ) from exc
+    except orjson.JSONDecodeError:
+        # The reference API renders truncated tool_call arguments verbatim rather
+        # than rejecting them; rejecting turns any history-replay request into a 400.
+        return arguments
 
     if not isinstance(parsed_arguments, dict):
         raise ValueError(
@@ -120,6 +120,17 @@ def parse_tool_call_arguments(arguments: str) -> Dict[str, Any]:
         )
 
     return parsed_arguments
+
+
+def _strip_schema_ids(obj):
+    """Return a copy with every "$id" removed. Used only for validation;
+    the caller's schema object is left untouched.
+    """
+    if isinstance(obj, dict):
+        return {k: _strip_schema_ids(v) for k, v in obj.items() if k != "$id"}
+    if isinstance(obj, list):
+        return [_strip_schema_ids(x) for x in obj]
+    return obj
 
 
 def normalize_assistant_tool_call_arguments(
@@ -850,7 +861,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                try:
+                    Draft202012Validator.check_schema(tool.function.parameters)
+                except SchemaError:
+                    # Draft 2020-12 forbids a non-empty fragment in "$id", which
+                    # Draft-07 allowed for anchors. Accept the schema only if it
+                    # validates once the "$id" keys are dropped; any other defect
+                    # still falls through to the handler below.
+                    Draft202012Validator.check_schema(
+                        _strip_schema_ids(tool.function.parameters)
+                    )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
