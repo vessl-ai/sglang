@@ -97,9 +97,44 @@ class W4AFp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
-                return UnquantizedLinearMethod()
-            return Fp8LinearMethod(self)
+            # Four attention projections are stored as FP8 in the checkpoint; every
+            # other linear is bf16 and stays unquantized. Routing them to
+            # Fp8LinearMethod(self) would pull them into the [128, 128] block-quant
+            # path, which fails on b_proj (output size 6).
+            _K3_ATTN_FP8_ALLOW = {
+                "fused_qkvg_proj",   # KDA layers, fused q/k/v/g
+                "qkv_proj",          # same layers when dp-attention splits the fusion
+                "g_proj",            # MLA gate, plus KDA g when unfused
+                "o_proj",            # attention output projection
+            }
+            _name = prefix.rsplit(".", 1)[-1] if prefix else ""
+            if _name in _K3_ATTN_FP8_ALLOW:
+                from sglang.srt.layers.quantization.fp8 import (
+                    Fp8Config,
+                    Fp8LinearMethod,
+                )
+
+                cfg = getattr(self, "_k3_baked_cfg", None)
+                if cfg is None:
+                    cfg = Fp8Config(
+                        # The checkpoint already stores these as FP8.
+                        is_checkpoint_fp8_serialized=True,
+                        activation_scheme="dynamic",
+                        weight_block_size=None,
+                    )
+                    self._k3_baked_cfg = cfg
+                # Log what matched. A name that does not match is not an error --
+                # it silently leaves the tensor in bf16. Expected with dp=2:
+                # qkv_proj 69, g_proj 93, o_proj 93.
+                n = getattr(self, "_k3_baked_n", None)
+                if n is None:
+                    n = {}
+                    self._k3_baked_n = n
+                n[_name] = n.get(_name, 0) + 1
+                if sum(n.values()) % 50 == 0 or sum(n.values()) < 3:
+                    print(f"K3_ATTN_FP8_BAKED: loaded so far {dict(n)}", flush=True)
+                return Fp8LinearMethod(cfg)
+            return UnquantizedLinearMethod()
         elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
         return None
