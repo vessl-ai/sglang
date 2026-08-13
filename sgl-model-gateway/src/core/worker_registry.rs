@@ -347,6 +347,7 @@ impl WorkerRegistry {
             }
 
             worker.set_healthy(false);
+            worker.mark_removed();
             Metrics::remove_worker_metrics(worker.url());
 
             // Sync removal to mesh if enabled (no-op if mesh is not enabled)
