@@ -89,6 +89,10 @@ class Sampler(nn.Module):
         """Apply custom logit processors and sanitize non-finite logits."""
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
+        # --- solar-open2 FSM (injected) ---
+        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
+
+        _solar_fsm.apply(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits
 

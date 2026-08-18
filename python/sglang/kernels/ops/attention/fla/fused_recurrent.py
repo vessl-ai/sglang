@@ -11,6 +11,8 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
+_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
@@ -428,6 +430,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    BETA_SCALE: tl.constexpr = 1.0,
 ):
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
@@ -482,7 +485,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     # Keep beta in fp32 (no bf16 round-trip) to match the generic decode
     # kernel `fused_sigmoid_gating_delta_rule_update`, which is the reference
     # validated against torch.
-    beta_val = tl.sigmoid(b_val).to(tl.float32)
+    beta_val = (BETA_SCALE * tl.sigmoid(b_val)).to(tl.float32)
 
     # Per-K decay: each K-row of the [V, K] state decays by its own exp(g_k).
     b_h *= exp(b_g)[None, :]
@@ -631,6 +634,7 @@ def fused_recurrent_kda_packed_decode(
     NV = triton.cdiv(V, BV)
     grid = (NV, B * HV)
     fused_recurrent_kda_packed_decode_kernel[grid](
+        BETA_SCALE=_SOLAR_KDA_BETA_SCALE,
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
