@@ -283,3 +283,16 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+
+# --- solar-open2 tool parser (injected) ---
+try:
+    from sglang.srt.function_call.solar_open2_detector import (
+        SolarOpen2Detector as _SolarOpen2Detector,
+    )
+
+    FunctionCallParser.ToolCallParserEnum["solar_open2"] = _SolarOpen2Detector
+    logger.info("[SOLAR-PATCH] registered tool-call parser 'solar_open2'")
+except Exception as _solar_err:
+    logger.error("[SOLAR-PATCH] solar_open2 tool parser registration FAILED: %s", _solar_err)
+    raise

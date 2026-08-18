@@ -51,6 +51,8 @@ from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
+_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+
 
 class KimiMoE(nn.Module):
     def __init__(
@@ -389,7 +391,7 @@ class KimiDeltaAttention(nn.Module):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
+            beta = beta.float().sigmoid() * _SOLAR_KDA_BETA_SCALE
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

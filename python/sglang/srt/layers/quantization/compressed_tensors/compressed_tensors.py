@@ -211,8 +211,19 @@ class CompressedTensorsConfig(QuantizationConfig):
         """Get the weight block size from the quantization config."""
         if "Linear" in self.target_scheme_map:
             weights_config = self.target_scheme_map["Linear"].get("weights")
-            if weights_config and hasattr(weights_config, "block_structure"):
+            if weights_config and getattr(weights_config, "block_structure", None):
                 return weights_config.block_structure
+        # Regex-target configs (e.g. Solar-Open2-W4A8) have no "Linear" key at
+        # all; fall back to the first config_group that declares a block
+        # structure. Groups without one (int4 group-quantized MoE) return None
+        # and are skipped.
+        for _scheme in self.target_scheme_map.values():
+            if not isinstance(_scheme, dict):
+                continue
+            _w = _scheme.get("weights")
+            _bs = getattr(_w, "block_structure", None) if _w is not None else None
+            if _bs:
+                return _bs
         return None
 
     @classmethod

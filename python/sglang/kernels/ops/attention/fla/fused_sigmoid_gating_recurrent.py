@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+
 
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
@@ -51,6 +53,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr = False,
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    BETA_SCALE: tl.constexpr = 1.0,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -171,7 +174,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = BETA_SCALE / (1.0 + tl.exp(-b_b))
 
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
@@ -325,6 +328,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        BETA_SCALE=_SOLAR_KDA_BETA_SCALE,
         q=q,
         k=k,
         v=v,

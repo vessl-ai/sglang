@@ -1438,6 +1438,13 @@ class ReasoningParser:
         if model_type.lower() == "minimax-m3" and force_reasoning is None:
             force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
+        # --- solar-open2 force_reasoning override (injected) ---
+        # The solar_open2 template pre-closes the think block for
+        # reasoning_effort none/low, so whether the stream starts inside
+        # reasoning depends on the request, not on the detector default.
+        if model_type.lower() == "solar_open2":
+            force_reasoning = solar_open2_force_reasoning(request)
+
         # Only pass force_reasoning if explicitly set, let detectors use their defaults
         kwargs = {"stream_reasoning": stream_reasoning}
         if force_reasoning is not None:
@@ -1492,3 +1499,64 @@ class ReasoningParser:
         the stream ends."""
         ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
+
+
+# --- solar-open2 reasoning parser (injected) ---
+_SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
+
+
+def solar_open2_force_reasoning(request) -> bool:
+    """Mirror chat_template.jinja: thinking is opened in the generation prompt
+    only when reasoning_effort is medium/high (unset -> template default
+    "high")."""
+    if request is None:
+        return True
+    effort = getattr(request, "reasoning_effort", None)
+    if effort is None:
+        effort = (getattr(request, "chat_template_kwargs", None) or {}).get(
+            "reasoning_effort"
+        )
+    if effort is None:
+        return True
+    return str(effort).lower() in _SOLAR_OPEN2_THINK_OPEN_EFFORTS
+
+
+class SolarOpen2Detector(BaseReasoningFormatDetector):
+    """Solar Open2 reasoning detector.
+
+    ``<|think:start|>`` / ``<|think:end|>`` are single special tokens. The chat
+    template opens thinking (prefills ``<|think:start|>`` into the generation
+    prompt) only when ``reasoning_effort`` is ``medium``/``high`` (default
+    "high" when unset); for ``none``/``low``/anything else it emits an
+    already-closed ``<|think:start|><|think:end|>`` block and the model
+    answers directly, so the generated stream starts in content, not
+    reasoning. Whether the stream starts inside reasoning therefore depends
+    on the request (see ``solar_open2_force_reasoning`` and the
+    ``ReasoningParser.__init__`` override below), not on a fixed default.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<|think:start|>",
+            "<|think:end|>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
+ReasoningParser.DetectorMap["solar_open2"] = SolarOpen2Detector
+import logging as _solar_logging
+
+_solar_logging.getLogger(__name__).info(
+    "[SOLAR-PATCH] registered reasoning parser 'solar_open2'"
+)
