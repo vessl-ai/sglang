@@ -568,11 +568,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # --- solar-open2 FSM verify plan (injected) ---
+        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
+
+        _solar_fsm_plan = _solar_fsm.plan_verify(
+            batch.reqs, verify_ids_2d, verify_ids_2d.shape[1]
+        )
+
         fold_eligible = (
             self._verify_executor.verify_epilogue is not None
             and proposal.folded
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+            # --- solar-open2 FSM fold gate (injected) ---
+            and not (_solar_fsm_plan is not None and _solar_fsm_plan.needs_eager)
         )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -597,6 +606,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+
+        # --- solar-open2 FSM verify mask (injected) ---
+        if _solar_fsm_plan is not None and _solar_fsm_plan.needs_eager:
+            # Same tensor and row order the grammar-noop check above relies
+            # on: rows are (request-major, chain-minor), stride = chain length.
+            _solar_fsm_plan.apply(
+                logits_output.next_token_logits,
+                verify_lens=getattr(layout, "verify_lens", None),
+            )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
