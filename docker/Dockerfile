@@ -1,4 +1,23 @@
 ARG CUDA_VERSION=13.0.1
+
+# By parameterizing the base of the stages that sit above the whole dependency
+# set, a build can start from a published image of an earlier build's stage
+# instead of rebuilding it. The defaults are the in-Dockerfile stage names, so
+# the default build graph is exactly the one described below; passing an image
+# ref makes BuildKit skip every stage that only that ref depended on.
+#
+# Example:
+# docker build --target framework_final \
+#   --build-arg FRAMEWORK_BASE_IMAGE=registry.acme.org/sglang-framework@sha256:... \
+#   --build-arg GATEWAY_BUILDER_BASE_IMAGE=registry.acme.org/sglang-framework@sha256:...
+#
+# framework_final installs the sglang source with --no-deps, so an external
+# FRAMEWORK_BASE_IMAGE freezes the dependency set at the commit that base was
+# built from. docker/check_base_deps.py runs as the last step of framework_final
+# and fails the build when that set no longer satisfies python/pyproject.toml.
+ARG FRAMEWORK_BASE_IMAGE=framework
+ARG GATEWAY_BUILDER_BASE_IMAGE=base
+
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -442,7 +461,7 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
 ########################################################
 # Builds sgl-model-gateway in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
+FROM ${GATEWAY_BUILDER_BASE_IMAGE} AS gateway_builder
 
 ARG GITHUB_ARTIFACTORY
 ARG BRANCH_TYPE
@@ -660,7 +679,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 FROM scratch AS local_src
 COPY . /src
 
-FROM framework AS framework_final
+FROM ${FRAMEWORK_BASE_IMAGE} AS framework_final
 
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
@@ -726,6 +745,16 @@ COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
+
+# The editable install above is --no-deps: every dependency comes from the stage
+# underneath. When that stage is an external FRAMEWORK_BASE_IMAGE built from an
+# older commit, a dependency added or bumped since then is simply absent and the
+# build still succeeds, failing as an ImportError only once the server starts.
+# Assert the environment against the source's own dependency list instead.
+COPY docker/check_base_deps.py /usr/local/bin/sglang-check-base-deps
+RUN python3 /usr/local/bin/sglang-check-base-deps \
+    --pyproject /sgl-workspace/sglang/python/pyproject.toml \
+    --extras "${BUILD_TYPE}"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
