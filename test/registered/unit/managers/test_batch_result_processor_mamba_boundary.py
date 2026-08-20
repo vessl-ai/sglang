@@ -175,18 +175,11 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                         "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
                     ),
                     patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_observability",
-                        return_value=SimpleNamespace(enable_metrics=False),
-                    ),
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_disagg",
-                        return_value=SimpleNamespace(
-                            disaggregation_decode_enable_offload_kvcache=False
-                        ),
-                    ),
+                    # Upstream also stubs get_observability and get_disagg here.
+                    # Neither exists in this file on release/v0.5.17 -- metrics
+                    # go through self.server_args.enable_metrics and there is no
+                    # disagg offload branch on this path -- so patching them
+                    # raises AttributeError instead of isolating anything.
                     patch.object(
                         SchedulerBatchResultProcessor,
                         "_mamba_prefix_cache_update",
