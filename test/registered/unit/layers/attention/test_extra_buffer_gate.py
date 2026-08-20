@@ -4,8 +4,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+from sglang.srt.server_args import ServerArgs
 
 
 def _view(**kwargs):
@@ -117,6 +120,73 @@ class TestSupportsMambaCacheExtraBuffer(unittest.TestCase):
                 "Qwen3NextForCausalLM",
             )
         )
+
+
+class TestValidateMambaExtraBuffer(unittest.TestCase):
+    """The page_size guard in ``ServerArgs._validate_mamba_extra_buffer``.
+
+    It runs during ``__post_init__``, before ``_handle_page_size`` has defaulted
+    ``page_size`` -- so it must not reach for anything that resolves page_size,
+    and it must tolerate ``None``. An earlier revision asserted through the
+    ``mamba_cache_chunk_size`` property and raised ``TypeError`` on the default
+    launch of the very model it was written for.
+    """
+
+    def _validate(self, page_size, model_chunk=None):
+        args = ServerArgs.__new__(ServerArgs)
+        hf_config = SimpleNamespace()
+        if model_chunk is not None:
+            hf_config.mamba_chunk_size = model_chunk
+        view = SimpleNamespace(
+            page_size=page_size,
+            mamba_radix_cache_strategy="extra_buffer",
+            speculative_num_draft_tokens=None,
+            # unrelated pre-existing check asserts track_interval % page_size == 0
+            mamba_track_interval=(page_size or 64) * 2,
+            chunked_prefill_size=None,
+            disaggregation_mode="null",
+            speculative_algorithm=None,
+        )
+        # The checks that already lived here reach for the
+        # mamba_cache_chunk_size property, which resolves a full ServerArgs.
+        # Stub it: this test is about the page_size ceiling, and the point of
+        # the ceiling's own code is that it does NOT go through that property.
+        with mock.patch.object(
+            ServerArgs,
+            "get_model_config",
+            lambda self: SimpleNamespace(hf_config=hf_config),
+        ), mock.patch.object(
+            ServerArgs,
+            "mamba_cache_chunk_size",
+            new_callable=mock.PropertyMock,
+            return_value=model_chunk or FLA_CHUNK_SIZE,
+        ), mock.patch(
+            "sglang.srt.arg_groups.overrides.supports_mamba_cache_extra_buffer",
+            return_value=True,
+        ):
+            ServerArgs._validate_mamba_extra_buffer(args, view, "SolarOpen2ForCausalLM")
+
+    def test_unset_page_size_does_not_raise(self):
+        """The default launch path: page_size is still None here."""
+        self._validate(page_size=None)
+
+    def test_page_size_within_the_kernel_chunk_is_accepted(self):
+        self._validate(page_size=FLA_CHUNK_SIZE)
+
+    def test_page_size_above_the_kernel_chunk_is_refused(self):
+        with self.assertRaises(AssertionError):
+            self._validate(page_size=FLA_CHUNK_SIZE * 2)
+
+    def test_model_declared_chunk_raises_the_ceiling(self):
+        """A Mamba2-family model chunks at its own config value, not the FLA one.
+
+        Asserting FLA_CHUNK_SIZE for them would refuse configurations that serve
+        today -- NemotronH, FalconH1 and GraniteMoeHybrid all ship a
+        mamba_chunk_size well above 64.
+        """
+        self._validate(page_size=256, model_chunk=256)
+        with self.assertRaises(AssertionError):
+            self._validate(page_size=512, model_chunk=256)
 
 
 if __name__ == "__main__":

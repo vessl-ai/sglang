@@ -36,9 +36,9 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
     The kernel stores ``h[i_t]`` at the top of its chunk loop, before chunk
     ``i_t`` is accumulated, so ``h[j]`` is the state *entering* chunk ``j``:
     the state after exactly ``j`` completed chunks, never including chunk ``j``
-    itself. Combined with ``mamba_cache_chunk_size`` equalling this kernel's own
+    itself. Combined with ``page_size`` not exceeding this kernel's own
     ``CHUNK_SIZE`` -- which ``ServerArgs._validate_mamba_extra_buffer`` asserts
-    at startup -- that is what makes ``offset + len // C`` in
+    at startup when a page_size is set -- that is what makes ``offset + len // C`` in
     ``_init_track_ssm_indices`` the last completed boundary. This test covers
     the kernel half of that pair; ``test_track_ssm_indices.py`` covers the index
     arithmetic. The expression is correct as written; these exist to keep it

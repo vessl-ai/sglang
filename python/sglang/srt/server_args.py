@@ -5333,32 +5333,40 @@ class ServerArgs:
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
-        # h[] is chunked at FLA_CHUNK_SIZE for the FLA-convention backends (KDA,
-        # GDN), and _init_track_ssm_indices derives num_h_states and the
-        # per-request offsets from mamba_cache_chunk_size instead. Those agree
-        # only while page_size stays within the kernel's chunk. Above it,
-        # num_h_states under-counts, every per-request offset after the first
-        # points into a neighbouring request's block, and the restore is wrong
-        # with no error -- the standing "TODO: handle mamba_cache_chunk_size %
-        # page size != 0" in _init_track_ssm_indices. The guard meant to
-        # compensate compares mamba_track_fla_chunk_aligned against
-        # mamba_track_seqlen_aligned in schedule_batch, but on the plain-extend
-        # branch both sides are computed from mamba_cache_chunk_size with
-        # identical expressions, so that branch never fires. Fail at startup
-        # rather than serve cross-request state.
+        # _init_track_ssm_indices sizes each request's h[] block from
+        # mamba_cache_chunk_size = max(model chunk, page_size), but the kernel
+        # that writes h[] chunks at the model's own value -- FLA_CHUNK_SIZE for
+        # the KDA/GDN convention, config.mamba_chunk_size for Mamba2. Raise
+        # page_size above that and num_h_states under-counts: every per-request
+        # offset after the first points into a neighbouring request's block and
+        # the restore is wrong with no error. That is the standing "TODO: handle
+        # mamba_cache_chunk_size % page size != 0" in _init_track_ssm_indices,
+        # and the guard meant to compensate is dead code -- schedule_batch
+        # compares mamba_track_fla_chunk_aligned against
+        # mamba_track_seqlen_aligned, but on the plain-extend branch both sides
+        # are the same expression, so it never fires.
         #
-        # Scoped to models that do not declare their own mamba_chunk_size: a
-        # model that does (NemotronH ships 256) is on the Mamba2 convention,
-        # takes the other branch in _init_track_ssm_indices, and never reaches
-        # chunk_delta_h -- so this invariant is not its to satisfy and asserting
-        # it would refuse a configuration that works today.
-        hf_config = self.get_model_config().hf_config
-        if getattr(hf_config, "mamba_chunk_size", None) is None:
-            assert self.mamba_cache_chunk_size == FLA_CHUNK_SIZE, (
-                f"extra_buffer reads h[] as chunked at FLA_CHUNK_SIZE="
-                f"{FLA_CHUNK_SIZE}, but mamba_cache_chunk_size="
-                f"{self.mamba_cache_chunk_size} (page_size={view.page_size}). "
-                f"Use a page_size no larger than {FLA_CHUNK_SIZE}."
+        # Read the model's chunk directly rather than through
+        # self.mamba_cache_chunk_size: that property resolves page_size, which
+        # __post_init__ has not defaulted yet at this point (_handle_page_size
+        # runs after _handle_model_specific_adjustments), so touching it here
+        # would both raise on the default launch and freeze a stale cache for
+        # the rest of the process.
+        #
+        # Conservative for BailingMoeV2_5: it runs on LightningAttentionBackend,
+        # which tracks by per-request lengths and never indexes a batch-wide
+        # h[], so the constraint is not really its own. Narrowing would mean
+        # knowing the attention backend here, which this layer does not.
+        if view.page_size is not None:
+            hf_config = self.get_model_config().hf_config
+            kernel_chunk = getattr(hf_config, "mamba_chunk_size", None)
+            if kernel_chunk is None:
+                kernel_chunk = FLA_CHUNK_SIZE
+            assert view.page_size <= kernel_chunk, (
+                f"extra_buffer sizes h[] blocks by max(model_chunk, page_size) "
+                f"while the kernel chunks at {kernel_chunk}, so page_size="
+                f"{view.page_size} would index past each request's own block. "
+                f"Use a page_size no larger than {kernel_chunk}."
             )
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             # The PD-disagg decode pool is not wired for lazy slots.
