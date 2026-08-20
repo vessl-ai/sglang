@@ -271,7 +271,7 @@ def _register() -> None:
             arch_names=["SolarOpen2ForCausalLM"],
             uses_mamba_radix_cache=True,
             support_mamba_cache=True,
-            support_mamba_cache_extra_buffer=False,
+            support_mamba_cache_extra_buffer=True,
         )
     )
 

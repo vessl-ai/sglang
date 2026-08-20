@@ -1143,13 +1143,15 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
-        # Solar-Open2 reuses KimiDeltaAttention / KDAAttnBackend verbatim, so it
-        # performs the same track-snapshot writes the other KDA archs here do.
-        # Without this entry the strategy resolves to "no_buffer", which
-        # force-disables the overlap scheduler and pins page_size to 1 -- and a
-        # page_size of 1 is what makes the mooncake L3 key count explode (one
-        # key per token; at page_size 64 the same cache needs ~1/79 as many
-        # keys, measured).
+        # Solar-Open2 runs on KDAAttnBackend and performs the same track-snapshot
+        # writes as the other KDA archs listed here. Without the entry the
+        # strategy resolves to "no_buffer", which force-disables the overlap
+        # scheduler and makes any page_size > 1 fail the assertion in
+        # ServerArgs._validate_mamba_no_buffer at startup -- so the arch is
+        # pinned to one radix key per token, which is what inflates the L3 key
+        # count for a store-backed deployment. Note supports_mamba_cache_extra_buffer
+        # below additionally requires linear_attn_backend == "triton"; on any
+        # other linear-attn backend this entry is inert.
         "SolarOpen2ForCausalLM",
     }
 )
