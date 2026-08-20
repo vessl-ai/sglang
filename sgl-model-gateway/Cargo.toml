@@ -205,3 +205,10 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# [vessl] openai-protocol 1.0.0 rejects empty user message content, which
+# OpenAI's API and our engines both accept (defect D-3). The rule survives in
+# the crate's latest release, so we carry the fix as a vendored patch until
+# lightseekorg/smg takes it upstream.
+[patch.crates-io]
+openai-protocol = { path = "vendor/openai-protocol" }

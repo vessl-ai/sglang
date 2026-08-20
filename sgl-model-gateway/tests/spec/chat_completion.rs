@@ -568,3 +568,34 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
         err
     );
 }
+
+// [vessl] Regression tests for defect D-3: the vendored openai-protocol patch
+// (sgl-model-gateway/vendor/openai-protocol) drops the empty-user-content
+// rejection while keeping the empty-messages-array rejection.
+
+#[test]
+fn test_empty_user_content_is_valid() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": ""}],
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "Empty user content should be accepted: OpenAI's API and the engines \
+         this gateway fronts both accept it"
+    );
+}
+
+#[test]
+fn test_empty_messages_array_is_invalid() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "messages": [],
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_err(),
+        "An empty messages array should still be rejected"
+    );
+}
