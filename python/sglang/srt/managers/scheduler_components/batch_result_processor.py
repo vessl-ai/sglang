@@ -934,7 +934,10 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        lazy = mamba_extra_buffer_lazy_enabled()
+        # Upstream reads this through a module-level helper introduced by a
+        # refactor this branch does not carry; the two other reads in this file
+        # already go through get_server_args().
+        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
         known_mamba_boundary = None
         completed_mamba_boundary = None
         lookahead = 0
