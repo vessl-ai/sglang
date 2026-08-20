@@ -479,9 +479,23 @@ WORKDIR /build
 # Copy ONLY the gateway source (not the full repo)
 COPY sgl-model-gateway /build/sgl-model-gateway
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
+# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain.
+#
+# The leading rm is what makes this stage work when GATEWAY_BUILDER_BASE_IMAGE
+# is a prebuilt framework image rather than the default `base` stage. That
+# image already carries a stable toolchain under /root/.rustup, and rustup-init
+# starts by moving the existing one aside -- a rename of a directory that
+# exists only in a lower overlayfs layer, which returns EXDEV on any node
+# whose overlay module has redirect_dir off (the default):
+#   error: could not rename 'component' file from
+#   '/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/share/doc/cargo'
+#   ...: Invalid cross-device link (os error 18)
+# Deleting the directory first is a whiteout in the upper layer, which
+# overlayfs does handle, and it costs nothing: this stage installs a fresh
+# stable toolchain either way and deletes it again on the last line.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    rm -rf /root/.cargo /root/.rustup \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
