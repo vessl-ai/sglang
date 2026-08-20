@@ -783,6 +783,28 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    # The solar_open2 chat template opens thinking only for medium/high
+    # (reasoning_parser._SOLAR_OPEN2_THINK_OPEN_EFFORTS); any other value
+    # pre-closes the think block, so an effort above high would silently
+    # disable reasoning. Fold those values into "high" before the template,
+    # require_reasoning, and the reasoning parser read the request.
+    _SOLAR_OPEN2_EFFORT_FOLD = ("xhigh", "max")
+
+    def _normalize_solar_open2_reasoning_effort(
+        self, request: ChatCompletionRequest
+    ) -> None:
+        effort = request.reasoning_effort
+        if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
+            request.reasoning_effort = "high"
+        ctk = request.chat_template_kwargs
+        if ctk:
+            effort = ctk.get("reasoning_effort")
+            if (
+                isinstance(effort, str)
+                and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD
+            ):
+                ctk["reasoning_effort"] = "high"
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -795,6 +817,9 @@ class OpenAIServingChat(OpenAIServingBase):
             effort = ctk.get("reasoning_effort")
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
+
+        if self.reasoning_parser == "solar_open2":
+            self._normalize_solar_open2_reasoning_effort(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
