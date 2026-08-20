@@ -51,7 +51,9 @@ from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
-_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+_SOLAR_KDA_BETA_SCALE = float(
+    __import__("os").environ.get("SOLAR_KDA_BETA_SCALE", "1.0")
+)
 
 
 class KimiMoE(nn.Module):

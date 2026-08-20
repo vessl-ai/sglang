@@ -4,7 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+_SOLAR_KDA_BETA_SCALE = float(
+    __import__("os").environ.get("SOLAR_KDA_BETA_SCALE", "1.0")
+)
 
 
 @triton.jit(do_not_specialize=["T"])
