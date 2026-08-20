@@ -1986,6 +1986,19 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser == "solar_open2":
+            # The solar_open2 template pre-closes the think block for every
+            # reasoning_effort other than medium/high, so ``<|think:end|>``
+            # never appears in the output. With require_reasoning=True the
+            # scheduler's usage counter (Req.update_reasoning_tokens) would
+            # then label every completion token as reasoning. Same rule as
+            # the reasoning parser (solar_open2_force_reasoning).
+            from sglang.srt.parser.reasoning_parser import (
+                solar_open2_force_reasoning,
+            )
+
+            return solar_open2_force_reasoning(request)
+
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
             # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
