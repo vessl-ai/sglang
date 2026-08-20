@@ -37,7 +37,8 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_observability,
-    get_server_args,
+    mamba_extra_buffer_lazy_enabled,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
@@ -195,6 +196,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -360,6 +362,7 @@ class SchedulerBatchResultProcessor:
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
+        self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
@@ -563,7 +566,7 @@ class SchedulerBatchResultProcessor:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
-                get_server_return_hidden_states_mode(server_args),
+                get_server_return_hidden_states_mode(),
             ),
             batch.spec_info,
         )
@@ -1013,10 +1016,7 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        # Upstream reads this through a module-level helper introduced by a
-        # refactor this branch does not carry; the two other reads in this file
-        # already go through get_server_args().
-        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = mamba_extra_buffer_lazy_enabled()
         known_mamba_boundary = None
         completed_mamba_boundary = None
         lookahead = 0
@@ -1091,7 +1091,7 @@ class SchedulerBatchResultProcessor:
                     prepare_release(req)
                 is_insert = (
                     req.mamba_lazy_is_insert
-                    if get_server_args().enable_mamba_extra_buffer_lazy()
+                    if mamba_extra_buffer_lazy_enabled()
                     else True
                 )
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
@@ -1127,14 +1127,11 @@ class SchedulerBatchResultProcessor:
         if req.mamba_ping_pong_track_buffer is None:
             return
 
-        lazy = get_server_args().enable_mamba_extra_buffer_lazy()
+        lazy = mamba_extra_buffer_lazy_enabled()
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv_committed_len
-            # Upstream reads this off the runtime-context bags; on this branch
-            # mamba_track_interval is not published into them, and this file
-            # already goes through get_server_args() for the same value below.
-            assert track_seqlen % get_server_args().mamba_track_interval == 0
+            assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
@@ -1187,7 +1184,6 @@ class SchedulerBatchResultProcessor:
             keep_written_by_this_step = (
                 crossed and planned_pos == req.mamba_next_track_idx
             )
-            server_args = get_server_args()
             other_idx = 1 - req.mamba_next_track_idx
             # Recompute the in-flight verify's plan (kv_committed_len is
             # frozen since its prepare, so the recompute is exact).
@@ -1196,7 +1192,7 @@ class SchedulerBatchResultProcessor:
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
                 get_exec().mamba.mamba_track_interval,
-                server_args.max_speculative_num_draft_tokens,
+                max_speculative_num_draft_tokens(),
             )
             if (
                 planned_pos is None

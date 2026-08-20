@@ -36,6 +36,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -104,8 +105,15 @@ _PER_REQUEST_OPTIONAL_FIELDS = frozenset(
 )
 
 
-def _make_tokenizer_manager() -> TokenizerManager:
-    """Create a TokenizerManager with mocked dependencies, bypassing __init__."""
+def _make_tokenizer_manager(case) -> TokenizerManager:
+    """Create a TokenizerManager with mocked dependencies, bypassing __init__.
+
+    The config it reads comes from the bags, so the stand-in needs a published
+    config rather than attributes on a mock.
+    """
+    override = get_context().override_server_args(speculative_algorithm=None)
+    override.install()
+    case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
     tm._config_updates = []
@@ -217,7 +225,7 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 
     def test_abort_removes_rid_from_state(self):
         """After _handle_abort_req, rid should be removed from rid_to_state."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "abort_test_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -229,7 +237,7 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 
     def test_abort_allows_resubmit_same_rid(self):
         """After abort, _init_req_state should accept the same rid again."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "resubmit_after_abort_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -250,7 +258,7 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 
     def test_abort_sets_finished_and_notifies(self):
         """_handle_abort_req should mark state as finished and set the event."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "abort_notify_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -271,7 +279,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
     def test_batch_output_removes_rid_on_finish(self):
         """When a request finishes in _handle_batch_output, rid should be removed."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "batch_finish_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -283,7 +291,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
     def test_batch_output_allows_resubmit_after_finish(self):
         """After a request finishes, the same rid can be resubmitted."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "batch_resubmit_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -304,7 +312,7 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
 
     def test_batch_output_keeps_rid_when_not_finished(self):
         """When a request is not yet finished, rid should remain in rid_to_state."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "batch_ongoing_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -321,7 +329,7 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
     def test_duplicate_rid_raises_error(self):
         """_init_req_state should raise ValueError if rid already exists."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "duplicate_rid"
         state = _make_req_state(rid)
         tm.rid_to_state[rid] = state
@@ -339,7 +347,7 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
     def test_unique_rid_succeeds(self):
         """_init_req_state should succeed with a unique rid."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "unique_rid"
 
         obj = Mock(spec=GenerateReqInput)
@@ -353,7 +361,7 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
         self.assertIn(rid, tm.rid_to_state)
 
     def test_batch_duplicate_preflight_does_not_insert_partial_state(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         existing_rid = "existing"
         existing_state = _make_req_state(existing_rid)
         tm.rid_to_state[existing_rid] = existing_state
@@ -371,7 +379,7 @@ class TestResubmitAfterCompletion(CustomTestCase):
 
     def test_complete_then_resubmit_same_rid(self):
         """A request that completes normally should allow resubmission with the same rid."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "complete_resubmit_rid"
 
         # Phase 1: simulate a request in rid_to_state, then complete it
@@ -397,7 +405,7 @@ class TestResubmitAfterCompletion(CustomTestCase):
 
     def test_abort_then_resubmit_same_rid(self):
         """An aborted request should allow resubmission with the same rid."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "abort_resubmit_rid"
 
         # Phase 1: simulate a request, then abort it
@@ -431,9 +439,9 @@ class _DummyAsyncCM:
         return False
 
 
-def _make_tm_for_generate() -> TokenizerManager:
+def _make_tm_for_generate(case) -> TokenizerManager:
     """Augment the mocked TokenizerManager with what generate_request needs."""
-    tm = _make_tokenizer_manager()
+    tm = _make_tokenizer_manager(case)
     tm.server_args.language_only = False
     tm.server_args.tokenizer_worker_num = 1
     tm.server_args.enable_strict_thinking = False
@@ -468,7 +476,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
     """Direct tests for _discard_pending_req_states."""
 
     def test_discard_single_aborts_scheduler_before_cleanup(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rid = "d_single"
         tm.rid_to_state[rid] = _make_req_state(rid, dispatched=True)
         obj = Mock(spec=GenerateReqInput)
@@ -481,7 +489,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         self.assertFalse(abort_req.abort_all)
 
     def test_discard_unsent_batch_without_scheduler_abort(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         rids = ["d0", "d1", "d2"]
         for r in rids:
             tm.rid_to_state[r] = _make_req_state(r)
@@ -495,7 +503,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
     def test_discard_ignores_already_removed(self):
         """Popping a rid that is no longer present must not raise."""
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         tm.rid_to_state["p1"] = _make_req_state("p1")
         obj = Mock(spec=GenerateReqInput)
         obj.is_single = False
@@ -504,7 +512,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         self.assertNotIn("p1", tm.rid_to_state)
 
     def test_parallel_cleanup_aborts_children_and_allows_parent_reuse(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         parent = _make_generate_obj("parent", is_single=True)
         lifecycle_ids = tm._init_req_state(parent)
 
@@ -529,7 +537,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
         self.assertIn("parent", tm.rid_to_state)
 
     def test_stale_cleanup_does_not_remove_reused_rid(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         old_obj = _make_generate_obj("reused", is_single=True)
         old_lifecycle_ids = tm._init_req_state(old_obj)
         tm._remove_req_state("reused")
@@ -546,7 +554,7 @@ class TestDiscardPendingReqStates(CustomTestCase):
 
 class TestParallelAbortRouting(CustomTestCase):
     def test_parent_abort_fans_out_to_children(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
         tm.server_args.tokenizer_worker_num = 1
         tm._register_child_rid("parent", "choice_0")
         tm._register_child_rid("parent", "choice_1")
@@ -562,7 +570,7 @@ class TestParallelAbortRouting(CustomTestCase):
 
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
 
         async def drive():
             sibling_closed = asyncio.Event()
@@ -590,7 +598,7 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
         asyncio.run(drive())
 
     def test_failing_non_stream_choice_cancels_and_closes_sibling_waiters(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
 
         async def drive():
             sibling_closed = asyncio.Event()
@@ -616,7 +624,7 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
 
 class TestParallelRidReuse(CustomTestCase):
     def test_completed_n2_request_can_repeat_the_same_logical_rid(self):
-        tm = _make_tokenizer_manager()
+        tm = _make_tokenizer_manager(self)
 
         async def complete_child(rid):
             await tm._handle_batch_output(_make_batch_str_output(rid))
@@ -648,6 +656,60 @@ class TestParallelRidReuse(CustomTestCase):
             self.assertFalse(tm.child_rid_to_logical_rid)
 
 
+class TestParallelStreamTaskCleanup(CustomTestCase):
+    def test_failing_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager(self)
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            stream = tm._stream_batch_responses(
+                [failing_choice(), blocked_choice()],
+                ["choice-0", "choice-1"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await stream.__anext__()
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
+
+    def test_failing_non_stream_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager(self)
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await tm._collect_batch_responses([failing_choice(), blocked_choice()])
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
+
+
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     """generate_request must not leak rid_to_state when dispatch fails.
 
@@ -658,7 +720,7 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     """
 
     def test_single_failure_before_dispatch_cleans_up(self):
-        tm = _make_tm_for_generate()
+        tm = _make_tm_for_generate(self)
         rid = "single_overlen"
         obj = _make_generate_obj(rid, is_single=True)
         # Simulate over-length rejection during tokenization/validation.
@@ -679,7 +741,7 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         self.assertNotIn(rid, tm.rid_to_state)
 
     def test_batch_failure_before_dispatch_cleans_up_all(self):
-        tm = _make_tm_for_generate()
+        tm = _make_tm_for_generate(self)
         rids = ["b0", "b1", "b2"]
         obj = _make_generate_obj(list(rids), is_single=False)
 
@@ -745,6 +807,23 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
 
     def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
         tm = _make_tm_for_generate()
+        obj = GenerateReqInput(
+            text="hello",
+            rid="thinking-budget",
+            sampling_params={},
+            max_thinking_tokens=32,
+        )
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "--enable-strict-thinking"):
+            asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state)
+
+    def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+        tm = _make_tm_for_generate(self)
         obj = GenerateReqInput(
             text="hello",
             rid="thinking-budget",
