@@ -103,9 +103,11 @@ class TestTrackSsmIndices(unittest.TestCase):
         another sequence's recurrent state -- including negative indices, which
         Python wraps to the end of the buffer rather than raising.
         """
-        # Deliberately includes a sequence shorter than one chunk, which is the
-        # case that turns an over-eager "- 1" into a negative index.
-        lens = [70, 40, 200]
+        # The short sequence goes FIRST on purpose: its offset is 0, so an
+        # over-eager "- 1" produces a negative index there. Anywhere else in the
+        # batch the same slip lands on a neighbour's block instead -- also
+        # wrong, also caught below, but not the sharper case.
+        lens = [40, 70, 200]
         fb = _forward_batch(
             extend_seq_lens=lens,
             prefix_lens=[0, 0, 0],

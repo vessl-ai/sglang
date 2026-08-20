@@ -106,7 +106,7 @@ class TestSupportsMambaCacheExtraBuffer(unittest.TestCase):
     def test_partial_view_without_per_phase_fields(self):
         """Callers build partial views; a missing override means "not set".
 
-        Reading the per-phase fields directly turned those callers into
+        Reading the per-phase fields directly makes those callers an
         AttributeError instead of a verdict.
         """
         self.assertFalse(
@@ -127,9 +127,7 @@ class TestValidateMambaExtraBuffer(unittest.TestCase):
 
     It runs during ``__post_init__``, before ``_handle_page_size`` has defaulted
     ``page_size`` -- so it must not reach for anything that resolves page_size,
-    and it must tolerate ``None``. An earlier revision asserted through the
-    ``mamba_cache_chunk_size`` property and raised ``TypeError`` on the default
-    launch of the very model it was written for.
+    and it must tolerate ``None``.
     """
 
     def _validate(self, page_size, model_chunk=None):
@@ -147,11 +145,21 @@ class TestValidateMambaExtraBuffer(unittest.TestCase):
             disaggregation_mode="null",
             speculative_algorithm=None,
         )
+        # This validator asserts the platform (CUDA/MUSA/NPU/ROCm) before it
+        # reaches the page_size ceiling, and this test runs on a CPU runner --
+        # without the patch every case here would be catching that assert
+        # instead, and the "refused" case would pass for the wrong reason.
+        #
         # The checks that already lived here reach for the
-        # mamba_cache_chunk_size property, which resolves a full ServerArgs.
-        # Stub it: this test is about the page_size ceiling, and the point of
-        # the ceiling's own code is that it does NOT go through that property.
-        with mock.patch.object(
+        # mamba_cache_chunk_size property, which resolves a full ServerArgs, so
+        # it is stubbed too -- with the real max(chunk, page_size) semantics
+        # rather than a constant. A constant would let a tautological ceiling
+        # (`page_size <= self.mamba_cache_chunk_size`, i.e. page <= max(chunk,
+        # page), always true) pass this suite. The ceiling's own code
+        # deliberately does not go through that property.
+        with mock.patch(
+            "sglang.srt.server_args.is_cuda", return_value=True
+        ), mock.patch.object(
             ServerArgs,
             "get_model_config",
             lambda self: SimpleNamespace(hf_config=hf_config),
@@ -159,7 +167,7 @@ class TestValidateMambaExtraBuffer(unittest.TestCase):
             ServerArgs,
             "mamba_cache_chunk_size",
             new_callable=mock.PropertyMock,
-            return_value=model_chunk or FLA_CHUNK_SIZE,
+            side_effect=lambda: max(model_chunk or FLA_CHUNK_SIZE, page_size or 1),
         ), mock.patch(
             "sglang.srt.arg_groups.overrides.supports_mamba_cache_extra_buffer",
             return_value=True,

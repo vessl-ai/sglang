@@ -5339,9 +5339,13 @@ class ServerArgs:
         # the KDA/GDN convention, config.mamba_chunk_size for Mamba2. Raise
         # page_size above that and num_h_states under-counts: every per-request
         # offset after the first points into a neighbouring request's block and
-        # the restore is wrong with no error. That is the standing "TODO: handle
-        # mamba_cache_chunk_size % page size != 0" in _init_track_ssm_indices,
-        # and the guard meant to compensate is dead code -- schedule_batch
+        # the restore is wrong with no error. Note this is NOT the standing
+        # "TODO: handle mamba_cache_chunk_size % page size != 0" in
+        # _init_track_ssm_indices -- that condition cannot fire, because the
+        # mamba_cache_chunk_size property already asserts the two divide each
+        # other. The reachable failure is page_size exceeding the chunk the
+        # kernel actually uses, which is what this guards. The guard meant to
+        # compensate downstream is dead code -- schedule_batch
         # compares mamba_track_fla_chunk_aligned against
         # mamba_track_seqlen_aligned, but on the plain-extend branch both sides
         # are the same expression, so it never fires.

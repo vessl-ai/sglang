@@ -1147,11 +1147,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # Solar-Open2 runs on KDAAttnBackend and performs the same
-        # track-snapshot writes as KimiLinearForCausalLM above. Listed here
-        # rather than left to its spec declaration because this lookup does
-        # not import anything: a spec reaches the registry only once its
-        # config module has been imported, which for an in-tree model is an
-        # ordering assumption with nothing enforcing it.
+        # track-snapshot writes as KimiLinearForCausalLM above. In-tree, so
+        # listed here rather than left to its spec -- see
+        # supports_mamba_cache_extra_buffer below.
         "SolarOpen2ForCausalLM",
     }
 )

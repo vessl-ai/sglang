@@ -276,8 +276,7 @@ def _register() -> None:
             # arg_groups.overrides._MAMBA_EXTRA_BUFFER_ARCHS for in-tree archs
             # and this field for out-of-tree ones, so for Solar this is a
             # declaration that must agree with that list rather than the thing
-            # that decides. It said False while the list said True for one
-            # revision, which is the state this comment exists to prevent.
+            # that decides.
             support_mamba_cache_extra_buffer=True,
         )
     )
