@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5)
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import types
 import unittest
@@ -116,8 +116,14 @@ class TestTrackSsmIndices(unittest.TestCase):
 
         num_h = torch.tensor([(n - 1) // CHUNK_SIZE + 1 for n in lens])
         offsets = torch.cat([torch.zeros(1, dtype=torch.int64), num_h.cumsum(0)[:-1]])
-        lo = offsets[: len(h_src)]
-        hi = lo + num_h[: len(h_src)]
+        # Select windows with the same predicate production uses, not by row
+        # order. Slicing the first len(h_src) rows happens to line up only while
+        # every sequence is both unaligned and tracked; add an aligned or
+        # masked-out one and the windows would silently pair with the wrong
+        # sequences while the containment check kept passing.
+        rows = (torch.tensor(lens) % CHUNK_SIZE) != 0
+        lo = offsets[rows]
+        hi = lo + num_h[rows]
 
         self.assertTrue(
             bool(((h_src >= lo) & (h_src < hi)).all()),
@@ -170,6 +176,62 @@ class TestTrackSsmIndices(unittest.TestCase):
             final_src.numel(),
             1,
             "the aligned sequence restores its live state, not an h entry",
+        )
+
+    def test_untracked_sequences_still_consume_their_offset(self):
+        """A masked-out sequence must still occupy its slice of ``h``.
+
+        The offsets are a cumulative sum over every sequence in the batch, taken
+        before the track mask is applied, because the kernel writes an h block
+        for each sequence whether or not the scheduler wants a snapshot of it.
+        If the cumsum were ever taken after masking, every sequence downstream
+        of an untracked one would read a neighbour's block -- the same failure
+        as an off-by-one index, reached a different way.
+        """
+        lens = [200, 100, 328]
+        fb = _forward_batch(
+            extend_seq_lens=lens,
+            prefix_lens=[0, 0, 0],
+            track_seqlens=lens,
+            track_mask=[True, False, True],
+        )
+        h_src, _, _, _ = _call(_make_backend(), fb)
+
+        num_h = torch.tensor([(n - 1) // CHUNK_SIZE + 1 for n in lens])
+        offsets = torch.cat([torch.zeros(1, dtype=torch.int64), num_h.cumsum(0)[:-1]])
+        expected = (offsets + num_h - 1)[torch.tensor([True, False, True])]
+
+        self.assertTrue(
+            torch.equal(h_src, expected),
+            f"track_ssm_h_src={h_src.tolist()}, expected {expected.tolist()}. "
+            f"Sequence 1 is untracked but still owns h entries; skipping its "
+            f"block would shift sequence 2 onto sequence 1's state.",
+        )
+
+    def test_prefix_length_does_not_shift_the_index(self):
+        """``num_h_states`` comes from the extend length, the index from the tracked one.
+
+        Those are two different quantities and a nonzero prefix is what separates
+        them: the h block is sized by how many tokens this round computes, while
+        the entry within it is chosen by how far into the sequence the snapshot
+        should sit. Every other case here runs with an empty prefix, which hides
+        a swap between the two.
+        """
+        prefix, extend = 512, 200
+        fb = _forward_batch(
+            extend_seq_lens=[extend],
+            prefix_lens=[prefix],
+            track_seqlens=[prefix + extend],
+            track_mask=[True],
+        )
+        h_src, _, _, _ = _call(_make_backend(), fb)
+
+        expected = extend // CHUNK_SIZE  # offset is 0 for the first sequence
+        self.assertTrue(
+            torch.equal(h_src, torch.tensor([expected])),
+            f"track_ssm_h_src={h_src.tolist()}, expected [{expected}] -- the "
+            f"prefix is already in the cache, so only the {extend} tokens this "
+            f"round computed have h entries.",
         )
 
 

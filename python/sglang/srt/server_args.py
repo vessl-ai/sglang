@@ -5333,27 +5333,33 @@ class ServerArgs:
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm (FLA)."
-        # The extra_buffer index math treats h[] as chunked at the FLA kernel's
-        # own CHUNK_SIZE: _init_track_ssm_indices derives num_h_states and the
-        # per-request offsets from mamba_cache_chunk_size, while the kernel that
-        # writes h[] uses FLA_CHUNK_SIZE unconditionally. Those agree only while
-        # page_size <= FLA_CHUNK_SIZE. At a larger page_size, num_h_states
-        # under-counts, every per-request offset after the first points into a
-        # neighbouring request's block, and the resulting restore is wrong with
-        # no error -- see the standing "TODO: handle mamba_cache_chunk_size %
-        # page size != 0" in hybrid_linear_attn_backend._init_track_ssm_indices.
-        # The guard that was meant to compensate (schedule_batch, comparing
-        # mamba_track_fla_chunk_aligned against mamba_track_seqlen_aligned) is
-        # unreachable: both sides are computed from mamba_cache_chunk_size with
-        # identical expressions, so _force_track_h never fires. Fail at startup
-        # instead of serving cross-request state.
-        assert self.mamba_cache_chunk_size == FLA_CHUNK_SIZE, (
-            f"extra_buffer assumes h[] is chunked at FLA_CHUNK_SIZE="
-            f"{FLA_CHUNK_SIZE}, but mamba_cache_chunk_size="
-            f"{self.mamba_cache_chunk_size} (page_size={view.page_size}, "
-            f"model mamba_chunk_size may also raise it). Use a page_size no "
-            f"larger than {FLA_CHUNK_SIZE}."
-        )
+        # h[] is chunked at FLA_CHUNK_SIZE for the FLA-convention backends (KDA,
+        # GDN), and _init_track_ssm_indices derives num_h_states and the
+        # per-request offsets from mamba_cache_chunk_size instead. Those agree
+        # only while page_size stays within the kernel's chunk. Above it,
+        # num_h_states under-counts, every per-request offset after the first
+        # points into a neighbouring request's block, and the restore is wrong
+        # with no error -- the standing "TODO: handle mamba_cache_chunk_size %
+        # page size != 0" in _init_track_ssm_indices. The guard meant to
+        # compensate compares mamba_track_fla_chunk_aligned against
+        # mamba_track_seqlen_aligned in schedule_batch, but on the plain-extend
+        # branch both sides are computed from mamba_cache_chunk_size with
+        # identical expressions, so that branch never fires. Fail at startup
+        # rather than serve cross-request state.
+        #
+        # Scoped to models that do not declare their own mamba_chunk_size: a
+        # model that does (NemotronH ships 256) is on the Mamba2 convention,
+        # takes the other branch in _init_track_ssm_indices, and never reaches
+        # chunk_delta_h -- so this invariant is not its to satisfy and asserting
+        # it would refuse a configuration that works today.
+        hf_config = self.get_model_config().hf_config
+        if getattr(hf_config, "mamba_chunk_size", None) is None:
+            assert self.mamba_cache_chunk_size == FLA_CHUNK_SIZE, (
+                f"extra_buffer reads h[] as chunked at FLA_CHUNK_SIZE="
+                f"{FLA_CHUNK_SIZE}, but mamba_cache_chunk_size="
+                f"{self.mamba_cache_chunk_size} (page_size={view.page_size}). "
+                f"Use a page_size no larger than {FLA_CHUNK_SIZE}."
+            )
         if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
             # The PD-disagg decode pool is not wired for lazy slots.
             assert view.disaggregation_mode == "null", (
