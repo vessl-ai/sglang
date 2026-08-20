@@ -302,9 +302,27 @@ class MambaAttnBackendBase(AttentionBackend):
         # Unaligned: intermediate state from h.
         # TODO: handle mamba_cache_chunk_size % page size != 0
         not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // mamba_cache_chunk_size
-        )
+        if isinstance(self, Mamba2AttnBackend):
+            # Mamba2 stores one h[] entry per chunk *boundary*, so len // C is
+            # already the last completed block for it.
+            track_ssm_h_src = offset_masked[not_aligned] + (
+                lens_masked[not_aligned] // mamba_cache_chunk_size
+            )
+        else:
+            # KDA/GDN write num_h_states = ceil(len / C) entries, so len // C
+            # addresses the *ragged* trailing block -- the partial state at the
+            # end of this round -- rather than the last fully completed one.
+            # Restoring from it reconstructs the sequence from a state that
+            # includes tokens past the chunk boundary. The last completed block
+            # is len // C - 1.
+            #
+            # clamp(min=0) is load-bearing: a round shorter than one chunk has
+            # no completed block at all, and -1 would index backwards out of
+            # this request's h[] region into another request's state. Clamping
+            # leaves those rounds on the original index, which is in-range.
+            track_ssm_h_src = offset_masked[not_aligned] + torch.clamp(
+                lens_masked[not_aligned] // mamba_cache_chunk_size - 1, min=0
+            )
         track_ssm_h_dst = dst_masked[not_aligned]
 
         return (

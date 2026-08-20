@@ -1143,6 +1143,14 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # Solar-Open2 reuses KimiDeltaAttention / KDAAttnBackend verbatim, so it
+        # performs the same track-snapshot writes the other KDA archs here do.
+        # Without this entry the strategy resolves to "no_buffer", which
+        # force-disables the overlap scheduler and pins page_size to 1 -- and a
+        # page_size of 1 is what makes the mooncake L3 key count explode (one
+        # key per token; at page_size 64 the same cache needs ~1/79 as many
+        # keys, measured).
+        "SolarOpen2ForCausalLM",
     }
 )
 
