@@ -144,9 +144,13 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     processor.process_batch_result_decode(result_batch, batch_result)
 
                 scheduler.process_batch_result = process_batch_result
+                # Upstream reads the interval off the runtime-context bags
+                # (get_exec().mamba); this branch keeps it on server_args, which
+                # is what both call sites under test go through.
                 server_args = SimpleNamespace(
                     enable_mamba_extra_buffer=lambda: True,
                     enable_mamba_extra_buffer_lazy=lambda: False,
+                    mamba_track_interval=4,
                 )
 
                 with (
@@ -158,11 +162,14 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                         "sglang.srt.managers.schedule_batch.get_server_args",
                         return_value=server_args,
                     ),
+                    # batch_result_processor imports get_server_args into its
+                    # own namespace, so patching schedule_batch's does not reach
+                    # the boundary assertion -- it would fall through to the
+                    # process-global ServerArgs, which a unit test has not set.
                     patch(
-                        "sglang.srt.managers.schedule_batch.get_exec",
-                        return_value=SimpleNamespace(
-                            mamba=SimpleNamespace(mamba_track_interval=4)
-                        ),
+                        "sglang.srt.managers.scheduler_components."
+                        "batch_result_processor.get_server_args",
+                        return_value=server_args,
                     ),
                     patch(
                         "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"

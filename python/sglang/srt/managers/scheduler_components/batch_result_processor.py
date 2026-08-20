@@ -1032,7 +1032,10 @@ class SchedulerBatchResultProcessor:
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv_committed_len
-            assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
+            # Upstream reads this off the runtime-context bags; on this branch
+            # mamba_track_interval is not published into them, and this file
+            # already goes through get_server_args() for the same value below.
+            assert track_seqlen % get_server_args().mamba_track_interval == 0
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
