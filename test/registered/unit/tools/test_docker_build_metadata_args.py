@@ -160,16 +160,29 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
                 "abcdef12",
             )
 
+    def _after(self, dockerfile, marker):
+        """Everything past a stage header, asserting the header is still there.
+
+        Splitting and indexing [1] turns a renamed stage into an IndexError
+        pointing at this file rather than at the Dockerfile that moved -- which
+        is how the FRAMEWORK_BASE_IMAGE parameterisation went unnoticed here.
+        """
+        head, sep, tail = dockerfile.partition(marker)
+        self.assertTrue(sep, f"stage header {marker!r} is gone from docker/Dockerfile")
+        return tail
+
     def test_final_dockerfile_stages_embed_metadata_contract(self):
         dockerfile = DOCKERFILE_PATH.read_text()
-        framework_stage = dockerfile.split("FROM framework AS framework_final", 1)[
-            1
-        ].split("FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime")[
-            0
-        ]
-        runtime_stage = dockerfile.split(
-            "FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime", 1
-        )[1]
+        runtime_header = (
+            "FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime"
+        )
+        # The base is a build arg so the stage can sit on a prebuilt framework
+        # image; the arg defaults to the `framework` stage name, so the default
+        # build graph is unchanged.
+        framework_stage = self._after(
+            dockerfile, "FROM ${FRAMEWORK_BASE_IMAGE} AS framework_final"
+        ).split(runtime_header)[0]
+        runtime_stage = self._after(dockerfile, runtime_header)
 
         for stage in (framework_stage, runtime_stage):
             for expected in (

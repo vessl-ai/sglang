@@ -1128,8 +1128,11 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 )
 
 # Architectures that support the extra_buffer mamba radix cache strategy.
-# Single source of truth: ServerArgs._support_mamba_cache_extra_buffer
-# delegates here.
+# In-tree archs are listed here; an out-of-tree model can instead declare
+# support_mamba_cache_extra_buffer on its LinearAttnModelSpec, which
+# supports_mamba_cache_extra_buffer below also consults. Both routes end at
+# that one function, which is what ServerArgs._support_mamba_cache_extra_buffer
+# delegates to.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -1143,6 +1146,11 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # Solar-Open2 runs on KDAAttnBackend and performs the same
+        # track-snapshot writes as KimiLinearForCausalLM above. In-tree, so
+        # listed here rather than left to its spec -- see
+        # supports_mamba_cache_extra_buffer below.
+        "SolarOpen2ForCausalLM",
     }
 )
 
@@ -1150,9 +1158,38 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
-    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        return view.linear_attn_backend == "triton"
-    return False
+    from sglang.srt.configs.linear_attn_model_registry import (
+        get_linear_attn_spec_by_arch,
+    )
+
+    if model_arch not in _MAMBA_EXTRA_BUFFER_ARCHS:
+        # An out-of-tree model registers through LinearAttnModelSpec instead of
+        # editing the frozenset above, so honour its declaration too -- otherwise
+        # the field is a promise the code does not keep and a model can set it,
+        # get nothing, and have no error to say why. Such a model has been
+        # imported by the time it is served, so the registry is populated;
+        # in-tree archs stay in the frozenset, where nothing has to be imported
+        # first.
+        spec = get_linear_attn_spec_by_arch(model_arch)
+        if spec is None or not spec.support_mamba_cache_extra_buffer:
+            return False
+
+    # The h[] snapshots the extra_buffer index math reads are produced by the
+    # PREFILL kernel, and KDA dispatches per phase:
+    # linear_attn_prefill_backend or linear_attn_backend. Checking only the base
+    # field passes --linear-attn-prefill-backend flashkda through, enabling
+    # extra_buffer against a kernel whose chunk layout the index math does not
+    # assume. The decode backend is deliberately not part of this: h[] is
+    # written at extend time, and this pass runs before
+    # _handle_linear_attn_backend resolves the per-phase fields, so a decode
+    # constraint here would reject explicit --linear-attn-decode-backend
+    # configurations that work today while still missing the ones it aims at.
+    # getattr: callers construct partial views in tests and during resolution,
+    # and a missing per-phase field means "not overridden", not an error.
+    prefill = getattr(view, "linear_attn_prefill_backend", None) or getattr(
+        view, "linear_attn_backend", None
+    )
+    return prefill == "triton"
 
 
 @register_post_process

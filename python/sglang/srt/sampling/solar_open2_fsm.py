@@ -79,7 +79,7 @@ class _Config:
     budget_ratio: float = 0.75
     # R4 measured this as a REGRESSION (GPQA 74.0% -> 68.0%): forbidding EOS in
     # fresh CONTENT forces a model that wanted to stop to emit something, which
-    # raised truncation (1->7) and unparseable answers (1->6). The fork's rule
+    # raised truncation (1->7) and unparsable answers (1->6). The fork's rule
     # only makes sense together with the rest of its FSM; ported in isolation it
     # hurts. Kept as an opt-in so the asset survives, default OFF.
     content_mask: bool = False
@@ -188,8 +188,14 @@ class SolarReqFSM:
     """Per-request REASONING tracker. Lives on the Req, so a row permutation
     can never hand one request another request's state."""
 
-    __slots__ = ("in_reasoning", "count", "last_len", "budget", "forced",
-                 "content_progress")
+    __slots__ = (
+        "in_reasoning",
+        "count",
+        "last_len",
+        "budget",
+        "forced",
+        "content_progress",
+    )
 
     def __init__(self, prompt_ids: Sequence[int], max_new_tokens: Optional[int]):
         # Mirrors the fork's _initial_state: inside reasoning iff the last
@@ -378,7 +384,7 @@ class _SimState:
 
     __slots__ = ("in_reasoning", "count", "content_progress")
 
-    def __init__(self, fsm: "SolarReqFSM"):
+    def __init__(self, fsm: SolarReqFSM):
         self.in_reasoning = fsm.in_reasoning
         self.count = fsm.count
         self.content_progress = fsm.content_progress
@@ -484,7 +490,7 @@ def plan_verify(reqs, verify_ids_2d, stride: int) -> Optional[VerifyPlan]:
     for req in reqs:
         fsm = getattr(req, "_solar_fsm", None)
         if fsm is None:
-            near = True   # unseen request: fall through and build its state
+            near = True  # unseen request: fall through and build its state
             break
         fsm.advance(req.output_ids)
         if fsm.in_reasoning and fsm.count + stride >= fsm.budget:

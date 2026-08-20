@@ -294,5 +294,7 @@ try:
     FunctionCallParser.ToolCallParserEnum["solar_open2"] = _SolarOpen2Detector
     logger.info("[SOLAR-PATCH] registered tool-call parser 'solar_open2'")
 except Exception as _solar_err:
-    logger.error("[SOLAR-PATCH] solar_open2 tool parser registration FAILED: %s", _solar_err)
+    logger.error(
+        "[SOLAR-PATCH] solar_open2 tool parser registration FAILED: %s", _solar_err
+    )
     raise

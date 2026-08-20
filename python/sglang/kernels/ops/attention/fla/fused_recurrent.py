@@ -11,7 +11,9 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
-_SOLAR_KDA_BETA_SCALE = float(__import__('os').environ.get('SOLAR_KDA_BETA_SCALE', '1.0'))
+_SOLAR_KDA_BETA_SCALE = float(
+    __import__("os").environ.get("SOLAR_KDA_BETA_SCALE", "1.0")
+)
 
 
 @triton.jit(do_not_specialize=["T"])

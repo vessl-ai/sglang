@@ -115,9 +115,7 @@ class SolarOpen2Config(KimiLinearConfig):
                     f"got {gqa_layers!r} for num_hidden_layers={num_hidden_layers}"
                 )
         elif layer_types is not None:
-            gqa_layers = [
-                i for i, t in enumerate(layer_types) if t == "full_attention"
-            ]
+            gqa_layers = [i for i, t in enumerate(layer_types) if t == "full_attention"]
         else:
             # gqa_layers takes priority over gqa_interval; only used as fallback.
             gqa_layers = [
@@ -231,8 +229,9 @@ class SolarOpen2Config(KimiLinearConfig):
         qc["ignore"] = ignore
         kwargs["quantization_config"] = qc
         logger.info(
-            "[SOLAR-GATE] compressed-tensors ignore widened with %d KDA layers "
-            "x %s", len(kda_layer_ids_0b), list(_KDA_UNQUANTIZED_PROJ)
+            "[SOLAR-GATE] compressed-tensors ignore widened with %d KDA layers " "x %s",
+            len(kda_layer_ids_0b),
+            list(_KDA_UNQUANTIZED_PROJ),
         )
 
     # ---- convention overrides ------------------------------------------------
@@ -271,7 +270,14 @@ def _register() -> None:
             arch_names=["SolarOpen2ForCausalLM"],
             uses_mamba_radix_cache=True,
             support_mamba_cache=True,
-            support_mamba_cache_extra_buffer=False,
+            # Solar-Open2 reuses KimiDeltaAttention / KDAAttnBackend and so
+            # performs the same track-snapshot writes KimiLinearForCausalLM
+            # does. The resolution path reads
+            # arg_groups.overrides._MAMBA_EXTRA_BUFFER_ARCHS for in-tree archs
+            # and this field for out-of-tree ones, so for Solar this is a
+            # declaration that must agree with that list rather than the thing
+            # that decides.
+            support_mamba_cache_extra_buffer=True,
         )
     )
 
