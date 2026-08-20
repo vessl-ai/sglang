@@ -1502,6 +1502,8 @@ class ReasoningParser:
 
 
 # --- solar-open2 reasoning parser (injected) ---
+from sglang.srt.function_call import solar_open2_detector as _solar_tool_detector
+
 _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
 
 
@@ -1533,6 +1535,15 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     reasoning. Whether the stream starts inside reasoning therefore depends
     on the request (see ``solar_open2_force_reasoning`` and the
     ``ReasoningParser.__init__`` override below), not on a fixed default.
+
+    A tool call opened while the think block is still unclosed ends reasoning
+    at the opener and routes the rest of the stream to the tool-call parser:
+    the real ``<|tool_call:start|>`` marker via the base class's
+    ``tool_start_token`` escape, and the fence-opened degenerate shape
+    (`` ```name `` followed by ``<|tool_arg:start|>`` — see
+    ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
+    Without the escape, everything up to a never-emitted ``<|think:end|>`` is
+    labeled reasoning_content and the client receives an empty answer.
     """
 
     def __init__(
@@ -1548,10 +1559,62 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
             "<|think:end|>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            tool_start_token=_solar_tool_detector.TOOL_CALL_START,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
+
+    @staticmethod
+    def _fence_escape_offset(text: str) -> Optional[int]:
+        """Offset where a fence-opened tool call starts in ``text``, or None."""
+        m = _solar_tool_detector.FENCE_CALL_OPEN.search(text)
+        if m is None:
+            return None
+        return m.start() + (1 if text[m.start()] == "\n" else 0)
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(text)
+        if ret.reasoning_text and not ret.normal_text:
+            cut = self._fence_escape_offset(ret.reasoning_text)
+            if cut is not None:
+                return StreamingParseResult(
+                    reasoning_text=ret.reasoning_text[:cut],
+                    normal_text=ret.reasoning_text[cut:],
+                )
+        return ret
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        if not self._in_reasoning:
+            return super().parse_streaming_increment(new_text)
+        pending = self._buffer + new_text
+        if self.think_end_token not in pending:
+            cut = self._fence_escape_offset(pending)
+            if cut is not None:
+                self._buffer = ""
+                self._in_reasoning = False
+                reasoning_text = pending[:cut]
+                think_start = self.think_start_token + self.think_start_self_label
+                if not self.stripped_think_start and think_start in reasoning_text:
+                    reasoning_text = reasoning_text.replace(think_start, "", 1)
+                    self.stripped_think_start = True
+                return StreamingParseResult(
+                    reasoning_text=reasoning_text, normal_text=pending[cut:]
+                )
+            # Hold back a trailing possible fence opener so the fence line is
+            # not streamed away as reasoning before its argument marker
+            # arrives.
+            hold = _solar_tool_detector.partial_fence_open_len(pending)
+            if hold:
+                if len(pending) == hold:
+                    self._buffer = pending
+                    return StreamingParseResult()
+                self._buffer = ""
+                ret = super().parse_streaming_increment(pending[:-hold])
+                self._buffer += pending[-hold:]
+                return ret
+        self._buffer = ""
+        return super().parse_streaming_increment(pending)
 
 
 ReasoningParser.DetectorMap["solar_open2"] = SolarOpen2Detector
