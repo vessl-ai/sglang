@@ -248,3 +248,20 @@ class SolarOpen2Detector(BaseFormatDetector):
             end=TOOL_CALL_END,
             trigger=TOOL_CALL_START,
         )
+
+    def supports_structural_tag(self) -> bool:
+        """The legacy structural tag cannot express this wire format: xgrammar
+        hard-codes JSON between ``begin`` and ``end``, while Solar arguments
+        are ``<|tool_arg:*|>`` marker runs. Constrained decoding under that
+        tag forces JSON arguments into the envelope — a hybrid
+        ``_parse_calls`` binds zero calls from — so a forced tool choice
+        returns 200 with empty content and no tool_calls."""
+        return False
+
+    def parses_required_natively(self) -> bool:
+        """``tool_choice="required"``/named must skip grammar constraints and
+        parse the model's native output format instead. Best-effort by
+        design: the prompt (tools filtered to the named function) steers the
+        call; nothing structurally forces one. A generation with no call
+        falls back to plain content with ``finish_reason="stop"``."""
+        return True
