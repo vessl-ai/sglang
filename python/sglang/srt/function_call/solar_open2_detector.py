@@ -27,6 +27,18 @@ A call whose function name is not in ``request.tools`` is emitted to the client
 as-is (with a warning) rather than discarded: the client owns name validation
 and can surface the mismatch back to the model, whereas a dropped call yields
 an empty response with no diagnostic.
+
+JSON argument body: when ``tool_choice`` is ``required`` or names a function,
+the structural-tag constraint forces the call envelope but writes the
+arguments as a JSON object instead of ``<|tool_arg:...|>`` markers::
+
+    <|tool_call:start|>{function_name}
+    {"arg_name": value, ...}<|tool_call:end|>
+
+A call body with no argument markers is therefore parsed as JSON when it
+parses as an object (values arrive already typed, so schema coercion is
+skipped); a non-empty body that is neither marker-formed nor a JSON object is
+kept as ``{"__raw": body}`` with a warning rather than dropped.
 """
 
 from __future__ import annotations
@@ -133,7 +145,7 @@ class SolarOpen2Detector(BaseFormatDetector):
         self.eot_token = TOOL_CALL_END
         self.tool_call_pattern = re.compile(
             rf"{re.escape(TOOL_CALL_START)}(.+?)\n"
-            rf"((?:{re.escape(TOOL_ARG_START)}.*?{re.escape(TOOL_ARG_END)}\n?)*)"
+            rf"(.*?)"
             rf"{re.escape(TOOL_CALL_END)}",
             re.DOTALL,
         )
@@ -183,11 +195,30 @@ class SolarOpen2Detector(BaseFormatDetector):
                     "emitting the call for the client to handle",
                     name,
                 )
+            body = match.group(2) or ""
             args = {}
-            for arg_match in self.tool_arg_pattern.finditer(match.group(2) or ""):
-                key = arg_match.group(1).strip()
-                raw = arg_match.group(2)
-                args[key] = _coerce(raw, _param_type(name, key, tools))
+            if TOOL_ARG_START in body:
+                for arg_match in self.tool_arg_pattern.finditer(body):
+                    key = arg_match.group(1).strip()
+                    raw = arg_match.group(2)
+                    args[key] = _coerce(raw, _param_type(name, key, tools))
+            elif body.strip():
+                # Structural-tag constrained output (tool_choice required or
+                # named): JSON object between the name line and the end
+                # marker, values already typed (see module docstring).
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    args = parsed
+                else:
+                    logger.warning(
+                        "Solar Open2: call body for %r is neither argument "
+                        "markers nor a JSON object; passing it through raw",
+                        name,
+                    )
+                    args = {"__raw": body}
             calls.append(
                 ToolCallItem(
                     tool_index=indices.get(name, len(calls)),
