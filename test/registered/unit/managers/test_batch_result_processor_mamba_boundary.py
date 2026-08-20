@@ -53,8 +53,19 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=True,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(),
-        model_config=SimpleNamespace(think_end_ids=None),
+        # On release/v0.5.17 process_batch_result_decode reads these straight
+        # off the objects below; upstream reaches the same values through
+        # get_observability() / get_disagg(), which is why an empty namespace is
+        # enough there and not here. Every attribute the decode path touches is
+        # listed, whether or not the branch that reads it is taken -- an omission
+        # surfaces as an AttributeError from inside production code, which reads
+        # like a bug in the code under test.
+        server_args=SimpleNamespace(
+            enable_metrics=False,
+            enable_hisparse=False,
+            disaggregation_decode_enable_offload_kvcache=False,
+        ),
+        model_config=SimpleNamespace(think_end_id=None, think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=None,
         hisparse_coordinator=None,
