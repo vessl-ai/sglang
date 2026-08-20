@@ -7,7 +7,6 @@ import unittest
 from unittest import mock
 
 import torch
-
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,

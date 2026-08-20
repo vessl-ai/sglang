@@ -45,8 +45,8 @@ class TestSupportsMambaCacheExtraBuffer(unittest.TestCase):
         model being served rather than merely existing.
         """
         from sglang.srt.configs.linear_attn_model_registry import (
-            LinearAttnModelSpec,
             _LINEAR_ATTN_MODEL_REGISTRY,
+            LinearAttnModelSpec,
             register_linear_attn_model,
         )
 

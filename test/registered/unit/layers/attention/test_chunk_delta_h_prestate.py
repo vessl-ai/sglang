@@ -9,8 +9,8 @@ import unittest
 import torch
 
 try:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as CHUNK
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-        CHUNK_SIZE as CHUNK,
         chunk_gated_delta_rule_fwd_h,
     )
 
