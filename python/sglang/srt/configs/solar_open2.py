@@ -271,6 +271,14 @@ def _register() -> None:
             arch_names=["SolarOpen2ForCausalLM"],
             uses_mamba_radix_cache=True,
             support_mamba_cache=True,
+            # Consulted by
+            # arg_groups.overrides.supports_mamba_cache_extra_buffer, which is
+            # what resolves the mamba radix cache strategy. Solar-Open2 reuses
+            # KimiDeltaAttention / KDAAttnBackend and so performs the same
+            # track-snapshot writes KimiLinearForCausalLM does. With this
+            # False the strategy resolves to no_buffer, which force-disables
+            # the overlap scheduler and makes any page_size > 1 fail a startup
+            # assertion.
             support_mamba_cache_extra_buffer=True,
         )
     )

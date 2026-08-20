@@ -1,6 +1,8 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+# Triton has to JIT chunk_gated_delta_rule_fwd_kernel_h_blockdim64 on a cold
+# autotune cache before either test can run, which dominates the runtime.
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 
@@ -8,15 +10,15 @@ import torch
 
 try:
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as CHUNK,
         chunk_gated_delta_rule_fwd_h,
     )
 
     _IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
     chunk_gated_delta_rule_fwd_h = None
+    CHUNK = None
     _IMPORT_ERROR = e
-
-CHUNK = 64
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
@@ -25,17 +27,23 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
 
     ``h`` is the intermediate-state buffer that the hybrid-SSM prefix-cache
     restore path reads from: ``_init_track_ssm_indices`` picks an entry out of it
-    for rounds that do not land on a chunk boundary, and whatever it picks is
-    written into the radix cache and later resumed from. Getting the index wrong
-    by one chunk does not raise -- it resumes a request from 64 tokens earlier
-    and answers slightly differently, with no error and no metric.
+    for sequences whose extend length does not land on a chunk boundary, and
+    whatever it picks is written into the radix cache and later resumed from.
+    Getting the index wrong by one chunk does not raise -- it silently resumes
+    the request from an earlier state and answers slightly differently, with no
+    error and no metric.
 
     The kernel stores ``h[i_t]`` at the top of its chunk loop, before chunk
     ``i_t`` is accumulated, so ``h[j]`` is the state *entering* chunk ``j``:
     the state after exactly ``j`` completed chunks, never including chunk ``j``
-    itself. That convention is what makes ``offset + len // C`` the last
-    completed boundary, and it is asserted here because it lives in Triton and
-    is invisible to any reader of the consuming code.
+    itself. Combined with ``mamba_cache_chunk_size`` equalling this kernel's own
+    ``CHUNK_SIZE`` -- which ``ServerArgs._validate_mamba_extra_buffer`` asserts
+    at startup -- that is what makes ``offset + len // C`` in
+    ``_init_track_ssm_indices`` the last completed boundary. This test covers
+    the kernel half of that pair; ``test_track_ssm_indices.py`` covers the index
+    arithmetic. The expression is correct as written; these exist to keep it
+    that way, because nothing else in the tree records the convention it rests
+    on and the convention lives in Triton.
     """
 
     def setUp(self):
@@ -48,26 +56,42 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
 
     def _inputs(self):
         g = torch.Generator(device=self.dev).manual_seed(1234)
-        # Small magnitudes on purpose: the delta rule diverges for random inputs
-        # at unit scale (h reaches ~1e7) and every comparison below becomes
-        # meaningless without the recurrence staying contractive.
+        # Small magnitudes on purpose: with gk all-zero there is no decay, so
+        # random unit-scale inputs let the delta rule grow without bound and the
+        # equality comparisons below degenerate into noise. The magnitude guard
+        # in test_h_entry_excludes_its_own_chunk is what enforces this.
         k = (
             torch.randn(
-                self.B, self.T, self.Hg, self.K, generator=g, device=self.dev,
+                self.B,
+                self.T,
+                self.Hg,
+                self.K,
+                generator=g,
+                device=self.dev,
                 dtype=torch.bfloat16,
             )
             * 0.02
         )
         w = (
             torch.randn(
-                self.B, self.T, self.H, self.K, generator=g, device=self.dev,
+                self.B,
+                self.T,
+                self.H,
+                self.K,
+                generator=g,
+                device=self.dev,
                 dtype=torch.bfloat16,
             )
             * 0.02
         )
         u = (
             torch.randn(
-                self.B, self.T, self.H, self.V, generator=g, device=self.dev,
+                self.B,
+                self.T,
+                self.H,
+                self.V,
+                generator=g,
+                device=self.dev,
                 dtype=torch.bfloat16,
             )
             * 0.02
@@ -97,9 +121,7 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
     def test_h_entry_excludes_its_own_chunk(self):
         """Perturbing chunk ``j`` must leave ``h[0..j]`` untouched."""
         initial_state = (
-            torch.randn(
-                1, self.H, self.V, self.K, device=self.dev, dtype=torch.float32
-            )
+            torch.randn(1, self.H, self.V, self.K, device=self.dev, dtype=torch.float32)
             * 0.02
         )
 
@@ -113,7 +135,12 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
         h_base = self._run(*base, initial_state)
         h_pert = self._run(*pert, initial_state)
 
-        self.assertTrue(torch.isfinite(h_base).all(), "recurrence diverged")
+        self.assertLess(
+            h_base.abs().max().item(),
+            1e3,
+            "recurrence is not contractive at this input scale; the equality "
+            "comparisons below would be comparing noise",
+        )
         self.assertEqual(h_base.shape[1], (self.T + CHUNK - 1) // CHUNK)
 
         for j in range(target + 1):
@@ -135,20 +162,17 @@ class TestChunkDeltaHIsPreState(unittest.TestCase):
     def test_first_entry_is_the_incoming_state(self):
         """``h[0]`` is the state entering chunk 0, i.e. the initial state."""
         initial_state = (
-            torch.randn(
-                1, self.H, self.V, self.K, device=self.dev, dtype=torch.float32
-            )
+            torch.randn(1, self.H, self.V, self.K, device=self.dev, dtype=torch.float32)
             * 0.02
         )
         h = self._run(*self._inputs(), initial_state)
-        # h is bf16 while the state pool is fp32, so this is a downcast, not an
-        # exact copy: compare at bf16 resolution rather than with torch.equal.
-        torch.testing.assert_close(
-            h[:, 0].float(),
-            initial_state.float(),
-            rtol=0,
-            atol=torch.finfo(torch.bfloat16).eps * initial_state.abs().max().item(),
-            msg="h[0] is not the incoming state, so h[j] is not a pre-state",
+        # The kernel's i_t == 0 store is `zeros + initial_state`, then a cast to
+        # h's dtype -- so this is exactly the downcast and nothing else. Assert
+        # it as such rather than picking a tolerance: any real mismatch (h[0]
+        # being the post-chunk-0 state) differs by far more than one rounding.
+        self.assertTrue(
+            torch.equal(h[:, 0], initial_state.to(h.dtype)),
+            "h[0] is not the incoming state, so h[j] is not a pre-state",
         )
 
 
