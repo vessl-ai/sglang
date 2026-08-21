@@ -22,11 +22,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
+    ChatCompletionResponseStreamChoice,
     ChatMessage,
     CompletionRequest,
+    DeltaMessage,
     Function,
     ModelCard,
     ModelList,
+    RepetitionDetectionParams,
     Tool,
     UsageInfo,
 )
@@ -140,6 +143,34 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["max_new_tokens"], 150)
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
+
+    def test_repetition_detection_round_trips_into_sampling_params(self):
+        """A repetition_detection field on the request must survive into the
+        sampling params dict handed to the engine (as a plain dict, matching
+        how other optional structured params are threaded through)."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            repetition_detection={
+                "max_pattern_size": 3,
+                "min_pattern_size": 1,
+                "min_count": 3,
+            },
+        )
+        self.assertIsInstance(req.repetition_detection, RepetitionDetectionParams)
+        params = req.to_sampling_params(["</s>"], {}, None)
+        self.assertEqual(
+            params["repetition_detection"],
+            {"max_pattern_size": 3, "min_pattern_size": 1, "min_count": 3},
+        )
+
+    def test_repetition_detection_absent_is_none_in_sampling_params(self):
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi"}]
+        )
+        self.assertIsNone(req.repetition_detection)
+        params = req.to_sampling_params(["</s>"], {}, None)
+        self.assertIsNone(params["repetition_detection"])
 
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
@@ -569,6 +600,67 @@ class TestModelSerialization(unittest.TestCase):
         self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
         self.assertEqual(data["token_ids"], [4, 5])
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
+
+    def test_finish_reason_repetition_accepted_non_streaming_choice(self):
+        """The engine's own "repetition" finish_reason must round-trip
+        through the non-streaming choice model without pydantic rejecting it."""
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="loop loop loop"),
+            finish_reason="repetition",
+        )
+        self.assertEqual(choice.finish_reason, "repetition")
+
+    def test_finish_reason_repetition_accepted_streaming_choice(self):
+        choice = ChatCompletionResponseStreamChoice(
+            index=0,
+            delta=DeltaMessage(),
+            finish_reason="repetition",
+        )
+        self.assertEqual(choice.finish_reason, "repetition")
+
+
+class TestRepetitionDetectionParams(unittest.TestCase):
+    """Test RepetitionDetectionParams validation (vLLM-parity rules)."""
+
+    def test_defaults_disabled(self):
+        params = RepetitionDetectionParams()
+        self.assertEqual(params.max_pattern_size, 0)
+        self.assertEqual(params.min_pattern_size, 0)
+        self.assertEqual(params.min_count, 0)
+
+    def test_valid_combo(self):
+        params = RepetitionDetectionParams(
+            max_pattern_size=5, min_pattern_size=1, min_count=3
+        )
+        self.assertEqual(params.max_pattern_size, 5)
+        self.assertEqual(params.min_pattern_size, 1)
+        self.assertEqual(params.min_count, 3)
+
+    def test_max_pattern_size_negative_rejected(self):
+        with self.assertRaises(ValidationError):
+            RepetitionDetectionParams(max_pattern_size=-1)
+
+    def test_min_pattern_size_negative_rejected(self):
+        with self.assertRaises(ValidationError):
+            RepetitionDetectionParams(min_pattern_size=-1)
+
+    def test_min_pattern_size_greater_than_max_rejected(self):
+        with self.assertRaises(ValidationError):
+            RepetitionDetectionParams(
+                max_pattern_size=2, min_pattern_size=5, min_count=3
+            )
+
+    def test_min_count_below_2_with_max_pattern_size_set_rejected(self):
+        with self.assertRaises(ValidationError):
+            RepetitionDetectionParams(
+                max_pattern_size=2, min_pattern_size=1, min_count=1
+            )
+
+    def test_min_count_below_2_allowed_when_disabled(self):
+        # max_pattern_size == 0 disables the feature; min_count is unchecked.
+        params = RepetitionDetectionParams(max_pattern_size=0, min_count=0)
+        self.assertEqual(params.max_pattern_size, 0)
 
 
 class TestFunctionDeferLoading(unittest.TestCase):
