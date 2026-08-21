@@ -65,6 +65,9 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.solar_open2_detector import (
+    TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
+)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -739,6 +742,29 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
+                if self._solar_single_call_stop_matched(
+                    request,
+                    self._effective_tools(request),
+                    content["meta_info"].get("finish_reason"),
+                ):
+                    # The stop string that halted generation was the
+                    # terminator this call needs to close (see
+                    # _solar_single_call_stop_matched) and the detokenizer
+                    # trimmed it; feed it back in as one more increment so
+                    # the buffered detector emits the completed call before
+                    # the finish_reason chunk goes out.
+                    async for chunk in self._process_tool_call_stream(
+                        index,
+                        SOLAR_OPEN2_TOOL_CALL_END,
+                        parser_dict,
+                        content,
+                        request,
+                        has_tool_calls,
+                        continuous_usage_stats,
+                    ):
+                        if chunk:
+                            yield chunk
+
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
@@ -1041,6 +1067,32 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 ctk["reasoning_effort"] = "high"
 
+    def _solar_single_call_stop_matched(
+        self,
+        request: ChatCompletionRequest,
+        effective_tools: List[Tool],
+        finish_reason: Optional[Dict[str, Any]],
+    ) -> bool:
+        """True when this request injected the Solar Open2 per-call
+        terminator as a stop string (parallel_tool_calls=False, no
+        structural-tag constraint exists for this detector — see
+        SolarOpen2Detector.supports_structural_tag) and generation halted on
+        exactly that stop. The detokenizer trims a matched stop string from
+        the output by default, so the terminator the detector requires must
+        be glued back on before parsing -- unless no_stop_trim asked to keep
+        it, in which case it is already in the text and the parser already
+        consumed it; gluing it back on again would leak a second copy."""
+        return bool(
+            self.tool_call_parser == "solar_open2"
+            and request.tool_choice != "none"
+            and effective_tools
+            and request.parallel_tool_calls is False
+            and not request.no_stop_trim
+            and finish_reason
+            and finish_reason.get("type") == "stop"
+            and finish_reason.get("matched") == SOLAR_OPEN2_TOOL_CALL_END
+        )
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -1100,6 +1152,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
+                    tool_call_stop = parser.detector.eot_token
+                elif (
+                    self.tool_call_parser == "solar_open2"
+                    and request.parallel_tool_calls is False
+                ):
+                    # No structural-tag constraint exists for this detector
+                    # (supports_structural_tag is False), so enforce
+                    # parallel_tool_calls=False by halting generation at the
+                    # first call's terminator instead. Unlike kimi_k3's stop
+                    # (a section-envelope closer outside each call, harmless
+                    # to trim), this terminator is required inside every
+                    # call, so _process_tool_calls / _process_tool_call_stream
+                    # glue it back onto the text before parsing.
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
@@ -1795,10 +1860,16 @@ class OpenAIServingChat(OpenAIServingBase):
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
+            effective_tools = self._effective_tools(request)
 
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+
+            if self._solar_single_call_stop_matched(
+                request, effective_tools, finish_reason
+            ):
+                text += SOLAR_OPEN2_TOOL_CALL_END
 
             # Handle reasoning content
             reasoning_text = None
@@ -1826,7 +1897,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            effective_tools = self._effective_tools(request)
             if (
                 request.tool_choice != "none"
                 and effective_tools
