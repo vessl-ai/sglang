@@ -185,6 +185,16 @@ def _init_cpu_threads_env(
 
 
 def _needs_attn_tp_pynccl(server_args: ServerArgs) -> bool:
+    """Bootstrap-time allowlist: whether the attention-TP group needs a
+    PyNCCL communicator provisioned for capture-safe broadcasts.
+
+    This must enumerate EVERY feature that performs a graph-capture-safe
+    broadcast (parallel_state.broadcast_capture_safe) on the attn-TP group.
+    A feature missing from this allowlist does not fail here -- it only
+    fails later, at first CUDA graph capture, with the PyNCCL RuntimeError
+    raised from parallel_state.broadcast_capture_safe. When adding a new
+    attn-TP capture-safe broadcast user, add its gating condition below.
+    """
     graph_config = server_args.cuda_graph_config
     decode_graph_enabled = graph_config.decode.backend != Backend.DISABLED
     supports_pynccl_graph = current_platform.is_cuda() or current_platform.is_rocm()

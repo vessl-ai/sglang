@@ -1422,8 +1422,12 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or not pynccl_comm.available:
             raise RuntimeError(
-                f"CUDA graph broadcast on group {self.unique_name!r} requires "
-                "an available PyNCCL communicator."
+                f"CUDA graph broadcast on group {self.unique_name!r} requires an "
+                "available PyNCCL communicator. If this is the attention-TP "
+                "group, the feature issuing this broadcast must be added to "
+                "_needs_attn_tp_pynccl() in "
+                "sglang/srt/distributed/bootstrap.py so bootstrap provisions "
+                "the communicator."
             )
         with pynccl_comm.change_state(enable=True):
             pynccl_comm.broadcast(input_, src=src)

@@ -141,6 +141,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._mask_token_id = runtime_config.mask_token_id
 
         parallel = get_parallel()
+        # These two group selections key on different conditions and that
+        # asymmetry is intentional, not a bug -- do not "fix" one without the
+        # other. _tp_sync spans the ranks that must agree on sampling/CPU
+        # decisions (keys on server_args.enable_dp_attention). _draft_graph_group
+        # spans the ranks that jointly capture the draft graph and take the
+        # group-min memory probe (keys on self._draft_dp_context_enabled, i.e.
+        # enable_dp_attention AND not draft_is_moe). The two conditions differ
+        # only for a MoE draft under dp-attention, where the draft runs under
+        # full TP; the attn_tp == 1 ValueError above (raised for exactly that
+        # configuration) makes _tp_sync's attn_tp_group a no-op (world_size
+        # 1) in the one case where it would otherwise diverge from
+        # _draft_graph_group's tp_group.
         self._tp_sync = DsparkTpSync(
             parallel.attn_tp_group
             if server_args.enable_dp_attention
