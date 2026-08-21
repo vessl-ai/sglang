@@ -1789,6 +1789,17 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
     Without the escape, everything up to a never-emitted ``<|think:end|>`` is
     labeled reasoning_content and the client receives an empty answer.
+
+    The content region may open with *redundant* ``<|think:end|>`` sentinels.
+    The FSM (``srt/sampling/solar_open2_fsm.py``) force-closes reasoning once
+    the reasoning budget is spent, and the model frequently emits its own close
+    immediately after with nothing in between. Whichever split ends reasoning
+    consumes exactly one sentinel, so every extra one opens ``content`` and
+    reaches the client verbatim -- ``<|think:end|>`` is ``special=False`` in the
+    tokenizer, so nothing downstream strips it. This detector consumes the
+    whole run instead. CONTENT is deliberately unmasked by the FSM ("parser
+    owns it"), and doing this here also covers surplus sentinels the FSM had no
+    hand in.
     """
 
     def __init__(
@@ -1809,6 +1820,43 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
+        # Whether real content has been emitted yet, and any sentinel fragment
+        # held back because it straddles a streaming chunk boundary.
+        self._content_started = False
+        self._content_head_hold = ""
+
+    def _consume_leading_think_end(self, text: str) -> str:
+        """Drop the run of ``<|think:end|>`` opening the content region."""
+        while text.startswith(self.think_end_token):
+            text = text[len(self.think_end_token) :]
+        return text
+
+    def _scrub_content_head(self, ret: StreamingParseResult) -> StreamingParseResult:
+        """Consume redundant sentinels at the head of the content region.
+
+        Streaming only: the sentinel run can be split across chunks, so a
+        fragment that is still a prefix of the sentinel is held rather than
+        streamed. The hold is bounded by the sentinel's length and is dropped
+        by ``finish()`` if the stream ends inside it -- a fragment of a control
+        sentinel is never part of an answer.
+        """
+        if self._content_started:
+            return ret
+        text = self._content_head_hold + ret.normal_text
+        if not text:
+            return ret
+        self._content_head_hold = ""
+        text = self._consume_leading_think_end(text)
+        if not text:
+            ret.normal_text = ""
+            return ret
+        if self.think_end_token.startswith(text):
+            self._content_head_hold = text
+            ret.normal_text = ""
+            return ret
+        ret.normal_text = text
+        self._content_started = True
+        return ret
 
     @staticmethod
     def _fence_escape_offset(text: str) -> Optional[int]:
@@ -1827,9 +1875,17 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                     reasoning_text=ret.reasoning_text[:cut],
                     normal_text=ret.reasoning_text[cut:],
                 )
+        ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        return self._scrub_content_head(self._parse_increment(new_text))
+
+    def finish(self) -> StreamingParseResult:
+        self._content_head_hold = ""
+        return super().finish()
+
+    def _parse_increment(self, new_text: str) -> StreamingParseResult:
         if not self._in_reasoning:
             return super().parse_streaming_increment(new_text)
         pending = self._buffer + new_text

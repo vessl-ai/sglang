@@ -1,5 +1,6 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
+import json
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
@@ -17,6 +18,7 @@ from sglang.srt.parser.reasoning_parser import (
     Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
+    SolarOpen2Detector,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1361,6 +1363,102 @@ class TestCohereCommand4DetectorFinish(CustomTestCase):
         end = detector.finish()
         self.assertEqual(end.normal_text, "the answer")
         self.assertEqual(end.reasoning_text, "")
+
+
+class TestSolarOpen2SurplusThinkEnd(CustomTestCase):
+    """INF-365 A: redundant ``<|think:end|>`` must not open ``content``.
+
+    The FSM force-closes reasoning when the reasoning budget is spent and the
+    model then emits its own close with nothing in between, so the stream can
+    carry two or more sentinels in a row. Whichever split ends reasoning
+    consumes exactly one; the rest used to reach the client verbatim.
+    """
+
+    END = "<|think:end|>"
+
+    def _stream(self, detector, chunks):
+        reasoning, content = [], []
+        for chunk in chunks:
+            ret = detector.parse_streaming_increment(chunk)
+            reasoning.append(ret.reasoning_text)
+            content.append(ret.normal_text)
+        ret = detector.finish()
+        reasoning.append(ret.reasoning_text)
+        content.append(ret.normal_text)
+        return "".join(reasoning), "".join(content)
+
+    def test_single_sentinel_unchanged(self):
+        """The ordinary case keeps working: one sentinel, clean split."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f"thinking{self.END}Hello")
+        self.assertEqual(ret.reasoning_text, "thinking")
+        self.assertEqual(ret.normal_text, "Hello")
+
+    def test_double_sentinel_is_consumed(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f"thinking{self.END}{self.END}Hello")
+        self.assertEqual(ret.reasoning_text, "thinking")
+        self.assertEqual(ret.normal_text, "Hello")
+
+    def test_sentinel_run_is_consumed(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f"thinking{self.END * 4}Hello")
+        self.assertEqual(ret.reasoning_text, "thinking")
+        self.assertEqual(ret.normal_text, "Hello")
+
+    def test_sentinel_later_in_content_is_left_alone(self):
+        """Only the head of the content region is scrubbed."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f"thinking{self.END}Hello{self.END}there")
+        self.assertEqual(ret.reasoning_text, "thinking")
+        self.assertEqual(ret.normal_text, f"Hello{self.END}there")
+
+    def test_json_answer_stays_parseable(self):
+        """The reported break: a surplus sentinel made valid JSON unparsable."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f'thinking{self.END}{self.END}{{"a": 1}}')
+        self.assertEqual(json.loads(ret.normal_text), {"a": 1})
+
+    def test_streaming_double_sentinel_one_chunk(self):
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(
+            detector, ["thinking", f"{self.END}{self.END}Hel", "lo"]
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "Hello")
+
+    def test_streaming_surplus_sentinel_split_across_chunks(self):
+        """A surplus sentinel straddling a chunk boundary is still consumed.
+
+        Defensive: the sentinel is one token, so a token-aligned stream never
+        splits it mid-string. This pins the held-fragment path anyway.
+        """
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(
+            detector, ["thinking", f"{self.END}<|think", ":end|>Hello"]
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "Hello")
+
+    def test_streaming_single_sentinel_unchanged(self):
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(detector, ["thinking", self.END, "Hello"])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "Hello")
+
+    def test_streaming_partial_sentinel_at_eos_is_dropped(self):
+        """A stream ending inside the sentinel emits no fragment."""
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(detector, ["thinking", f"{self.END}<|think"])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "")
+
+    def test_no_reasoning_path_unaffected(self):
+        """reasoning_effort low/none: the template pre-closes, so no sentinel."""
+        detector = SolarOpen2Detector(force_reasoning=False)
+        ret = detector.detect_and_parse("Hello")
+        self.assertEqual(ret.reasoning_text, "")
+        self.assertEqual(ret.normal_text, "Hello")
 
 
 if __name__ == "__main__":
