@@ -17,6 +17,8 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.sampler import next_token_ids_synced_in_sampler
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -1520,7 +1522,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch_output.logits_output,
                 batch_output.next_token_ids,
             )
-            self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
+            # Sampler._sync_token_ids_across_tp (sampler.py) already all-reduced
+            # next_token_ids over its tp_sync_group when it applies. DFlash
+            # always broadcasts over the full tp_group here, never
+            # attn_tp_group, so this is only provably redundant when dp
+            # attention is disabled (the sampler's group is then the same
+            # full tp_group too); under dp attention the sampler's group can
+            # be the smaller attn_tp_group, so DFlash still needs its own
+            # broadcast to close the rest of tp_group.
+            if is_dp_attention_enabled() or not next_token_ids_synced_in_sampler(
+                batch.sampling_info
+            ):
+                self._tp_group.broadcast_capture_safe(next_token_ids, src=0)
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)

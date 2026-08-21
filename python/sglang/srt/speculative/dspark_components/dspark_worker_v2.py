@@ -8,6 +8,7 @@ import torch
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.sampler import next_token_ids_synced_in_sampler
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -446,7 +447,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        self._tp_sync.sync(next_token_ids)
+        # Sampler._sync_token_ids_across_tp (sampler.py) already all-reduced
+        # next_token_ids over the same TP group when it applies; skip the
+        # redundant broadcast in that case.
+        if not next_token_ids_synced_in_sampler(batch.sampling_info):
+            self._tp_sync.sync(next_token_ids)
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)

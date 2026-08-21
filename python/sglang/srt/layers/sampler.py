@@ -67,6 +67,14 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def next_token_ids_synced_in_sampler(sampling_info) -> bool:
+    """True when Sampler._sync_token_ids_across_tp already all-reduced the
+    sampled ids this step, making a follow-up TP broadcast redundant."""
+    return SYNC_TOKEN_IDS_ACROSS_TP or bool(
+        sampling_info is not None and sampling_info.grammars
+    )
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
