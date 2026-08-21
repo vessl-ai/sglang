@@ -969,6 +969,11 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    enable_repetition_detection: A[
+        bool,
+        "Enable the repetition_detection request field (vLLM-parity N-gram loop early termination). When off, the field is accepted but has no effect.",
+        NS("schedule"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)

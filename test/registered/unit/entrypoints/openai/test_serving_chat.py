@@ -28,6 +28,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
+from sglang.srt.function_call.solar_open2_detector import (
+    TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -766,6 +769,54 @@ class ServingChatTestCase(unittest.TestCase):
         result = self.chat._process_messages(request, is_multimodal=False)
 
         self.assertIsNone(result.stop)
+
+    def test_solar_open2_parallel_tool_calls_false_injects_call_end_stop(self):
+        """No structural tag exists for solar_open2, so parallel_tool_calls=False
+        is enforced by stopping generation at the per-call terminator instead --
+        but only when the request actually asks for it."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "solar_open2"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+
+        cases = (
+            ({}, None),
+            ({"parallel_tool_calls": True}, None),
+            ({"parallel_tool_calls": False}, [SOLAR_OPEN2_TOOL_CALL_END]),
+        )
+        for extra_kwargs, expected_stop in cases:
+            with (
+                self.subTest(extra_kwargs=extra_kwargs),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                parser = parser_cls.return_value
+                parser.detector.eot_token = SOLAR_OPEN2_TOOL_CALL_END
+                parser.detector.parses_required_natively.return_value = True
+                parser.get_structure_constraint.return_value = None
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Paris?"}],
+                    tools=[tool],
+                    tool_choice="auto",
+                    **extra_kwargs,
+                )
+
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertEqual(result.stop, expected_stop)
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
@@ -2773,6 +2824,204 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+
+class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
+    """glue-back: the detokenizer trims the injected TOOL_CALL_END stop, so
+    the terminator the detector requires must be re-appended before parsing
+    (see OpenAIServingChat._solar_single_call_stop_matched)."""
+
+    _WEATHER_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }
+    # What the model actually emitted before the stop-matched terminator was
+    # trimmed off by the detokenizer.
+    _TRIMMED_CALL_TEXT = (
+        "<|tool_call:start|>get_weather\n"
+        "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>"
+    )
+
+    def setUp(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.tool_call_parser = "solar_open2"
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+        self.request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris and Tokyo?"}],
+            tools=[self._WEATHER_TOOL],
+            tool_choice="auto",
+            parallel_tool_calls=False,
+        )
+
+    def test_non_streaming_glue_back_extracts_single_call(self):
+        ret = [
+            {
+                "text": self._TRIMMED_CALL_TEXT,
+                "meta_info": {
+                    "id": "chatcmpl-solar-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "stop",
+                        "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                    },
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.request, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertIsNotNone(choice.message.tool_calls)
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "get_weather")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments), {"location": "Paris"}
+        )
+
+    def test_non_streaming_no_glue_back_without_parallel_tool_calls_false(self):
+        """The same trimmed text with parallel_tool_calls unset (default True)
+        is not our stop to glue back onto -- the detector sees an unterminated
+        call and drops it, same as before this fix."""
+        request = self.request.model_copy(update={"parallel_tool_calls": True})
+        ret = [
+            {
+                "text": self._TRIMMED_CALL_TEXT,
+                "meta_info": {
+                    "id": "chatcmpl-solar-test-2",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "stop",
+                        "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                    },
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(request, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.finish_reason, "stop")
+        self.assertIsNone(choice.message.tool_calls)
+
+    def test_streaming_glue_back_emits_completed_call(self):
+        parser_dict = {}
+        has_tool_calls = {}
+        content = {
+            "text": self._TRIMMED_CALL_TEXT,
+            "meta_info": {
+                "id": "chatcmpl-solar-stream-test",
+                "finish_reason": {
+                    "type": "stop",
+                    "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                },
+            },
+        }
+
+        async def run():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=self.request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=False,
+                prompt_tokens={0: 5},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 10},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+
+        self.assertTrue(has_tool_calls.get(0))
+        tool_call_deltas = [
+            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if '"tool_calls"' in c
+        ]
+        self.assertEqual(len(tool_call_deltas), 1)
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_call_deltas[0]["function"]["arguments"]),
+            {"location": "Paris"},
+        )
+
+    def test_streaming_no_glue_back_when_no_stop_trim_keeps_terminator(self):
+        """no_stop_trim=True means the detokenizer kept the terminator in the
+        text and the parser already consumed it; gluing it back on again
+        would leak a second `<|tool_call:end|>` as a content delta."""
+        request = self.request.model_copy(update={"no_stop_trim": True})
+        parser_dict = {}
+        has_tool_calls = {}
+        content = {
+            "text": self._TRIMMED_CALL_TEXT + SOLAR_OPEN2_TOOL_CALL_END,
+            "meta_info": {
+                "id": "chatcmpl-solar-stream-no-trim-test",
+                "finish_reason": {
+                    "type": "stop",
+                    "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                },
+            },
+        }
+
+        async def run():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=False,
+                prompt_tokens={0: 5},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 10},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+
+        self.assertTrue(has_tool_calls.get(0))
+        tool_call_deltas = [
+            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if '"tool_calls"' in c
+        ]
+        self.assertEqual(len(tool_call_deltas), 1)
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_call_deltas[0]["function"]["arguments"]),
+            {"location": "Paris"},
+        )
+        for chunk in chunks:
+            self.assertNotIn(SOLAR_OPEN2_TOOL_CALL_END, chunk)
 
 
 class TestNormalizeToolContent(unittest.TestCase):

@@ -369,6 +369,26 @@ class TestSkipTokenizerInit(unittest.TestCase):
         self.assertEqual(server_args.detokenizer_worker_num, 1)
 
 
+class TestEnableRepetitionDetectionArg(unittest.TestCase):
+    """Regression for --enable-repetition-detection: default off, and the
+    intake gate (schedule_batch.apply_repetition_detection_gate) reads this
+    field, so the flag must actually reach ServerArgs from argv."""
+
+    def test_default_is_false(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertFalse(server_args.enable_repetition_detection)
+
+    def test_cli_flag_enables_it(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(["--model", "dummy"])
+        self.assertFalse(args.enable_repetition_detection)
+
+        args = parser.parse_args(["--model", "dummy", "--enable-repetition-detection"])
+        self.assertTrue(args.enable_repetition_detection)
+
+
 class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     # The backend selection moved to the resolution pipeline; these policy
     # tests drive the pass through its read-only view.

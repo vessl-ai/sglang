@@ -66,6 +66,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
+    # N-gram loop detector (vLLM parity). Accepted as a raw
+    # {max_pattern_size, min_pattern_size, min_count} dict; __post_init__
+    # validates it and rewrites it in place to the normalized form the
+    # scheduler gates on (None when disabled).
+    repetition_detection: Optional[Dict] = None
     min_new_tokens: int = 0
     n: int = 1
     json_schema: Optional[str] = None
@@ -140,6 +145,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         self.ebnf = self.ebnf or None
         self.structural_tag = self.structural_tag or None
 
+        self._normalize_repetition_detection()
+
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
@@ -147,6 +154,51 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = 1
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
+
+    def _normalize_repetition_detection(self):
+        """Validate and normalize the N-gram loop detector (vLLM parity:
+        ``SamplingParams.repetition_detection``). Runs once at construction so
+        the scheduler-side gate is a single ``is None`` check.
+
+        ``repetition_detection`` is rewritten in place to ``None`` when
+        disabled (``max_pattern_size == 0``, the default), else to a dict of
+        the three normalized ints (``min_pattern_size <= 0`` normalizes to 1).
+        """
+        if self.repetition_detection is None:
+            return
+
+        max_pattern_size = self.repetition_detection.get("max_pattern_size", 0)
+        min_pattern_size = self.repetition_detection.get("min_pattern_size", 0)
+        min_count = self.repetition_detection.get("min_count", 0)
+        if max_pattern_size < 0:
+            raise ValueError(
+                f"repetition_detection.max_pattern_size must be >= 0, got {max_pattern_size}."
+            )
+        if min_pattern_size < 0:
+            raise ValueError(
+                f"repetition_detection.min_pattern_size must be >= 0, got {min_pattern_size}."
+            )
+        if min_pattern_size > max_pattern_size:
+            raise ValueError(
+                "repetition_detection.min_pattern_size must be <= max_pattern_size, got "
+                f"min_pattern_size={min_pattern_size}, max_pattern_size={max_pattern_size}."
+            )
+        if max_pattern_size > 0 and min_count < 2:
+            raise ValueError(
+                "repetition_detection.min_count must be >= 2 when max_pattern_size "
+                f"is set (> 0), got {min_count}."
+            )
+
+        if max_pattern_size == 0:
+            # max_pattern_size == 0 disables the feature (vLLM parity).
+            self.repetition_detection = None
+        else:
+            self.repetition_detection = {
+                "max_pattern_size": max_pattern_size,
+                # A pattern of length 0 is meaningless; normalize it to 1.
+                "min_pattern_size": min_pattern_size if min_pattern_size > 0 else 1,
+                "min_count": min_count,
+            }
 
     def verify(self, vocab_size):
         if not math.isfinite(self.temperature) or self.temperature < 0.0:

@@ -32,7 +32,11 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.schedule_batch import Modality, Req
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    Req,
+    apply_repetition_detection_gate,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
@@ -1572,6 +1576,7 @@ class MMReceiverBase(ABC):
         # context alive for the process instead of creating a temporary context
         # whose destruction also closes its per-request socket.
         self.scheduler_context = zmq.Context()
+        self.server_args = server_args
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
         # (tokenizer manager process), it grows / shrinks in place as encoders
@@ -2089,6 +2094,10 @@ class MMReceiverBase(ABC):
             logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
 
     def create_req(self, recv_req: TokenizedGenerateReqInput):
+        # This path bypasses Scheduler.handle_generate_request (the encode
+        # side hands the Req straight to Req(...) below), so it needs its own
+        # intake gate rather than relying on the scheduler's.
+        apply_repetition_detection_gate(self.server_args, recv_req.sampling_params)
         req = Req(
             recv_req.rid,
             recv_req.input_text,
