@@ -79,7 +79,9 @@ class TestRepetitionDetectionFinish(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertIsInstance(req.finished_reason, FINISH_REPETITION)
         self.assertEqual(req.finished_reason.pattern_len, 2)
-        self.assertEqual(req.finished_reason.to_json(), {"type": "repetition", "matched": 2})
+        self.assertEqual(
+            req.finished_reason.to_json(), {"type": "repetition", "matched": 2}
+        )
         # No trimming: finished_len stays unset and the full output survives.
         self.assertIsNone(req.finished_len)
         self.assertEqual(list(req.output_ids_through_stop), list(req.output_ids))
