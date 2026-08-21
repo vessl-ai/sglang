@@ -101,7 +101,9 @@ def gate_base(root):
             "engine would start and then fail to resolve the model type at "
             "load time."
         )
-    print("[SOLAR-GATE] base image carries Solar-Open2 sources + config registration: OK")
+    print(
+        "[SOLAR-GATE] base image carries Solar-Open2 sources + config registration: OK"
+    )
 
 
 def gate_beta(root):
