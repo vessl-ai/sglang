@@ -10,7 +10,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
-from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 
@@ -152,14 +151,23 @@ def _resolve_folded_sampling(
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
+    if available_memory_gb is None:
+        # A rank-local probe here could fold on a subset of ranks -- exactly
+        # the cross-rank divergence this function's docstring warns about.
+        # Without a group-agreed probe, AUTO must stay eager rather than guess.
+        if tp_rank == 0:
+            logger.warning(
+                "DSpark folded sampling disabled: AUTO mode requires a "
+                "group-agreed free-memory probe, but none was available; "
+                "sampling batches will take the eager proposal path. Set "
+                "SGLANG_DSPARK_FOLDED_SAMPLING=%d to force.",
+                int(DsparkFoldedSampling.FORCE),
+            )
+        return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
-    if available_memory_gb is None:
-        available_memory_gb = get_available_gpu_memory(
-            device, torch.cuda.current_device()
-        )
     if available_memory_gb - need_gb >= _CAPTURE_HEADROOM_GB:
         return True
     if tp_rank == 0:
