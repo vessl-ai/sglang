@@ -871,6 +871,7 @@ def silu_mul_per_token_quant_for_cutlass_moe(
         BLOCK_SIZE=1024,
     )
 
+
 def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
     input: torch.Tensor,
     output: torch.Tensor,

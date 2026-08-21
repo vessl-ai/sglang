@@ -29,16 +29,14 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
+    per_token_scale_reorder_for_cutlass_moe,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
-    per_token_scale_reorder_for_cutlass_moe,
-    silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_per_token_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
     per_tensor_quant_fp8,
 )
 

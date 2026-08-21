@@ -91,13 +91,11 @@ struct cutlass_3x_w4a8_group_gemm {
   // The N stride is `bool` so the same kernel serves both layouts:
   //   true  -> per-token, reads one scale per row
   //   false -> scalar broadcast, preserving the static per-tensor path
-  using ScaleA = cutlass::epilogue::fusion::Sm90RowBroadcast<
-      0, TileShape, ElementAccumulator*, ElementAccumulator,
-      cute::Stride<cute::_0, bool, cute::_0>>;
+  using ScaleA = cutlass::epilogue::fusion::
+      Sm90RowBroadcast<0, TileShape, ElementAccumulator*, ElementAccumulator, cute::Stride<cute::_0, bool, cute::_0>>;
   using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
-  using ComputeMul = cutlass::epilogue::fusion::Sm90Compute<
-      cutlass::multiplies, ElementD, ElementAccumulator,
-      cutlass::FloatRoundStyle::round_to_nearest>;
+  using ComputeMul = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, ElementD, ElementAccumulator, cutlass::FloatRoundStyle::round_to_nearest>;
   using FusionOp = cutlass::epilogue::fusion::Sm90EVT<ComputeMul, ScaleA, AccFetch>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -206,7 +204,11 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(
       a_scales.numel() == 1 || a_scales.numel() == a_tensors.size(0),
       "A Scale tensor must hold either one scale (per-tensor) or one per A row "
-      "(per-token), got ", a_scales.numel(), " for ", a_tensors.size(0), " rows");
+      "(per-token), got ",
+      a_scales.numel(),
+      " for ",
+      a_tensors.size(0),
+      " rows");
   TORCH_CHECK(a_scales.scalar_type() == torch::kFloat32, "A Scale tensor must be float32");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
