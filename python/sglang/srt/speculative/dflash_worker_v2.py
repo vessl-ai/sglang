@@ -1364,6 +1364,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         device,
     ):
+        # Draft candidates feed out_tokens on every accept path; sync them so a
+        # draft-side divergence cannot leak into the committed tokens. With
+        # candidates and target_predict both synced, the greedy accept/bonus math is
+        # deterministic integer comparison, so a rank-local Triton->eager fallback
+        # flip cannot desync ranks either.
+        self._tp_group.broadcast_capture_safe(candidates, src=0)
+
         new_seq_lens = None
         target_predict = None
         if (
