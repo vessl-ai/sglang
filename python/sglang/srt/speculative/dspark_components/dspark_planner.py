@@ -311,6 +311,14 @@ class DSparkVerifyPlanner:
             self._maybe_gather_dp_verify_tier(batch=batch, local_tier_num_tokens=0)
             return
         resolved = future_map.resolve_confidence_cpu(batch)
+        # `resolved` is rank-local (it may be None on some ranks while another
+        # rank has a value), but that only decides the *value* passed below --
+        # every rank still reaches broadcast_optional_int. Participation in
+        # this collective may depend only on rank-uniform state (budget
+        # planner presence, batch.forward_mode / is_extend_in_batch, which
+        # are schedule-level batch structure and identical across ranks by
+        # construction), never on rank-local tensor content, or ranks that do
+        # enter it deadlock waiting on ranks that skipped it.
         local_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
@@ -384,17 +392,24 @@ class DSparkVerifyPlanner:
         req_pool_indices: torch.Tensor,
     ) -> Optional[int]:
         """Resolve one shared budget before any layout-dependent branch."""
-        if not self.schedules_verify_budget or confidence is None:
+        # Participation in the broadcast below may depend only on rank-uniform
+        # config (schedules_verify_budget, disable_overlap_schedule); confidence
+        # is rank-local proposal state (e.g. missing on an eager/failed-graph
+        # fallback rank) and must not gate the collective, or ranks that do
+        # enter it deadlock waiting on ranks that skipped it.
+        if not self.schedules_verify_budget:
             return None
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
         # Preserve per-rank planner state before selecting one shared decision.
-        local_budget = self.compute_budget_sync(
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            req_pool_indices=req_pool_indices,
-        )
+        local_budget = None
+        if confidence is not None:
+            local_budget = self.compute_budget_sync(
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+            )
         draft_input.verify_token_budget = self._tp_sync.broadcast_optional_int(
             local_budget
         )
@@ -593,25 +608,43 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        # Participation in the sync below may depend only on rank-uniform
+        # state: after Fix A's broadcast_optional_int, `budget` is already
+        # agreed across ranks. A missing confidence tensor is rank-local
+        # proposal state (e.g. an eager/failed-graph fallback rank) and must
+        # not gate the collective, or ranks that do enter it deadlock waiting
+        # on ranks that skipped it.
+        if self._budget_planner is None or budget is None:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=confidence,
-            budget=budget,
-            cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
+        if confidence is not None:
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                confidence=confidence,
+                budget=budget,
+                cfg=self._schedule_cfg,
+            ).to(device=device, dtype=torch.int32)
+            # Validate the LOCALLY computed schedule before the sync
+            # overwrites it on non-src ranks -- a rank-divergent verify_lens
+            # is exactly what these checks exist to surface.
+            if resolve_level() >= InvariantCheckLevel.WARN:
+                verify_lens_64 = verify_lens.to(torch.int64)
+                effective_floor = max(self._schedule_cfg.min_verify_len, 1)
+                expect(
+                    _VERIFY_LEN_BUDGET,
+                    (verify_lens_64 - effective_floor).sum() <= budget,
+                    msg=f"budget={budget}",
+                )
+        else:
+            # This rank's proposal produced no confidence tensor; it still
+            # must join the collective and adopt the src rank's schedule.
+            verify_lens = torch.empty(
+                req_pool_indices.shape[0], device=device, dtype=torch.int32
+            )
         self._tp_sync.sync(verify_lens)
 
-        if resolve_level() >= InvariantCheckLevel.WARN:
-            verify_lens_64 = verify_lens.to(torch.int64)
-            effective_floor = max(self._schedule_cfg.min_verify_len, 1)
-            expect(
-                _VERIFY_LEN_BUDGET,
-                (verify_lens_64 - effective_floor).sum() <= budget,
-                msg=f"budget={budget}",
-            )
-
-        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+        if (
+            confidence is not None
+            and envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get()
+        ):
             self._log_verify_lens_decision(
                 req_pool_indices=req_pool_indices,
                 prefix_lens=prefix_lens,
