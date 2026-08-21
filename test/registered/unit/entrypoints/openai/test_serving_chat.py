@@ -3208,5 +3208,127 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class TestSolarOpen2BudgetSpentWithoutAnswer(unittest.TestCase):
+    """INF-365 B: an empty answer left by a spent reasoning budget reports
+    `length`, not `stop`.
+
+    The FSM force-closes the think block when the budget (a slice of
+    `max_tokens`) runs out, and the model can emit EOS with the answer still
+    unwritten. `stop` tells the client the empty answer is the model's own
+    choice, so nothing retries it.
+    """
+
+    END = "<|think:end|>"
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.reasoning_parser = "solar_open2"
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+        self.chat.reasoning_parser = "solar_open2"
+
+    def _req(self):
+        return ChatCompletionRequest(
+            model="upstage/solar-pro4",
+            messages=[{"role": "user", "content": "Why is the sky blue?"}],
+            separate_reasoning=True,
+            max_tokens=600,
+        )
+
+    def _ret(self, text, finish_type="stop"):
+        return [
+            {
+                "text": text,
+                "meta_info": {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 400,
+                    "weight_version": "default",
+                    "finish_reason": {"type": finish_type, "matched": None},
+                },
+                "index": 0,
+            }
+        ]
+
+    # --- the predicate ----------------------------------------------------
+
+    def test_predicate_truth_table(self):
+        cases = [
+            # (finish, has_content, has_reasoning, has_tool_calls, expected)
+            ("stop", False, True, False, True),  # the defect
+            ("stop", True, True, False, False),  # an answer came out
+            ("stop", False, False, False, False),  # reasoning never ran
+            ("stop", False, True, True, False),  # a tool call is the answer
+            ("length", False, True, False, False),  # already labelled
+            ("abort", False, True, False, False),
+        ]
+        for finish, content, reasoning, tools, expected in cases:
+            with self.subTest(finish=finish, content=content, reasoning=reasoning):
+                self.assertEqual(
+                    self.chat._budget_spent_without_answer(
+                        finish, content, reasoning, tools
+                    ),
+                    expected,
+                )
+
+    def test_predicate_is_scoped_to_solar_open2(self):
+        """Another parser's empty answer has other causes and keeps `stop`."""
+        self.chat.reasoning_parser = "qwen3-thinking"
+        self.assertFalse(
+            self.chat._budget_spent_without_answer("stop", False, True, False)
+        )
+
+    # --- non-streaming response -------------------------------------------
+
+    def test_forced_close_with_no_answer_reports_length(self):
+        """Reasoning closed, nothing after it: the answer was truncated away."""
+        response = self.chat._build_chat_response(
+            self._req(), self._ret(f"thinking cut off mid-sen{self.END}"), created=0
+        )
+        choice = response.choices[0]
+        self.assertEqual(choice.message.content, "")
+        self.assertEqual(choice.message.reasoning_content, "thinking cut off mid-sen")
+        self.assertEqual(choice.finish_reason, "length")
+        self.assertIsNone(choice.matched_stop)
+
+    def test_surplus_sentinel_only_content_reports_length(self):
+        """The A fix strips a sentinel-only body; what is left must not be a
+        silent `stop`."""
+        response = self.chat._build_chat_response(
+            self._req(), self._ret(f"thinking{self.END}{self.END}"), created=0
+        )
+        choice = response.choices[0]
+        self.assertEqual(choice.message.content, "")
+        self.assertEqual(choice.finish_reason, "length")
+
+    def test_reasoning_never_closed_reports_length(self):
+        """max_tokens cut the stream inside reasoning: no answer either."""
+        response = self.chat._build_chat_response(
+            self._req(), self._ret("still thinking when the budget ran out"), created=0
+        )
+        self.assertEqual(response.choices[0].message.content, "")
+        self.assertEqual(response.choices[0].finish_reason, "length")
+
+    def test_ordinary_answer_keeps_stop(self):
+        response = self.chat._build_chat_response(
+            self._req(), self._ret(f"thinking{self.END}The sky is blue."), created=0
+        )
+        choice = response.choices[0]
+        self.assertEqual(choice.message.content, "The sky is blue.")
+        self.assertEqual(choice.finish_reason, "stop")
+
+    def test_whitespace_only_answer_reports_length(self):
+        """Whitespace is not an answer."""
+        response = self.chat._build_chat_response(
+            self._req(), self._ret(f"thinking{self.END}\n\n  "), created=0
+        )
+        self.assertEqual(response.choices[0].finish_reason, "length")
+
+    def test_engine_length_is_left_alone(self):
+        response = self.chat._build_chat_response(
+            self._req(), self._ret(f"thinking{self.END}", finish_type="length"), created=0
+        )
+        self.assertEqual(response.choices[0].finish_reason, "length")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
