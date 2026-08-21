@@ -1414,7 +1414,7 @@ class TestSolarOpen2SurplusThinkEnd(CustomTestCase):
         self.assertEqual(ret.normal_text, f"Hello{self.END}there")
 
     def test_json_answer_stays_parseable(self):
-        """The reported break: a surplus sentinel made valid JSON unparseable."""
+        """The reported break: a surplus sentinel made valid JSON unparsable."""
         detector = SolarOpen2Detector()
         ret = detector.detect_and_parse(f'thinking{self.END}{self.END}{{"a": 1}}')
         self.assertEqual(json.loads(ret.normal_text), {"a": 1})
