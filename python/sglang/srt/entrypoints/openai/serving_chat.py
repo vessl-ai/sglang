@@ -1079,12 +1079,15 @@ class OpenAIServingChat(OpenAIServingBase):
         SolarOpen2Detector.supports_structural_tag) and generation halted on
         exactly that stop. The detokenizer trims a matched stop string from
         the output by default, so the terminator the detector requires must
-        be glued back on before parsing."""
+        be glued back on before parsing -- unless no_stop_trim asked to keep
+        it, in which case it is already in the text and the parser already
+        consumed it; gluing it back on again would leak a second copy."""
         return bool(
             self.tool_call_parser == "solar_open2"
             and request.tool_choice != "none"
             and effective_tools
             and request.parallel_tool_calls is False
+            and not request.no_stop_trim
             and finish_reason
             and finish_reason.get("type") == "stop"
             and finish_reason.get("matched") == SOLAR_OPEN2_TOOL_CALL_END

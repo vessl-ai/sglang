@@ -2968,6 +2968,61 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             {"location": "Paris"},
         )
 
+    def test_streaming_no_glue_back_when_no_stop_trim_keeps_terminator(self):
+        """no_stop_trim=True means the detokenizer kept the terminator in the
+        text and the parser already consumed it; gluing it back on again
+        would leak a second `<|tool_call:end|>` as a content delta."""
+        request = self.request.model_copy(update={"no_stop_trim": True})
+        parser_dict = {}
+        has_tool_calls = {}
+        content = {
+            "text": self._TRIMMED_CALL_TEXT + SOLAR_OPEN2_TOOL_CALL_END,
+            "meta_info": {
+                "id": "chatcmpl-solar-stream-no-trim-test",
+                "finish_reason": {
+                    "type": "stop",
+                    "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                },
+            },
+        }
+
+        async def run():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=False,
+                prompt_tokens={0: 5},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 10},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+
+        self.assertTrue(has_tool_calls.get(0))
+        tool_call_deltas = [
+            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if '"tool_calls"' in c
+        ]
+        self.assertEqual(len(tool_call_deltas), 1)
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_call_deltas[0]["function"]["arguments"]),
+            {"location": "Paris"},
+        )
+        for chunk in chunks:
+            self.assertNotIn(SOLAR_OPEN2_TOOL_CALL_END, chunk)
+
 
 class TestNormalizeToolContent(unittest.TestCase):
     """Unit tests for normalize_tool_content()."""
