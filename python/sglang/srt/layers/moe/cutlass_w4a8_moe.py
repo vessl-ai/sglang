@@ -29,14 +29,14 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
+    per_token_scale_reorder_for_cutlass_moe,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
-    silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
+    silu_mul_per_token_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
     per_tensor_quant_fp8,
 )
 
@@ -141,22 +141,43 @@ def cutlass_w4a8_moe(
         dtype=torch.float8_e4m3fn,
     )
 
-    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
     if a1_scale is None:
-        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        per_tensor_absmax_fp8(a, a1_scale)
-
-    pre_reorder_for_cutlass_moe(
-        a,
-        gateup_input,
-        src2dst,
-        topk_ids,
-        a1_scale,
-        num_local_experts,
-        topk,
-        m,
-        k,
-    )
+        # Dynamic activation scale, one per token. A per-tensor amax lets any one
+        # row set the quantization scale for every other row in the batch, so a
+        # row that is not part of the request -- the padding the prefill CUDA
+        # graph appends to reach a captured bucket -- decides how every real
+        # token is quantized. That padding varies between runs, which is enough
+        # to flip near-tied top-k routing decisions and make temperature=0 output
+        # differ run to run. Per-token also matches what compressed-tensors
+        # checkpoints declare (input_activations.strategy="token").
+        #
+        # The scale is produced in the permuted row order the GEMM expects, and
+        # computing it inside the reorder saves the extra full read of `a` that
+        # per_tensor_absmax_fp8 needed.
+        a1_scale = torch.empty(m * topk, dtype=torch.float32, device=device)
+        per_token_scale_reorder_for_cutlass_moe(
+            a,
+            gateup_input,
+            a1_scale,
+            src2dst,
+            topk_ids,
+            num_local_experts,
+            topk,
+            m,
+            k,
+        )
+    else:
+        pre_reorder_for_cutlass_moe(
+            a,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            a1_scale,
+            num_local_experts,
+            topk,
+            m,
+            k,
+        )
 
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
@@ -199,8 +220,9 @@ def cutlass_w4a8_moe(
     )
 
     if a2_scale is None:
-        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+        # Same reasoning as a1_scale: one scale per row of the intermediate.
+        a2_scale = torch.empty(m * topk, dtype=torch.float32, device=device)
+        silu_mul_per_token_quant_for_cutlass_moe(
             c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
         )
     else:

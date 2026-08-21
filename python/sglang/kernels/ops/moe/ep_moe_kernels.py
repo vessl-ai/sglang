@@ -733,6 +733,145 @@ def silu_mul_dynamic_scale_triton_kernel_for_cutlass_moe(
     tl.atomic_max(scale_ptr, absmax / fp8_max)
 
 
+@triton.jit
+def per_token_scale_reorder_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    gateup_input_ptr,
+    scale_perm_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    num_local_experts,
+    topk,
+    hidden_size,
+    fp8_max,
+    BLOCK_K: tl.constexpr,
+):
+    """Per-token activation scale, fused with the reorder.
+
+    One program per source token: read the row once, take its own absmax,
+    quantize with that scale, scatter to the expert-ordered rows, and store the
+    scale at the same permuted positions so the grouped GEMM can index it.
+
+    This replaces the pair (per_tensor_absmax_fp8 + pre_reorder), which read the
+    activation twice and collapsed the whole batch to a single scale.
+    """
+    src_idx = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < hidden_size
+    x = tl.load(input_ptr + src_idx * hidden_size + offs, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
+    scale = absmax / fp8_max
+    q = (x * (1.0 / scale)).to(gateup_input_ptr.dtype.element_ty)
+    token_topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    token_src2dst_ptr = src2dst_ptr + src_idx * topk
+    for idx in range(topk):
+        expert_id = tl.load(token_topk_ids_ptr + idx)
+        if expert_id != num_local_experts:
+            dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
+            tl.store(gateup_input_ptr + dst_idx * hidden_size + offs, q, mask=mask)
+            tl.store(scale_perm_ptr + dst_idx, scale)
+
+
+def per_token_scale_reorder_for_cutlass_moe(
+    input,
+    gateup_input,
+    scale_perm,
+    src2dst,
+    topk_ids,
+    num_local_experts,
+    topk,
+    num_tokens,
+    hidden_size,
+):
+    """Quantize + reorder with one scale per token.
+
+    ``scale_perm`` comes back in the same permuted row order as ``gateup_input``
+    and is passed straight to the CUTLASS grouped GEMM as ``a_scales``.
+    Every row the GEMM reads is written here, so the buffer needs no init.
+    """
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    per_token_scale_reorder_triton_kernel_for_cutlass_moe[(num_tokens,)](
+        input_ptr=input,
+        gateup_input_ptr=gateup_input,
+        scale_perm_ptr=scale_perm,
+        src2dst_ptr=src2dst,
+        topk_ids_ptr=topk_ids,
+        num_local_experts=num_local_experts,
+        topk=topk,
+        hidden_size=hidden_size,
+        fp8_max=fp8_max,
+        BLOCK_K=triton.next_power_of_2(hidden_size),
+        num_warps=8,
+    )
+
+
+@triton.jit
+def silu_mul_per_token_quant_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    num_tokens_tensor_ptr,
+    intermediate_size,
+    fp8_max,
+    fp8_min,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    num_tokens = tl.load(num_tokens_tensor_ptr)
+    if row < num_tokens:
+        gate_base = input_ptr + row.to(tl.int64) * 2 * intermediate_size
+        up_base = gate_base + intermediate_size
+        absmax = 0.0
+        for off in tl.range(0, intermediate_size, BLOCK_SIZE):
+            idx = off + tl.arange(0, BLOCK_SIZE)
+            m = idx < intermediate_size
+            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32)
+            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32)
+            gate_up = gate / (1 + tl.exp(-gate)) * up
+            absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
+        scale = tl.maximum(absmax, 1e-10) / fp8_max
+        tl.store(scale_ptr + row, scale)
+        inv = 1.0 / scale
+        out_base = output_ptr + row.to(tl.int64) * intermediate_size
+        for off in tl.range(0, intermediate_size, BLOCK_SIZE):
+            idx = off + tl.arange(0, BLOCK_SIZE)
+            m = idx < intermediate_size
+            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32)
+            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32)
+            gate_up = gate / (1 + tl.exp(-gate)) * up
+            q = tl.minimum(tl.maximum(gate_up * inv, fp8_min), fp8_max)
+            tl.store(out_base + idx, q.to(output_ptr.dtype.element_ty), mask=m)
+
+
+def silu_mul_per_token_quant_for_cutlass_moe(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    scale: torch.Tensor,
+    num_tokens_tensor: torch.Tensor,
+    expected_num_tokens: int,
+    intermediate_size: int,
+):
+    """Per-token counterpart of silu_mul_dynamic_tensorwise_quant_for_cutlass_moe.
+
+    The tensorwise version needs two passes: a flat grid reducing into one scalar
+    with tl.atomic_max, then a second kernel to quantize. Here each row owns its
+    scale, so one program per row does both.
+    """
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    silu_mul_per_token_quant_triton_kernel_for_cutlass_moe[(expected_num_tokens,)](
+        input_ptr=input,
+        output_ptr=output,
+        scale_ptr=scale,
+        num_tokens_tensor_ptr=num_tokens_tensor,
+        intermediate_size=intermediate_size,
+        fp8_max=fp8_max,
+        fp8_min=-fp8_max,
+        BLOCK_SIZE=1024,
+    )
+
+
 def silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
     input: torch.Tensor,
     output: torch.Tensor,
