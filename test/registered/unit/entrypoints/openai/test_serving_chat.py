@@ -3325,7 +3325,9 @@ class TestSolarOpen2BudgetSpentWithoutAnswer(unittest.TestCase):
 
     def test_engine_length_is_left_alone(self):
         response = self.chat._build_chat_response(
-            self._req(), self._ret(f"thinking{self.END}", finish_type="length"), created=0
+            self._req(),
+            self._ret(f"thinking{self.END}", finish_type="length"),
+            created=0,
         )
         self.assertEqual(response.choices[0].finish_reason, "length")
 
