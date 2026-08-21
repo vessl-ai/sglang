@@ -57,7 +57,13 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_cuda,
+    is_cuda_alike,
+    is_hip,
+    is_npu,
+)
 
 _is_npu = is_npu()
 
@@ -343,7 +349,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
-        if is_cuda() and capture_decode_cuda_graph:
+        if is_cuda_alike() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(
                 self.device,
                 self.gpu_id,
