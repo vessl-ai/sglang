@@ -190,6 +190,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    apply_repetition_detection_gate,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -2301,6 +2302,12 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # Strip repetition_detection when the feature is off, once here at
+        # intake, before it reaches any Req construction below (normal
+        # request, session request, or session-not-found abort all read
+        # sampling_params off this same recv_req).
+        apply_repetition_detection_gate(self.server_args, recv_req.sampling_params)
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None

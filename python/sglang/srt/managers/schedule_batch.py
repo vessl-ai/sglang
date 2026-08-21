@@ -795,6 +795,22 @@ def _has_repeating_pattern(
     return True
 
 
+def apply_repetition_detection_gate(
+    server_args: ServerArgs, sampling_params: SamplingParams
+) -> None:
+    """Strip ``repetition_detection`` from *sampling_params* in place unless
+    the server was started with ``--enable-repetition-detection``.
+
+    Called once at request intake, before a :class:`Req` is built from the
+    (possibly shared) ``SamplingParams``. With the field nulled here,
+    ``Req._check_repetition_finish`` sees the same ``is None`` gate it sees
+    when a request simply never set the field, so the disabled path costs
+    exactly what it costs today.
+    """
+    if not server_args.enable_repetition_detection:
+        sampling_params.repetition_detection = None
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 

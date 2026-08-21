@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_MATCHED_TOKEN,
     FINISH_REPETITION,
     Req,
+    apply_repetition_detection_gate,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -208,6 +209,46 @@ class TestRepetitionDetectionValidation(unittest.TestCase):
 
     def test_max_pattern_size_zero_disables_without_raising(self):
         sp = SamplingParams(repetition_detection={"max_pattern_size": 0})
+        self.assertIsNone(sp.repetition_detection)
+
+
+class _FakeServerArgs:
+    def __init__(self, enable_repetition_detection: bool):
+        self.enable_repetition_detection = enable_repetition_detection
+
+
+class TestApplyRepetitionDetectionGate(unittest.TestCase):
+    """Regression for the request-intake gate (ServerArgs.enable_repetition_detection):
+    flag off must null the field before it ever reaches a Req; flag on must
+    preserve it untouched."""
+
+    def _normalized_sp(self):
+        sp = SamplingParams(
+            repetition_detection={
+                "max_pattern_size": 2,
+                "min_pattern_size": 2,
+                "min_count": 3,
+            }
+        )
+        sp.normalize(tokenizer=_MockTokenizerForNormalize())
+        return sp
+
+    def test_flag_off_nulls_repetition_detection(self):
+        sp = self._normalized_sp()
+        self.assertIsNotNone(sp.repetition_detection)
+        apply_repetition_detection_gate(_FakeServerArgs(False), sp)
+        self.assertIsNone(sp.repetition_detection)
+
+    def test_flag_on_preserves_repetition_detection(self):
+        sp = self._normalized_sp()
+        expected = dict(sp.repetition_detection)
+        apply_repetition_detection_gate(_FakeServerArgs(True), sp)
+        self.assertEqual(sp.repetition_detection, expected)
+
+    def test_flag_off_is_noop_when_field_already_none(self):
+        sp = self._normalized_sp()
+        sp.repetition_detection = None
+        apply_repetition_detection_gate(_FakeServerArgs(False), sp)
         self.assertIsNone(sp.repetition_detection)
 
 
