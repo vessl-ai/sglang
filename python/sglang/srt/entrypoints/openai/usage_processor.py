@@ -10,14 +10,13 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _cached_details(count: int) -> PromptTokensDetails:
-        """Build the ``prompt_tokens_details`` entry for cache reporting.
-
-        Always emits ``cached_tokens`` (including ``0``) so that, under
-        ``--enable-cache-report``, clients can rely on the field being present
-        on every response — a cache miss reports ``{"cached_tokens": 0}``, as
-        OpenAI does, rather than omitting the details entirely.
-        """
+    def cached_details(
+        count: int, enable_cache_report: bool
+    ) -> Optional[PromptTokensDetails]:
+        """Cache-report ``prompt_tokens_details``: None when reporting is off,
+        otherwise always ``{"cached_tokens": count}`` (even 0, as OpenAI does)."""
+        if not enable_cache_report:
+            return None
         return PromptTokensDetails(cached_tokens=count)
 
     @staticmethod
@@ -42,13 +41,13 @@ class UsageProcessor:
             r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
-        cached_details = None
-        if enable_cache_report:
-            cached_total = sum(
-                responses[i]["meta_info"].get("cached_tokens", 0)
-                for i in range(0, len(responses), n_choices)
-            )
-            cached_details = UsageProcessor._cached_details(cached_total)
+        cached_total = sum(
+            responses[i]["meta_info"].get("cached_tokens", 0)
+            for i in range(0, len(responses), n_choices)
+        )
+        cached_details = UsageProcessor.cached_details(
+            count=cached_total, enable_cache_report=enable_cache_report
+        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -79,12 +78,11 @@ class UsageProcessor:
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._cached_details(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
-            )
-            if enable_cache_report
-            else None
+        cached_details = UsageProcessor.cached_details(
+            count=sum(
+                tok for idx, tok in cached_tokens.items() if idx % n_choices == 0
+            ),
+            enable_cache_report=enable_cache_report,
         )
 
         return UsageProcessor.calculate_token_usage(
@@ -108,11 +106,7 @@ class UsageProcessor:
         video_tokens: int = 0,
     ) -> UsageInfo:
         """Calculate token usage information"""
-        # `cached_tokens` is a PromptTokensDetails when cache reporting is
-        # enabled (carrying the cached count, possibly 0) or None when it is
-        # disabled. Multimodal counts are attached to the same object,
-        # creating one only when there is something to report so plain-text
-        # requests without cache reporting keep prompt_tokens_details=None.
+        # Attach multimodal counts to the cache-report details (or a fresh object when there are none).
         details = cached_tokens
         if image_tokens or audio_tokens or video_tokens:
             if details is None:
