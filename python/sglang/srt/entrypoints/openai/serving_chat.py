@@ -1113,14 +1113,16 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Optional[Dict[str, Any]],
     ) -> bool:
         """True when this request injected the Solar Open2 per-call
-        terminator as a stop string (parallel_tool_calls=False, no
-        structural-tag constraint exists for this detector — see
-        SolarOpen2Detector.supports_structural_tag) and generation halted on
-        exactly that stop. The detokenizer trims a matched stop string from
-        the output by default, so the terminator the detector requires must
-        be glued back on before parsing -- unless no_stop_trim asked to keep
-        it, in which case it is already in the text and the parser already
-        consumed it; gluing it back on again would leak a second copy."""
+        terminator as a stop string (parallel_tool_calls=False; the legacy
+        structural tag built from SolarOpen2Detector.structure_info has no
+        call-count limit — only at_least_one — so the cap is enforced by
+        halting generation at the first call's terminator instead) and
+        generation halted on exactly that stop. The detokenizer trims a
+        matched stop string from the output by default, so the terminator
+        the detector requires must be glued back on before parsing -- unless
+        no_stop_trim asked to keep it, in which case it is already in the
+        text and the parser already consumed it; gluing it back on again
+        would leak a second copy."""
         return bool(
             self.tool_call_parser == "solar_open2"
             and request.tool_choice != "none"
@@ -1196,14 +1198,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser == "solar_open2"
                     and request.parallel_tool_calls is False
                 ):
-                    # No structural-tag constraint exists for this detector
-                    # (supports_structural_tag is False), so enforce
-                    # parallel_tool_calls=False by halting generation at the
-                    # first call's terminator instead. Unlike kimi_k3's stop
-                    # (a section-envelope closer outside each call, harmless
-                    # to trim), this terminator is required inside every
-                    # call, so _process_tool_calls / _process_tool_call_stream
-                    # glue it back onto the text before parsing.
+                    # The structural tag (when tool_choice is required/named
+                    # or strict) forces each call's envelope but has no
+                    # call-count knob — only at_least_one — and for auto
+                    # there is no constraint at all, so parallel_tool_calls
+                    # =False is enforced by halting generation at the first
+                    # call's terminator instead. Unlike kimi_k3's stop (a
+                    # section-envelope closer outside each call, harmless to
+                    # trim), this terminator is required inside every call,
+                    # so _process_tool_calls / _process_tool_call_stream glue
+                    # it back onto the text before parsing.
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None

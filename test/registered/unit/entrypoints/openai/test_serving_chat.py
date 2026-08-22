@@ -22,6 +22,8 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ToolChoice,
+    ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -771,9 +773,13 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(result.stop)
 
     def test_solar_open2_parallel_tool_calls_false_injects_call_end_stop(self):
-        """No structural tag exists for solar_open2, so parallel_tool_calls=False
-        is enforced by stopping generation at the per-call terminator instead --
-        but only when the request actually asks for it."""
+        """The solar_open2 structural tag has no call-count knob (only
+        at_least_one) and auto has no constraint at all, so
+        parallel_tool_calls=False is enforced by stopping generation at the
+        per-call terminator instead -- but only when the request actually
+        asks for it. The stop injection does not depend on the constraint
+        (get_structure_constraint is mocked to None here for the auto
+        case)."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "solar_open2"
@@ -804,7 +810,8 @@ class ServingChatTestCase(unittest.TestCase):
             ):
                 parser = parser_cls.return_value
                 parser.detector.eot_token = SOLAR_OPEN2_TOOL_CALL_END
-                parser.detector.parses_required_natively.return_value = True
+                parser.detector.parses_required_natively.return_value = False
+                parser.detector.supports_structural_tag.return_value = True
                 parser.get_structure_constraint.return_value = None
                 request = ChatCompletionRequest(
                     model="x",
@@ -817,6 +824,69 @@ class ServingChatTestCase(unittest.TestCase):
                 result = self.chat._process_messages(request, is_multimodal=False)
 
                 self.assertEqual(result.stop, expected_stop)
+
+    def test_solar_open2_required_uses_structural_tag_constraint(self):
+        """required/named tool_choice must route through the real
+        FunctionCallParser (no mocking here) and land on the legacy
+        structural_tag built from SolarOpen2Detector.structure_info -- the
+        grammar-forced constraint this issue restores. parallel_tool_calls
+        =False keeps the same constraint and additionally gets the
+        <|tool_call:end|> stop string, since the tag itself cannot cap the
+        call count (see _solar_single_call_stop_matched)."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "solar_open2"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[tool],
+            tool_choice="required",
+        )
+        result = self.chat._process_messages(request, is_multimodal=False)
+
+        self.assertEqual(result.tool_call_constraint[0], "structural_tag")
+        tag = result.tool_call_constraint[1]
+        self.assertTrue(tag.at_least_one)
+        self.assertTrue(
+            any(
+                s.begin == "<|tool_call:start|>get_weather\n"
+                and s.end == "<|tool_call:end|>"
+                for s in tag.structures
+            )
+        )
+        self.assertFalse(result.stop)
+
+        request_no_parallel = request.model_copy(update={"parallel_tool_calls": False})
+        result_no_parallel = self.chat._process_messages(
+            request_no_parallel, is_multimodal=False
+        )
+        self.assertEqual(result_no_parallel.tool_call_constraint[0], "structural_tag")
+        self.assertTrue(result_no_parallel.tool_call_constraint[1].at_least_one)
+        self.assertEqual(result_no_parallel.stop, [SOLAR_OPEN2_TOOL_CALL_END])
+
+        named_request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[tool],
+            tool_choice=ToolChoice(
+                type="function", function=ToolChoiceFuncName(name="get_weather")
+            ),
+        )
+        named_result = self.chat._process_messages(named_request, is_multimodal=False)
+        self.assertEqual(named_result.tool_call_constraint[0], "structural_tag")
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
@@ -3022,6 +3092,205 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         )
         for chunk in chunks:
             self.assertNotIn(SOLAR_OPEN2_TOOL_CALL_END, chunk)
+
+    # --- grammar-forced JSON-body call (tool_choice="required"/"auto") ---
+    # What xgrammar writes under the legacy structural_tag: a JSON object
+    # between the call markers instead of <|tool_arg:*|> runs (see
+    # SolarOpen2Detector.structure_info / module docstring).
+    _JSON_BODY_TRIMMED_CALL_TEXT = (
+        '<|tool_call:start|>get_weather\n{"location": "Paris"}'
+    )
+
+    def test_required_non_streaming_json_body_glue_back_extracts_single_call(self):
+        request = self.request.model_copy(update={"tool_choice": "required"})
+        ret = [
+            {
+                "text": self._JSON_BODY_TRIMMED_CALL_TEXT,
+                "meta_info": {
+                    "id": "chatcmpl-solar-json-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "stop",
+                        "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                    },
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(request, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertIsNotNone(choice.message.tool_calls)
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "get_weather")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments), {"location": "Paris"}
+        )
+
+    def test_required_streaming_json_body_glue_back_emits_completed_call(self):
+        request = self.request.model_copy(update={"tool_choice": "required"})
+        parser_dict = {}
+        has_tool_calls = {}
+        content = {
+            "text": self._JSON_BODY_TRIMMED_CALL_TEXT,
+            "meta_info": {
+                "id": "chatcmpl-solar-json-stream-test",
+                "finish_reason": {
+                    "type": "stop",
+                    "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                },
+            },
+        }
+
+        async def run():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=False,
+                prompt_tokens={0: 5},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 10},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+
+        self.assertTrue(has_tool_calls.get(0))
+        tool_call_deltas = [
+            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if '"tool_calls"' in c
+        ]
+        self.assertEqual(len(tool_call_deltas), 1)
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_call_deltas[0]["function"]["arguments"]),
+            {"location": "Paris"},
+        )
+
+    def test_auto_non_streaming_json_body_glue_back_extracts_single_call(self):
+        ret = [
+            {
+                "text": self._JSON_BODY_TRIMMED_CALL_TEXT,
+                "meta_info": {
+                    "id": "chatcmpl-solar-json-auto-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "stop",
+                        "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                    },
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(self.request, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "get_weather")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments), {"location": "Paris"}
+        )
+
+    def test_auto_streaming_json_body_glue_back_emits_completed_call(self):
+        parser_dict = {}
+        has_tool_calls = {}
+        content = {
+            "text": self._JSON_BODY_TRIMMED_CALL_TEXT,
+            "meta_info": {
+                "id": "chatcmpl-solar-json-auto-stream-test",
+                "finish_reason": {
+                    "type": "stop",
+                    "matched": SOLAR_OPEN2_TOOL_CALL_END,
+                },
+            },
+        }
+
+        async def run():
+            chunks = []
+            async for chunk in self.chat._generate_stream_content(
+                content=content,
+                index=0,
+                request=self.request,
+                stream_offsets={},
+                reasoning_parser_dict={},
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=None,
+                finish_reason_type="stop",
+                continuous_usage_stats=False,
+                prompt_tokens={0: 5},
+                reasoning_tokens={0: 0},
+                completion_tokens={0: 10},
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+
+        self.assertTrue(has_tool_calls.get(0))
+        tool_call_deltas = [
+            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
+            for c in chunks
+            if '"tool_calls"' in c
+        ]
+        self.assertEqual(len(tool_call_deltas), 1)
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_call_deltas[0]["function"]["arguments"]),
+            {"location": "Paris"},
+        )
+
+    def test_required_non_streaming_json_body_full_text_no_glue_back_needed(self):
+        """Same JSON-body envelope without the stop-string path: the call's
+        own terminator is already in the text (parallel_tool_calls default,
+        finish_reason plain stop with no `matched`)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        ret = [
+            {
+                "text": self._JSON_BODY_TRIMMED_CALL_TEXT + SOLAR_OPEN2_TOOL_CALL_END,
+                "meta_info": {
+                    "id": "chatcmpl-solar-json-full-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(request, ret, created=123)
+        choice = response.choices[0]
+
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tool_call = choice.message.tool_calls[0]
+        self.assertEqual(tool_call.function.name, "get_weather")
+        self.assertEqual(
+            json.loads(tool_call.function.arguments), {"location": "Paris"}
+        )
 
 
 class TestNormalizeToolContent(unittest.TestCase):
