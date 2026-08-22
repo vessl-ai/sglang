@@ -10,9 +10,15 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def _cached_details(count: int) -> PromptTokensDetails:
+        """Build the ``prompt_tokens_details`` entry for cache reporting.
+
+        Always emits ``cached_tokens`` (including ``0``) so that, under
+        ``--enable-cache-report``, clients can rely on the field being present
+        on every response — a cache miss reports ``{"cached_tokens": 0}``, as
+        OpenAI does, rather than omitting the details entirely.
+        """
+        return PromptTokensDetails(cached_tokens=count)
 
     @staticmethod
     def calculate_response_usage(
@@ -42,7 +48,7 @@ class UsageProcessor:
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+            cached_details = UsageProcessor._cached_details(cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -74,7 +80,7 @@ class UsageProcessor:
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
-            UsageProcessor._details_if_cached(
+            UsageProcessor._cached_details(
                 sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
             )
             if enable_cache_report
@@ -102,10 +108,11 @@ class UsageProcessor:
         video_tokens: int = 0,
     ) -> UsageInfo:
         """Calculate token usage information"""
-        # `cached_tokens` is already a PromptTokensDetails (or None) carrying the
-        # cached count. Attach multimodal counts to the same object, creating one
-        # only when there is something to report so plain-text requests keep
-        # prompt_tokens_details=None (backward compatible).
+        # `cached_tokens` is a PromptTokensDetails when cache reporting is
+        # enabled (carrying the cached count, possibly 0) or None when it is
+        # disabled. Multimodal counts are attached to the same object,
+        # creating one only when there is something to report so plain-text
+        # requests without cache reporting keep prompt_tokens_details=None.
         details = cached_tokens
         if image_tokens or audio_tokens or video_tokens:
             if details is None:

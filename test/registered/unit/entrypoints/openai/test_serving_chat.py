@@ -22,6 +22,7 @@ from fastapi import Request
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    PromptTokensDetails,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
@@ -2266,6 +2267,25 @@ class ServingChatTestCase(unittest.TestCase):
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertIsNone(usages[0].get("prompt_tokens_details"))
+
+    def test_continuous_usage_cached_details_zero_when_enabled(self):
+        """A cache miss (cached_tokens=0) still yields PromptTokensDetails(cached_tokens=0), not None."""
+        self.tm.server_args.enable_cache_report = True
+        content = {"meta_info": {"cached_tokens": 0}}
+        details = self.chat._continuous_usage_cached_details(content)
+        self.assertEqual(details, PromptTokensDetails(cached_tokens=0))
+        self.assertEqual(details.model_dump(), {"cached_tokens": 0})
+
+    def test_continuous_usage_cached_details_nonzero_when_enabled(self):
+        self.tm.server_args.enable_cache_report = True
+        content = {"meta_info": {"cached_tokens": 4}}
+        details = self.chat._continuous_usage_cached_details(content)
+        self.assertEqual(details, PromptTokensDetails(cached_tokens=4))
+
+    def test_continuous_usage_cached_details_none_when_disabled(self):
+        self.tm.server_args.enable_cache_report = False
+        content = {"meta_info": {"cached_tokens": 4}}
+        self.assertIsNone(self.chat._continuous_usage_cached_details(content))
 
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
