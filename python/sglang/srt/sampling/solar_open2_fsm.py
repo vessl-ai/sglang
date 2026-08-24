@@ -222,8 +222,10 @@ class SolarReqFSM:
         self.forced = False
 
     def _step(self, tok: int) -> None:
-        """Per-token transition. Mirrored by ``_SimState.step``, which walks a
-        throwaway copy of this state over a speculative chain."""
+        """Per-token transition. Reused verbatim as ``_SimState.step``, which
+        walks a throwaway copy of this state over a speculative chain, so the
+        two can never drift. Touches only ``in_reasoning`` / ``count`` /
+        ``content_progress`` -- the slots ``_SimState`` also carries."""
         if tok == CFG.think_start:
             self.in_reasoning = True
             self.content_progress = False
@@ -268,15 +270,31 @@ class SolarReqFSM:
         return self.in_reasoning and self.count >= self.budget
 
 
+def _fsm_stale(req) -> bool:
+    """True when the FSM hung off ``req`` predates the request's last retraction.
+
+    A retraction throws away whatever the in-flight commit already fed the FSM:
+    the scheduler drops the pending run instead of appending it to
+    ``req.output_ids`` (see ``process_batch_result_decode``'s
+    ``req.finished() or req.is_retracted`` skip under overlap). That would leave
+    ``consumed`` permanently ahead of ``len(req.output_ids)``, and ``advance()``
+    only ever moves forward -- so it would silently skip that many real tokens,
+    including a ``<|think:end|>``. Rebuild instead and let ``advance()`` replay
+    ``req.output_ids``, which a retraction keeps intact.
+    """
+    return getattr(req, "_solar_fsm_retractions", 0) != req.retraction_count
+
+
 def _req_fsm(req) -> SolarReqFSM:
     """Get (or build) the persistent FSM hung off a request."""
     fsm = getattr(req, "_solar_fsm", None)
-    if fsm is None:
+    if fsm is None or _fsm_stale(req):
         fsm = SolarReqFSM(
             getattr(req, "origin_input_ids", ()) or (),
             getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
         )
         req._solar_fsm = fsm
+        req._solar_fsm_retractions = req.retraction_count
     return fsm
 
 
@@ -529,18 +547,10 @@ class _SimState:
         self.count = fsm.count
         self.content_progress = fsm.content_progress
 
-    def step(self, tok: int) -> None:
-        """Mirror of SolarReqFSM._step's per-token transition."""
-        if tok == CFG.think_start:
-            self.in_reasoning = True
-            self.content_progress = False
-            self.count = 0
-        elif tok == CFG.think_end:
-            self.in_reasoning = False
-        elif self.in_reasoning:
-            self.count += 1
-        elif tok == CFG.tool_call_end or tok not in CFG.all_controls:
-            self.content_progress = True
+    # The persistent FSM's own transition, reused rather than mirrored: a
+    # drift between the chain walk and the committed state is exactly the
+    # class of bug this module exists to avoid.
+    step = SolarReqFSM._step
 
     def exhausted(self, budget: int) -> bool:
         return self.in_reasoning and self.count >= budget
@@ -624,8 +634,9 @@ def plan_gate(reqs, stride: int) -> bool:
     window = 2 * stride
     for req in reqs:
         fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None:
-            # No committed state to judge from yet.
+        if fsm is None or _fsm_stale(req):
+            # No committed state to judge from yet (or it predates a retraction
+            # and _req_fsm will rebuild it after the barrier).
             return True
         fsm.advance(req.output_ids)
         if fsm.budget <= window:

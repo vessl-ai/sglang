@@ -45,6 +45,7 @@ def _req(
         grammar=grammar,
         is_retracted=is_retracted,
         inflight_middle_chunks=0,
+        retraction_count=0,
         finished=lambda f=finished: f,
     )
     if fsm is not None:
@@ -240,6 +241,35 @@ class TestSolarReqFsmCommitAdvance(SolarOpen2FsmVerifyTestBase):
         fsm.advance([50, 51, 52, 53])
         self.assertEqual(fsm.count, 4)
         self.assertEqual(fsm.consumed, 4)
+
+
+class TestRetractionRebuildsFsm(SolarOpen2FsmVerifyTestBase):
+    def test_discarded_commit_after_retraction_does_not_skip_tokens(self):
+        # The barrier committed a run that the scheduler then threw away when
+        # the request was retracted, so `consumed` is ahead of output_ids.
+        # Without the rebuild, advance() would skip the tokens the request
+        # regenerates -- including the think_end below.
+        req = _req(rid="r0", origin_input_ids=[THINK_START], max_new_tokens=100)
+        fsm = solar_open2_fsm._req_fsm(req)
+        fsm.commit([50, 51, 52])  # run dropped by the retraction
+        self.assertEqual(fsm.consumed, 3)
+        self.assertTrue(fsm.in_reasoning)
+
+        req.retraction_count = 1
+        req.output_ids = [60, THINK_END, 61]
+
+        fsm = solar_open2_fsm._req_fsm(req)
+        fsm.advance(req.output_ids)
+        self.assertEqual(fsm.consumed, 3)
+        self.assertFalse(fsm.in_reasoning)
+
+    def test_plan_gate_is_conservative_after_a_retraction(self):
+        req = _req(rid="r0", origin_input_ids=[THINK_START], max_new_tokens=100)
+        solar_open2_fsm._req_fsm(req)  # seed the persistent FSM
+        self.assertFalse(solar_open2_fsm.plan_gate([req], 3))
+
+        req.retraction_count = 1
+        self.assertTrue(solar_open2_fsm.plan_gate([req], 3))
 
 
 class TestPlanGate(SolarOpen2FsmVerifyTestBase):
