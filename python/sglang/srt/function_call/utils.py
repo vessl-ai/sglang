@@ -112,14 +112,23 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
 
 def normalize_json_schema_types(schema: Any) -> None:
     """
-    Walk a JSON Schema in place and rewrite non-standard ``"type"`` values
+    Walk a JSON Schema in place, rewriting non-standard ``"type"`` values
     (e.g. ``"varchar"``, ``"enum"``, ``"int"``) to their standard JSON Schema
-    equivalents.
+    equivalents and dropping a ``"required"`` key whose value is ``null``.
 
     Acts as a compatibility layer for tool ``parameters`` schemas exported
     from database / ORM tooling, which often uses DB type names rather than
     JSON Schema types. Unknown types are left untouched so that downstream
     validation can still surface genuine errors.
+
+    ``"required": null`` gets the same treatment for the same reason: some
+    client tooling serializes an unset ``required`` as ``null`` instead of
+    omitting the key. JSON Schema wants an array there, so a validator
+    rejects the whole schema over a key that carries no constraint. An
+    absent ``"required"`` and an empty one mean the same thing, so dropping
+    it changes nothing the schema permits. Only ``"required"`` is scrubbed
+    this way -- ``null`` is a legal value for keywords such as ``"default"``
+    and ``"const"``, where dropping it would change what the schema means.
 
     Mutates the input dict in place; the rewritten schema is also what gets
     rendered into the model prompt, so e.g. a user-supplied ``"varchar"``
@@ -132,6 +141,9 @@ def normalize_json_schema_types(schema: Any) -> None:
         return
     if not isinstance(schema, dict):
         return
+
+    if "required" in schema and schema["required"] is None:
+        del schema["required"]
 
     if "type" in schema:
         t = schema["type"]

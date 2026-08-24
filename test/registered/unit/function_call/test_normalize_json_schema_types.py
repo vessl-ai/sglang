@@ -404,6 +404,93 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertIs(schema["unevaluatedProperties"], False)
         self._assert_accepts(schema)
 
+    def test_null_required_is_dropped(self):
+        """``required: null`` is treated as absent.
+
+        JSON Schema wants an array there, so leaving the null in place makes
+        `check_schema` reject the whole tool over a key that constrains
+        nothing.
+        """
+        schema = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": None,
+        }
+        normalize_json_schema_types(schema)
+        self.assertNotIn("required", schema)
+        self._assert_accepts(schema)
+
+    def test_null_required_is_dropped_in_nested_schemas(self):
+        """The walker already visits every subschema, so nesting is covered."""
+        schema = {
+            "type": "object",
+            "required": None,
+            "properties": {
+                "where": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": None,
+                },
+                "stops": {
+                    "type": "array",
+                    "items": {"type": "object", "required": None},
+                },
+            },
+            "$defs": {"leg": {"type": "object", "required": None}},
+        }
+        normalize_json_schema_types(schema)
+        self.assertNotIn("required", schema)
+        self.assertNotIn("required", schema["properties"]["where"])
+        self.assertNotIn("required", schema["properties"]["stops"]["items"])
+        self.assertNotIn("required", schema["$defs"]["leg"])
+        self._assert_accepts(schema)
+
+    def test_valid_required_is_untouched(self):
+        schema = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        }
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["required"], ["location"])
+        self._assert_accepts(schema)
+
+    def test_empty_required_array_is_untouched(self):
+        schema = {"type": "object", "properties": {}, "required": []}
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["required"], [])
+        self._assert_accepts(schema)
+
+    def test_null_is_preserved_where_it_is_a_legal_value(self):
+        """Only ``required`` is scrubbed.
+
+        ``null`` means something for ``default`` and ``const``, and it is a
+        legal ``enum`` member -- dropping it would change the schema.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "a": {"type": ["string", "null"], "default": None},
+                "b": {"const": None},
+                "c": {"enum": [None, "x"]},
+            },
+        }
+        normalize_json_schema_types(schema)
+        self.assertIn("default", schema["properties"]["a"])
+        self.assertIsNone(schema["properties"]["a"]["default"])
+        self.assertIn("const", schema["properties"]["b"])
+        self.assertIsNone(schema["properties"]["b"]["const"])
+        self.assertEqual(schema["properties"]["c"]["enum"], [None, "x"])
+        self._assert_accepts(schema)
+
+    def test_wrongly_typed_required_still_fails_validation(self):
+        """Scrubbing null must not turn into "accept any ``required``"."""
+        schema = {"type": "object", "required": "location"}
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["required"], "location")
+        with self.assertRaises(SchemaError):
+            Draft202012Validator.check_schema(schema)
+
 
 if __name__ == "__main__":
     unittest.main()

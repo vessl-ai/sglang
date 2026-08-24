@@ -1062,6 +1062,60 @@ class ServingChatTestCase(unittest.TestCase):
                     "Tool names must be unique across request and message tools.",
                 )
 
+    def test_null_tool_parameters_required_is_accepted(self):
+        """A tool whose ``parameters.required`` is null must not 400.
+
+        Client tooling that serializes an unset ``required`` as null rather
+        than omitting the key produces this shape, and the null constrains
+        nothing -- rejecting the whole request over it is not useful.
+        """
+        parameters = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": None,
+        }
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a location.",
+                        "parameters": parameters,
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        self.assertIsNone(self.chat._validate_request(request))
+        # Validation normalizes in place, and the normalized schema is what
+        # reaches the model prompt -- the null must be gone, not blanked.
+        self.assertNotIn("required", request.tools[0].function.parameters)
+
+    def test_tool_parameters_with_a_genuinely_invalid_required_still_fails(self):
+        """Dropping the null must not weaken validation of real mistakes."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object", "required": "location"},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        error = self.chat._validate_request(request)
+        self.assertIsNotNone(error)
+        self.assertIn("invalid 'parameters' schema", error)
+
     def test_jinja_rejects_non_object_tool_call_arguments(self):
         """History tool call arguments must parse to a JSON object."""
         self.template_manager.chat_template_name = None
