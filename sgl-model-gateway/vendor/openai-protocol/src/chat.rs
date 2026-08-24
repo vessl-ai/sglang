@@ -366,9 +366,10 @@ pub struct ChatCompletionRequest {
     pub repetition_detection: Option<Value>,
 
     /// Whether to add special tokens during tokenization, forwarded verbatim
-    /// to the engine. The engine validates; the router must not.
+    /// to the engine. Untyped so that no request shape is rejected here: the
+    /// router must never validate an injected field (contract F2).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub add_special_tokens: Option<bool>,
+    pub add_special_tokens: Option<Value>,
 }
 
 // ============================================================================

@@ -695,3 +695,27 @@ fn test_repetition_detection_non_object_value_round_trips_verbatim() {
         "Non-object repetition_detection should round-trip verbatim"
     );
 }
+
+#[test]
+fn test_add_special_tokens_non_bool_value_round_trips_verbatim() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "add_special_tokens": "false",
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "The router must accept a wrongly-typed add_special_tokens value \
+         too, since injected fields are never rejected by the router \
+         (contract F2)"
+    );
+
+    let out = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        out["add_special_tokens"],
+        json!("false"),
+        "A stringified add_special_tokens value should round-trip verbatim"
+    );
+}

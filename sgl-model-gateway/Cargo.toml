@@ -214,7 +214,8 @@ opt-level = 1
 # [vessl] The vendored patch also adds `repetition_detection` and
 # `add_special_tokens` as validation-free passthrough members of
 # ChatCompletionRequest (contract F3): the router would otherwise drop them on
-# deserialize→serialize. The engine validates their contents; the router must
-# not (contract F2).
+# deserialize→serialize. Both are untyped, so the router rejects no shape for
+# either field (contract F2); validating their contents, if anyone does, is
+# the engine's business, not the router's.
 [patch.crates-io]
 openai-protocol = { path = "vendor/openai-protocol" }
