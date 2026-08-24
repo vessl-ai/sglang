@@ -31,6 +31,14 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.solar_open2_detector import (
+    TOOL_ARG_END,
+    TOOL_ARG_START,
+    TOOL_ARG_VALUE,
+    TOOL_CALL_END,
+    TOOL_CALL_START,
+    SolarOpen2Detector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -5178,6 +5186,234 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestSolarOpen2Detector(unittest.TestCase):
+    """Grammar-forced tool_choice="required"/named relies on SolarOpen2Detector
+    inheriting the base-class capability defaults (supports_structural_tag()
+    True, parses_required_natively() False) so FunctionCallParser routes
+    required/named tool_choice through the legacy structural tag instead of
+    best-effort prompting. Under that tag xgrammar fills a JSON object
+    between the call markers instead of ``<|tool_arg:*|>`` runs; these tests
+    cover both the capability defaults and that JSON-body envelope.
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {"timezone": {"type": "string"}},
+                        "required": ["timezone"],
+                    },
+                ),
+            ),
+        ]
+
+    def test_capability_defaults_are_inherited(self):
+        """No override of supports_structural_tag/parses_required_natively:
+        reintroducing either override silently brings back the bug this
+        issue fixes (required/named tool_choice skipping grammar
+        constraints and falling back to best-effort prompting)."""
+        detector = SolarOpen2Detector()
+        self.assertTrue(detector.supports_structural_tag())
+        self.assertFalse(detector.parses_required_natively())
+        self.assertNotIn("supports_structural_tag", SolarOpen2Detector.__dict__)
+        self.assertNotIn("parses_required_natively", SolarOpen2Detector.__dict__)
+
+    def test_structure_info_envelope(self):
+        detector = SolarOpen2Detector()
+        info = detector.structure_info()("get_weather")
+        self.assertEqual(info.begin, f"{TOOL_CALL_START}get_weather\n")
+        self.assertEqual(info.end, TOOL_CALL_END)
+        self.assertEqual(info.trigger, TOOL_CALL_START)
+
+    def test_required_tool_choice_uses_structural_tag(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        tag = result[1]
+        self.assertTrue(tag.at_least_one)
+        self.assertEqual(tag.triggers, [TOOL_CALL_START])
+        begins = {s.begin for s in tag.structures}
+        ends = {s.end for s in tag.structures}
+        self.assertIn(f"{TOOL_CALL_START}get_weather\n", begins)
+        self.assertIn(f"{TOOL_CALL_START}get_time\n", begins)
+        self.assertEqual(ends, {TOOL_CALL_END})
+
+        named_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        named_result = parser.get_structure_constraint(named_choice)
+        self.assertIsNotNone(named_result)
+        self.assertEqual(named_result[0], "structural_tag")
+        self.assertTrue(named_result[1].at_least_one)
+
+        self.assertIsNone(parser.get_structure_constraint("auto"))
+
+    def test_json_body_envelope_parses_non_stream(self):
+        detector = SolarOpen2Detector()
+        text = (
+            f'{TOOL_CALL_START}get_weather\n{{"location": "Seoul", "days": 3}}'
+            f"{TOOL_CALL_END}"
+        )
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"location": "Seoul", "days": 3}
+        )
+
+        prose = "Let me check the weather. "
+        result2 = SolarOpen2Detector().detect_and_parse(prose + text, self.tools)
+        self.assertEqual(result2.normal_text, prose)
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(
+            json.loads(result2.calls[0].parameters), {"location": "Seoul", "days": 3}
+        )
+
+        pretty_text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            '{\n  "location": "Seoul",\n  "days": 3\n}'
+            f"{TOOL_CALL_END}"
+        )
+        result3 = SolarOpen2Detector().detect_and_parse(pretty_text, self.tools)
+        self.assertEqual(len(result3.calls), 1)
+        self.assertEqual(
+            json.loads(result3.calls[0].parameters), {"location": "Seoul", "days": 3}
+        )
+
+        empty_text = f"{TOOL_CALL_START}get_weather\n{{}}{TOOL_CALL_END}"
+        result4 = SolarOpen2Detector().detect_and_parse(empty_text, self.tools)
+        self.assertEqual(len(result4.calls), 1)
+        self.assertEqual(json.loads(result4.calls[0].parameters), {})
+
+    def _feed_streaming(self, detector, chunks):
+        calls = []
+        normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        return normal_text, calls
+
+    def _chunk_by_size(self, text, size):
+        return [text[i : i + size] for i in range(0, len(text), size)]
+
+    def test_json_body_envelope_parses_stream(self):
+        text = (
+            f'{TOOL_CALL_START}get_weather\n{{"location": "Seoul", "days": 3}}'
+            f"{TOOL_CALL_END}"
+        )
+        chunkings = [self._chunk_by_size(text, n) for n in (1, 2, 3, 4)]
+        # Also split exactly at marker boundaries.
+        chunkings.append(
+            [
+                TOOL_CALL_START,
+                "get_weather\n",
+                '{"location": "Seoul", "days": 3}',
+                TOOL_CALL_END,
+            ]
+        )
+        for chunks in chunkings:
+            detector = SolarOpen2Detector()
+            normal_text, calls = self._feed_streaming(detector, chunks)
+            self.assertEqual(normal_text, "")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0].name, "get_weather")
+            self.assertEqual(
+                json.loads(calls[0].parameters), {"location": "Seoul", "days": 3}
+            )
+
+    def test_native_marker_format_unchanged_non_stream(self):
+        detector = SolarOpen2Detector()
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Seoul{TOOL_ARG_END}"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}"
+            f"{TOOL_CALL_END}"
+        )
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"location": "Seoul", "days": 3}
+        )
+
+    def test_native_marker_format_unchanged_stream(self):
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Seoul{TOOL_ARG_END}"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}"
+            f"{TOOL_CALL_END}"
+        )
+        for size in (1, 3, 7):
+            detector = SolarOpen2Detector()
+            normal_text, calls = self._feed_streaming(
+                detector, self._chunk_by_size(text, size)
+            )
+            self.assertEqual(normal_text, "")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                json.loads(calls[0].parameters), {"location": "Seoul", "days": 3}
+            )
+
+    def test_two_calls_mixed_bodies(self):
+        detector = SolarOpen2Detector()
+        text = (
+            f'{TOOL_CALL_START}get_weather\n{{"location": "Seoul"}}{TOOL_CALL_END}'
+            f"{TOOL_CALL_START}get_time\n"
+            f"{TOOL_ARG_START}timezone{TOOL_ARG_VALUE}UTC{TOOL_ARG_END}"
+            f"{TOOL_CALL_END}"
+        )
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        by_name = {c.name: c for c in result.calls}
+        self.assertEqual(by_name["get_weather"].tool_index, 0)
+        self.assertEqual(by_name["get_time"].tool_index, 1)
+        self.assertEqual(
+            json.loads(by_name["get_weather"].parameters), {"location": "Seoul"}
+        )
+        self.assertEqual(
+            json.loads(by_name["get_time"].parameters), {"timezone": "UTC"}
+        )
+
+    def test_non_object_json_body_is_passed_through_raw(self):
+        detector = SolarOpen2Detector()
+        text = f"{TOOL_CALL_START}get_weather\n[1, 2]{TOOL_CALL_END}"
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"__raw": "[1, 2]"})
+
+    def test_json_body_unknown_name_still_emitted(self):
+        detector = SolarOpen2Detector()
+        text = f'{TOOL_CALL_START}not_a_tool\n{{"x": 1}}{TOOL_CALL_END}'
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "not_a_tool")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"x": 1})
 
 
 if __name__ == "__main__":

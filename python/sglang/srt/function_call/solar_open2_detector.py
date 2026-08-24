@@ -28,9 +28,12 @@ as-is (with a warning) rather than discarded: the client owns name validation
 and can surface the mismatch back to the model, whereas a dropped call yields
 an empty response with no diagnostic.
 
-JSON argument body: when ``tool_choice`` is ``required`` or names a function,
-the structural-tag constraint forces the call envelope but writes the
-arguments as a JSON object instead of ``<|tool_arg:...|>`` markers::
+JSON argument body: this detector inherits the base-class capability defaults
+(``supports_structural_tag()`` True, ``parses_required_natively()`` False), so
+``tool_choice="required"`` or a named choice is grammar-forced rather than
+parsed natively. The legacy structural tag built from ``structure_info()`` is
+the envelope xgrammar forces around each call, and it writes the arguments as
+a JSON object instead of ``<|tool_arg:...|>`` markers::
 
     <|tool_call:start|>{function_name}
     {"arg_name": value, ...}<|tool_call:end|>
@@ -39,6 +42,12 @@ A call body with no argument markers is therefore parsed as JSON when it
 parses as an object (values arrive already typed, so schema coercion is
 skipped); a non-empty body that is neither marker-formed nor a JSON object is
 kept as ``{"__raw": body}`` with a warning rather than dropped.
+
+The legacy structural tag has no call-count limit (only ``at_least_one``), so
+``parallel_tool_calls=False`` is enforced outside the grammar: serving_chat
+injects ``<|tool_call:end|>`` as a stop string and glues it back before
+parsing, capping generation at the first call (see
+``OpenAIServingChat._solar_single_call_stop_matched``).
 """
 
 from __future__ import annotations
@@ -274,25 +283,11 @@ class SolarOpen2Detector(BaseFormatDetector):
         )
 
     def structure_info(self) -> _GetInfoFunc:
+        """Envelope the legacy structural tag forces for ``required``/named
+        tool_choice: xgrammar fills a JSON object between ``begin`` and
+        ``end``, which ``_parse_calls`` accepts as the argument body."""
         return lambda name: StructureInfo(
             begin=f"{TOOL_CALL_START}{name}\n",
             end=TOOL_CALL_END,
             trigger=TOOL_CALL_START,
         )
-
-    def supports_structural_tag(self) -> bool:
-        """The legacy structural tag cannot express this wire format: xgrammar
-        hard-codes JSON between ``begin`` and ``end``, while Solar arguments
-        are ``<|tool_arg:*|>`` marker runs. Constrained decoding under that
-        tag forces JSON arguments into the envelope — a hybrid
-        ``_parse_calls`` binds zero calls from — so a forced tool choice
-        returns 200 with empty content and no tool_calls."""
-        return False
-
-    def parses_required_natively(self) -> bool:
-        """``tool_choice="required"``/named must skip grammar constraints and
-        parse the model's native output format instead. Best-effort by
-        design: the prompt (tools filtered to the named function) steers the
-        call; nothing structurally forces one. A generation with no call
-        falls back to plain content with ``finish_reason="stop"``."""
-        return True
