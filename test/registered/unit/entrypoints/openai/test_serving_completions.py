@@ -446,6 +446,66 @@ class ServingCompletionTestCase(unittest.TestCase):
             },
         )
 
+    def test_continuous_usage_chunks_report_cached_tokens(self):
+        """Per-chunk usage under continuous_usage_stats must carry
+        prompt_tokens_details.cached_tokens when cache reporting is on (the
+        completions path used to leave it null while the final usage chunk had it)."""
+        self.sc.tokenizer_manager.server_args.enable_cache_report = True
+        for cached in (0, 6):
+            with self.subTest(cached_tokens=cached):
+
+                async def _mock_generate(*args, _cached=cached, **kwargs):
+                    yield {
+                        "text": "Hello",
+                        "meta_info": {
+                            "id": "cmpl-cont-usage",
+                            "prompt_tokens": 10,
+                            "completion_tokens": 2,
+                            "cached_tokens": _cached,
+                            "finish_reason": {"type": "stop", "matched": None},
+                            "output_token_logprobs": None,
+                            "output_top_logprobs": None,
+                        },
+                        "index": 0,
+                    }
+
+                self.sc.tokenizer_manager.generate_request = _mock_generate
+                req = CompletionRequest(
+                    model="x",
+                    prompt="Hello world",
+                    max_tokens=100,
+                    stream=True,
+                    stream_options={
+                        "include_usage": True,
+                        "continuous_usage_stats": True,
+                    },
+                )
+                adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+                async def run_stream():
+                    return [
+                        chunk
+                        async for chunk in self.sc._generate_completion_stream(
+                            adapted_request, req, self.fastapi_request
+                        )
+                    ]
+
+                chunks = get_or_create_event_loop().run_until_complete(run_stream())
+                per_chunk_usages = []
+                for raw in chunks:
+                    if not raw.startswith("data: ") or raw.strip() == "data: [DONE]":
+                        continue
+                    data = json.loads(raw[len("data: ") :])
+                    if data.get("choices") and data.get("usage"):
+                        per_chunk_usages.append(data["usage"])
+                self.assertTrue(
+                    per_chunk_usages, "continuous_usage_stats attached no usage"
+                )
+                self.assertEqual(
+                    per_chunk_usages[0]["prompt_tokens_details"],
+                    {"cached_tokens": cached},
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

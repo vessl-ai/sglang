@@ -2337,6 +2337,13 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertIsNone(usages[0].get("prompt_tokens_details"))
 
+    def test_continuous_usage_reports_zero_cached_tokens_on_miss(self):
+        """Under cache reporting a cache miss serializes {"cached_tokens": 0}, not null."""
+        self.tm.server_args.enable_cache_report = True
+        usages = self._collect_continuous_usage(cached_tokens=0)
+        self.assertTrue(usages, "continuous_usage_stats attached no usage")
+        self.assertEqual(usages[0]["prompt_tokens_details"], {"cached_tokens": 0})
+
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
         """Test that streaming with incremental_streaming_output produces correct deltas.

@@ -648,10 +648,9 @@ class OpenAIServingChat(OpenAIServingBase):
     def _continuous_usage_cached_details(
         self, content: Dict[str, Any]
     ) -> Optional[PromptTokensDetails]:
-        if not self.tokenizer_manager.server_args.enable_cache_report:
-            return None
-        return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
+        return UsageProcessor.cached_details(
+            count=content["meta_info"].get("cached_tokens", 0),
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
     def _reported_prompt_tokens(self, meta_info: Dict[str, Any]) -> int:
