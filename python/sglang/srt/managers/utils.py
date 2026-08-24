@@ -78,6 +78,11 @@ class GenerationBatchResult:
     grammar_advanced: bool = False
     grammar_retained_tokens: Optional[list] = None
 
+    # Solar reasoning-FSM advance memoization; set by
+    # solar_open2_fsm.advance_committed on whichever commit path reaches the
+    # result first (grammar barrier or spec result resolver).
+    solar_fsm_advanced: bool = False
+
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None

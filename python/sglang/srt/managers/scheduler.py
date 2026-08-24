@@ -1831,9 +1831,15 @@ class Scheduler(
         bitmask sees the previous batch's committed tokens. Invoked mid-worker
         (before generate_token_bitmask) so the CPU advance overlaps the target
         verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        Also advances the Solar reasoning FSM over the same committed run, so its
+        verify plan and the grammar bitmask are built from the same state.
         """
+        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
+
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+            # --- solar-open2 FSM commit advance (injected) ---
+            _solar_fsm.advance_committed(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):

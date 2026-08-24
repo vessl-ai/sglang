@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -184,6 +185,16 @@ def init_from_env() -> None:
     )
 
 
+def is_active() -> bool:
+    """Whether the FSM is on. Resolves config lazily on first use."""
+    if CFG.enabled:
+        return True
+    if os.environ.get("SOLAR_FSM", "0") != "1":
+        return False
+    init_from_env()
+    return CFG.enabled
+
+
 class SolarReqFSM:
     """Per-request REASONING tracker. Lives on the Req, so a row permutation
     can never hand one request another request's state."""
@@ -191,7 +202,7 @@ class SolarReqFSM:
     __slots__ = (
         "in_reasoning",
         "count",
-        "last_len",
+        "consumed",
         "budget",
         "forced",
         "content_progress",
@@ -203,36 +214,70 @@ class SolarReqFSM:
         self.in_reasoning = _starts_in_reasoning(prompt_ids)
         self.content_progress = False
         self.count = 0
-        self.last_len = 0
+        self.consumed = 0
         if max_new_tokens and max_new_tokens > 0:
             self.budget = min(CFG.budget_abs, int(max_new_tokens * CFG.budget_ratio))
         else:
             self.budget = CFG.budget_abs
         self.forced = False
 
-    def advance(self, output_ids: Sequence[int]) -> None:
-        n = len(output_ids)
-        if n < self.last_len:  # retraction / restart
-            self.last_len = 0
+    def _step(self, tok: int) -> None:
+        """Per-token transition. Mirrored by ``_SimState.step``, which walks a
+        throwaway copy of this state over a speculative chain."""
+        if tok == CFG.think_start:
+            self.in_reasoning = True
+            self.content_progress = False
             self.count = 0
-        for i in range(self.last_len, n):
-            tok = output_ids[i]
-            if tok == CFG.think_start:
-                self.in_reasoning = True
-                self.content_progress = False
-                self.count = 0
-            elif tok == CFG.think_end:
-                self.in_reasoning = False
-            elif self.in_reasoning:
-                self.count += 1
-            elif tok == CFG.tool_call_end or tok not in CFG.all_controls:
-                # a completed tool call, or any ordinary token, counts as the
-                # turn having produced content -> the turn may now legally end
-                self.content_progress = True
-        self.last_len = n
+        elif tok == CFG.think_end:
+            self.in_reasoning = False
+        elif self.in_reasoning:
+            self.count += 1
+        elif tok == CFG.tool_call_end or tok not in CFG.all_controls:
+            # a completed tool call, or any ordinary token, counts as the
+            # turn having produced content -> the turn may now legally end
+            self.content_progress = True
+
+    def advance(self, output_ids: Sequence[int]) -> None:
+        """Catch up to ``req.output_ids``. A no-op when ``commit()`` has already
+        fed this run: ``consumed`` counts tokens and ``req.output_ids`` only ever
+        grows (a retraction re-prefills the tokens it already holds), so
+        ``len(output_ids) <= self.consumed`` means the FSM is level with or ahead
+        of it, never that it has to rewind.
+        """
+        n = len(output_ids)
+        if n <= self.consumed:
+            return
+        for i in range(self.consumed, n):
+            self._step(output_ids[i])
+        self.consumed = n
+
+    def commit(self, tokens: Sequence[int]) -> None:
+        """Step over a run of tokens this request has just committed.
+
+        The scheduler's commit path feeds the run here as soon as the verify
+        result lands, which is one scheduler step before ``req.output_ids``
+        grows by the same tokens. ``consumed`` counts tokens, not
+        ``output_ids`` entries, so the later ``advance(req.output_ids)`` sees
+        nothing new and the run is stepped over exactly once.
+        """
+        for tok in tokens:
+            self._step(tok)
+        self.consumed += len(tokens)
 
     def budget_exhausted(self) -> bool:
         return self.in_reasoning and self.count >= self.budget
+
+
+def _req_fsm(req) -> SolarReqFSM:
+    """Get (or build) the persistent FSM hung off a request."""
+    fsm = getattr(req, "_solar_fsm", None)
+    if fsm is None:
+        fsm = SolarReqFSM(
+            getattr(req, "origin_input_ids", ()) or (),
+            getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
+        )
+        req._solar_fsm = fsm
+    return fsm
 
 
 def _rindex(values: Sequence[int], needle: int) -> Optional[int]:
@@ -261,6 +306,37 @@ def _mask_tensor(ids: Tuple[int, ...], device: torch.device) -> torch.Tensor:
     return t
 
 
+_CONFLICT_LOG = {"last": 0.0, "num_suppressed": 0}
+_CONFLICT_LOG_INTERVAL = 60.0
+
+
+def _log_force_conflict(rows, stride: int, rids) -> None:
+    """Report rows where the FSM wanted to force <|think:end|> but the grammar
+    had already forbidden it -- the two are reading different committed state,
+    and forcing would leave the row fully masked."""
+    now = time.monotonic()
+    num_suppressed = _CONFLICT_LOG["num_suppressed"]
+    if now - _CONFLICT_LOG["last"] < _CONFLICT_LOG_INTERVAL:
+        _CONFLICT_LOG["num_suppressed"] = num_suppressed + len(rows)
+        return
+    _CONFLICT_LOG["last"] = now
+    _CONFLICT_LOG["num_suppressed"] = 0
+    if rids is not None and stride > 0:
+        named = [rids[r // stride] for r in rows if r // stride < len(rids)]
+    else:
+        named = []
+    logger.warning(
+        "[SOLAR-FSM] grammar already forbids <|think:end|> (id=%s) on %d row(s) "
+        "%s (reqs %s); skipping the budget force there so the row keeps the "
+        "grammar's allowed set. %d earlier occurrence(s) suppressed.",
+        CFG.think_end,
+        len(rows),
+        rows,
+        named,
+        num_suppressed,
+    )
+
+
 # --------------------------------------------------------------------------
 # Hooks called from patched sglang core (see solar_patch.py)
 # --------------------------------------------------------------------------
@@ -283,17 +359,67 @@ def merge_rows(sampling_info, other) -> None:
         sampling_info.solar_fsm_rows = rows + other_rows
 
 
+def advance_committed(result, batch) -> None:
+    """Advance each request's FSM over the tokens THIS batch committed.
+
+    Called from the same commit path that advances the grammar FSM -- eagerly
+    from the scheduler's grammar barrier inside verify(), so the FSM state a
+    following verify step plans from is on the same time base as the grammar's,
+    and lazily from the spec result resolver otherwise. Idempotent via
+    ``result.solar_fsm_advanced``.
+
+    The run fed here is the one that lands in ``req.output_ids``: the
+    grammar-truncated run when the request has a grammar, the raw accepted run
+    otherwise, and the single prefilled token for an extend result.
+    """
+    if result.solar_fsm_advanced:
+        return
+    if not is_active():
+        return
+    is_decode = batch.forward_mode.is_decode()
+    if not (is_decode or batch.forward_mode.is_extend()):
+        return
+    if result.copy_done is not None:
+        result.copy_done.synchronize()
+    next_token_ids = result.next_token_ids.tolist()
+
+    if not is_decode:
+        # Extend: advance over the single token each completed-prefill req
+        # emitted (mirrors advance_grammar_fsm's extend branch).
+        for i, req in enumerate(batch.reqs):
+            if req.is_retracted or req.finished() or req.inflight_middle_chunks > 0:
+                continue
+            _req_fsm(req).commit([next_token_ids[i]])
+        result.solar_fsm_advanced = True
+        return
+
+    # Decode: non-spec decode has no accepted run here and is driven by
+    # advance(req.output_ids) instead.
+    if result.accept_lens is None:
+        return
+    accept_lens = result.accept_lens.tolist()
+    stride = result.speculative_num_draft_tokens
+    assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
+    for i, req in enumerate(batch.reqs):
+        if req.is_retracted or req.finished():
+            continue
+        if req.grammar is not None and result.grammar_retained_tokens is not None:
+            run = result.grammar_retained_tokens[i]
+            if run is None:
+                continue
+        else:
+            run = next_token_ids[i * stride : i * stride + accept_lens[i]]
+        _req_fsm(req).commit(run)
+    result.solar_fsm_advanced = True
+
+
 _WARNED = {"shape": False}
 
 
 def apply(logits: torch.Tensor, sampling_info) -> None:
     """Mask ``logits`` in place according to each row's FSM state."""
-    if not CFG.enabled:
-        if os.environ.get("SOLAR_FSM", "0") != "1":
-            return
-        init_from_env()
-        if not CFG.enabled:
-            return
+    if not is_active():
+        return
 
     rows = getattr(sampling_info, "solar_fsm_rows", None)
     if not rows:
@@ -313,13 +439,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
     force_rows: List[int] = []
     mask_rows: Dict[Tuple[int, ...], List[int]] = {}
     for i, req in enumerate(rows):
-        fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None:
-            fsm = SolarReqFSM(
-                getattr(req, "origin_input_ids", ()) or (),
-                getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
-            )
-            req._solar_fsm = fsm
+        fsm = _req_fsm(req)
         fsm.advance(req.output_ids)
         if fsm.in_reasoning:
             if fsm.budget_exhausted():
@@ -346,27 +466,36 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 
     if force_rows:
         rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
-        keep = logits[rsel, CFG.think_end].clone()
-        logits[rsel, :] = NEG_INF
-        logits[rsel, CFG.think_end] = keep
-        for i in force_rows:
-            fsm = rows[i]._solar_fsm
-            if not fsm.forced:
-                fsm.forced = True
-                logger.info(
-                    "[SOLAR-FSM] reasoning budget %d exhausted -> forcing "
-                    "<|think:end|>",
-                    fsm.budget,
-                )
+        # A row the grammar has already closed to <|think:end|> would become
+        # fully -inf if forced; the sampler then returns an arbitrary id that
+        # the grammar rejects on accept. Leave those rows to the grammar.
+        allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
+        blocked = [r for r, ok in zip(force_rows, allowed) if not ok]
+        force_rows = [r for r, ok in zip(force_rows, allowed) if ok]
+        if blocked:
+            _log_force_conflict(blocked, 1, [r.rid for r in rows])
+        if force_rows:
+            rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
+            keep = logits[rsel, CFG.think_end].clone()
+            logits[rsel, :] = NEG_INF
+            logits[rsel, CFG.think_end] = keep
+            for i in force_rows:
+                fsm = rows[i]._solar_fsm
+                if not fsm.forced:
+                    fsm.forced = True
+                    logger.info(
+                        "[SOLAR-FSM] reasoning budget %d exhausted -> forcing "
+                        "<|think:end|> (req %s)",
+                        fsm.budget,
+                        rows[i].rid,
+                    )
 
 
 # --------------------------------------------------------------------------
 # Speculative verify path (R5-8). See BUILDLOG §[R5-8].
 #
 # `apply()` above is injected into layers/sampler.py, which the DSpark verify
-# path never reaches -- so with spec ON the reasoning budget was never enforced
-# (measured: `<|think:end|>` fired at the budget position in 12/12 spec-OFF
-# generations and 0/12 spec-ON). These helpers mask the *verify* logits instead.
+# path never reaches, so these helpers mask the *verify* logits instead.
 #
 # Row layout is NOT the 1-row-1-token convention of ordinary decode. The verify
 # scatter kernel (dspark_verify_window.py:537-549) computes
@@ -378,6 +507,17 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 #
 # The persistent FSM is never advanced from draft tokens -- rejected drafts
 # therefore need no rollback. Only a throwaway copy walks the chain.
+#
+# Two decisions split across the target-verify launch:
+#   * `plan_gate` runs before the launch, off whatever committed state is
+#     available then -- which can lag by one accepted run, since the grammar
+#     barrier that feeds `advance_committed` hasn't run yet for this step. It
+#     decides only whether the folded in-graph accept path must be left (a
+#     conservative, sync-free check); it builds no mask.
+#   * `plan_verify` runs after the launch, once the caller has run the grammar
+#     barrier (`advance_committed` / `advance_grammar_fsm`), so the FSM state it
+#     reads and the grammar bitmask built alongside it describe the same
+#     committed prefix. It builds the actual per-row masks.
 # --------------------------------------------------------------------------
 class _SimState:
     """Throwaway FSM state used to walk a speculative chain."""
@@ -390,7 +530,7 @@ class _SimState:
         self.content_progress = fsm.content_progress
 
     def step(self, tok: int) -> None:
-        """Mirror of SolarReqFSM.advance()'s per-token transition."""
+        """Mirror of SolarReqFSM._step's per-token transition."""
         if tok == CFG.think_start:
             self.in_reasoning = True
             self.content_progress = False
@@ -409,28 +549,14 @@ class _SimState:
 class VerifyPlan:
     """Per-(request, chain position) masks for one target-verify step."""
 
-    __slots__ = ("force_rows", "mask_rows", "stride", "bs")
+    __slots__ = ("force_rows", "mask_rows", "stride", "bs", "rids")
 
-    def __init__(self, force_rows, mask_rows, stride, bs):
+    def __init__(self, force_rows, mask_rows, stride, bs, rids):
         self.force_rows = force_rows
         self.mask_rows = mask_rows
         self.stride = stride
         self.bs = bs
-
-    @property
-    def needs_eager(self) -> bool:
-        """Whether this step must leave the folded in-graph accept path.
-
-        The folded epilogue accepts inside the cuda graph off its own buffers,
-        where a mask applied to `next_token_logits` never lands. Forcing eager
-        costs the in-graph accept, so we only pay it on steps where the FSM
-        actually has to intervene -- i.e. a budget boundary falls inside the
-        chain. (Design B, BUILDLOG §[R5-8] ⑤; SOLAR_FSM_SPEC_ALWAYS_EAGER=1
-        selects the always-on variant.)
-        """
-        if CFG.spec_always_eager:
-            return bool(self.force_rows or self.mask_rows)
-        return bool(self.force_rows)
+        self.rids = rids
 
     def apply(self, logits: torch.Tensor, verify_lens=None) -> None:
         expect_rows = self.bs * self.stride
@@ -461,59 +587,82 @@ class VerifyPlan:
         force = keep(self.force_rows)
         if force:
             rsel = torch.tensor(force, dtype=torch.long, device=logits.device)
-            kept = logits[rsel, CFG.think_end].clone()
-            logits[rsel, :] = NEG_INF
-            logits[rsel, CFG.think_end] = kept
+            # A row the grammar has already closed to <|think:end|> would become
+            # fully -inf if forced; the sampler then returns an arbitrary id that
+            # the grammar rejects on accept. Leave those rows to the grammar.
+            allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
+            blocked = [r for r, ok in zip(force, allowed) if not ok]
+            force = [r for r, ok in zip(force, allowed) if ok]
+            if blocked:
+                _log_force_conflict(blocked, self.stride, self.rids)
+            if force:
+                rsel = torch.tensor(force, dtype=torch.long, device=logits.device)
+                kept = logits[rsel, CFG.think_end].clone()
+                logits[rsel, :] = NEG_INF
+                logits[rsel, CFG.think_end] = kept
 
 
-def plan_verify(reqs, verify_ids_2d, stride: int) -> Optional[VerifyPlan]:
-    """Build the verify-step masks. Host work; call before the target forward.
+def plan_gate(reqs, stride: int) -> bool:
+    """Whether this verify step must leave the folded in-graph accept path.
 
-    Returns None when the FSM is inactive, so the caller keeps stock behaviour.
+    The folded epilogue accepts inside the cuda graph off its own buffers,
+    where a mask written into ``next_token_logits`` never lands, so the choice
+    has to be made before the target verify launches -- before the grammar
+    barrier has fed the previous step's committed run to the FSMs. The state
+    read here can therefore lag by up to one accepted run, so the boundary
+    window is widened to ``2 * stride``: forcing eager on a step that turns out
+    to need no mask costs throughput, missing a needed mask costs correctness.
+
+    Host-only and sync-free: it never touches the draft tokens on device.
     """
-    if not CFG.enabled:
-        if os.environ.get("SOLAR_FSM", "0") != "1":
-            return None
-        init_from_env()
-        if not CFG.enabled:
-            return None
+    if not is_active():
+        return False
     if not reqs or stride <= 0:
-        return None
-
-    # Fast path: `verify_ids_2d.tolist()` is a device->host copy, i.e. a sync on
-    # every decode step. The chain walk can only change the outcome when a
-    # request is within `stride` tokens of its budget, and that is decidable
-    # from committed state alone. Nothing near the boundary -> no plan, no sync.
-    # (With CONTENT masking off -- the default -- the budget force is the only
-    # thing this plan produces.)
-    near = False
+        return False
+    if CFG.spec_always_eager:
+        return True
+    window = 2 * stride
     for req in reqs:
         fsm = getattr(req, "_solar_fsm", None)
         if fsm is None:
-            near = True  # unseen request: fall through and build its state
-            break
+            # No committed state to judge from yet.
+            return True
         fsm.advance(req.output_ids)
-        if fsm.in_reasoning and fsm.count + stride >= fsm.budget:
-            near = True
-            break
-    if not near and not CFG.content_mask and not CFG.spec_always_eager:
+        if fsm.budget <= window:
+            return True
+        if fsm.in_reasoning and fsm.count + window >= fsm.budget:
+            return True
+    return False
+
+
+def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
+    """Build the verify-step masks. Host work; call after the target forward,
+    once the grammar barrier has advanced the committed state.
+
+    ``chain_ids`` is a host-resident copy of the verify chain ``(bs, stride)``,
+    staged before the target launch (the caller already owns one for the
+    grammar path -- ``GrammarTree.resolve()``), so ``.tolist()`` here is not a
+    device sync.
+
+    Returns None when the FSM is inactive, so the caller keeps stock behaviour.
+    """
+    if not is_active():
+        return None
+    if not reqs or stride <= 0:
         return None
 
-    chain = verify_ids_2d.tolist()
+    chain = chain_ids.tolist()
     bs = min(len(reqs), len(chain))
     force_rows: List[int] = []
     mask_rows: Dict[Tuple[int, ...], List[int]] = {}
+    rids = [reqs[i].rid for i in range(bs)]
 
     for i in range(bs):
         req = reqs[i]
-        fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None:
-            fsm = SolarReqFSM(
-                getattr(req, "origin_input_ids", ()) or (),
-                getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
-            )
-            req._solar_fsm = fsm
-        # committed tokens only -- drafts never touch the persistent state
+        fsm = _req_fsm(req)
+        # Committed tokens only -- drafts never touch the persistent state.
+        # Usually a no-op here: the grammar barrier's advance_committed() has
+        # already fed this run through commit().
         fsm.advance(req.output_ids)
         sim = _SimState(fsm)
         row_ids = chain[i]
@@ -526,6 +675,14 @@ def plan_verify(reqs, verify_ids_2d, stride: int) -> Optional[VerifyPlan]:
             if sim.in_reasoning:
                 if sim.exhausted(fsm.budget):
                     force_rows.append(row)
+                    if w == 0 and not fsm.forced:
+                        fsm.forced = True
+                        logger.info(
+                            "[SOLAR-FSM] reasoning budget %d exhausted -> "
+                            "forcing <|think:end|> (req %s, verify)",
+                            fsm.budget,
+                            rids[i],
+                        )
                 else:
                     mask_rows.setdefault(CFG.reasoning_forbidden, []).append(row)
             elif not CFG.content_mask:
@@ -535,4 +692,4 @@ def plan_verify(reqs, verify_ids_2d, stride: int) -> Optional[VerifyPlan]:
             else:
                 mask_rows.setdefault(CFG.content_fresh_forbidden, []).append(row)
 
-    return VerifyPlan(force_rows, mask_rows, stride, bs)
+    return VerifyPlan(force_rows, mask_rows, stride, bs, rids)
