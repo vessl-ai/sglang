@@ -210,5 +210,11 @@ opt-level = 1
 # OpenAI's API and our engines both accept (defect D-3). The rule survives in
 # the crate's latest release, so we carry the fix as a vendored patch until
 # lightseekorg/smg takes it upstream.
+#
+# [vessl] The vendored patch also adds `repetition_detection` and
+# `add_special_tokens` as validation-free passthrough members of
+# ChatCompletionRequest (contract F3): the router would otherwise drop them on
+# deserialize→serialize. The engine validates their contents; the router must
+# not (contract F2).
 [patch.crates-io]
 openai-protocol = { path = "vendor/openai-protocol" }
