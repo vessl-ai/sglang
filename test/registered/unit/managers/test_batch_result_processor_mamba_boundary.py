@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -53,19 +54,8 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=True,
         enable_overlap_mlx=False,
-        # On release/v0.5.17 process_batch_result_decode reads these straight
-        # off the objects below; upstream reaches the same values through
-        # get_observability() / get_disagg(), which is why an empty namespace is
-        # enough there and not here. Every attribute the decode path touches is
-        # listed, whether or not the branch that reads it is taken -- an omission
-        # surfaces as an AttributeError from inside production code, which reads
-        # like a bug in the code under test.
-        server_args=SimpleNamespace(
-            enable_metrics=False,
-            enable_hisparse=False,
-            disaggregation_decode_enable_offload_kvcache=False,
-        ),
-        model_config=SimpleNamespace(think_end_id=None, think_end_ids=None),
+        server_args=SimpleNamespace(),
+        model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=None,
         hisparse_coordinator=None,
@@ -155,42 +145,25 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     processor.process_batch_result_decode(result_batch, batch_result)
 
                 scheduler.process_batch_result = process_batch_result
-                # Upstream reads the interval off the runtime-context bags
-                # (get_exec().mamba); this branch keeps it on server_args, which
-                # is what both call sites under test go through.
-                server_args = SimpleNamespace(
-                    enable_mamba_extra_buffer=lambda: True,
-                    enable_mamba_extra_buffer_lazy=lambda: False,
-                    mamba_track_interval=4,
-                )
 
                 with (
+                    # The mamba predicates and the track interval read the
+                    # published bags, so publish the configuration under test
+                    # (non-lazy extra buffer, interval 4); observability and
+                    # disagg reads are served by the same publish at their
+                    # defaults.
+                    get_context().override_server_args(
+                        mamba_radix_cache_strategy="extra_buffer",
+                        mamba_track_interval=4,
+                    ),
                     patch(
                         "sglang.srt.managers.schedule_batch.alloc_for_decode",
                         return_value=torch.tensor([3], dtype=torch.int64),
                     ),
                     patch(
-                        "sglang.srt.managers.schedule_batch.get_server_args",
-                        return_value=server_args,
-                    ),
-                    # batch_result_processor imports get_server_args into its
-                    # own namespace, so patching schedule_batch's does not reach
-                    # the boundary assertion -- it would fall through to the
-                    # process-global ServerArgs, which a unit test has not set.
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_server_args",
-                        return_value=server_args,
-                    ),
-                    patch(
                         "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
                     ),
                     patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    # Upstream also stubs get_observability and get_disagg here.
-                    # Neither exists in this file on release/v0.5.17 -- metrics
-                    # go through self.server_args.enable_metrics and there is no
-                    # disagg offload branch on this path -- so patching them
-                    # raises AttributeError instead of isolating anything.
                     patch.object(
                         SchedulerBatchResultProcessor,
                         "_mamba_prefix_cache_update",
