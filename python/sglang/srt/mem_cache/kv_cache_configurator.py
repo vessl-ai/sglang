@@ -791,7 +791,14 @@ class KVCacheConfigurator:
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
             enable_mamba_extra_buffer_lazy=self.server_args.enable_mamba_extra_buffer_lazy(),
-            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
+            # A PD prefill server never runs TARGET_VERIFY, so skip the
+            # verify-only per-draft-token state snapshots (see the draft-head
+            # case above: None => the pool skips SpeculativeState).
+            speculative_num_draft_tokens=(
+                None
+                if get_disagg().disaggregation_mode == "prefill"
+                else self.server_args.max_speculative_num_draft_tokens
+            ),
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
@@ -1881,7 +1888,13 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot, see memory_pool.py). Skipped under replayssm
             # (no intermediate_ssm allocated).
-            if has_spec_dec and not replayssm_active:
+            # A PD prefill pool never allocates the spec-verify scratch, so
+            # the KV budget must not pre-deduct it either.
+            if (
+                has_spec_dec
+                and not replayssm_active
+                and get_disagg().disaggregation_mode != "prefill"
+            ):
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
@@ -1905,7 +1918,13 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
-            if has_spec_dec and not replayssm_active:
+            # A PD prefill pool never allocates the spec-verify scratch, so
+            # the KV budget must not pre-deduct it either.
+            if (
+                has_spec_dec
+                and not replayssm_active
+                and get_disagg().disaggregation_mode != "prefill"
+            ):
                 intermediate_size = (
                     stage_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
@@ -1927,7 +1946,15 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
-            if has_spec_dec and not replayssm_active:
+            # A PD prefill pool never allocates the spec-verify scratch, so
+            # max_mamba_cache_size is solved without the D term (falls through
+            # to the plain per-slot budget below), and there is no
+            # intermediate size to pre-deduct from total_rest_memory either.
+            if (
+                has_spec_dec
+                and not replayssm_active
+                and get_disagg().disaggregation_mode != "prefill"
+            ):
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
