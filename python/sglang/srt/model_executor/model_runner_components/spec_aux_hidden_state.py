@@ -96,6 +96,58 @@ def _resolve_eagle_aux_hidden_state(
                 config.eagle_aux_hidden_state_layer_ids = None
 
 
+def _validate_aux_capture_layers(
+    *,
+    target_layer_ids: list[int],
+    target_num_layers: int,
+    hf_text_config: Any,
+    source: str,
+    taps_are_declared: bool,
+) -> None:
+    """Validate the target layers whose hidden states feed the draft.
+
+    Both rules guard silent failures -- the engine boots and serves either way.
+    An id outside the target's layer range makes the draft read a layer that is
+    not there; an id on a linear-attention layer of a hybrid target hands the
+    draft a tensor it was not trained on, which only costs accept rate.
+
+    ``DFlashDraftConfig.resolve_target_layer_ids`` already applies the range
+    rule to the ids it builds, but a caller may replace those ids afterwards, so
+    it is applied again here against the final set.
+
+    ``taps_are_declared`` gates the attention-kind rule to ids a config actually
+    states. ``build_target_layer_ids`` spaces its picks evenly and knows nothing
+    about hybrid layouts, so on a hybrid target it lands on linear-attention
+    layers routinely -- failing that would reject a choice no config author
+    made.
+    """
+    for idx, val in enumerate(target_layer_ids):
+        if val < 0 or val >= target_num_layers:
+            raise ValueError(
+                f"{source} contains an out-of-range layer id. "
+                f"target_layer_ids[{idx}]={val}, "
+                f"target_num_layers={target_num_layers}."
+            )
+
+    if not taps_are_declared:
+        return
+    layer_types = getattr(hf_text_config, "layer_types", None)
+    if not layer_types or len(layer_types) != target_num_layers:
+        # Not a hybrid target, or a layer_types that does not line up with the
+        # layer count -- either way the full-attention rule cannot be read.
+        return
+    bad = [i for i in target_layer_ids if layer_types[i] != "full_attention"]
+    if bad:
+        full_attention = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        raise ValueError(
+            f"{source} taps layers that are not full attention on a hybrid "
+            f"target: {bad} are {[layer_types[i] for i in bad]}. The draft reads "
+            "the target's attention output at these layers, so a tap on a "
+            "linear-attention layer boots clean and only costs accept rate. "
+            f"full-attention layers: {full_attention}."
+        )
+
+
 def _resolve_dflash_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
@@ -150,9 +202,12 @@ def _resolve_dflash_aux_hidden_state(
         draft_architectures = (
             getattr(draft_model_config.hf_config, "architectures", None) or []
         )
-        if "MuseGlimmerAssistantModel" in draft_architectures:
+        ids_are_shifted = "MuseGlimmerAssistantModel" in draft_architectures
+        if ids_are_shifted:
             target_layer_ids = [i + 1 for i in target_layer_ids]
 
+        capture_layer_source = "dflash_config.target_layer_ids"
+        taps_are_declared = dflash_draft_config.target_layer_ids is not None
         if spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_config import (
                 parse_dspark_draft_config,
@@ -167,7 +222,22 @@ def _resolve_dflash_aux_hidden_state(
                     f"got markov_rank={dspark_draft_config.markov_rank}."
                 )
             if dspark_draft_config.target_layer_ids is not None:
+                # Replaces the ids resolve_target_layer_ids validated above.
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+                capture_layer_source = "dspark_target_layer_ids"
+                taps_are_declared = True
+
+        # Validate the ids that will actually be captured. Skipped for a shifted
+        # native export: those are HF layer-output ids, not target layer indices,
+        # so neither rule can be read into them.
+        if not ids_are_shifted:
+            _validate_aux_capture_layers(
+                target_layer_ids=target_layer_ids,
+                target_num_layers=target_num_layers,
+                hf_text_config=model_config.hf_text_config,
+                source=capture_layer_source,
+                taps_are_declared=taps_are_declared,
+            )
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
