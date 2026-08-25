@@ -1,10 +1,11 @@
 """The Solar-Open2 serving contract, asserted in the tree instead of an image.
 
-These three axes used to be checked by a gate script baked into a serving image
-as its ``ENTRYPOINT`` (``docker/solar_open2/``). That put a model's contract into
-a container layer, where it could only ever be checked for the one model the
-image was built for, and where a caller who overrode ``command`` skipped it
-entirely. The checks belong here: they are facts about this tree.
+These three axes were once checked by a gate script baked into a serving image
+as its ``ENTRYPOINT``. That put a model's contract into a container layer, where
+it could only ever be checked for the one model the image was built for, and
+where a caller who overrode ``command`` skipped it entirely. The checks belong
+here: they are facts about this tree, so this is where they can be checked for
+every model at once and where no deployment can opt out.
 
 Each axis is a silent-failure mode -- the engine boots, serves and returns 200s
 whether or not it holds:
