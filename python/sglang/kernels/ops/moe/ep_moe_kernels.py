@@ -812,6 +812,7 @@ def silu_mul_per_token_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
     scale_ptr,
+    a1_scale_ptr,
     num_tokens_tensor_ptr,
     intermediate_size,
     fp8_max,
@@ -821,14 +822,20 @@ def silu_mul_per_token_quant_triton_kernel_for_cutlass_moe(
     row = tl.program_id(0)
     num_tokens = tl.load(num_tokens_tensor_ptr)
     if row < num_tokens:
+        # INF-405: the GEMM runs on the proven scalar epilogue with scale=1, so
+        # the row's activation scale is folded here (gate and up both carry it).
+        if a1_scale_ptr is not None:
+            s1 = tl.load(a1_scale_ptr + row).to(tl.float32)
+        else:
+            s1 = 1.0
         gate_base = input_ptr + row.to(tl.int64) * 2 * intermediate_size
         up_base = gate_base + intermediate_size
         absmax = 0.0
         for off in tl.range(0, intermediate_size, BLOCK_SIZE):
             idx = off + tl.arange(0, BLOCK_SIZE)
             m = idx < intermediate_size
-            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32)
-            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32)
+            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32) * s1
+            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32) * s1
             gate_up = gate / (1 + tl.exp(-gate)) * up
             absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
         scale = tl.maximum(absmax, 1e-10) / fp8_max
@@ -838,8 +845,8 @@ def silu_mul_per_token_quant_triton_kernel_for_cutlass_moe(
         for off in tl.range(0, intermediate_size, BLOCK_SIZE):
             idx = off + tl.arange(0, BLOCK_SIZE)
             m = idx < intermediate_size
-            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32)
-            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32)
+            gate = tl.load(gate_base + idx, mask=m, other=0.0).to(tl.float32) * s1
+            up = tl.load(up_base + idx, mask=m, other=0.0).to(tl.float32) * s1
             gate_up = gate / (1 + tl.exp(-gate)) * up
             q = tl.minimum(tl.maximum(gate_up * inv, fp8_min), fp8_max)
             tl.store(out_base + idx, q.to(output_ptr.dtype.element_ty), mask=m)
@@ -852,6 +859,7 @@ def silu_mul_per_token_quant_for_cutlass_moe(
     num_tokens_tensor: torch.Tensor,
     expected_num_tokens: int,
     intermediate_size: int,
+    a1_scale: torch.Tensor = None,
 ):
     """Per-token counterpart of silu_mul_dynamic_tensorwise_quant_for_cutlass_moe.
 
@@ -864,6 +872,7 @@ def silu_mul_per_token_quant_for_cutlass_moe(
         input_ptr=input,
         output_ptr=output,
         scale_ptr=scale,
+        a1_scale_ptr=a1_scale,
         num_tokens_tensor_ptr=num_tokens_tensor,
         intermediate_size=intermediate_size,
         fp8_max=fp8_max,
@@ -963,6 +972,7 @@ def post_reorder_triton_kernel_for_cutlass_moe(
     src2dst_ptr,
     topk_ids_ptr,
     topk_weights_ptr,
+    a2_scale_ptr,
     num_local_experts,
     topk,
     num_tokens,
@@ -998,6 +1008,9 @@ def post_reorder_triton_kernel_for_cutlass_moe(
                 dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
+                # INF-405: fold the row's activation scale skipped in the GEMM.
+                if a2_scale_ptr is not None:
+                    weight_scale *= tl.load(a2_scale_ptr + dst_idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
@@ -1017,6 +1030,7 @@ def post_reorder_for_cutlass_moe(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    a2_scale=None,
 ):
     grid, block_dim = _get_launch_config_2d(down_output.device, num_tokens, hidden_size)
 
@@ -1026,6 +1040,7 @@ def post_reorder_for_cutlass_moe(
         src2dst_ptr=src2dst,
         topk_ids_ptr=topk_ids,
         topk_weights_ptr=topk_weights,
+        a2_scale_ptr=a2_scale,
         num_local_experts=num_local_experts,
         topk=topk,
         num_tokens=num_tokens,

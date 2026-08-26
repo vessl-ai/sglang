@@ -155,6 +155,10 @@ def cutlass_w4a8_moe(
         # computing it inside the reorder saves the extra full read of `a` that
         # per_tensor_absmax_fp8 needed.
         a1_scale = torch.empty(m * topk, dtype=torch.float32, device=device)
+        # INF-405: the per-token vector must NOT reach the GEMM epilogue (its
+        # row-broadcast path mis-applies the vector; see the axis probe in the
+        # incident). The GEMM gets scale=1 and the vector is folded downstream.
+        dynamic_a1_scale = a1_scale
         per_token_scale_reorder_for_cutlass_moe(
             a,
             gateup_input,
@@ -167,6 +171,7 @@ def cutlass_w4a8_moe(
             k,
         )
     else:
+        dynamic_a1_scale = None
         pre_reorder_for_cutlass_moe(
             a,
             gateup_input,
@@ -203,7 +208,11 @@ def cutlass_w4a8_moe(
         c1,
         gateup_input,
         w1_q,
-        a1_scale.float(),
+        (
+            torch.ones(1, dtype=torch.float32, device=device)
+            if dynamic_a1_scale is not None
+            else a1_scale.float()
+        ),
         w1_scale,
         expert_offsets[:-1],
         problem_sizes1,
@@ -222,10 +231,18 @@ def cutlass_w4a8_moe(
     if a2_scale is None:
         # Same reasoning as a1_scale: one scale per row of the intermediate.
         a2_scale = torch.empty(m * topk, dtype=torch.float32, device=device)
+        dynamic_a2_scale = a2_scale
         silu_mul_per_token_quant_for_cutlass_moe(
-            c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+            c1,
+            intermediate_q,
+            a2_scale,
+            expert_offsets[-1:],
+            m * topk,
+            n,
+            a1_scale=dynamic_a1_scale,
         )
     else:
+        dynamic_a2_scale = None
         silu_mul_static_tensorwise_quant_for_cutlass_moe(
             c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
         )
@@ -234,7 +251,11 @@ def cutlass_w4a8_moe(
         c2,
         intermediate_q,
         w2_q,
-        a2_scale.float(),
+        (
+            torch.ones(1, dtype=torch.float32, device=device)
+            if dynamic_a2_scale is not None
+            else a2_scale.float()
+        ),
         w2_scale,
         expert_offsets[:-1],
         problem_sizes2,
@@ -259,6 +280,7 @@ def cutlass_w4a8_moe(
         m,
         k,
         routed_scaling_factor,
+        a2_scale=dynamic_a2_scale,
     )
     return output
 
