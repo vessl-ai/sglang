@@ -822,6 +822,22 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.
             "kv_events": server_args.describe_kv_events_publisher(),
+            # Which source revision this process was launched from, as declared
+            # by the supervisor that started it. A dev rig serves an editable
+            # tree whose commit moves under a fixed image, so the image digest
+            # does not identify the running code; this is what makes a
+            # measurement taken against a rig attributable. `None` in a normal
+            # deployment, where the digest is the answer.
+            "rig": {
+                field: os.environ[variable]
+                for field, variable in (
+                    ("generation", "RIG_GENERATION"),
+                    ("head_sha", "RIG_HEAD_SHA"),
+                    ("source_dir", "RIG_SOURCE_DIR"),
+                )
+                if variable in os.environ
+            }
+            or None,
         }
     )
 
