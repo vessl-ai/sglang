@@ -82,12 +82,28 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+        # Mirror Fp8Config.from_config (fp8.py:314-324): without this, ignored_layers
+        # is never populated from config.json and defaults to [] (w4afp8.py:44,57),
+        # so is_layer_skipped() in get_quant_method() (w4afp8.py:100) always returns
+        # False and bf16-only layers (e.g. KDA qkv_proj/f_a_proj/f_b_proj/b_proj/
+        # g_a_proj/g_b_proj) get wrongly wrapped in Fp8LinearMethod.
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = normalized
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            ignored_layers=ignored_layers,
         )
 
     def get_quant_method(
