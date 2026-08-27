@@ -495,8 +495,7 @@ class VisionTritonAttention(nn.Module):
             seq_lens = kwargs.get("sequence_lengths")
             if seq_lens is None:
                 seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
-            else:
-                seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
+            seq_lens = seq_lens.to(device=q.device, dtype=torch.int32)
             max_seqlen = resolve_precomputed_max_seqlen(
                 cu_seqlens_gpu, kwargs.get("max_seqlen")
             )
@@ -1012,6 +1011,10 @@ QKV_BACKEND_IMPL = {
     "xpu_attn": VisionIntelXPUAttention,
 }
 
+# backends that read q/k/v through explicit per-dim strides, and so accept the
+# strided views of the packed qkv projection output instead of dense copies
+STRIDED_QKV_BACKENDS = frozenset({"fa3", "fa4", "triton_attn", "amx_attn"})
+
 
 class VisionAttention(nn.Module):
     r"""
@@ -1126,6 +1129,19 @@ class VisionAttention(nn.Module):
         )
 
         self.use_qkv_parallel = use_qkv_parallel
+        # `qkv_proj` writes q, k and v interleaved into a single buffer, so slicing
+        # it back apart yields views whose only non-unit stride is over tokens.
+        # Backends in `STRIDED_QKV_BACKENDS` consume those views directly, which
+        # saves copying the whole projection output once per layer. Two consumers
+        # sitting between the projection and the backend need a dense layout and
+        # so opt out: the internvl qk-norm, which normalizes q/k in place, and the
+        # model-supplied position embedding appliers, which reshape q/k freely.
+        self.pass_strided_qkv = (
+            use_qkv_parallel
+            and self.qkv_backend_name in STRIDED_QKV_BACKENDS
+            and not qk_normalization
+            and customized_position_embedding_applier is None
+        )
         if use_qkv_parallel:
             self.qkv_proj = QKVParallelLinear(
                 hidden_size=embed_dim,
@@ -1374,7 +1390,7 @@ class VisionAttention(nn.Module):
             # [s, b, head, head_size] --> [b, s, head, head_size]
             q, k, v = [rearrange(x, "s b ... -> b s ...") for x in (q, k, v)]
 
-        if not (_is_cpu and _is_cpu_amx_available):
+        if not self.pass_strided_qkv:
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()

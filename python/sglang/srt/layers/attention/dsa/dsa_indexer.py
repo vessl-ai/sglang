@@ -40,7 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_device,
     get_exec,
     get_parallel,
@@ -237,7 +236,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = configured_pp_size()
+            pp_size = get_parallel().config.pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -467,7 +466,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dim=-1,
                 )
             with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
                 if self.use_dsa_indexer_fusion:
                     key, weights_raw = self._fused_k_weights(x)
                 else:
@@ -563,7 +561,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
+        if _is_cuda or _is_hip or _is_xpu:
+            dummy_q_rope = torch.empty_like(k_rope)
+        else:
+            dummy_q_rope = k_rope
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
@@ -851,10 +855,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if use_dg_native:
             seqlens_32_2d = ctx_2d
+        elif ctx_2d is not None:
+            if ctx_2d.size(1) == 1:
+                seqlens_32_2d = ctx_2d
+            else:
+                seqlens_32_2d = ctx_2d.reshape(-1).contiguous().view(-1, 1)
         elif seqlens_32.dim() == 2:
-            seqlens_32_2d = seqlens_32
+            if seqlens_32.size(1) == 1:
+                seqlens_32_2d = seqlens_32.contiguous()
+            else:
+                seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
-            seqlens_32_2d = seqlens_32.unsqueeze(-1)
+            seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
@@ -870,6 +882,54 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+
+        # DeepGEMM SM100 paged MQA misaligns when batch_size exceeds num_sms:
+        # chunk per sm_count with per-chunk schedule metadata, else defer to the
+        # plain kernel. Injected into the shared helpers as the kernel fn.
+        def _chunked_fp8_paged_mqa_logits(
+            q: torch.Tensor,
+            kv_cache: torch.Tensor,
+            w: torch.Tensor,
+            context_lens: torch.Tensor,
+            block_table: torch.Tensor,
+            mqa_schedule_metadata: torch.Tensor,
+            max_len: int,
+            clean_logits: bool = False,
+        ) -> torch.Tensor:
+            batch_size, chunk_next_n = q.shape[:2]
+            if batch_size == 0:
+                return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
+            if batch_size <= self.sm_count:
+                return deep_gemm.fp8_paged_mqa_logits(
+                    q,
+                    kv_cache,
+                    w,
+                    context_lens,
+                    block_table,
+                    mqa_schedule_metadata,
+                    max_len,
+                    clean_logits=clean_logits,
+                )
+            logits_chunks = []
+            for start in range(0, batch_size, self.sm_count):
+                end = min(start + self.sm_count, batch_size)
+                chunk_context_lens = context_lens[start:end]
+                chunk_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    chunk_context_lens, blocksize, self.sm_count
+                )
+                logits_chunks.append(
+                    deep_gemm.fp8_paged_mqa_logits(
+                        q[start:end],
+                        kv_cache,
+                        w[start * chunk_next_n : end * chunk_next_n],
+                        chunk_context_lens,
+                        block_table[start:end],
+                        chunk_schedule_metadata,
+                        max_len,
+                        clean_logits=clean_logits,
+                    )
+                )
+            return torch.cat(logits_chunks, dim=0)
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -903,7 +963,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -917,7 +977,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                deep_gemm.fp8_paged_mqa_logits,
+                _chunked_fp8_paged_mqa_logits,
                 q_fp8,
                 kv_cache_fp8,
                 weights,

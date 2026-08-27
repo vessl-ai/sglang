@@ -293,6 +293,13 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
+    def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        policy = self._determine_active_policy(waiting_queue)
+        return (
+            isinstance(policy, CacheAwarePolicy)
+            or self.tree_cache.supports_fast_match_prefix()
+        )
+
     def _validate_and_adjust_policy(
         self, policy: str, tree_cache: BasePrefixCache
     ) -> Policy:
@@ -830,6 +837,11 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def chunk_budget_exhausted(self) -> bool:
+        return (
+            self.rem_chunk_tokens is not None and self.rem_chunk_tokens < self.page_size
+        )
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
