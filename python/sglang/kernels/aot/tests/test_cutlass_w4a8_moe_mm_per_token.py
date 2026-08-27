@@ -9,6 +9,7 @@ epilogue가 고쳐질 때까지 xfail(strict)로 둔다 — 파이썬 쪽은 이
 쓰지 않고(scalar=1 GEMM + triton fold), 이 테스트가 통과하기 시작하면 epilogue가
 고쳐졌다는 신호이므로 strict 실패로 알아차린다.
 """
+
 import pytest
 import torch
 from sgl_kernel import cutlass_w4a8_moe_mm
@@ -22,7 +23,9 @@ def _pack_int4(v):
 
 def _pack_interleave(E, ref_w, ref_s):
     n, k = ref_w.shape[1], ref_w.shape[2]
-    w_q = _pack_int4(ref_w.cpu()).cuda().view(E, n, k // 2).view(torch.int8).contiguous()
+    w_q = (
+        _pack_int4(ref_w.cpu()).cuda().view(E, n, k // 2).view(torch.int8).contiguous()
+    )
     al = 4 if k % 512 == 0 else 1
     s = (
         ref_s.reshape(E, n, k // 128 // al, al)
@@ -65,9 +68,19 @@ def test_per_token_scale_with_row_variance(rows_per_e):
 
     c = torch.empty((m, n), dtype=torch.bfloat16, device=dev)
     cutlass_w4a8_moe_mm(
-        c, a_q, w, a_scale.float().contiguous(), w_s,
-        expert_offsets[:-1], problem_sizes,
-        a_strides, a_strides, c_strides, c_strides, 128, 8,
+        c,
+        a_q,
+        w,
+        a_scale.float().contiguous(),
+        w_s,
+        expert_offsets[:-1],
+        problem_sizes,
+        a_strides,
+        a_strides,
+        c_strides,
+        c_strides,
+        128,
+        8,
     )
 
     c_ref = torch.empty((m, n), dtype=torch.float32, device=dev)
