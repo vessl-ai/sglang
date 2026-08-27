@@ -1352,6 +1352,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
             )
+        if quant_config and quant_config.get_name() == "w4afp8":
+            return (
+                "Shared experts fusion is not supported for W4AFP8: routed and "
+                "shared experts use different quant methods."
+            )
         return None
 
     def determine_num_fused_shared_experts(self):
