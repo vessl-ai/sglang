@@ -27,7 +27,10 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    default_cuda_graph_config,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -221,7 +224,21 @@ def _init_cpu_threads_env(
 
 
 def _needs_attn_tp_pynccl(server_args: ServerArgs) -> bool:
+    # `cuda_graph_config` is declared as None and only populated by
+    # `_handle_cuda_graph_config()`, which runs inside `resolve_once()`. That
+    # resolution is an explicit, separate step (see `entrypoints/engine.py`), so
+    # this helper can be reached while the field is still unresolved.
     graph_config = server_args.cuda_graph_config
+    if graph_config is None:
+        # Evaluate against the same defaults the resolver would produce when no
+        # --cuda-graph-* flags are given, so the answer does not depend on
+        # whether resolution has run yet. (Returning False here instead would
+        # silently disable pynccl for configs that enable it, e.g.
+        # SGLANG_DSA_TOPK_BROADCAST=1, with no error or log.)
+        # Note: this is the pre-compat default; `_apply_cuda_graph_compatibility`
+        # may still disable a phase later. That only matters for the prefill
+        # term below, which is OR'd with the decode term.
+        graph_config = default_cuda_graph_config()
     decode_graph_enabled = graph_config.decode.backend != Backend.DISABLED
     supports_pynccl_graph = current_platform.is_cuda() or current_platform.is_rocm()
     algo = (server_args.speculative_algorithm or "").upper()
