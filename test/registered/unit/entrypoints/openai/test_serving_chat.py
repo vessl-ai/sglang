@@ -3921,6 +3921,68 @@ class TestSolarOpen2BudgetSpentWithoutAnswer(unittest.TestCase):
         )
         self.assertEqual(response.choices[0].finish_reason, "length")
 
+    # --- streaming tool path (INF-414) --------------------------------------
+
+    def _drive_tool_stream(self, delta, has_content):
+        """Run one delta through `_process_tool_call_stream` with a stub
+        parser that treats everything as normal text (no tool markup)."""
+        parser = Mock()
+        parser.parse_stream_chunk = Mock(return_value=(delta, []))
+        request = ChatCompletionRequest(
+            model="upstage/solar-pro4",
+            messages=[{"role": "user", "content": "What's the weather in Seoul?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            max_tokens=600,
+        )
+        content = {"meta_info": {"id": f"chatcmpl-{uuid.uuid4()}"}}
+
+        async def run():
+            return [
+                chunk
+                async for chunk in self.chat._process_tool_call_stream(
+                    0,
+                    delta,
+                    {0: parser},
+                    content,
+                    request,
+                    has_tool_calls={},
+                    has_content=has_content,
+                )
+            ]
+
+        return get_or_create_event_loop().run_until_complete(run())
+
+    def test_tool_path_text_answer_marks_has_content(self):
+        """INF-414: with tools offered, answer text flows through the tool
+        parser, which owns the content path entirely — the regular content
+        branch that records `has_content` never runs. Unless the tool path
+        records it too, the finish chunk demotes an answered `stop` to
+        `length`, and tool-bearing agent clients read every plain-text answer
+        as truncated."""
+        has_content = {}
+        chunks = self._drive_tool_stream("The weather in Seoul is sunny.", has_content)
+        self.assertTrue(chunks)  # the text still reaches the client
+        self.assertTrue(has_content.get(0, False))
+        # with the mark in place, the demotion predicate keeps `stop`
+        self.assertFalse(
+            self.chat._budget_spent_without_answer("stop", True, True, False)
+        )
+
+    def test_tool_path_whitespace_is_not_an_answer(self):
+        """Whitespace-only text keeps the answerless-stop demotion armed,
+        mirroring the regular content branch's `strip()` bar."""
+        has_content = {}
+        self._drive_tool_stream("\n\n  ", has_content)
+        self.assertFalse(has_content.get(0, False))
+
+    def test_tool_path_marking_is_scoped_to_solar_open2(self):
+        """Another parser's stream never feeds the solar-only demotion, so
+        the tool path leaves its bookkeeping untouched for it."""
+        self.chat.reasoning_parser = "qwen3-thinking"
+        has_content = {}
+        self._drive_tool_stream("The weather in Seoul is sunny.", has_content)
+        self.assertFalse(has_content.get(0, False))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

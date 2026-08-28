@@ -777,6 +777,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 has_tool_calls,
                 continuous_usage_stats,
                 flush=finish_reason_type is not None and finish_reason_type != "abort",
+                has_content=has_content,
             ):
                 if chunk:
                     yield chunk
@@ -802,6 +803,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         request,
                         has_tool_calls,
                         continuous_usage_stats,
+                        has_content=has_content,
                     ):
                         if chunk:
                             yield chunk
@@ -2589,11 +2591,19 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
+        has_content: Optional[Dict[int, bool]] = None,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
         held back waiting for a marker that can no longer arrive.
+
+        When the parser is active it owns the content path entirely, so answer
+        text emitted here must mark ``has_content`` itself — the regular
+        content branch that normally records it never runs. Without the mark,
+        `_budget_spent_without_answer` reads an answered stop as answerless
+        and demotes it to `length` (INF-414). The marking is guarded to
+        solar_open2 because the flag's only consumer is.
         """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
@@ -2643,6 +2653,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Yield normal text
         if normal_text:
+            if (
+                has_content is not None
+                and normal_text.strip()
+                and self.reasoning_parser == "solar_open2"
+            ):
+                # The flag's only consumer is the solar_open2-scoped
+                # answerless-stop demotion (_budget_spent_without_answer);
+                # the guard keeps this fork bookkeeping visibly inert for
+                # every other model.
+                has_content[index] = True
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),
