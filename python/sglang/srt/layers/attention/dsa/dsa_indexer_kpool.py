@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging  # [R12-OOMGUARD] this module had no logger; mirrors dsa_indexer.py:63
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -50,6 +51,8 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+logger = logging.getLogger(__name__)  # [R12-OOMGUARD]
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -948,6 +951,112 @@ class IndexerKPool(MultiPlatformOp):
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
+    # [R12-OOMGUARD-MARKER] ------------------------------------------------------
+    # `_should_chunk_mqa_logits` above existed but had ZERO call sites in this file,
+    # so every fp8_mqa_logits() call allocated the full [rows, k_rows] float32 logits
+    # tensor unguarded. Observed failure (lucas glm53f-c2, 2026-08-28 13:10:50Z):
+    #   tvm.error.InternalError: CUDA out of memory. Tried to allocate 4.29 GiB.
+    # -> Scheduler exception -> SIGQUIT -> exitCode 0.
+    # This helper ports the guard + row-chunked fallback from the sibling
+    # implementation `dsa_indexer.py` (:1142 call, :1198-1200 budget, :1215-1245 loop).
+    # Row chunking is safe here because `topk_from_pooled_history_logits` asserts
+    # `logits.shape[0] == group_lengths.shape[0]` and `out_rows` only right-pads with
+    # -1 (kpool_fp8_index.py:570,573,610-616) -- rows are 1:1, never scattered.
+    _MQA_LOGITS_BYTES_PER_ELEM = 4  # mirrors dsa_indexer.py:200
+
+    def _mqa_logits_topk_guarded(
+        self,
+        *,
+        q_rows: torch.Tensor,
+        kv_fp8,
+        weight_rows: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        num_k: int,
+        pool_lens: torch.Tensor,
+        seq_lens=None,
+        page_table=None,
+        topk_offsets=None,
+        row_starts=None,
+        out_rows=None,
+        page_table_row_index=None,
+        clean_logits: bool = True,
+    ) -> torch.Tensor:
+        """fp8_mqa_logits + kpool topk, chunked over q rows when the logits buffer
+        would not fit. Returns exactly what `_topk_from_kpool_logits` returns."""
+        n_rows = q_rows.shape[0]
+        need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
+            n_rows, num_k, q_rows.device
+        )
+
+        def _topk(logits, sl):
+            return self._topk_from_kpool_logits(
+                logits,
+                pool_lens[sl],
+                seq_lens=None if seq_lens is None else seq_lens[sl],
+                page_table=None if page_table is None else page_table[sl],
+                topk_offsets=None if topk_offsets is None else topk_offsets[sl],
+                row_starts=None if row_starts is None else row_starts[sl],
+                out_rows=None,
+                page_table_row_index=(
+                    None if page_table_row_index is None else page_table_row_index[sl]
+                ),
+            )
+
+        if not need_chunk:
+            logits = deep_gemm.fp8_mqa_logits(
+                q_rows.contiguous(),
+                kv_fp8,
+                weight_rows.contiguous(),
+                ks,
+                ke,
+                clean_logits=clean_logits,
+            )
+            result = _topk(logits, slice(0, n_rows))
+        else:
+            bytes_per_row = num_k * self._MQA_LOGITS_BYTES_PER_ELEM
+            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
+            max_rows = min(max_rows, n_rows)
+            logger.warning(
+                "[R12-OOMGUARD] chunking mqa logits: rows=%d num_k=%d "
+                "logits=%.2f GiB free=%.2f GiB -> max_rows=%d",
+                n_rows,
+                num_k,
+                n_rows * bytes_per_row / 2**30,
+                logits_budget_bytes / 2**30,
+                max_rows,
+            )
+            parts = []
+            start = 0
+            while start < n_rows:
+                end = min(start + max_rows, n_rows)
+                sl = slice(start, end)
+                logits_chunk = deep_gemm.fp8_mqa_logits(
+                    q_rows[sl].contiguous(),
+                    kv_fp8,
+                    weight_rows[sl].contiguous(),
+                    ks[sl],
+                    ke[sl],
+                    clean_logits=clean_logits,
+                )
+                parts.append(_topk(logits_chunk, sl))
+                del logits_chunk
+                start = end
+            result = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+        if out_rows is not None and out_rows != result.shape[0]:
+            padded = torch.full(
+                (out_rows, result.shape[1]),
+                -1,
+                dtype=result.dtype,
+                device=result.device,
+            )
+            padded[: result.shape[0]] = result
+            result = padded
+        return result
+
+    # [/R12-OOMGUARD-MARKER] -----------------------------------------------------
+
     def _get_topk_ragged_kpool_plan(
         self,
         forward_batch: ForwardBatch,
@@ -1001,15 +1110,12 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
+            # [R12-OOMGUARD] defer the logits allocation until the topk side-inputs
+            # below are built, so the guarded helper can chunk over q rows.
+            kv_fp8_guarded = (k_fp8.contiguous(), k_scale.contiguous())
+            logits = None
         else:
+            kv_fp8_guarded = None
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
         topk_method = metadata.topk_transform_method
@@ -1031,6 +1137,25 @@ class IndexerKPool(MultiPlatformOp):
                 topk_offsets_all = attn_metadata.topk_indices_offset
                 if topk_offsets_all is not None and row_select is not None:
                     topk_offsets_all = topk_offsets_all.index_select(0, row_select)
+
+        if kv_fp8_guarded is not None:
+            # [R12-OOMGUARD] was: unguarded deep_gemm.fp8_mqa_logits(...) above
+            return self._mqa_logits_topk_guarded(
+                q_rows=q_fp8[:n_real],
+                kv_fp8=kv_fp8_guarded,
+                weight_rows=weights[:n_real],
+                ks=ks_per_q,
+                ke=ke_per_q,
+                num_k=int(total_k_rows),
+                pool_lens=pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                row_starts=ks_per_q,
+                out_rows=total_q,
+                page_table_row_index=page_table_row_index_all,
+                clean_logits=True,
+            )
 
         return self._topk_from_kpool_logits(
             logits,
@@ -1115,16 +1240,12 @@ class IndexerKPool(MultiPlatformOp):
             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
                 torch.int32
             )
-            logits = deep_gemm.fp8_mqa_logits(
-                q_work,
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights_work,
-                ks,
-                ke,
-                clean_logits=True,
-            )
+            # [R12-OOMGUARD] defer allocation; see _mqa_logits_topk_guarded
+            kv_fp8_guarded = (k_fp8.contiguous(), k_scale.contiguous())
+            logits = None
             pool_lens = ke
         else:
+            kv_fp8_guarded = None
             logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
             pool_lens = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
             ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
@@ -1139,6 +1260,24 @@ class IndexerKPool(MultiPlatformOp):
                 .to(torch.int32)
                 .unsqueeze(0)
                 .expand(actual_seq_q, -1)
+            )
+
+        if kv_fp8_guarded is not None:
+            # [R12-OOMGUARD] was: unguarded deep_gemm.fp8_mqa_logits(...) above
+            return self._mqa_logits_topk_guarded(
+                q_rows=q_work,
+                kv_fp8=kv_fp8_guarded,
+                weight_rows=weights_work,
+                ks=ks,
+                ke=ke,
+                num_k=int(pool_kv_len),
+                pool_lens=pool_lens,
+                seq_lens=tail_tokens,
+                page_table=page_table_local,
+                topk_offsets=None,
+                row_starts=ks,
+                out_rows=out_rows,
+                clean_logits=True,
             )
 
         return self._topk_from_kpool_logits(
@@ -1349,15 +1488,11 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[q_slice].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
-                    weights[q_slice].contiguous(),
-                    row_starts,
-                    local_pool_lens,
-                    clean_logits=True,
-                )
+                # [R12-OOMGUARD] defer allocation; see _mqa_logits_topk_guarded
+                kv_fp8_guarded = (k_fp8.contiguous(), k_scale.contiguous())
+                local_logits = None
             else:
+                kv_fp8_guarded = None
                 local_logits = torch.empty(
                     (q_len, 0), dtype=torch.float32, device=q_fp8.device
                 )
@@ -1381,13 +1516,31 @@ class IndexerKPool(MultiPlatformOp):
             ):
                 topk_offsets_local = topk_offsets[q_slice]
 
-            local_topk = self._topk_from_kpool_logits(
-                local_logits,
-                local_pool_lens,
-                seq_lens=local_seqlens,
-                page_table=page_table_local,
-                topk_offsets=topk_offsets_local,
-            )
+            if kv_fp8_guarded is not None:
+                # [R12-OOMGUARD] was: unguarded deep_gemm.fp8_mqa_logits(...) above
+                local_topk = self._mqa_logits_topk_guarded(
+                    q_rows=q_fp8[q_slice],
+                    kv_fp8=kv_fp8_guarded,
+                    weight_rows=weights[q_slice],
+                    ks=row_starts,
+                    ke=local_pool_lens,
+                    num_k=int(pool_seq_len),
+                    pool_lens=local_pool_lens,
+                    seq_lens=local_seqlens,
+                    page_table=page_table_local,
+                    topk_offsets=topk_offsets_local,
+                    row_starts=None,
+                    out_rows=None,
+                    clean_logits=True,
+                )
+            else:
+                local_topk = self._topk_from_kpool_logits(
+                    local_logits,
+                    local_pool_lens,
+                    seq_lens=local_seqlens,
+                    page_table=page_table_local,
+                    topk_offsets=topk_offsets_local,
+                )
 
             topk_result[q_slice] = local_topk
             if pool_seq_len > 0 and deferred_cache_write is not None:
