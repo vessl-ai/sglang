@@ -737,6 +737,7 @@ class IndexerKPool(MultiPlatformOp):
             page_table_row_index=page_table_row_index,
         )
 
+
     def _get_kpool_decode_metadata(
         self,
         metadata: BaseIndexerMetadata,
@@ -990,11 +991,20 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         def _topk(logits, sl):
+            # `page_table_row_index` holds absolute row indices into the whole
+            # page table (kpool_topk_transform.cuh:264 reads
+            # `page_table_row_index[bid]` as a row of `page_table`), so the table
+            # must stay whole while the index is sliced with the q rows. Slicing
+            # both leaves indices pointing past the end of a chunk-sized table.
+            # `_topk_from_kpool_logits` makes the same distinction upstream.
+            paged = page_table
+            if paged is not None and page_table_row_index is None:
+                paged = paged[sl]
             return self._topk_from_kpool_logits(
                 logits,
                 pool_lens[sl],
                 seq_lens=None if seq_lens is None else seq_lens[sl],
-                page_table=None if page_table is None else page_table[sl],
+                page_table=paged,
                 topk_offsets=None if topk_offsets is None else topk_offsets[sl],
                 row_starts=None if row_starts is None else row_starts[sl],
                 out_rows=None,
