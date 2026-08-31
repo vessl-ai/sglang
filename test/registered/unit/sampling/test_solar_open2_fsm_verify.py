@@ -96,7 +96,7 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.content_done_forbidden = ()
         cfg.budget_ratio = 0.75
         cfg.budget_abs = 1000
-        cfg.content_mask = False
+        cfg.content_mask = "off"
         cfg.spec_always_eager = False
         cfg._mask_cache.clear()
         solar_open2_fsm._CONFLICT_LOG["last"] = 0.0
@@ -372,6 +372,163 @@ class TestAdvanceCommitted(SolarOpen2FsmVerifyTestBase):
         fsm = solar_open2_fsm._req_fsm(req)
         self.assertEqual(fsm.count, 1)
         self.assertEqual(fsm.consumed, 1)
+
+
+class TestStepMarksForced(SolarOpen2FsmVerifyTestBase):
+    def test_step_marks_forced_on_budget_close(self):
+        fsm = _fsm(budget=4, in_reasoning=True, count=0)
+        for _ in range(4):
+            fsm._step(20)
+        fsm._step(THINK_END)
+        self.assertTrue(fsm.forced)
+        self.assertFalse(fsm.in_reasoning)
+
+        fsm_below = _fsm(budget=4, in_reasoning=True, count=0)
+        for _ in range(2):
+            fsm_below._step(20)
+        fsm_below._step(THINK_END)
+        self.assertFalse(fsm_below.forced)
+        self.assertFalse(fsm_below.in_reasoning)
+
+    def test_sim_state_mirrors_forced_and_budget(self):
+        fsm_forced = _fsm(budget=4, in_reasoning=False, count=4)
+        fsm_forced.forced = True
+        sim_forced = solar_open2_fsm._SimState(fsm_forced)
+        self.assertEqual(sim_forced.forced, fsm_forced.forced)
+        self.assertEqual(sim_forced.budget, fsm_forced.budget)
+
+        fsm_unforced = _fsm(budget=4, in_reasoning=False, count=1)
+        sim_unforced = solar_open2_fsm._SimState(fsm_unforced)
+        self.assertEqual(sim_unforced.forced, fsm_unforced.forced)
+        self.assertEqual(sim_unforced.budget, fsm_unforced.budget)
+
+
+class TestContentMaskModesNonSpec(SolarOpen2FsmVerifyTestBase):
+    def test_unforced_mode_masks_eos_after_model_close(self):
+        solar_open2_fsm.CFG.content_mask = "unforced"
+
+        # Below-budget close -> forced False -> fresh CONTENT masked.
+        fsm_fresh = _fsm(budget=5, in_reasoning=True, count=0)
+        req_fresh = _req(rid="fresh", output_ids=[20, 21, THINK_END], fsm=fsm_fresh)
+        # Below-budget close, then one ordinary token -> content_progress.
+        fsm_progress = _fsm(budget=5, in_reasoning=True, count=0)
+        req_progress = _req(
+            rid="progress", output_ids=[20, 21, THINK_END, 22], fsm=fsm_progress
+        )
+
+        logits = torch.zeros(2, VOCAB_SIZE)
+        sampling_info = types.SimpleNamespace(
+            solar_fsm_rows=[req_fresh, req_progress]
+        )
+        solar_open2_fsm.apply(logits, sampling_info)
+
+        self.assertFalse(fsm_fresh.forced)
+        # Fresh CONTENT: EOS masked, an untouched id (tool_call_start's stand-in
+        # here) is not.
+        self.assertEqual(logits[0, EOS].item(), float("-inf"))
+        self.assertEqual(logits[0, 5].item(), 0.0)
+
+        # content_progress row: content_done_forbidden is empty in this
+        # fixture -> EOS free, im_end allowed.
+        self.assertTrue(fsm_progress.content_progress)
+        self.assertTrue(torch.equal(logits[1], torch.zeros(VOCAB_SIZE)))
+
+    def test_unforced_mode_leaves_budget_close_unmasked(self):
+        solar_open2_fsm.CFG.content_mask = "unforced"
+
+        fsm = _fsm(budget=2, in_reasoning=True, count=0)
+        req = _req(output_ids=[20, 21, THINK_END], fsm=fsm)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        sampling_info = types.SimpleNamespace(solar_fsm_rows=[req])
+        solar_open2_fsm.apply(logits, sampling_info)
+
+        self.assertTrue(fsm.forced)
+        self.assertTrue(torch.equal(logits[0], torch.zeros(VOCAB_SIZE)))
+
+    def test_always_mode_masks_regardless_of_forced(self):
+        solar_open2_fsm.CFG.content_mask = "always"
+
+        fsm = _fsm(budget=2, in_reasoning=True, count=0)
+        req = _req(output_ids=[20, 21, THINK_END], fsm=fsm)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        sampling_info = types.SimpleNamespace(solar_fsm_rows=[req])
+        solar_open2_fsm.apply(logits, sampling_info)
+
+        self.assertTrue(fsm.forced)
+        self.assertEqual(logits[0, EOS].item(), float("-inf"))
+
+    def test_off_mode_unchanged(self):
+        solar_open2_fsm.CFG.content_mask = "off"
+
+        fsm_below = _fsm(budget=5, in_reasoning=True, count=0)
+        req_below = _req(rid="below", output_ids=[20, 21, THINK_END], fsm=fsm_below)
+        fsm_at = _fsm(budget=2, in_reasoning=True, count=0)
+        req_at = _req(rid="at", output_ids=[20, 21, THINK_END], fsm=fsm_at)
+
+        logits = torch.zeros(2, VOCAB_SIZE)
+        sampling_info = types.SimpleNamespace(solar_fsm_rows=[req_below, req_at])
+        solar_open2_fsm.apply(logits, sampling_info)
+
+        self.assertFalse(fsm_below.forced)
+        self.assertTrue(fsm_at.forced)
+        self.assertTrue(torch.equal(logits, torch.zeros(2, VOCAB_SIZE)))
+
+
+class TestContentMaskModesSpec(SolarOpen2FsmVerifyTestBase):
+    def test_plan_verify_unforced_masks_per_chain_position(self):
+        solar_open2_fsm.CFG.content_mask = "unforced"
+        chain = torch.tensor([[5, 6, THINK_END, 7]])
+        stride = 4
+
+        # Below-budget close (budget=3): count is 1 when THINK_END lands ->
+        # forced False -> rows after the close get the fresh/done masks.
+        fsm_below = _fsm(budget=3, in_reasoning=True, count=0, consumed=0)
+        req_below = _req(output_ids=[], fsm=fsm_below)
+        plan_below = solar_open2_fsm.plan_verify([req_below], chain, stride=stride)
+
+        self.assertEqual(plan_below.force_rows, [])
+        self.assertEqual(
+            sorted(plan_below.mask_rows[solar_open2_fsm.CFG.reasoning_forbidden]),
+            [0, 1],
+        )
+        self.assertEqual(
+            plan_below.mask_rows[solar_open2_fsm.CFG.content_fresh_forbidden], [2]
+        )
+        self.assertEqual(
+            plan_below.mask_rows[solar_open2_fsm.CFG.content_done_forbidden], [3]
+        )
+
+        # Budget-coincident close (budget=1): count reaches budget at the
+        # ordinary token right before THINK_END -> forced True -> rows after
+        # the close are left unmasked, exactly like OFF.
+        fsm_at = _fsm(budget=1, in_reasoning=True, count=0, consumed=0)
+        req_at = _req(output_ids=[], fsm=fsm_at)
+        plan_at = solar_open2_fsm.plan_verify([req_at], chain, stride=stride)
+
+        self.assertEqual(
+            sorted(plan_at.mask_rows.get(solar_open2_fsm.CFG.reasoning_forbidden, [])),
+            [0],
+        )
+        self.assertEqual(plan_at.force_rows, [1])
+        masked_rows = {r for rows in plan_at.mask_rows.values() for r in rows}
+        self.assertNotIn(2, masked_rows)
+        self.assertNotIn(3, masked_rows)
+        self.assertNotIn(2, plan_at.force_rows)
+        self.assertNotIn(3, plan_at.force_rows)
+
+
+class TestParseContentMask(unittest.TestCase):
+    def test_accepts_known_values(self):
+        self.assertEqual(solar_open2_fsm._parse_content_mask("0"), "off")
+        self.assertEqual(solar_open2_fsm._parse_content_mask(""), "off")
+        self.assertEqual(solar_open2_fsm._parse_content_mask("off"), "off")
+        self.assertEqual(solar_open2_fsm._parse_content_mask("1"), "always")
+        self.assertEqual(solar_open2_fsm._parse_content_mask("always"), "always")
+        self.assertEqual(solar_open2_fsm._parse_content_mask("unforced"), "unforced")
+
+    def test_init_from_env_rejects_unknown_content_mask_value(self):
+        with self.assertRaises(RuntimeError):
+            solar_open2_fsm._parse_content_mask("maybe")
 
 
 if __name__ == "__main__":

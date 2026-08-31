@@ -78,12 +78,17 @@ class _Config:
     content_fresh_forbidden: Tuple[int, ...] = ()
     content_done_forbidden: Tuple[int, ...] = ()
     budget_ratio: float = 0.75
-    # R4 measured this as a REGRESSION (GPQA 74.0% -> 68.0%): forbidding EOS in
-    # fresh CONTENT forces a model that wanted to stop to emit something, which
-    # raised truncation (1->7) and unparsable answers (1->6). The fork's rule
-    # only makes sense together with the rest of its FSM; ported in isolation it
-    # hurts. Kept as an opt-in so the asset survives, default OFF.
-    content_mask: bool = False
+    # R4 measured "always" as a REGRESSION (GPQA 74.0% -> 68.0%): forbidding
+    # EOS in fresh CONTENT forces a model that wanted to stop to emit
+    # something, which raised truncation (1->7) and unparsable answers (1->6).
+    # The fork's rule only makes sense together with the rest of its FSM;
+    # ported in isolation it hurts a model that closed the think block on its
+    # own. "unforced" (INF-414) narrows the rule to the population it can't
+    # hurt: mask fresh-CONTENT EOS only after a model-emitted <|think:end|>,
+    # and leave a budget-forced close exactly as OFF behaves, since forcing
+    # content there is what drove the R4 regression to max_tokens.
+    # One of "off" / "always" / "unforced"; see ``_parse_content_mask``.
+    content_mask: str = "off"
     # R5-8: masking the verify logits costs the folded in-graph accept, so by
     # default we only leave the folded path on steps where the reasoning budget
     # actually falls inside the draft chain. Set 1 to mask every verify step
@@ -127,6 +132,21 @@ def _eos_ids(tokenizer_dir: str) -> List[int]:
     return ids
 
 
+def _parse_content_mask(value: str) -> str:
+    """Map ``SOLAR_FSM_CONTENT_MASK``'s raw env value to a content_mask mode.
+
+    Fails loudly on an unrecognized value instead of silently falling back to
+    "off" -- a typo here should not silently disable the requested mode.
+    """
+    if value in ("0", "off", ""):
+        return "off"
+    if value in ("1", "always"):
+        return "always"
+    if value == "unforced":
+        return "unforced"
+    raise RuntimeError(f"SOLAR_FSM_CONTENT_MASK: unrecognized value {value!r}")
+
+
 def init_from_env() -> None:
     """Resolve ids + budget. Called lazily on first sampler pass."""
     if not os.environ.get("SOLAR_FSM", "0") == "1":
@@ -165,7 +185,9 @@ def init_from_env() -> None:
     CFG.content_done_forbidden = build({CFG.tool_call_start, CFG.im_end}, False)
 
     CFG.budget_ratio = float(os.environ.get("SOLAR_FSM_BUDGET_RATIO", "0.75"))
-    CFG.content_mask = os.environ.get("SOLAR_FSM_CONTENT_MASK", "0") == "1"
+    CFG.content_mask = _parse_content_mask(
+        os.environ.get("SOLAR_FSM_CONTENT_MASK", "0")
+    )
     CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
     CFG.budget_abs = int(os.environ.get("SOLAR_FSM_BUDGET_ABS", str(_FORK_ABS_BUDGET)))
     CFG.enabled = True
@@ -224,13 +246,16 @@ class SolarReqFSM:
     def _step(self, tok: int) -> None:
         """Per-token transition. Reused verbatim as ``_SimState.step``, which
         walks a throwaway copy of this state over a speculative chain, so the
-        two can never drift. Touches only ``in_reasoning`` / ``count`` /
-        ``content_progress`` -- the slots ``_SimState`` also carries."""
+        two can never drift. Touches ``in_reasoning`` / ``count`` /
+        ``content_progress`` / ``forced`` / reads ``budget`` -- the slots
+        ``_SimState`` also carries."""
         if tok == CFG.think_start:
             self.in_reasoning = True
             self.content_progress = False
             self.count = 0
         elif tok == CFG.think_end:
+            if self.in_reasoning and self.count >= self.budget:
+                self.forced = True
             self.in_reasoning = False
         elif self.in_reasoning:
             self.count += 1
@@ -434,6 +459,20 @@ def advance_committed(result, batch) -> None:
 _WARNED = {"shape": False}
 
 
+def _content_mask_applies(state) -> bool:
+    """Whether the fresh-CONTENT EOS mask applies to ``state``'s row.
+
+    ``state`` is a ``SolarReqFSM`` (non-spec ``apply()``) or a ``_SimState``
+    (speculative ``plan_verify()``); both carry ``forced``. "always" masks
+    every fresh-CONTENT row regardless of how the think block closed;
+    "unforced" narrows that to rows whose close was model-emitted, i.e. NOT a
+    budget-forced (or budget-coincident) close -- see ``_Config.content_mask``.
+    """
+    return CFG.content_mask == "always" or (
+        CFG.content_mask == "unforced" and not state.forced
+    )
+
+
 def apply(logits: torch.Tensor, sampling_info) -> None:
     """Mask ``logits`` in place according to each row's FSM state."""
     if not is_active():
@@ -464,7 +503,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 force_rows.append(i)
             else:
                 mask_rows.setdefault(CFG.reasoning_forbidden, []).append(i)
-        elif not CFG.content_mask:
+        elif not _content_mask_applies(fsm):
             continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
         elif fsm.content_progress:
             mask_rows.setdefault(CFG.content_done_forbidden, []).append(i)
@@ -540,12 +579,14 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 class _SimState:
     """Throwaway FSM state used to walk a speculative chain."""
 
-    __slots__ = ("in_reasoning", "count", "content_progress")
+    __slots__ = ("in_reasoning", "count", "content_progress", "forced", "budget")
 
     def __init__(self, fsm: SolarReqFSM):
         self.in_reasoning = fsm.in_reasoning
         self.count = fsm.count
         self.content_progress = fsm.content_progress
+        self.forced = fsm.forced
+        self.budget = fsm.budget
 
     # The persistent FSM's own transition, reused rather than mirrored: a
     # drift between the chain walk and the committed state is exactly the
@@ -696,7 +737,7 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                         )
                 else:
                     mask_rows.setdefault(CFG.reasoning_forbidden, []).append(row)
-            elif not CFG.content_mask:
+            elif not _content_mask_applies(sim):
                 continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
             elif sim.content_progress:
                 mask_rows.setdefault(CFG.content_done_forbidden, []).append(row)
