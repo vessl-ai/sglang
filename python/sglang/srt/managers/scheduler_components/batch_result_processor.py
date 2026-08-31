@@ -1127,7 +1127,18 @@ class SchedulerBatchResultProcessor:
                 return
             if kept < len(run):
                 run = run[:kept]
+        was_open = req._content_token_offset is None
         req.update_reasoning_tokens(run, think_end_ids)
+        if was_open and req._content_token_offset is not None and not req.finished():
+            # The stop check ran before this and skipped the whole run, because
+            # the think block was still open at the time. Under speculative
+            # decoding that run can carry <|think:end|> *and* the answer tokens
+            # after it, so a stop inside the answer would be missed for good --
+            # the next step's window is sized from that step's acceptance and
+            # does not reach back over this one. Re-run it now that the content
+            # offset exists; update_finish_state returns immediately on an
+            # already-finished req and the checks it repeats are stateless.
+            req.update_finish_state(len(run))
 
     def _mamba_prefix_cache_update(
         self,

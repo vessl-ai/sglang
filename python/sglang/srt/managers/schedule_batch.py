@@ -948,6 +948,11 @@ class Req(ReqDllmMixin):
         self.reasoning_tokens = 0
         self._think_end_matcher: Optional[TokenSequenceMatcher] = None
         self._think_end_match_len = 0
+        # Index into output_ids where the answer begins: the token right after
+        # the one that completed <|think:end|>. None while the think block is
+        # still open. Read by _check_str_based_finish to keep stop strings off
+        # the thinking.
+        self._content_token_offset: Optional[int] = None
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1486,9 +1491,15 @@ class Req(ReqDllmMixin):
         )
         # Cover all newly accepted tokens so an early stop string is not missed
         # when speculative decoding accepts multiple tokens per step.
-        return min(
+        tail_len = min(
             max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
         )
+        # Never reach back past the first content token: the window is sized in
+        # tokens, so right after the think block closes it would otherwise still
+        # span thinking text and match a stop there.
+        if self._content_token_offset is not None:
+            tail_len = min(tail_len, len(self.output_ids) - self._content_token_offset)
+        return tail_len
 
     def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
@@ -1499,6 +1510,11 @@ class Req(ReqDllmMixin):
             return ""
 
         tail_len = self._stop_match_tail_len(new_accepted_len)
+        # `output_ids[-0:]` is the whole list, not the empty tail. A zero-length
+        # window is what the content clamp produces on the step the think block
+        # closes -- no answer token exists yet -- so it has to be spelled out.
+        if tail_len <= 0:
+            return ""
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1583,6 +1599,16 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
+        # A stop string is about the answer. While the think block is still open
+        # there is no answer yet, so nothing may match: solar-pro4's thinking
+        # almost always opens "1.  **Identify ...", and a client stop of "**"
+        # ends the turn on the model's own reasoning style with no answer ever
+        # produced. Once the block closes, matching resumes from the first
+        # content token -- see _stop_match_tail_len, which clamps the decode
+        # window to _content_token_offset so the thinking that preceded the
+        # answer cannot satisfy a stop either.
+        if self.require_reasoning and self._content_token_offset is None:
+            return False
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
@@ -1918,6 +1944,11 @@ class Req(ReqDllmMixin):
             if matched == len(self._think_end_matcher):
                 self.reasoning_tokens += position + 1
                 self._is_reasoning_over = True
+                # output_ids already holds this whole run, so the answer starts
+                # at the token after the one that completed the sentinel.
+                self._content_token_offset = (
+                    len(self.output_ids) - len(token_id) + position + 1
+                )
                 return
 
         self._think_end_match_len = matched
