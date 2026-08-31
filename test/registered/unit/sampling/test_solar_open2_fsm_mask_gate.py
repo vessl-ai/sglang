@@ -254,5 +254,82 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertTrue(fsm.plan_gate([req], 8))
 
 
+class TestApplyFoldedMask(unittest.TestCase):
+    """The row-wise mask itself. It is the piece the folded accept path depends
+    on, and the piece a live boot cannot check: a row/column transposition or a
+    broadcast mistake writes -inf somewhere plausible and the engine keeps
+    serving."""
+
+    def setUp(self):
+        import torch
+
+        self.torch = torch
+        self.stride, self.vocab = 4, 128  # wide enough for THINK_START/THINK_END
+        self.forbid = torch.tensor([2, 5], dtype=torch.long)
+
+    def _logits(self, rows):
+        # logits[r, c] = r*100 + c, so a transposition is visible in the values
+        t = self.torch.arange(rows * self.vocab, dtype=self.torch.float32)
+        return (t.view(rows, self.vocab) % self.vocab) + (
+            self.torch.arange(rows, dtype=self.torch.float32).unsqueeze(1) * 100
+        )
+
+    def test_only_the_flagged_rows_and_forbidden_columns_move(self):
+        rows = 2 * self.stride
+        before = self._logits(rows)
+        after = before.clone()
+        flags = self.torch.tensor([False] * self.stride + [True] * self.stride)
+        fsm.apply_folded_mask(after, flags, self.forbid)
+
+        self.assertTrue(
+            self.torch.isinf(after[self.stride :, self.forbid]).all(),
+            "every flagged row's forbidden ids must be -inf",
+        )
+        self.assertTrue(
+            self.torch.equal(after[: self.stride], before[: self.stride]),
+            "an unflagged row must not move at all",
+        )
+        keep = [c for c in range(self.vocab) if c not in (2, 5)]
+        self.assertTrue(
+            self.torch.equal(after[:, keep], before[:, keep]),
+            "no column outside the forbidden set may move",
+        )
+
+    def test_an_all_false_buffer_writes_nothing(self):
+        """The claim the unarmed step rests on, and with it every deployment
+        that does not run this model."""
+        before = self._logits(self.stride)
+        after = before.clone()
+        flags = self.torch.zeros(self.stride, dtype=self.torch.bool)
+        fsm.apply_folded_mask(
+            after, flags, self.torch.tensor([0], dtype=self.torch.long)
+        )
+        self.assertTrue(self.torch.equal(after, before))
+
+    def test_dtype_is_preserved(self):
+        """A float32 -inf operand would promote and then fail the index_put_."""
+        for dtype in (self.torch.float16, self.torch.bfloat16, self.torch.float32):
+            with self.subTest(str(dtype)):
+                logits = self._logits(self.stride).to(dtype)
+                flags = self.torch.ones(self.stride, dtype=self.torch.bool)
+                fsm.apply_folded_mask(logits, flags, self.forbid)
+                self.assertEqual(logits.dtype, dtype)
+                self.assertTrue(self.torch.isinf(logits[:, self.forbid]).all())
+
+    def test_think_end_is_never_masked(self):
+        """plan_verify's force branch reads whether <|think:end|> is still
+        finite before forcing it, so this mask must leave that column alone —
+        it is what ties the two mechanisms together."""
+        _cfg()
+        logits = self._logits(self.stride)
+        flags = self.torch.ones(self.stride, dtype=self.torch.bool)
+        forbid = self.torch.tensor(
+            list(fsm.CFG.reasoning_forbidden), dtype=self.torch.long
+        )
+        self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
+        fsm.apply_folded_mask(logits, flags, forbid)
+        self.assertTrue(self.torch.isfinite(logits[:, THINK_END]).all())
+
+
 if __name__ == "__main__":
     unittest.main()

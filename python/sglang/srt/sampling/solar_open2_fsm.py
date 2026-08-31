@@ -612,6 +612,28 @@ class VerifyPlan:
                 logits[rsel, CFG.think_end] = kept
 
 
+def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
+    """Write ``NEG_INF`` over ``forbid_ids`` in every row ``row_flags`` marks.
+
+    The row-wise half of the reasoning mask, split out from the epilogue that
+    calls it so it can be exercised without a GPU: it is plain tensor work with
+    no FSM state, and it is the piece the folded accept path depends on.
+
+    ``logits`` is ``(bs * stride, vocab)`` in the verify step's own row order,
+    request-major and chain-minor; ``row_flags`` is a bool tensor over those
+    rows. Written in place. Every operand's shape is fixed once ``bs`` is, which
+    is what lets these kernels sit inside a captured cuda graph and be replayed:
+    only the *contents* of ``row_flags`` change between steps, so an unarmed
+    step runs the same kernels and writes each selected logit back unchanged.
+
+    ``masked_fill`` rather than ``torch.where``: it keeps ``logits``' dtype,
+    where a float32 -inf operand would promote and then fail the index_put_ on a
+    half-precision logits tensor.
+    """
+    rows = row_flags.unsqueeze(1)
+    logits[:, forbid_ids] = logits[:, forbid_ids].masked_fill(rows, NEG_INF)
+
+
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
@@ -660,19 +682,26 @@ def plan_gate(reqs, stride: int) -> bool:
 def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     """Per-(request, chain position) flags for the in-graph reasoning mask.
 
-    True where ``plan_verify`` would write ``CFG.reasoning_forbidden`` into the
-    row: the row is in REASONING and its budget is not spent. A row whose budget
-    *is* spent needs a forced ``<|think:end|>`` instead, and :func:`plan_gate`
-    has already sent that step to the eager path, so it is left False here.
+    True where the request's **committed** state is in REASONING with budget
+    left. A row whose budget is spent needs a forced ``<|think:end|>`` instead,
+    which only ``plan_verify`` can write, and :func:`plan_gate` has already sent
+    that step to the eager path -- so it is left False here.
 
-    Committed state only, which is what keeps this sync-free -- the draft chain
+    Committed state only, which is what keeps this sync-free: the draft chain
     lives on device and reading it before the target launch is the sync this
-    whole path exists to avoid. So every chain position of a request carries the
-    request's committed state, and a row that leaves REASONING mid-chain stays
-    masked for the rest of that chain. That errs toward forbidding EOS just
-    after ``<|think:end|>``, where the model has an answer to write before it
-    ends the turn anyway; the opposite error is the defect this mask exists to
-    close.
+    whole path exists to avoid. ``plan_verify`` *does* walk the chain, so the
+    two disagree wherever a draft moves the state, in both directions:
+
+    * A drafted ``<|think:end|>`` takes ``plan_verify`` out of REASONING at that
+      position; these flags stay True for the rest of the chain. Overmasking,
+      and bounded -- at most ``stride - 1`` rows, cleared once the next step's
+      committed state catches up. It is not free: EOS is forbidden where the
+      model may legitimately want it, so a non-EOS token is accepted and
+      committed after the answer. It is the cheaper error.
+    * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
+      that position; these flags stay False, and ``plan_gate`` does not fire on
+      a committed-CONTENT row either. That row goes unmasked. It is the error
+      this mask exists to prevent, and closing it needs the chain here.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """

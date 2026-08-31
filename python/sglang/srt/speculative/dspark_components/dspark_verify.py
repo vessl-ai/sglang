@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 import msgspec
@@ -486,6 +487,9 @@ class AcceptOuts(msgspec.Struct):
     out_tokens: torch.Tensor
 
 
+logger = logging.getLogger(__name__)
+
+
 def _fsm_forbidden_ids() -> List[int]:
     """The reasoning forbidden set, resolved once at epilogue construction.
 
@@ -574,6 +578,7 @@ class DsparkVerifyEpilogue:
         self.fsm_forbid_buf = torch.tensor(
             _fsm_forbidden_ids(), dtype=torch.long, device=device
         )
+        self._fsm_ids_checked = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -603,7 +608,7 @@ class DsparkVerifyEpilogue:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
 
-    def set_fsm_rows(self, flags) -> None:
+    def set_fsm_rows(self, flags, forbidden_ids=None) -> None:
         """Stage the in-graph reasoning mask for the step about to launch.
 
         Host-side, before the target verify, in the same window ``begin_step``
@@ -616,6 +621,21 @@ class DsparkVerifyEpilogue:
         if not flags:
             self.fsm_row_buf.zero_()
             return
+        if not self._fsm_ids_checked:
+            # The forbidden ids were snapshotted at construction and the flags
+            # are decided per step, so the two can describe different worlds if
+            # the FSM resolved after this object was built. Left unchecked that
+            # masks token id 0 instead of the EOS ids -- the customer-visible
+            # defect wearing a disguise, with nothing in the logs.
+            self._fsm_ids_checked = True
+            if list(forbidden_ids or ()) != self.fsm_forbid_buf.tolist():
+                logger.error(
+                    "[SOLAR-FSM] in-graph mask holds %s but the FSM now forbids "
+                    "%s; the mask was captured before the FSM resolved and is "
+                    "masking the wrong ids",
+                    self.fsm_forbid_buf.tolist(),
+                    list(forbidden_ids or ()),
+                )
         n = min(len(flags), self.fsm_row_buf.shape[0])
         self.fsm_row_buf[:n].copy_(
             torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
@@ -635,17 +655,18 @@ class DsparkVerifyEpilogue:
         a request's ``verify_lens`` that ``VerifyPlan.apply`` filters out. The
         accept trims them (``cutoff_verify_lens``), so the extra writes do not
         reach a committed token.
+
+        The tensor work itself is ``solar_open2_fsm.apply_folded_mask``, which
+        is where it is unit-tested.
         """
         if self.strided_logits is None:
             return
+        from sglang.srt.sampling.solar_open2_fsm import apply_folded_mask
+
         n = bs * self.stride
-        rows = self.fsm_row_buf[:n].unsqueeze(1)
-        sel = self.strided_logits[:n]
-        ids = self.fsm_forbid_buf
-        # masked_fill rather than torch.where: it keeps sel's dtype, where a
-        # float32 -inf operand would promote and then fail the index_put_ on a
-        # half-precision logits tensor.
-        sel[:, ids] = sel[:, ids].masked_fill(rows, float("-inf"))
+        apply_folded_mask(
+            self.strided_logits[:n], self.fsm_row_buf[:n], self.fsm_forbid_buf
+        )
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

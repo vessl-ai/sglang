@@ -697,7 +697,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         _solar_fsm_epilogue = self._verify_executor.verify_epilogue
         if _solar_fsm_epilogue is not None:
             _solar_fsm_epilogue.set_fsm_rows(
-                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1])
+                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1]),
+                _solar_fsm.CFG.reasoning_forbidden,
             )
 
         # Must stay ahead of the target verify launch below. The Solar FSM plans
