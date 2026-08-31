@@ -612,16 +612,45 @@ class VerifyPlan:
                 logits[rsel, CFG.think_end] = kept
 
 
+def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
+    """Write ``NEG_INF`` over ``forbid_ids`` in every row ``row_flags`` marks.
+
+    The row-wise half of the reasoning mask, split out from the epilogue that
+    calls it so it can be exercised without a GPU: it is plain tensor work with
+    no FSM state, and it is the piece the folded accept path depends on.
+
+    ``logits`` is ``(bs * stride, vocab)`` in the verify step's own row order,
+    request-major and chain-minor; ``row_flags`` is a bool tensor over those
+    rows. Written in place. Every operand's shape is fixed once ``bs`` is, which
+    is what lets these kernels sit inside a captured cuda graph and be replayed:
+    only the *contents* of ``row_flags`` change between steps, so an unarmed
+    step runs the same kernels and writes each selected logit back unchanged.
+
+    ``masked_fill`` rather than ``torch.where``: it keeps ``logits``' dtype,
+    where a float32 -inf operand would promote and then fail the index_put_ on a
+    half-precision logits tensor.
+    """
+    rows = row_flags.unsqueeze(1)
+    logits[:, forbid_ids] = logits[:, forbid_ids].masked_fill(rows, NEG_INF)
+
+
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    The folded epilogue accepts inside the cuda graph off its own buffers,
-    where a mask written into ``next_token_logits`` never lands, so the choice
-    has to be made before the target verify launches -- before the grammar
-    barrier has fed the previous step's committed run to the FSMs. The state
-    read here can therefore lag by up to one accepted run, so the boundary
-    window is widened to ``2 * stride``: forcing eager on a step that turns out
-    to need no mask costs throughput, missing a needed mask costs correctness.
+    Two things can only be done on the eager path, and this predicate names
+    them: forcing ``<|think:end|>`` on a row whose reasoning budget is spent,
+    and the ``content_mask`` sets. Both are ``plan_verify``'s work, and
+    ``plan_verify`` runs after the grammar barrier -- too late for the folded
+    epilogue, which accepts inside the cuda graph off its own buffers.
+
+    The reasoning mask is **not** in that list. It is the common case and it
+    would cost the folded path for most of a generation, so it is applied
+    inside the graph instead (``DsparkVerifyEpilogue._apply_fsm_mask``, fed by
+    :func:`folded_mask_flags`). This predicate therefore stays what its name
+    says: the fold escape, widened to ``2 * stride`` because the state read
+    here can lag by up to one accepted run -- forcing eager on a step that
+    turns out to need nothing costs throughput, missing a needed force costs
+    correctness.
 
     Host-only and sync-free: it never touches the draft tokens on device.
     """
@@ -630,6 +659,10 @@ def plan_gate(reqs, stride: int) -> bool:
     if not reqs or stride <= 0:
         return False
     if CFG.spec_always_eager:
+        return True
+    if CFG.content_mask:
+        # The content sets are plan_verify's alone; nothing in the graph applies
+        # them. Off by default.
         return True
     window = 2 * stride
     for req in reqs:
@@ -644,6 +677,50 @@ def plan_gate(reqs, stride: int) -> bool:
         if fsm.in_reasoning and fsm.count + window >= fsm.budget:
             return True
     return False
+
+
+def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
+    """Per-(request, chain position) flags for the in-graph reasoning mask.
+
+    True where the request's **committed** state is in REASONING with budget
+    left. A row whose budget is spent needs a forced ``<|think:end|>`` instead,
+    which only ``plan_verify`` can write, and :func:`plan_gate` has already sent
+    that step to the eager path -- so it is left False here.
+
+    Committed state only, which is what keeps this sync-free: the draft chain
+    lives on device and reading it before the target launch is the sync this
+    whole path exists to avoid. ``plan_verify`` *does* walk the chain, so the
+    two disagree wherever a draft moves the state, in both directions:
+
+    * A drafted ``<|think:end|>`` takes ``plan_verify`` out of REASONING at that
+      position; these flags stay True for the rest of the chain. Overmasking,
+      and bounded -- at most ``stride - 1`` rows, cleared once the next step's
+      committed state catches up. It is not free: EOS is forbidden where the
+      model may legitimately want it, so a non-EOS token is accepted and
+      committed after the answer. It is the cheaper error.
+    * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
+      that position; these flags stay False, and ``plan_gate`` does not fire on
+      a committed-CONTENT row either. That row goes unmasked. It is the error
+      this mask exists to prevent, and closing it needs the chain here.
+
+    Returns None when the FSM is inactive, so the caller keeps stock behaviour.
+    """
+    if not is_active() or not reqs or stride <= 0:
+        return None
+    flags: List[bool] = []
+    for req in reqs:
+        fsm = getattr(req, "_solar_fsm", None)
+        if fsm is None or _fsm_stale(req):
+            # plan_gate sent this step eager; plan_verify will judge it with
+            # fresh state after the barrier.
+            flags.extend([False] * stride)
+            continue
+        fsm.advance(req.output_ids)
+        # _SimState.exhausted's own predicate, read off the committed FSM:
+        # in REASONING with the budget not yet spent.
+        on = bool(fsm.in_reasoning and fsm.count < fsm.budget)
+        flags.extend([on] * stride)
+    return flags
 
 
 def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
