@@ -489,17 +489,22 @@ class AcceptOuts(msgspec.Struct):
 def _fsm_forbidden_ids() -> List[int]:
     """The reasoning forbidden set, resolved once at epilogue construction.
 
-    Returns a one-element placeholder when the FSM is off, so the mask kernels
-    still have a static index to write through and the captured graph is the
-    same shape either way. With every row flag False they write nothing.
+    Returns a one-element placeholder when the FSM is off (or not importable),
+    so the mask kernels still have a static index to write through and the
+    captured graph is the same shape either way. That placeholder is only ever
+    paired with an all-False row buffer -- ``folded_mask_flags`` returns None
+    while the FSM is inactive, which disarms every row -- so it writes nothing.
     """
     try:
         from sglang.srt.sampling import solar_open2_fsm as _fsm
-
-        if _fsm.is_active() and _fsm.CFG.reasoning_forbidden:
-            return list(_fsm.CFG.reasoning_forbidden)
-    except Exception:  # noqa: BLE001 - the epilogue must not depend on the FSM
-        pass
+    except ImportError:  # the epilogue must not depend on the FSM being present
+        return [0]
+    # A misconfigured SOLAR_FSM_TOKENIZER_DIR raises out of is_active() on
+    # purpose, and it must keep raising here: swallowing it would leave the
+    # placeholder in place for the process's life and mask token id 0 instead
+    # of the EOS ids, which is the customer-visible defect wearing a disguise.
+    if _fsm.is_active() and _fsm.CFG.reasoning_forbidden:
+        return list(_fsm.CFG.reasoning_forbidden)
     return [0]
 
 
@@ -547,9 +552,16 @@ class DsparkVerifyEpilogue:
         # --- solar-open2 FSM in-graph reasoning mask (injected) ---
         # The reasoning mask is the common case and would cost the folded path
         # for most of a generation if it forced the eager one, so it lands
-        # inside the graph instead. Both accept paths read the same tensor
-        # (run_compact assigns strided_logits to next_token_logits), so masking
-        # here covers folded and eager alike.
+        # inside the graph instead.
+        #
+        # Scope, precisely: these kernels are captured into the verify graph
+        # (the epilogue runs from capture_tail_hooks), so they execute on every
+        # replay of it and on nothing else. On a replayed step that covers both
+        # accept paths, because run_compact adopts strided_logits as
+        # next_token_logits exactly when the graph ran. A step that does not
+        # replay -- no epilogue, non-compact, or can_run_cuda_graph false --
+        # never runs them, and dspark_worker_v2 falls back to plan_verify on
+        # the eager path for that case.
         # Both buffers are allocated here, before graph capture, and both are
         # unconditional: _apply_fsm_mask has to emit its kernels into the
         # captured graph whether or not the FSM is on, because a graph is
@@ -562,7 +574,6 @@ class DsparkVerifyEpilogue:
         self.fsm_forbid_buf = torch.tensor(
             _fsm_forbidden_ids(), dtype=torch.long, device=device
         )
-        self.fsm_neg_inf = torch.tensor(float("-inf"), device=device)
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -619,6 +630,11 @@ class DsparkVerifyEpilogue:
         ``strided_logits`` and the accept that reads it. Shapes are static for a
         given ``bs``, which is what a captured graph requires; an unarmed step
         is an all-False row buffer, so the same kernels run and write nothing.
+
+        Every row of ``bs * stride`` is masked, including the padding rows past
+        a request's ``verify_lens`` that ``VerifyPlan.apply`` filters out. The
+        accept trims them (``cutoff_verify_lens``), so the extra writes do not
+        reach a committed token.
         """
         if self.strided_logits is None:
             return
@@ -626,7 +642,10 @@ class DsparkVerifyEpilogue:
         rows = self.fsm_row_buf[:n].unsqueeze(1)
         sel = self.strided_logits[:n]
         ids = self.fsm_forbid_buf
-        sel[:, ids] = torch.where(rows, self.fsm_neg_inf, sel[:, ids])
+        # masked_fill rather than torch.where: it keeps sel's dtype, where a
+        # float32 -inf operand would promote and then fail the index_put_ on a
+        # half-precision logits tensor.
+        sel[:, ids] = sel[:, ids].masked_fill(rows, float("-inf"))
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

@@ -768,7 +768,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         # bitmask above describe the same committed prefix. Applied after the
         # grammar mask: both write -inf into the same tensor, and the FSM's job
         # is to close the illegal exits from the reasoning block.
-        if _solar_fsm_gate:
+        #
+        # Runs on two kinds of step. The gate names what only plan_verify can
+        # do -- force <|think:end|> at a spent budget, the content_mask sets.
+        # The second condition is the reasoning mask's fallback: the in-graph
+        # mask is baked into the verify cuda graph, so a step that does not
+        # replay that graph never executes it, and this is the only carrier
+        # left. Both are known here because the target verify has returned.
+        _solar_fsm_in_graph = (
+            self._verify_executor.verify_epilogue is not None
+            and run_compact
+            and can_run_cuda_graph
+        )
+        if _solar_fsm_gate or not _solar_fsm_in_graph:
             if not batch.has_grammar and grammar_barrier is not None:
                 # The grammar path runs the barrier inside build_grammar_vocab_mask;
                 # without a grammar in the batch it still has to run here, and it

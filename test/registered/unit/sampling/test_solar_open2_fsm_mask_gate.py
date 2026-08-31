@@ -66,6 +66,33 @@ def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
 
 
 class TestSolarFsmMaskGate(unittest.TestCase):
+    def setUp(self):
+        # CFG is module-global. Configuring it here rather than inside each test
+        # keeps a fixture built in a loop header -- which Python evaluates before
+        # the body runs -- from being built against whatever the previous test
+        # left behind, and restoring it in tearDown keeps this file from leaving
+        # a live FSM behind for the other sampler suites in the same process.
+        self._saved = {
+            k: getattr(fsm.CFG, k)
+            for k in (
+                "enabled",
+                "think_start",
+                "think_end",
+                "all_controls",
+                "reasoning_forbidden",
+                "content_mask",
+                "spec_always_eager",
+                "budget_abs",
+                "budget_ratio",
+            )
+        }
+        _cfg()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(fsm.CFG, k, v)
+        fsm.CFG._mask_cache.clear()
+
     def test_reasoning_row_far_from_the_budget_is_flagged(self):
         """The defect's own case. 44 tokens into a 3072-token budget is nowhere
         near the boundary, so the gate correctly declines -- nothing there needs
@@ -80,42 +107,98 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
 
     def test_no_reasoning_row_is_left_unmasked(self):
-        """The pairing invariant, over the state space that matters: whatever
-        plan_verify would mask as a reasoning row is covered by the gate or by
-        the flag. A gap here is the defect."""
+        """The pairing invariant, as an equality: the rows plan_verify would
+        mask with reasoning_forbidden are exactly the rows the in-graph flag
+        claims, unless the step is eager anyway. Equality, not implication —
+        an all-True implementation satisfies implication and would overmask
+        every answer."""
         import torch
 
-        for label, req, stride in (
-            ("early reasoning", _req([7] * 44), 8),
-            ("reasoning at the budget boundary", _req([7] * 3070), 8),
-            ("content", _req([7, THINK_END, 7]), 4),
-            ("fresh reasoning", _req([7]), 4),
+        for label, req, stride, chain in (
+            ("early reasoning", _req([7] * 44), 8, None),
+            ("reasoning at the budget boundary", _req([7] * 3070), 8, None),
+            ("content", _req([7, THINK_END, 7]), 4, None),
+            ("fresh reasoning", _req([7]), 4, None),
+            ("spent budget", _req([7] * 3072), 8, None),
+            # A chain that leaves the block: plan_verify walks it and stops
+            # masking at the drafted <|think:end|>, the flags cannot see it.
+            ("chain drafts think_end", _req([7] * 44), 4, [7, THINK_END, 7, 7]),
         ):
             with self.subTest(label):
-                _cfg()
                 gated = fsm.plan_gate([req], stride)
                 flags = fsm.folded_mask_flags([req], stride) or []
-                plan = fsm.plan_verify([req], torch.tensor([[7] * stride]), stride)
+                ids = chain if chain is not None else [7] * stride
+                plan = fsm.plan_verify([req], torch.tensor([ids]), stride)
                 masked = set()
                 if plan:
-                    for ids, rows in plan.mask_rows.items():
-                        if ids == fsm.CFG.reasoning_forbidden:
+                    for forbidden, rows in plan.mask_rows.items():
+                        if forbidden == fsm.CFG.reasoning_forbidden:
                             masked.update(rows)
+                flagged = {r for r, on in enumerate(flags) if on}
+                if label in ("content", "spent budget"):
+                    # Nothing to mask: content is the parser's, and a spent
+                    # budget is forced rather than masked.
+                    self.assertEqual(masked, set(), label)
+                else:
+                    self.assertTrue(
+                        masked,
+                        f"{label}: plan_verify masked nothing — the fixture "
+                        f"never reached REASONING, so this subtest would pass "
+                        f"without asserting anything",
+                    )
                 for row in masked:
                     self.assertTrue(
-                        gated or (row < len(flags) and flags[row]),
+                        gated or row in flagged,
                         f"{label}: row {row} would be masked by plan_verify but "
                         f"the step is not eager (gate={gated}) and the in-graph "
                         f"flag is not set",
                     )
+                if not gated and chain is None:
+                    # Where the chain does not move the state, the two must
+                    # agree exactly; a chain that transitions is the documented
+                    # divergence and only the one-directional check applies.
+                    self.assertEqual(flagged, masked, label)
 
-    def test_a_spent_budget_still_takes_the_eager_path(self):
-        """The force is plan_verify's alone -- nothing in the graph writes
-        <|think:end|> -- so the gate must still fire near the boundary, and the
-        flag must not claim that row."""
-        _cfg()
+    def test_flags_and_plan_verify_agree_row_for_row_across_a_batch(self):
+        """Row numbering is request-major, chain-minor. At bs=1 that convention
+        is indistinguishable from any other, so a batch is the only fixture
+        that can catch the two sides disagreeing about it."""
+        import torch
+
+        stride = 4
+        batch = [_req([7, THINK_END, 7]), _req([7] * 44)]
+        flags = fsm.folded_mask_flags(batch, stride)
+        self.assertEqual(len(flags), len(batch) * stride)
+        plan = fsm.plan_verify(batch, torch.tensor([[7] * stride] * 2), stride)
+        masked = set(plan.mask_rows.get(fsm.CFG.reasoning_forbidden, []))
+        self.assertEqual({r for r, on in enumerate(flags) if on}, masked)
+
+    def test_a_spent_budget_takes_the_eager_path_and_is_not_flagged(self):
+        """The force is plan_verify's alone — nothing in the graph writes
+        <|think:end|> — so a spent budget must go eager, and the flag must not
+        claim the row. Overclaiming it would forbid EOS after the block closed
+        and run the turn to max_tokens."""
+        req = _req([7] * 3072)  # budget = min(3072, 4096*0.75) = 3072, so spent
+        f = fsm._req_fsm(req)
+        f.advance(req.output_ids)
+        self.assertTrue(f.budget_exhausted(), "fixture must be spent")
+        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
+
+    def test_a_row_near_the_boundary_still_gates(self):
+        """The window is 2*stride wide and covers the run that has not been
+        fed yet, so the step before exhaustion is eager too."""
         req = _req([7] * 3070)
         self.assertTrue(fsm.plan_gate([req], 8))
+
+    def test_stale_state_gates_and_is_not_flagged(self):
+        """A retraction leaves the FSM describing a prefix that no longer
+        exists. plan_gate sends the step eager so plan_verify can rebuild it;
+        a flag from that state would be a guess."""
+        req = _req([7] * 44)
+        req.retraction_count = 1
+        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
 
     def test_content_row_is_not_flagged(self):
         _cfg()
