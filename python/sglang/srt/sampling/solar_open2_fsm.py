@@ -613,15 +613,31 @@ class VerifyPlan:
 
 
 def plan_gate(reqs, stride: int) -> bool:
-    """Whether this verify step must leave the folded in-graph accept path.
+    """Whether this verify step needs the mask, and so must leave the folded
+    in-graph accept path.
 
     The folded epilogue accepts inside the cuda graph off its own buffers,
-    where a mask written into ``next_token_logits`` never lands, so the choice
-    has to be made before the target verify launches -- before the grammar
-    barrier has fed the previous step's committed run to the FSMs. The state
-    read here can therefore lag by up to one accepted run, so the boundary
-    window is widened to ``2 * stride``: forcing eager on a step that turns out
-    to need no mask costs throughput, missing a needed mask costs correctness.
+    where a mask written into ``next_token_logits`` never lands, so a step that
+    needs a mask must run eager and the choice has to be made before the target
+    verify launches. The two are therefore one decision, not two: this predicate
+    gates ``plan_verify`` at the call site as well as the fold, and it has to
+    answer the same question ``plan_verify`` answers -- would any row be masked
+    or forced? -- rather than a cheaper proxy for it.
+
+    A REASONING row is that answer. ``plan_verify`` masks every reasoning row
+    with ``CFG.reasoning_forbidden`` (EOS ids included) and forces
+    ``<|think:end|>`` on one whose budget is spent; a CONTENT row is masked only
+    under ``CFG.content_mask``. Anything narrower leaves reasoning rows unmasked
+    on the steps it excludes, and an unmasked reasoning row can emit EOS
+    mid-think -- the block never closes, and the parser has no ``<|think:end|>``
+    to split on.
+
+    Residual, stated rather than hidden: the gate runs before the draft chain
+    exists, so it judges committed state only. A row committed in CONTENT whose
+    chain drafts ``<|think:start|>`` enters REASONING at ``w > 0`` and is masked
+    by ``plan_verify`` on a step this gate declined -- on the folded path that
+    mask does not land. Closing that needs the chain here, which is a device
+    read this predicate exists to avoid.
 
     Host-only and sync-free: it never touches the draft tokens on device.
     """
@@ -631,7 +647,6 @@ def plan_gate(reqs, stride: int) -> bool:
         return False
     if CFG.spec_always_eager:
         return True
-    window = 2 * stride
     for req in reqs:
         fsm = getattr(req, "_solar_fsm", None)
         if fsm is None or _fsm_stale(req):
@@ -639,9 +654,7 @@ def plan_gate(reqs, stride: int) -> bool:
             # and _req_fsm will rebuild it after the barrier).
             return True
         fsm.advance(req.output_ids)
-        if fsm.budget <= window:
-            return True
-        if fsm.in_reasoning and fsm.count + window >= fsm.budget:
+        if fsm.in_reasoning or CFG.content_mask:
             return True
     return False
 
