@@ -2048,8 +2048,8 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     ``tool_start_token`` escape, and the fence-opened degenerate shape
     (`` ```name `` followed by ``<|tool_arg:start|>`` — see
     ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
-    Without the escape, everything up to a never-emitted ``<|think:end|>`` is
-    labeled reasoning_content and the client receives an empty answer.
+    Without the escape, the call would ride the think block to its end and
+    never reach the tool-call parser as a parseable block.
 
     The content region may open with *redundant* ``<|think:end|>`` sentinels.
     The FSM (``srt/sampling/solar_open2_fsm.py``) force-closes reasoning once
@@ -2061,6 +2061,16 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     whole run instead. CONTENT is deliberately unmasked by the FSM ("parser
     owns it"), and doing this here also covers surplus sentinels the FSM had no
     hand in.
+
+    When ``<|think:end|>`` never arrives at all — a stop string or the token
+    budget ends generation inside the think block — the whole output is the
+    answer, mirroring the reference parser (UpstageAI/vllm
+    ``SolarOpen2ReasoningParser.extract_reasoning``): a one-time parse returns
+    it as ``normal_text`` with no reasoning; a stream has already emitted it
+    as reasoning deltas, so ``finish`` re-emits the accumulated text once on
+    the content channel. Without the salvage everything up to the missing
+    sentinel is labeled reasoning_content and the client receives an empty
+    answer.
     """
 
     def __init__(
@@ -2085,6 +2095,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         # held back because it straddles a streaming chunk boundary.
         self._content_started = False
         self._content_head_hold = ""
+        # Reasoning already emitted this stream, kept only while the think
+        # block is still open: the salvage source when the stream ends
+        # without ``<|think:end|>`` (see ``finish``).
+        self._salvage_parts = []
 
     def _consume_leading_think_end(self, text: str) -> str:
         """Drop the run of ``<|think:end|>`` opening the content region."""
@@ -2136,15 +2150,39 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                     reasoning_text=ret.reasoning_text[:cut],
                     normal_text=ret.reasoning_text[cut:],
                 )
+            if self.think_end_token not in text:
+                # ``<|think:end|>`` never arrived: a stop string or the token
+                # budget ended generation inside the think block. Mirror the
+                # reference parser (UpstageAI/vllm
+                # ``SolarOpen2ReasoningParser.extract_reasoning``): the whole
+                # output is the answer, not an empty content channel.
+                return StreamingParseResult(normal_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        return self._scrub_content_head(self._parse_increment(new_text))
+        ret = self._scrub_content_head(self._parse_increment(new_text))
+        if self._in_reasoning:
+            if ret.reasoning_text:
+                self._salvage_parts.append(ret.reasoning_text)
+        else:
+            self._salvage_parts.clear()
+        return ret
 
     def finish(self) -> StreamingParseResult:
         self._content_head_hold = ""
-        return super().finish()
+        still_in_reasoning = self._in_reasoning
+        ret = super().finish()
+        salvage_parts, self._salvage_parts = self._salvage_parts, []
+        if still_in_reasoning and not ret.normal_text:
+            salvaged = "".join(salvage_parts) + ret.reasoning_text
+            if salvaged:
+                # The stream ended inside the think block: same rule as the
+                # ``detect_and_parse`` salvage. The reasoning deltas are
+                # already out, so the answer is re-emitted whole on the
+                # content channel rather than left empty.
+                return StreamingParseResult(normal_text=salvaged)
+        return ret
 
     def _parse_increment(self, new_text: str) -> StreamingParseResult:
         if not self._in_reasoning:

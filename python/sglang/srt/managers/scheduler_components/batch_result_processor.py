@@ -268,9 +268,9 @@ class SchedulerBatchResultProcessor:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
-
                     req.update_finish_state()
+                    # Order matters; see the decode path's note below.
+                    self._maybe_update_reasoning_tokens(req, next_token_id)
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
@@ -867,9 +867,12 @@ class SchedulerBatchResultProcessor:
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+            # Order matters: the counter reads finished_len, which the line
+            # above is what sets. Swapping these silently counts tokens past
+            # the stop trim as reasoning while completion tokens exclude them.
+            self._maybe_update_reasoning_tokens(req, next_token_id)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
@@ -1110,9 +1113,25 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
+        """Count reasoning usage for the newly accepted run.
+
+        Runs after ``update_finish_state``: reported completion tokens are the
+        stop-trimmed ``output_ids_through_stop``, so tokens past
+        ``finished_len`` (a stop mid-verify-run, or the max_new_tokens cap)
+        must not count as reasoning either — both usage numbers share one
+        basis.
+        """
         think_end_ids = self.model_config.think_end_ids
-        if req.require_reasoning and think_end_ids:
-            req.update_reasoning_tokens(next_token_id, think_end_ids)
+        if not (req.require_reasoning and think_end_ids):
+            return
+        run = next_token_id if isinstance(next_token_id, list) else [next_token_id]
+        if req.finished_len is not None:
+            kept = req.finished_len - (len(req.output_ids) - len(run))
+            if kept <= 0:
+                return
+            if kept < len(run):
+                run = run[:kept]
+        req.update_reasoning_tokens(run, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,
