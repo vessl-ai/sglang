@@ -737,7 +737,6 @@ class IndexerKPool(MultiPlatformOp):
             page_table_row_index=page_table_row_index,
         )
 
-
     def _get_kpool_decode_metadata(
         self,
         metadata: BaseIndexerMetadata,
