@@ -669,203 +669,6 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
 
-    def _budget_spent_without_answer(
-        self,
-        finish_reason_type: Optional[str],
-        has_content: bool,
-        has_reasoning: bool,
-        has_tool_calls: bool,
-    ) -> bool:
-        """Whether a `stop` that produced no answer is really a truncation.
-
-        `solar_open2` gives reasoning a budget that is a slice of the request's
-        `max_tokens` (`srt/sampling/solar_open2_fsm.py`). When it runs out the
-        FSM force-closes the think block with the answer still unwritten, and
-        the model can emit EOS right there. EOS is the proximate cause, the
-        token limit is the real one, and only the latter is actionable:
-        reported as `stop` the empty answer reads as the model's own choice, so
-        no client retries it or even records it, while `length` already means
-        "the token budget ended this" in every OpenAI-compatible client. The
-        reasoning text is cut mid-sentence in these responses, so something
-        *was* truncated.
-
-        Scoped to `solar_open2` because the mechanism is: no other detector
-        carves a budget out of `max_tokens`. An empty answer under any other
-        parser has other causes -- a forced detector swallowing the whole
-        output, for one -- and keeps whatever the engine reported.
-
-        Narrow within `solar_open2` too: reasoning ran, no answer text came
-        out, and no tool call stood in for one.
-        """
-        return (
-            self.reasoning_parser == "solar_open2"
-            and finish_reason_type == "stop"
-            and has_reasoning
-            and not has_content
-            and not has_tool_calls
-        )
-
-    async def _generate_stream_content(
-        self,
-        content: Dict[str, Any],
-        index: int,
-        request: ChatCompletionRequest,
-        stream_offsets: Dict[int, int],
-        reasoning_parser_dict: Dict,
-        parser_dict: Dict,
-        has_tool_calls: Dict[int, bool],
-        choice_logprobs: Optional[Dict],
-        finish_reason_type: Optional[str],
-        continuous_usage_stats: bool,
-        prompt_tokens: Dict[int, int],
-        reasoning_tokens: Dict[int, int],
-        completion_tokens: Dict[int, int],
-        has_content: Optional[Dict[int, bool]] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Generate SSE chunks for streaming content."""
-        offset = stream_offsets.get(index, 0)
-        if self.tokenizer_manager.server_args.incremental_streaming_output:
-            delta = content["text"]
-        else:
-            delta = content["text"][offset:]
-            stream_offsets[index] = len(content["text"])
-
-        # Attach logprobs to the first chunk emitted this step (reasoning,
-        # tool-call, or content) so they aren't dropped when a parser is active
-        # nor duplicated across chunks; flush any leftover at the end.
-        remaining_logprobs = choice_logprobs
-
-        # Handle reasoning content
-        if self.reasoning_parser and request.separate_reasoning:
-            reasoning_text, delta = self._process_reasoning_stream(
-                index,
-                delta,
-                reasoning_parser_dict,
-                content,
-                request,
-                finish_reason_type,
-            )
-            if reasoning_text:
-                usage = None
-                if continuous_usage_stats:
-                    usage = UsageProcessor.calculate_token_usage(
-                        prompt_tokens=prompt_tokens.get(index, 0),
-                        reasoning_tokens=reasoning_tokens.get(index, 0),
-                        completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
-                    ).model_dump()
-
-                yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
-                    model=request.model,
-                    index=index,
-                    reasoning_content=reasoning_text,
-                    logprobs=remaining_logprobs,
-                    usage=usage,
-                )
-                remaining_logprobs = None
-
-        # Handle tool calls
-        if self._tool_call_parsing_active(request):
-            async for chunk in self._process_tool_call_stream(
-                index,
-                delta,
-                parser_dict,
-                content,
-                request,
-                has_tool_calls,
-                continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
-                has_content=has_content,
-            ):
-                if chunk:
-                    yield chunk
-
-            # Send any remaining tool call arguments when generation finishes
-            if finish_reason_type is not None and index in parser_dict:
-                if self._solar_single_call_stop_matched(
-                    request,
-                    self._effective_tools(request),
-                    content["meta_info"].get("finish_reason"),
-                ):
-                    # The stop string that halted generation was the
-                    # terminator this call needs to close (see
-                    # _solar_single_call_stop_matched) and the detokenizer
-                    # trimmed it; feed it back in as one more increment so
-                    # the buffered detector emits the completed call before
-                    # the finish_reason chunk goes out.
-                    async for chunk in self._process_tool_call_stream(
-                        index,
-                        SOLAR_OPEN2_TOOL_CALL_END,
-                        parser_dict,
-                        content,
-                        request,
-                        has_tool_calls,
-                        continuous_usage_stats,
-                        has_content=has_content,
-                    ):
-                        if chunk:
-                            yield chunk
-
-                parser = parser_dict[index]
-                remaining_chunk = self._check_for_unstreamed_tool_args(
-                    parser, content, request, index
-                )
-                if remaining_chunk:
-                    yield remaining_chunk
-
-        else:
-            # Regular content
-            if delta:
-                if has_content is not None and delta.strip():
-                    has_content[index] = True
-                usage = None
-                if continuous_usage_stats:
-                    usage = UsageProcessor.calculate_token_usage(
-                        prompt_tokens=prompt_tokens.get(index, 0),
-                        reasoning_tokens=reasoning_tokens.get(index, 0),
-                        completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
-                    ).model_dump()
-
-                yield build_sse_content(
-                    chunk_id=content["meta_info"]["id"],
-                    created=int(time.time()),
-                    model=request.model,
-                    index=index,
-                    content=delta,
-                    logprobs=remaining_logprobs,
-                    usage=usage,
-                )
-                remaining_logprobs = None
-
-        # Flush logprobs still unattached this step — only when a parser is
-        # active, since _process_tool_call_stream may consume the delta and emit
-        # no content chunk. On the plain path an empty-delta step has no chunk
-        # to attach to either way, and a standalone empty-delta logprobs chunk
-        # is not a shape clients expect.
-        if remaining_logprobs is not None and (
-            self.reasoning_parser or self.tool_call_parser
-        ):
-            usage = None
-            if continuous_usage_stats:
-                usage = UsageProcessor.calculate_token_usage(
-                    prompt_tokens=prompt_tokens.get(index, 0),
-                    reasoning_tokens=reasoning_tokens.get(index, 0),
-                    completion_tokens=completion_tokens.get(index, 0),
-                    cached_tokens=self._continuous_usage_cached_details(content),
-                ).model_dump()
-
-            yield build_sse_content(
-                chunk_id=content["meta_info"]["id"],
-                created=int(time.time()),
-                model=request.model,
-                index=index,
-                logprobs=remaining_logprobs,
-                usage=usage,
-            )
-
     def _tool_call_parsing_active(self, request: ChatCompletionRequest) -> bool:
         """Whether this request's output runs through the tool-call parser.
 
@@ -1639,7 +1442,6 @@ class OpenAIServingChat(OpenAIServingBase):
         stream_offsets = {}
         n_prev_tokens = {}
         has_tool_calls = {}
-        has_content = {}
         finish_reasons = {}
 
         # Usage tracking
@@ -1750,7 +1552,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
-                    has_content=has_content,
                 ):
                     yield chunk
 
@@ -1764,16 +1565,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-
-                if self._budget_spent_without_answer(
-                    finish_reason_type,
-                    has_content.get(idx, False),
-                    reasoning_tokens.get(idx, 0) > 0,
-                    has_tool_calls.get(idx, False),
-                ):
-                    final_finish_reason = "length"
-                    # A matched stop string would contradict `length`.
-                    matched_stop = None
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
@@ -2019,16 +1810,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 if finish_reason and "matched" in finish_reason
                 else None
             )
-            if self._budget_spent_without_answer(
-                finish_reason_type,
-                bool((text or "").strip()),
-                bool((reasoning_text or "").strip()),
-                bool(tool_calls),
-            ):
-                finish_reason_type = "length"
-                # A matched stop string would contradict `length`.
-                matched_stop = None
-
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
@@ -2591,19 +2372,12 @@ class OpenAIServingChat(OpenAIServingBase):
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
         flush: bool = False,
-        has_content: Optional[Dict[int, bool]] = None,
     ):
         """Process tool calls in streaming response.
 
         With flush=True (the terminal delta), the parser also drains text it
         held back waiting for a marker that can no longer arrive.
 
-        When the parser is active it owns the content path entirely, so answer
-        text emitted here must mark ``has_content`` itself — the regular
-        content branch that normally records it never runs. Without the mark,
-        `_budget_spent_without_answer` reads an answered stop as answerless
-        and demotes it to `length` (INF-414). The marking is guarded to
-        solar_open2 because the flag's only consumer is.
         """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
@@ -2653,16 +2427,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Yield normal text
         if normal_text:
-            if (
-                has_content is not None
-                and normal_text.strip()
-                and self.reasoning_parser == "solar_open2"
-            ):
-                # The flag's only consumer is the solar_open2-scoped
-                # answerless-stop demotion (_budget_spent_without_answer);
-                # the guard keeps this fork bookkeeping visibly inert for
-                # every other model.
-                has_content[index] = True
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(content=normal_text),

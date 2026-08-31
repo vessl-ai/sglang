@@ -2136,6 +2136,15 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                     reasoning_text=ret.reasoning_text[:cut],
                     normal_text=ret.reasoning_text[cut:],
                 )
+            # salvage, per the vLLM original
+            # (solar_open2_reasoning_parser.py:216-232): when the output holds
+            # no <|think:end|> at all the block was cut before it closed --
+            # by a stop string, a length cap, or an EOS mid-think -- and the
+            # text is the answer, not reasoning. The original returns
+            # (None, model_output); labelling it reasoning leaves the client
+            # with an empty answer.
+            if self.think_end_token not in text:
+                return StreamingParseResult(normal_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 

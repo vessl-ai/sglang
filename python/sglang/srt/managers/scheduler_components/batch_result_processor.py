@@ -864,12 +864,23 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
+            # count reasoning AFTER the trim. A spec run is
+            # committed whole and update_finish_state then cuts it at a stop
+            # token in its middle; counting before that cut let
+            # reasoning_tokens exceed completion_tokens, which
+            # output_streamer reads off the trimmed output_ids_through_stop.
+            # The vLLM original has no incremental counter at all -- its
+            # reasoning_tokens is a pure function of the emitted array
+            # (basic_parsers.py:183), so the overflow cannot arise there.
+            pre_extend_len = len(req.output_ids)
             req.output_ids.extend(next_token_id)
             new_accept_len = len(next_token_id)
 
-            self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+            kept = req.output_ids_through_stop
+            if len(kept) > pre_extend_len:
+                self._maybe_update_reasoning_tokens(req, list(kept[pre_extend_len:]))
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 

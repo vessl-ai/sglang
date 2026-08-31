@@ -1583,17 +1583,28 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
+        # a stop string is about the answer. While the
+        # think block is still open there is no answer yet, so nothing can
+        # match; matching here ends the turn on the model's own reasoning
+        # style and the client gets no answer at all.
+        if getattr(self, "require_reasoning", False) and not self._is_reasoning_over:
+            return False
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
             tail_str = self.tail_str(new_accepted_len)
+            # the accumulated check starts where the answer
+            # starts, so thinking text cannot satisfy it either. Searched from
+            # an offset rather than sliced: this runs on every decode step and
+            # slicing would copy the whole transcript each time.
+            answer_from = getattr(self, "_content_text_offset", None) or 0
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
                     stop_str_in_tail = stop_str in tail_str
-                    if stop_str_in_tail or stop_str in self.decoded_text:
+                    if stop_str_in_tail or self.decoded_text.find(stop_str, answer_from) != -1:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                         if stop_str_in_tail:
                             self.finished_len = self._locate_str_stop_finished_len(
@@ -1905,6 +1916,11 @@ class Req(ReqDllmMixin):
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
             return
+        # see _check_str_based_finish: the offset where
+        # the answer starts, so stop strings are matched against the answer
+        # rather than the thinking that preceded it.
+        if not hasattr(self, "_content_text_offset"):
+            self._content_text_offset = None
 
         if not isinstance(token_id, list):
             token_id = [token_id]
@@ -1918,6 +1934,8 @@ class Req(ReqDllmMixin):
             if matched == len(self._think_end_matcher):
                 self.reasoning_tokens += position + 1
                 self._is_reasoning_over = True
+                # answer text starts here.
+                self._content_text_offset = len(self.decoded_text)
                 return
 
         self._think_end_match_len = matched
