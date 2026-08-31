@@ -1626,5 +1626,78 @@ class TestSolarOpen2SurplusThinkEnd(CustomTestCase):
         self.assertEqual(ret.normal_text, "Hello")
 
 
+class TestSolarOpen2NoEndTagSalvage(CustomTestCase):
+    """A generation that ends before ``<|think:end|>`` still carries its answer.
+
+    A stop string or the token budget can end generation inside the think
+    block. The reference parser (UpstageAI/vllm) treats the whole output as
+    content in that case; labeling it all reasoning_content hands the client
+    an empty answer.
+    """
+
+    END = "<|think:end|>"
+
+    def _stream(self, detector, chunks):
+        reasoning, content = [], []
+        for chunk in chunks:
+            ret = detector.parse_streaming_increment(chunk)
+            reasoning.append(ret.reasoning_text)
+            content.append(ret.normal_text)
+        ret = detector.finish()
+        reasoning.append(ret.reasoning_text)
+        content.append(ret.normal_text)
+        return "".join(reasoning), "".join(content)
+
+    def test_oneshot_no_end_tag_is_content(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse("still thinking when the budget ran out")
+        self.assertEqual(ret.reasoning_text, "")
+        self.assertEqual(ret.normal_text, "still thinking when the budget ran out")
+
+    def test_oneshot_no_end_tag_strips_think_start(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse("<|think:start|>still thinking")
+        self.assertEqual(ret.reasoning_text, "")
+        self.assertEqual(ret.normal_text, "still thinking")
+
+    def test_oneshot_proper_close_with_empty_answer_stays_reasoning(self):
+        """An emitted ``<|think:end|>`` means the model chose to answer
+        nothing; the reasoning is not promoted to content."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(f"thinking{self.END}")
+        self.assertEqual(ret.reasoning_text, "thinking")
+        self.assertEqual(ret.normal_text, "")
+
+    def test_oneshot_tool_escape_still_splits(self):
+        """A tool call opened mid-think keeps ending reasoning at the opener;
+        the salvage only applies when nothing else claimed the output."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse(
+            "need the weather<|tool_call:start|>get_weather"
+        )
+        self.assertEqual(ret.reasoning_text, "need the weather")
+        self.assertEqual(ret.normal_text, "<|tool_call:start|>get_weather")
+
+    def test_streaming_no_end_tag_salvaged_at_finish(self):
+        """The reasoning deltas are already out; finish() re-emits the whole
+        text once on the content channel."""
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(detector, ["still ", "thinking"])
+        self.assertEqual(reasoning, "still thinking")
+        self.assertEqual(content, "still thinking")
+
+    def test_streaming_proper_close_with_empty_answer_not_salvaged(self):
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(detector, ["thinking", self.END])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "")
+
+    def test_streaming_answered_stream_unchanged(self):
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(detector, ["thinking", self.END, "Hello"])
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(content, "Hello")
+
+
 if __name__ == "__main__":
     unittest.main()

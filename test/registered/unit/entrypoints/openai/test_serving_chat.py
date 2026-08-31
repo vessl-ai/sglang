@@ -3798,14 +3798,14 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
-class TestSolarOpen2BudgetSpentWithoutAnswer(unittest.TestCase):
-    """INF-365 B: an empty answer left by a spent reasoning budget reports
-    `length`, not `stop`.
+class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
+    """A generation that ends before ``<|think:end|>`` keeps its answer.
 
-    The FSM force-closes the think block when the budget (a slice of
-    `max_tokens`) runs out, and the model can emit EOS with the answer still
-    unwritten. `stop` tells the client the empty answer is the model's own
-    choice, so nothing retries it.
+    The parser mirrors the reference implementation (UpstageAI/vllm): with no
+    end tag the whole output is the answer. The engine-reported finish_reason
+    passes through untouched — the answerless-stop demotion and its
+    has_content bookkeeping are gone now that the salvage leaves no answerless
+    stops to demote.
     """
 
     END = "<|think:end|>"
@@ -3839,149 +3839,70 @@ class TestSolarOpen2BudgetSpentWithoutAnswer(unittest.TestCase):
             }
         ]
 
-    # --- the predicate ----------------------------------------------------
-
-    def test_predicate_truth_table(self):
-        cases = [
-            # (finish, has_content, has_reasoning, has_tool_calls, expected)
-            ("stop", False, True, False, True),  # the defect
-            ("stop", True, True, False, False),  # an answer came out
-            ("stop", False, False, False, False),  # reasoning never ran
-            ("stop", False, True, True, False),  # a tool call is the answer
-            ("length", False, True, False, False),  # already labelled
-            ("abort", False, True, False, False),
-        ]
-        for finish, content, reasoning, tools, expected in cases:
-            with self.subTest(finish=finish, content=content, reasoning=reasoning):
-                self.assertEqual(
-                    self.chat._budget_spent_without_answer(
-                        finish, content, reasoning, tools
-                    ),
-                    expected,
-                )
-
-    def test_predicate_is_scoped_to_solar_open2(self):
-        """Another parser's empty answer has other causes and keeps `stop`."""
-        self.chat.reasoning_parser = "qwen3-thinking"
-        self.assertFalse(
-            self.chat._budget_spent_without_answer("stop", False, True, False)
-        )
-
     # --- non-streaming response -------------------------------------------
 
-    def test_forced_close_with_no_answer_reports_length(self):
-        """Reasoning closed, nothing after it: the answer was truncated away."""
+    def test_never_closed_salvages_answer(self):
+        """max_tokens or a stop string cut the stream inside reasoning: the
+        text is the answer, not reasoning."""
+        response = self.chat._build_chat_response(
+            self._req(), self._ret("still thinking when the budget ran out"), created=0
+        )
+        choice = response.choices[0]
+        self.assertEqual(
+            choice.message.content, "still thinking when the budget ran out"
+        )
+        self.assertIsNone(choice.message.reasoning_content)
+        self.assertEqual(choice.finish_reason, "stop")
+
+    def test_never_closed_keeps_engine_length(self):
+        """The engine's own finish_reason passes through untouched."""
+        response = self.chat._build_chat_response(
+            self._req(),
+            self._ret("still thinking", finish_type="length"),
+            created=0,
+        )
+        choice = response.choices[0]
+        self.assertEqual(choice.message.content, "still thinking")
+        self.assertEqual(choice.finish_reason, "length")
+
+    def test_forced_close_with_no_answer_keeps_stop(self):
+        """An emitted <|think:end|> with nothing after it is the model
+        answering nothing; the engine's `stop` stands, as in the reference
+        parser."""
         response = self.chat._build_chat_response(
             self._req(), self._ret(f"thinking cut off mid-sen{self.END}"), created=0
         )
         choice = response.choices[0]
         self.assertEqual(choice.message.content, "")
         self.assertEqual(choice.message.reasoning_content, "thinking cut off mid-sen")
-        self.assertEqual(choice.finish_reason, "length")
-        self.assertIsNone(choice.matched_stop)
+        self.assertEqual(choice.finish_reason, "stop")
 
-    def test_surplus_sentinel_only_content_reports_length(self):
-        """The A fix strips a sentinel-only body; what is left must not be a
-        silent `stop`."""
-        response = self.chat._build_chat_response(
-            self._req(), self._ret(f"thinking{self.END}{self.END}"), created=0
-        )
-        choice = response.choices[0]
-        self.assertEqual(choice.message.content, "")
-        self.assertEqual(choice.finish_reason, "length")
-
-    def test_reasoning_never_closed_reports_length(self):
-        """max_tokens cut the stream inside reasoning: no answer either."""
-        response = self.chat._build_chat_response(
-            self._req(), self._ret("still thinking when the budget ran out"), created=0
-        )
-        self.assertEqual(response.choices[0].message.content, "")
-        self.assertEqual(response.choices[0].finish_reason, "length")
-
-    def test_ordinary_answer_keeps_stop(self):
+    def test_ordinary_answer_unchanged(self):
         response = self.chat._build_chat_response(
             self._req(), self._ret(f"thinking{self.END}The sky is blue."), created=0
         )
         choice = response.choices[0]
         self.assertEqual(choice.message.content, "The sky is blue.")
+        self.assertEqual(choice.message.reasoning_content, "thinking")
         self.assertEqual(choice.finish_reason, "stop")
 
-    def test_whitespace_only_answer_reports_length(self):
-        """Whitespace is not an answer."""
-        response = self.chat._build_chat_response(
-            self._req(), self._ret(f"thinking{self.END}\n\n  "), created=0
+    # --- streaming ---------------------------------------------------------
+
+    def test_streaming_never_closed_salvages_at_stream_end(self):
+        """parse_stream_end() hands the accumulated reasoning to the content
+        channel when the stream ends still inside the think block."""
+        parser_dict = {}
+        content = {"meta_info": {"id": "chatcmpl-test"}}
+        reasoning, normal = self.chat._process_reasoning_stream(
+            0, "still thinking", parser_dict, content, self._req(), None
         )
-        self.assertEqual(response.choices[0].finish_reason, "length")
-
-    def test_engine_length_is_left_alone(self):
-        response = self.chat._build_chat_response(
-            self._req(),
-            self._ret(f"thinking{self.END}", finish_type="length"),
-            created=0,
+        self.assertEqual(reasoning, "still thinking")
+        self.assertEqual(normal, "")
+        reasoning, normal = self.chat._process_reasoning_stream(
+            0, " hard", parser_dict, content, self._req(), "stop"
         )
-        self.assertEqual(response.choices[0].finish_reason, "length")
-
-    # --- streaming tool path (INF-414) --------------------------------------
-
-    def _drive_tool_stream(self, delta, has_content):
-        """Run one delta through `_process_tool_call_stream` with a stub
-        parser that treats everything as normal text (no tool markup)."""
-        parser = Mock()
-        parser.parse_stream_chunk = Mock(return_value=(delta, []))
-        request = ChatCompletionRequest(
-            model="upstage/solar-pro4",
-            messages=[{"role": "user", "content": "What's the weather in Seoul?"}],
-            tools=[{"type": "function", "function": {"name": "get_weather"}}],
-            max_tokens=600,
-        )
-        content = {"meta_info": {"id": f"chatcmpl-{uuid.uuid4()}"}}
-
-        async def run():
-            return [
-                chunk
-                async for chunk in self.chat._process_tool_call_stream(
-                    0,
-                    delta,
-                    {0: parser},
-                    content,
-                    request,
-                    has_tool_calls={},
-                    has_content=has_content,
-                )
-            ]
-
-        return get_or_create_event_loop().run_until_complete(run())
-
-    def test_tool_path_text_answer_marks_has_content(self):
-        """INF-414: with tools offered, answer text flows through the tool
-        parser, which owns the content path entirely — the regular content
-        branch that records `has_content` never runs. Unless the tool path
-        records it too, the finish chunk demotes an answered `stop` to
-        `length`, and tool-bearing agent clients read every plain-text answer
-        as truncated."""
-        has_content = {}
-        chunks = self._drive_tool_stream("The weather in Seoul is sunny.", has_content)
-        self.assertTrue(chunks)  # the text still reaches the client
-        self.assertTrue(has_content.get(0, False))
-        # with the mark in place, the demotion predicate keeps `stop`
-        self.assertFalse(
-            self.chat._budget_spent_without_answer("stop", True, True, False)
-        )
-
-    def test_tool_path_whitespace_is_not_an_answer(self):
-        """Whitespace-only text keeps the answerless-stop demotion armed,
-        mirroring the regular content branch's `strip()` bar."""
-        has_content = {}
-        self._drive_tool_stream("\n\n  ", has_content)
-        self.assertFalse(has_content.get(0, False))
-
-    def test_tool_path_marking_is_scoped_to_solar_open2(self):
-        """Another parser's stream never feeds the solar-only demotion, so
-        the tool path leaves its bookkeeping untouched for it."""
-        self.chat.reasoning_parser = "qwen3-thinking"
-        has_content = {}
-        self._drive_tool_stream("The weather in Seoul is sunny.", has_content)
-        self.assertFalse(has_content.get(0, False))
+        self.assertEqual(reasoning, " hard")
+        self.assertEqual(normal, "still thinking hard")
 
 
 if __name__ == "__main__":
