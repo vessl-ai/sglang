@@ -690,6 +690,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
         _solar_fsm_gate = _solar_fsm.plan_gate(batch.reqs, verify_ids_2d.shape[1])
+        # The reasoning mask does not force the eager path -- it is staged here
+        # and applied inside the verify graph, so a thinking batch keeps the
+        # folded accept. The gate above stays what it was: the escape for the
+        # two things only plan_verify can do (force <|think:end|>, content sets).
+        _solar_fsm_epilogue = self._verify_executor.verify_epilogue
+        if _solar_fsm_epilogue is not None:
+            _solar_fsm_epilogue.set_fsm_rows(
+                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1])
+            )
 
         # Must stay ahead of the target verify launch below. The Solar FSM plans
         # off the same host copy of the chain.

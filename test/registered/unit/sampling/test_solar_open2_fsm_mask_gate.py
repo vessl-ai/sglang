@@ -1,17 +1,28 @@
-"""The mask gate must fire for any row the mask would touch.
+"""Every reasoning row is masked, on whichever accept path the step takes.
 
-``plan_gate`` decides two things at once, and they are one decision: the folded
-in-graph accept path cannot take a mask written into ``next_token_logits``, so a
-step that needs a mask must run eager. The caller
-(``dspark_worker_v2``) reads the same boolean to decide whether to call
-``plan_verify`` at all, so a gate narrower than "would any row be masked?"
-leaves reasoning rows unmasked on the steps it excludes -- and an unmasked
-reasoning row can emit EOS mid-think, which is the failure the mask exists to
-prevent.
+The reasoning mask forbids the EOS ids while a row is inside the think block.
+An unmasked reasoning row can emit EOS mid-think; the block never closes, the
+parser has no ``<|think:end|>`` to split on, and the whole output comes back as
+reasoning with an empty answer. That is the customer-reported shape.
 
-Pure CPU: ``plan_gate`` reads ``CFG`` and duck-typed request attributes only.
+Two mechanisms cover it, and the invariant is that together they leave no gap:
+
+* ``plan_gate`` sends the step to the eager path, where ``plan_verify`` writes
+  the mask. It fires only for what the eager path is *needed* for -- a forced
+  ``<|think:end|>`` at a spent budget, and the ``content_mask`` sets -- because
+  forcing eager on every thinking step would cost the folded in-graph accept
+  for most of a generation.
+* ``folded_mask_flags`` carries the reasoning mask into the graph instead, one
+  flag per (request, chain position) row.
+
+``test_no_reasoning_row_is_left_unmasked`` is the pairing: for every row
+``plan_verify`` would mask with ``reasoning_forbidden``, either the gate fired
+or the flag is set. The two cannot drift apart without that failing.
+
+Pure CPU: both predicates read ``CFG`` and duck-typed request attributes only.
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -55,65 +66,111 @@ def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
 
 
 class TestSolarFsmMaskGate(unittest.TestCase):
-    def test_reasoning_row_far_from_the_budget_still_gates(self):
-        """The case the old budget-window predicate answered wrongly: 44 tokens
-        into a 3072-token budget is nowhere near the boundary, and the EOS ban
-        is exactly as necessary there as at the boundary."""
+    def test_reasoning_row_far_from_the_budget_is_flagged(self):
+        """The defect's own case. 44 tokens into a 3072-token budget is nowhere
+        near the boundary, so the gate correctly declines -- nothing there needs
+        the eager path -- and the flag is what must carry the EOS ban."""
         _cfg()
         req = _req([7] * 44)
         f = fsm._req_fsm(req)
         f.advance(req.output_ids)
         self.assertTrue(f.in_reasoning, "fixture must be in REASONING")
         self.assertIn(EOS, fsm.CFG.reasoning_forbidden)
-        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertFalse(fsm.plan_gate([req], 8), "nothing here needs eager")
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
 
-    def test_gate_agrees_with_what_plan_verify_would_mask(self):
-        """Both directions, on one fixture: the gate is True exactly when
-        plan_verify produces rows, so neither can drift from the other."""
+    def test_no_reasoning_row_is_left_unmasked(self):
+        """The pairing invariant, over the state space that matters: whatever
+        plan_verify would mask as a reasoning row is covered by the gate or by
+        the flag. A gap here is the defect."""
         import torch
 
-        _cfg()
-        for label, req in (
-            ("reasoning", _req([7] * 44)),
-            ("content", _req([7, THINK_END, 7], in_think=True)),
+        for label, req, stride in (
+            ("early reasoning", _req([7] * 44), 8),
+            ("reasoning at the budget boundary", _req([7] * 3070), 8),
+            ("content", _req([7, THINK_END, 7]), 4),
+            ("fresh reasoning", _req([7]), 4),
         ):
             with self.subTest(label):
-                gated = fsm.plan_gate([req], 4)
-                plan = fsm.plan_verify([req], torch.tensor([[7] * 4]), 4)
-                produces = bool(plan and (plan.mask_rows or plan.force_rows))
-                self.assertEqual(
-                    gated,
-                    produces,
-                    f"{label}: gate={gated} but plan_verify produced={produces}",
-                )
+                _cfg()
+                gated = fsm.plan_gate([req], stride)
+                flags = fsm.folded_mask_flags([req], stride) or []
+                plan = fsm.plan_verify([req], torch.tensor([[7] * stride]), stride)
+                masked = set()
+                if plan:
+                    for ids, rows in plan.mask_rows.items():
+                        if ids == fsm.CFG.reasoning_forbidden:
+                            masked.update(rows)
+                for row in masked:
+                    self.assertTrue(
+                        gated or (row < len(flags) and flags[row]),
+                        f"{label}: row {row} would be masked by plan_verify but "
+                        f"the step is not eager (gate={gated}) and the in-graph "
+                        f"flag is not set",
+                    )
 
-    def test_content_row_does_not_gate_unless_content_mask_is_on(self):
+    def test_a_spent_budget_still_takes_the_eager_path(self):
+        """The force is plan_verify's alone -- nothing in the graph writes
+        <|think:end|> -- so the gate must still fire near the boundary, and the
+        flag must not claim that row."""
+        _cfg()
+        req = _req([7] * 3070)
+        self.assertTrue(fsm.plan_gate([req], 8))
+
+    def test_content_row_is_not_flagged(self):
         _cfg()
         req = _req([7, THINK_END, 7])
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
         self.assertFalse(fsm.plan_gate([req], 8))
+
+    def test_content_mask_still_takes_the_eager_path(self):
+        """The content sets have no in-graph carrier, so content_mask must gate
+        unconditionally or those rows go unmasked."""
         _cfg(content_mask=True)
         req = _req([7, THINK_END, 7])
         self.assertTrue(fsm.plan_gate([req], 8))
 
-    def test_one_reasoning_row_gates_the_whole_batch(self):
-        """The mask is per-row but the fold is per-step, so any masked row
-        forces the whole step eager."""
+    def test_flags_are_per_request_not_per_batch(self):
+        """The fold is per-step but the mask is per-row: one thinking request
+        beside one answering request must flag only its own rows."""
         _cfg()
         batch = [_req([7, THINK_END, 7]), _req([7] * 44)]
-        self.assertTrue(fsm.plan_gate(batch, 8))
+        self.assertEqual(
+            fsm.folded_mask_flags(batch, 4), [False] * 4 + [True] * 4
+        )
 
-    def test_no_committed_state_gates(self):
+    def test_no_committed_state_gates_and_is_not_flagged(self):
+        """plan_gate sends it eager, where plan_verify judges it with fresh
+        state; a flag from stale state would be a guess."""
         _cfg()
         req = _req([], primed=False)
         self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
 
-    def test_inactive_never_gates(self):
-        _cfg(enabled=False)
+    def test_inactive_never_gates_and_never_flags(self):
+        # is_active() resolves lazily and re-enables itself from SOLAR_FSM=1, so
+        # clearing CFG.enabled alone measures nothing where that variable is set
+        # -- which is every engine pod. Clear the environment too, and build the
+        # fixture first, since _req_fsm is one of the calls that re-resolves.
+        _cfg()
+        req = _req([7] * 44)
+        prev = os.environ.get("SOLAR_FSM")
+        os.environ["SOLAR_FSM"] = "0"
+        fsm.CFG.enabled = False
         try:
-            req = _req([7] * 44)
             self.assertFalse(fsm.plan_gate([req], 8))
+            self.assertIsNone(fsm.folded_mask_flags([req], 8))
         finally:
+            if prev is None:
+                os.environ.pop("SOLAR_FSM", None)
+            else:
+                os.environ["SOLAR_FSM"] = prev
             _cfg()
+
+    def test_spec_always_eager_still_forces_the_eager_path(self):
+        _cfg(spec_always_eager=True)
+        req = _req([7] * 44)
+        self.assertTrue(fsm.plan_gate([req], 8))
 
 
 if __name__ == "__main__":
