@@ -269,6 +269,7 @@ class SchedulerBatchResultProcessor:
                     req.output_ids.append(next_token_id)
 
                     req.update_finish_state()
+                    # Order matters; see the decode path's note below.
                     self._maybe_update_reasoning_tokens(req, next_token_id)
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
@@ -868,6 +869,9 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_last_decode_finish_time()
             req.update_finish_state(new_accept_len)
+            # Order matters: the counter reads finished_len, which the line
+            # above is what sets. Swapping these silently counts tokens past
+            # the stop trim as reasoning while completion tokens exclude them.
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)

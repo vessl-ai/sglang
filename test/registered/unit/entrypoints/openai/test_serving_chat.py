@@ -3803,9 +3803,12 @@ class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
 
     The parser mirrors the reference implementation (UpstageAI/vllm): with no
     end tag the whole output is the answer. The engine-reported finish_reason
-    passes through untouched — the answerless-stop demotion and its
-    has_content bookkeeping are gone now that the salvage leaves no answerless
-    stops to demote.
+    passes through untouched, the answerless-stop demotion and its has_content
+    bookkeeping having come out with it — not because the salvage leaves no
+    answerless stop, but because the reference reports one the same way. The
+    force-close emits the end tag and the model may answer nothing after it,
+    which the salvage does not cover;
+    ``test_forced_close_with_no_answer_keeps_stop`` below is that case.
     """
 
     END = "<|think:end|>"
