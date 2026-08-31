@@ -361,3 +361,243 @@ pub fn create_worker_update_workflow_data(
         updated_workers: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! INF-425 regression coverage: an optional step's failure must not strand
+    //! the steps that depend on it.
+    //!
+    //! `discover_metadata` is declared `FailureAction::ContinueNextStep` because
+    //! a worker is worth registering even when its metadata cannot be read. The
+    //! workflow engine has to honour that. wfaas 1.0.0 did not -- it signalled a
+    //! `ContinueNextStep` failure to dependents as `StepResult::Failure`, and
+    //! dependents are only woken on `Success | Skip`, so `create_worker` was
+    //! never scheduled and the whole registration ended deadlock-detected. On
+    //! the 2026-08-31 solar-pro4-prod decode roll that lost 13 of 26 new
+    //! decoders, each one permanently: service discovery keeps a pod whose add
+    //! failed in its tracked set, so every later watch event is dedupped away.
+
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+    use wfaas::{
+        InMemoryStore, StepExecutor, StepId, StepResult, WorkflowContext, WorkflowEngine,
+        WorkflowError, WorkflowId, WorkflowResult, WorkflowState, WorkflowStatus,
+    };
+
+    use super::*;
+
+    type Engine = WorkflowEngine<LocalWorkerWorkflowData, InMemoryStore<LocalWorkerWorkflowData>>;
+
+    /// Which steps ran, in order. The regression is a step that never runs, not
+    /// a step that fails, so the final status alone would not catch it.
+    #[derive(Default)]
+    struct ExecutionLog(Mutex<Vec<String>>);
+
+    impl ExecutionLog {
+        fn record(&self, step_id: &str) {
+            self.0.lock().unwrap().push(step_id.to_string());
+        }
+
+        fn ran(&self, step_id: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|s| s == step_id)
+        }
+
+        fn order(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Stands in for one real step: records that it ran, then succeeds or fails
+    /// on command. Keeps the workflow off the network without changing its shape.
+    struct ScriptedStep {
+        step_id: String,
+        log: Arc<ExecutionLog>,
+        fails: bool,
+    }
+
+    #[async_trait]
+    impl StepExecutor<LocalWorkerWorkflowData> for ScriptedStep {
+        async fn execute(
+            &self,
+            _context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+        ) -> WorkflowResult<StepResult> {
+            self.log.record(&self.step_id);
+            if self.fails {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new(self.step_id.clone()),
+                    message: format!("scripted failure in {}", self.step_id),
+                });
+            }
+            Ok(StepResult::Success)
+        }
+
+        fn is_retryable(&self, _error: &WorkflowError) -> bool {
+            true
+        }
+    }
+
+    /// The production definition with only its executors replaced, so the DAG
+    /// edges, retry policies, timeouts and failure actions under test are the
+    /// ones the router actually runs.
+    fn scripted_workflow(
+        failing_step: Option<&str>,
+        log: &Arc<ExecutionLog>,
+    ) -> WorkflowDefinition<LocalWorkerWorkflowData> {
+        let mut definition = create_local_worker_workflow(&RouterConfig::default());
+        if let Some(failing_step) = failing_step {
+            assert!(
+                definition
+                    .steps
+                    .iter()
+                    .any(|step| step.id.to_string() == failing_step),
+                "{failing_step} is not a step of local_worker_registration"
+            );
+        }
+        for step in &mut definition.steps {
+            let step_id = step.id.to_string();
+            step.executor = Arc::new(ScriptedStep {
+                fails: failing_step == Some(step_id.as_str()),
+                step_id,
+                log: Arc::clone(log),
+            });
+        }
+        definition
+    }
+
+    fn worker_data() -> LocalWorkerWorkflowData {
+        LocalWorkerWorkflowData {
+            config: serde_json::from_value(serde_json::json!({
+                "url": "http://scripted-worker:30000"
+            }))
+            .expect("a url-only worker config should deserialize"),
+            connection_mode: None,
+            discovered_labels: HashMap::new(),
+            dp_info: None,
+            workers: None,
+            final_labels: HashMap::new(),
+            detected_runtime_type: None,
+            // No scripted step reads the app context.
+            app_context: None,
+            actual_workers: None,
+        }
+    }
+
+    /// Run the workflow to a terminal status and hand back what ran.
+    /// `WorkflowEngine::wait_for_completion` drops the terminal state, which
+    /// would leave nothing to assert on, so poll `get_status` instead.
+    async fn run_local_worker_workflow(
+        failing_step: Option<&str>,
+    ) -> (Arc<ExecutionLog>, WorkflowState<LocalWorkerWorkflowData>) {
+        let log = Arc::new(ExecutionLog::default());
+        let engine = Engine::new();
+        engine
+            .register_workflow(scripted_workflow(failing_step, &log))
+            .expect("local_worker_registration should validate");
+
+        let instance = engine
+            .start_workflow(WorkflowId::new("local_worker_registration"), worker_data())
+            .await
+            .expect("workflow should start");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = engine
+                .get_status(instance)
+                .await
+                .expect("workflow state should be readable");
+            if !matches!(
+                state.status,
+                WorkflowStatus::Pending | WorkflowStatus::Running
+            ) {
+                return (log, state);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "workflow never reached a terminal status; ran {:?}",
+                log.order()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The regression itself.
+    #[tokio::test]
+    async fn optional_metadata_failure_still_registers_the_worker() {
+        let (log, state) = run_local_worker_workflow(Some("discover_metadata")).await;
+
+        assert!(
+            log.ran("discover_metadata"),
+            "the scripted step never ran, so the test proves nothing; ran {:?}",
+            log.order()
+        );
+        assert!(
+            log.ran("create_worker"),
+            "discover_metadata is ContinueNextStep, so its failure must not stop \
+             create_worker (INF-425); ran {:?}",
+            log.order()
+        );
+        assert!(
+            log.ran("register_workers"),
+            "the worker must reach the registry; ran {:?}",
+            log.order()
+        );
+        assert!(
+            log.ran("activate_workers"),
+            "the worker must be activated to take traffic; ran {:?}",
+            log.order()
+        );
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Completed,
+            "registration should complete without metadata; ran {:?}",
+            log.order()
+        );
+    }
+
+    #[tokio::test]
+    async fn every_step_runs_when_nothing_fails() {
+        let (log, state) = run_local_worker_workflow(None).await;
+
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        for step_id in [
+            "detect_connection_mode",
+            "discover_metadata",
+            "discover_dp_info",
+            "create_worker",
+            "register_workers",
+            "submit_tokenizer_job",
+            "update_policies",
+            "activate_workers",
+        ] {
+            assert!(
+                log.ran(step_id),
+                "{step_id} did not run; ran {:?}",
+                log.order()
+            );
+        }
+    }
+
+    /// The other direction: the harness has to be able to see a workflow fail,
+    /// or the test above would pass for the wrong reason.
+    #[tokio::test]
+    async fn a_fail_workflow_step_does_stop_the_workflow() {
+        let (log, state) = run_local_worker_workflow(Some("create_worker")).await;
+
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Failed,
+            "create_worker is FailWorkflow; ran {:?}",
+            log.order()
+        );
+        assert!(
+            !log.ran("register_workers"),
+            "nothing downstream of a FailWorkflow step should run; ran {:?}",
+            log.order()
+        );
+    }
+}
