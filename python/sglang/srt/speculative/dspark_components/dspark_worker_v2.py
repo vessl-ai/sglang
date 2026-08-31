@@ -694,6 +694,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # and applied inside the verify graph, so a thinking batch keeps the
         # folded accept. The gate above stays what it was: the escape for the
         # two things only plan_verify can do (force <|think:end|>, content sets).
+        # Read once: the staging condition below and the mask block further down
+        # must agree, and is_active() resolves lazily, so a second call could
+        # answer differently and leave the mask block without a chain.
+        _solar_fsm_on = _solar_fsm.is_active()
         _solar_fsm_epilogue = self._verify_executor.verify_epilogue
         if _solar_fsm_epilogue is not None:
             _solar_fsm_epilogue.set_fsm_rows(
@@ -703,9 +707,16 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         # Must stay ahead of the target verify launch below. The Solar FSM plans
         # off the same host copy of the chain.
+        #
+        # Staged whenever the FSM is on, not only when the gate fires: the mask
+        # block below also runs as the fallback for a step whose verify graph
+        # did not carry the in-graph mask, and whether that happens is not known
+        # until the target returns -- by which time it is too late to stage a
+        # host copy. Staging is the cheap half; ``resolve()`` is the wait, and
+        # only the block that uses the chain calls it.
         grammar_tree = (
             GrammarTree.from_linear_chain(verify_ids_2d)
-            if (batch.has_grammar or _solar_fsm_gate)
+            if (batch.has_grammar or _solar_fsm_gate or _solar_fsm_on)
             else None
         )
 
@@ -781,7 +792,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and run_compact
             and can_run_cuda_graph
         )
-        if _solar_fsm_gate or not _solar_fsm_in_graph:
+        # `_solar_fsm_on` is the same read the chain was staged on, so a step
+        # that reaches here always has one. Guarding on `grammar_tree` instead
+        # would turn a wiring mistake into a silently unmasked step, which is
+        # the defect this whole change exists to close.
+        if _solar_fsm_on and (_solar_fsm_gate or not _solar_fsm_in_graph):
             if not batch.has_grammar and grammar_barrier is not None:
                 # The grammar path runs the barrier inside build_grammar_vocab_mask;
                 # without a grammar in the batch it still has to run here, and it
