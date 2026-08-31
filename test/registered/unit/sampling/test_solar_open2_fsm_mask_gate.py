@@ -135,9 +135,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         beside one answering request must flag only its own rows."""
         _cfg()
         batch = [_req([7, THINK_END, 7]), _req([7] * 44)]
-        self.assertEqual(
-            fsm.folded_mask_flags(batch, 4), [False] * 4 + [True] * 4
-        )
+        self.assertEqual(fsm.folded_mask_flags(batch, 4), [False] * 4 + [True] * 4)
 
     def test_no_committed_state_gates_and_is_not_flagged(self):
         """plan_gate sends it eager, where plan_verify judges it with fresh
