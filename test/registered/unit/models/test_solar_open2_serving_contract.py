@@ -255,7 +255,46 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
             and n.func.attr == method
         ]
 
-    def test_the_eager_mask_is_gated_on_fsm_activity_not_on_the_budget_window(self):
+    @staticmethod
+    def _enclosing_function(tree, node):
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if any(n is node for n in ast.walk(fn)):
+                    return fn
+        return None
+
+    def _guard_tests(self, tree, method):
+        """Every expression that can decide whether `method` runs.
+
+        Four forms, because the defect is about which condition decides and a
+        reader can write that condition four ways: an enclosing ``if``, a
+        ternary, the left side of an ``and``, and -- the one that is easy to
+        miss -- an early ``return`` above the call in the same function, which
+        moves the decision out of the call's own guard without changing it.
+        """
+        calls = self._calls_to(tree, method)
+        tests = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.If, ast.IfExp)) and self._calls_to(node, method):
+                tests.append(node.test)
+            elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+                if any(self._calls_to(v, method) for v in node.values[1:]):
+                    tests.append(node.values[0])
+        for call in calls:
+            fn = self._enclosing_function(tree, call)
+            if fn is None:
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.If)
+                    and any(isinstance(n, ast.Return) for n in ast.walk(node))
+                    and not self._calls_to(node, method)
+                    and node.lineno < call.lineno
+                ):
+                    tests.append(node.test)
+        return tests
+
+    def test_the_eager_mask_consults_fsm_activity_not_only_the_budget_window(self):
         """INF-414, pinned: one boolean was answering two questions.
 
         ``plan_gate`` answers "is this step within 2*stride of the reasoning
@@ -264,15 +303,18 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
         so outside that window no row was masked, the EOS ids the mask forbids
         stayed live, and the model could end its turn inside the think block.
 
-        Asserted positively -- the guard must mention whether the FSM is active
-        -- rather than as "must not mention the gate". A negative form is
-        defeated by writing ``gate or False``, by ``not (not gate)``, or by
-        hoisting the gate into another local; a positive one is not, because the
-        activity name has to actually be there.
+        Asserted over the **union** of everything that can decide whether
+        ``plan_verify`` runs, not over each condition separately. Separately is
+        wrong in both directions: it passes a defect that moves the gate into an
+        early return or a ternary, and it fails a correct tree that splits the
+        folded-accept escape into its own ``if _solar_fsm_gate:`` branch with the
+        mask fallback in an ``elif`` -- a shape this worker's own comment
+        describes as legitimate. What must hold is only that activity is
+        consulted somewhere among them; a tree that never mentions it decides
+        the mask on the budget window alone.
 
-        An unguarded ``plan_verify`` is fine and deliberately passes: masking on
-        every step is the safe direction. What must not happen is a guard that
-        can exclude a step on which the FSM is active.
+        A wholly unguarded ``plan_verify`` passes and should: masking on every
+        step is the safe direction.
         """
         tree = _parse(self.WORKER)
         alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
@@ -283,25 +325,23 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
         activity = self._names_from(tree, alias, "is_active")
         self.assertTrue(
             activity,
-            f"no local is assigned from {alias}.is_active(); the eager mask cannot "
-            "be gated on whether the FSM is active",
+            f"no local is assigned from {alias}.is_active(); the eager mask "
+            "cannot be gated on whether the FSM is active",
         )
 
-        guards = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.If) and self._calls_to(n, "plan_verify")
-        ]
-        for guard in guards:
-            mentioned = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
-            with self.subTest(line=guard.lineno):
-                self.assertTrue(
-                    mentioned & activity,
-                    f"line {guard.lineno}: `if {ast.unparse(guard.test)}` decides "
-                    "whether to build the reasoning mask without consulting "
-                    f"{sorted(activity)}, so a step on which the FSM is active can "
-                    "be left unmasked",
-                )
+        tests = self._guard_tests(tree, "plan_verify")
+        if not tests:
+            return  # unguarded: masked on every step, which is the safe side
+        mentioned = {
+            n.id for t in tests for n in ast.walk(t) if isinstance(n, ast.Name)
+        }
+        self.assertTrue(
+            mentioned & activity,
+            "nothing that decides whether plan_verify runs consults "
+            f"{sorted(activity)} -- "
+            + "; ".join(f"line {t.lineno}: `{ast.unparse(t)}`" for t in tests)
+            + ". A step on which the FSM is active can be left unmasked.",
+        )
 
     def test_the_in_graph_mask_is_wired_to_the_verify_epilogue(self):
         """The other half of the mask, which no test reached.
