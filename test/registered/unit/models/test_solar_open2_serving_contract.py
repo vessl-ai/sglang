@@ -233,6 +233,108 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
                     f"dspark_worker_v2.py never calls {alias}.{hook}()",
                 )
 
+    @staticmethod
+    def _names_from(tree, alias, method):
+        """Names assigned from ``<alias>.<method>()``."""
+        out = set()
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+                continue
+            func = node.value.func
+            if isinstance(func, ast.Attribute) and func.attr == method:
+                out.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        return out
+
+    @staticmethod
+    def _calls_to(node, method):
+        return [
+            n
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == method
+        ]
+
+    def test_the_eager_mask_is_gated_on_fsm_activity_not_on_the_budget_window(self):
+        """INF-414, pinned: one boolean was answering two questions.
+
+        ``plan_gate`` answers "is this step within 2*stride of the reasoning
+        budget?", which is what the folded-accept escape needs. The call site
+        read it a second time to decide whether to call ``plan_verify`` at all,
+        so outside that window no row was masked, the EOS ids the mask forbids
+        stayed live, and the model could end its turn inside the think block.
+
+        Asserted positively -- the guard must mention whether the FSM is active
+        -- rather than as "must not mention the gate". A negative form is
+        defeated by writing ``gate or False``, by ``not (not gate)``, or by
+        hoisting the gate into another local; a positive one is not, because the
+        activity name has to actually be there.
+
+        An unguarded ``plan_verify`` is fine and deliberately passes: masking on
+        every step is the safe direction. What must not happen is a guard that
+        can exclude a step on which the FSM is active.
+        """
+        tree = _parse(self.WORKER)
+        alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
+        self.assertIsNotNone(
+            alias, "dspark_worker_v2.py does not import solar_open2_fsm"
+        )
+
+        activity = self._names_from(tree, alias, "is_active")
+        self.assertTrue(
+            activity,
+            f"no local is assigned from {alias}.is_active(); the eager mask cannot "
+            "be gated on whether the FSM is active",
+        )
+
+        guards = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.If) and self._calls_to(n, "plan_verify")
+        ]
+        for guard in guards:
+            mentioned = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+            with self.subTest(line=guard.lineno):
+                self.assertTrue(
+                    mentioned & activity,
+                    f"line {guard.lineno}: `if {ast.unparse(guard.test)}` decides "
+                    "whether to build the reasoning mask without consulting "
+                    f"{sorted(activity)}, so a step on which the FSM is active can "
+                    "be left unmasked",
+                )
+
+    def test_the_in_graph_mask_is_wired_to_the_verify_epilogue(self):
+        """The other half of the mask, which no test reached.
+
+        The eager ``plan_verify`` path covers steps that do not replay the
+        verify cuda graph. Steps that do are masked inside the graph instead:
+        the worker pushes ``folded_mask_flags`` into the epilogue's
+        ``set_fsm_rows``. Delete that call and the guard above still passes, the
+        wiring test above still passes, and every reasoning row on the in-graph
+        path goes unmasked -- INF-414 in full, with the suite green.
+        """
+        tree = _parse(self.WORKER)
+        alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
+        self.assertIsNotNone(
+            alias, "dspark_worker_v2.py does not import solar_open2_fsm"
+        )
+
+        wired = [
+            call
+            for call in self._calls_to(tree, "set_fsm_rows")
+            if any(
+                isinstance(arg, ast.Call)
+                and isinstance(arg.func, ast.Attribute)
+                and arg.func.attr == "folded_mask_flags"
+                for arg in call.args
+            )
+        ]
+        self.assertTrue(
+            wired,
+            "no set_fsm_rows(...) call takes folded_mask_flags(...) as an argument; "
+            "the in-graph verify path builds no reasoning mask",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
