@@ -1728,27 +1728,39 @@ if __name__ == "__main__":
 
 
 class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
-    """Continuing an assistant turn whose prefix is a plain answer.
+    """Continuing an assistant turn resumes inside the think block.
 
-    ``force_reasoning`` is True for any request that did not close reasoning,
-    and the base class only clears it when the prefix carries a sentinel. A
-    prefix that is ordinary answer text carries none, so without the detector's
-    own check the continuation would be read as an unclosed think block and the
-    caller would get an empty answer.
+    ``_handle_last_assistant_message`` (serving_chat.py) takes the prefix as the
+    raw string the client sent, and the prompt is rendered with
+    ``add_generation_prompt=True`` before the prefix tokens are appended -- so
+    for a reasoning turn the template's ``<|think:start|>`` sits ahead of the
+    prefix and the model resumes inside an open block. ``previous_content``
+    therefore never carries the opener unless a client typed it, and its absence
+    says nothing about whether reasoning is open. Reading it as "this is an
+    answer" would end reasoning early and deliver the model's own
+    ``<|think:end|>`` to the caller as text.
     """
 
     END = "<|think:end|>"
     START = "<|think:start|>"
 
-    def test_plain_prefix_continues_the_answer(self):
+    def test_plain_prefix_resumes_inside_the_block(self):
         detector = SolarOpen2Detector(
             continue_final_message=True, previous_content="The answer is "
         )
-        ret = detector.detect_and_parse("42.")
+        ret = detector.detect_and_parse(f"let me multiply{self.END}42.")
+        self.assertEqual(ret.reasoning_text, "let me multiply")
         self.assertEqual(ret.normal_text, "42.")
-        self.assertEqual(ret.reasoning_text, "")
 
-    def test_prefix_with_closed_think_continues_the_answer(self):
+    def test_plain_prefix_without_a_close_is_all_reasoning(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True, previous_content="The answer is "
+        )
+        ret = detector.detect_and_parse("still working it out")
+        self.assertEqual(ret.reasoning_text, "still working it out")
+        self.assertEqual(ret.normal_text, "")
+
+    def test_prefix_carrying_a_close_continues_the_answer(self):
         detector = SolarOpen2Detector(
             continue_final_message=True,
             previous_content=f"{self.START}th{self.END}The answer is ",
@@ -1756,17 +1768,6 @@ class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
         ret = detector.detect_and_parse("42.")
         self.assertEqual(ret.normal_text, "42.")
         self.assertEqual(ret.reasoning_text, "")
-
-    def test_prefix_inside_an_open_think_block_stays_reasoning(self):
-        """The prefix opened reasoning and never closed it, so the
-        continuation is still reasoning and no answer has been produced."""
-        detector = SolarOpen2Detector(
-            continue_final_message=True,
-            previous_content=f"{self.START}still think",
-        )
-        ret = detector.detect_and_parse("ing hard")
-        self.assertEqual(ret.reasoning_text, "ing hard")
-        self.assertEqual(ret.normal_text, "")
 
     def test_no_continuation_is_unaffected(self):
         detector = SolarOpen2Detector()
