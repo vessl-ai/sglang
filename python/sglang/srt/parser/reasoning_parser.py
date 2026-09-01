@@ -2090,6 +2090,20 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
+        # A continuation whose assistant prefix carries no think tokens at all
+        # is resuming an ANSWER, not an open think block: the chat template
+        # emits ``<|think:start|>`` at the head of a reasoning turn, so a
+        # prefix without it was never inside one. The base class only clears
+        # ``_in_reasoning`` when it sees a sentinel, which for this detector
+        # leaves ``force_reasoning``'s True standing, and the no-sentinel rule
+        # would then take the whole continuation as reasoning and hand the
+        # caller an empty answer.
+        if (
+            continue_final_message
+            and previous_content
+            and self.think_start_token not in previous_content
+        ):
+            self._in_reasoning = False
         # Whether real content has been emitted yet, and any sentinel fragment
         # held back because it straddles a streaming chunk boundary.
         self._content_started = False

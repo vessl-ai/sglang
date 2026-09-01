@@ -1725,3 +1725,51 @@ class TestSolarOpen2NoEndTag(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
+    """Continuing an assistant turn whose prefix is a plain answer.
+
+    ``force_reasoning`` is True for any request that did not close reasoning,
+    and the base class only clears it when the prefix carries a sentinel. A
+    prefix that is ordinary answer text carries none, so without the detector's
+    own check the continuation would be read as an unclosed think block and the
+    caller would get an empty answer.
+    """
+
+    END = "<|think:end|>"
+    START = "<|think:start|>"
+
+    def test_plain_prefix_continues_the_answer(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True, previous_content="The answer is "
+        )
+        ret = detector.detect_and_parse("42.")
+        self.assertEqual(ret.normal_text, "42.")
+        self.assertEqual(ret.reasoning_text, "")
+
+    def test_prefix_with_closed_think_continues_the_answer(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True,
+            previous_content=f"{self.START}th{self.END}The answer is ",
+        )
+        ret = detector.detect_and_parse("42.")
+        self.assertEqual(ret.normal_text, "42.")
+        self.assertEqual(ret.reasoning_text, "")
+
+    def test_prefix_inside_an_open_think_block_stays_reasoning(self):
+        """The prefix opened reasoning and never closed it, so the
+        continuation is still reasoning and no answer has been produced."""
+        detector = SolarOpen2Detector(
+            continue_final_message=True,
+            previous_content=f"{self.START}still think",
+        )
+        ret = detector.detect_and_parse("ing hard")
+        self.assertEqual(ret.reasoning_text, "ing hard")
+        self.assertEqual(ret.normal_text, "")
+
+    def test_no_continuation_is_unaffected(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse("still thinking")
+        self.assertEqual(ret.reasoning_text, "still thinking")
+        self.assertEqual(ret.normal_text, "")

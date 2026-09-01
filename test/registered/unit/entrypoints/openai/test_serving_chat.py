@@ -3798,17 +3798,21 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
-class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
-    """A generation that ends before ``<|think:end|>`` keeps its answer.
+class TestSolarOpen2TruncatedReasoning(unittest.TestCase):
+    """A generation that ends before ``<|think:end|>`` answered nothing.
 
-    The parser mirrors the reference implementation (UpstageAI/vllm): with no
-    end tag the whole output is the answer. The engine-reported finish_reason
-    passes through untouched, the answerless-stop demotion and its has_content
-    bookkeeping having come out with it — not because the salvage leaves no
-    answerless stop, but because the reference reports one the same way. The
-    force-close emits the end tag and the model may answer nothing after it,
-    which the salvage does not cover;
-    ``test_forced_close_with_no_answer_keeps_stop`` below is that case.
+    The text stays on the reasoning channel and content is empty, which is the
+    contract Upstage states for this model. The reference implementation
+    (UpstageAI/vllm) returns the whole output as content instead, which
+    presents a few tokens of thinking preamble as a complete answer.
+
+    The engine-reported finish_reason passes through untouched either way. A
+    caller that supplied the stop string that cut the block reads the empty
+    content together with the ``matched_stop`` naming their own parameter; a
+    budget that ran out with no client stop is relabelled by the proxy
+    (magma, ``demotedFinishReason``). The force-close case — an emitted end tag
+    with nothing after it — is ``test_forced_close_with_no_answer_keeps_stop``
+    below, and is unchanged.
     """
 
     END = "<|think:end|>"
@@ -3844,17 +3848,17 @@ class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
 
     # --- non-streaming response -------------------------------------------
 
-    def test_never_closed_salvages_answer(self):
+    def test_never_closed_is_reasoning_not_an_answer(self):
         """max_tokens or a stop string cut the stream inside reasoning: the
-        text is the answer, not reasoning."""
+        text is reasoning, and no answer was produced."""
         response = self.chat._build_chat_response(
             self._req(), self._ret("still thinking when the budget ran out"), created=0
         )
         choice = response.choices[0]
+        self.assertEqual(choice.message.content, "")
         self.assertEqual(
-            choice.message.content, "still thinking when the budget ran out"
+            choice.message.reasoning_content, "still thinking when the budget ran out"
         )
-        self.assertIsNone(choice.message.reasoning_content)
         self.assertEqual(choice.finish_reason, "stop")
 
     def test_never_closed_keeps_engine_length(self):
@@ -3865,7 +3869,8 @@ class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
             created=0,
         )
         choice = response.choices[0]
-        self.assertEqual(choice.message.content, "still thinking")
+        self.assertEqual(choice.message.content, "")
+        self.assertEqual(choice.message.reasoning_content, "still thinking")
         self.assertEqual(choice.finish_reason, "length")
 
     def test_forced_close_with_no_answer_keeps_stop(self):
@@ -3891,9 +3896,11 @@ class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
 
     # --- streaming ---------------------------------------------------------
 
-    def test_streaming_never_closed_salvages_at_stream_end(self):
-        """parse_stream_end() hands the accumulated reasoning to the content
-        channel when the stream ends still inside the think block."""
+    def test_streaming_never_closed_stays_on_the_reasoning_channel(self):
+        """A stream ending inside the think block has already delivered its
+        text as reasoning deltas; the end of the stream adds nothing to the
+        content channel. Re-emitting it there put the identical string on both
+        channels and made the fragment read as the answer."""
         parser_dict = {}
         content = {"meta_info": {"id": "chatcmpl-test"}}
         reasoning, normal = self.chat._process_reasoning_stream(
@@ -3905,7 +3912,7 @@ class TestSolarOpen2TruncatedReasoningSalvage(unittest.TestCase):
             0, " hard", parser_dict, content, self._req(), "stop"
         )
         self.assertEqual(reasoning, " hard")
-        self.assertEqual(normal, "still thinking hard")
+        self.assertEqual(normal, "")
 
 
 if __name__ == "__main__":
