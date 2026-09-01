@@ -234,14 +234,21 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
                 )
 
     @staticmethod
-    def _names_from(tree, alias, method):
-        """Names assigned from ``<alias>.<method>()``."""
+    def _names_from(tree, source):
+        """Locals assigned from ``<anything>.<source>``, call or attribute.
+
+        `source` names the method or attribute on the right-hand side, e.g.
+        ``verify_epilogue``. Read structurally so a rename of the local does not
+        silently empty the set the assertions rest on.
+        """
         out = set()
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            if not isinstance(node, ast.Assign):
                 continue
-            func = node.value.func
-            if isinstance(func, ast.Attribute) and func.attr == method:
+            value = node.value
+            if isinstance(value, ast.Call):
+                value = value.func
+            if isinstance(value, ast.Attribute) and value.attr == source:
                 out.update(t.id for t in node.targets if isinstance(t, ast.Name))
         return out
 
@@ -255,103 +262,37 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
             and n.func.attr == method
         ]
 
-    @staticmethod
-    def _enclosing_function(tree, node):
-        for fn in ast.walk(tree):
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if any(n is node for n in ast.walk(fn)):
-                    return fn
-        return None
-
-    def _guard_tests(self, tree, method):
-        """Every expression that can decide whether `method` runs.
-
-        Four forms, because the defect is about which condition decides and a
-        reader can write that condition four ways: an enclosing ``if``, a
-        ternary, the left side of an ``and``, and -- the one that is easy to
-        miss -- an early ``return`` above the call in the same function, which
-        moves the decision out of the call's own guard without changing it.
-        """
-        calls = self._calls_to(tree, method)
-        tests = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.If, ast.IfExp)) and self._calls_to(node, method):
-                tests.append(node.test)
-            elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
-                if any(self._calls_to(v, method) for v in node.values[1:]):
-                    tests.append(node.values[0])
-        for call in calls:
-            fn = self._enclosing_function(tree, call)
-            if fn is None:
-                continue
-            for node in ast.walk(fn):
-                if (
-                    isinstance(node, ast.If)
-                    and any(isinstance(n, ast.Return) for n in ast.walk(node))
-                    and not self._calls_to(node, method)
-                    and node.lineno < call.lineno
-                ):
-                    tests.append(node.test)
-        return tests
-
-    def test_the_eager_mask_consults_fsm_activity_not_only_the_budget_window(self):
-        """INF-414, pinned: one boolean was answering two questions.
-
-        ``plan_gate`` answers "is this step within 2*stride of the reasoning
-        budget?", which is what the folded-accept escape needs. The call site
-        read it a second time to decide whether to call ``plan_verify`` at all,
-        so outside that window no row was masked, the EOS ids the mask forbids
-        stayed live, and the model could end its turn inside the think block.
-
-        Asserted over the **union** of everything that can decide whether
-        ``plan_verify`` runs, not over each condition separately. Separately is
-        wrong in both directions: it passes a defect that moves the gate into an
-        early return or a ternary, and it fails a correct tree that splits the
-        folded-accept escape into its own ``if _solar_fsm_gate:`` branch with the
-        mask fallback in an ``elif`` -- a shape this worker's own comment
-        describes as legitimate. What must hold is only that activity is
-        consulted somewhere among them; a tree that never mentions it decides
-        the mask on the budget window alone.
-
-        A wholly unguarded ``plan_verify`` passes and should: masking on every
-        step is the safe direction.
-        """
-        tree = _parse(self.WORKER)
-        alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
-        self.assertIsNotNone(
-            alias, "dspark_worker_v2.py does not import solar_open2_fsm"
-        )
-
-        activity = self._names_from(tree, alias, "is_active")
-        self.assertTrue(
-            activity,
-            f"no local is assigned from {alias}.is_active(); the eager mask "
-            "cannot be gated on whether the FSM is active",
-        )
-
-        tests = self._guard_tests(tree, "plan_verify")
-        if not tests:
-            return  # unguarded: masked on every step, which is the safe side
-        mentioned = {
-            n.id for t in tests for n in ast.walk(t) if isinstance(n, ast.Name)
-        }
-        self.assertTrue(
-            mentioned & activity,
-            "nothing that decides whether plan_verify runs consults "
-            f"{sorted(activity)} -- "
-            + "; ".join(f"line {t.lineno}: `{ast.unparse(t)}`" for t in tests)
-            + ". A step on which the FSM is active can be left unmasked.",
-        )
-
     def test_the_in_graph_mask_is_wired_to_the_verify_epilogue(self):
-        """The other half of the mask, which no test reached.
+        """The half of the INF-414 mask that no test reached.
 
-        The eager ``plan_verify`` path covers steps that do not replay the
-        verify cuda graph. Steps that do are masked inside the graph instead:
-        the worker pushes ``folded_mask_flags`` into the epilogue's
-        ``set_fsm_rows``. Delete that call and the guard above still passes, the
-        wiring test above still passes, and every reasoning row on the in-graph
-        path goes unmasked -- INF-414 in full, with the suite green.
+        Steps that replay the verify cuda graph are masked inside it: the worker
+        pushes ``folded_mask_flags`` and the forbidden set into the verify
+        epilogue's ``set_fsm_rows``. Delete that call, or empty either argument,
+        and every reasoning row on the in-graph path goes unmasked while the FSM
+        suite and the wiring test above stay green.
+
+        Both arguments are checked, and the receiver with them. Passing
+        ``folded_mask_flags`` while dropping ``CFG.reasoning_forbidden`` leaves
+        the wiring intact and the mask inert, and a second call on some other
+        path would otherwise satisfy a module-wide search after the real one was
+        removed.
+
+        **The eager path is deliberately not asserted here.** Its invariant --
+        a step on which the FSM is active is never left unmasked -- is about
+        which condition decides, and every structural form of that question
+        tried so far was wrong in one direction or the other. Judging each
+        condition separately passes a gate moved into an early ``return`` or a
+        ternary, and fails the correct if/elif split this worker's comment at
+        :695-697 describes. Judging their union fixes both and then passes
+        ``if _solar_fsm_on and _solar_fsm_gate:`` -- INF-414 in full, with the
+        activity name present. Requiring that no conjunct be a bare gate name
+        catches that and brings the if/elif false positive back. A test that
+        passes the defect while claiming to pin it is worse than no test, so
+        what is asserted here is only what can be asserted soundly. The eager
+        path's behaviour is covered at the FSM level by
+        ``test/registered/unit/sampling/test_solar_open2_fsm_mask_gate.py``, and
+        the defective tree is caught by this test regardless, because it has no
+        ``set_fsm_rows`` call at all.
         """
         tree = _parse(self.WORKER)
         alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
@@ -359,20 +300,47 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
             alias, "dspark_worker_v2.py does not import solar_open2_fsm"
         )
 
-        wired = [
-            call
-            for call in self._calls_to(tree, "set_fsm_rows")
-            if any(
-                isinstance(arg, ast.Call)
-                and isinstance(arg.func, ast.Attribute)
-                and arg.func.attr == "folded_mask_flags"
-                for arg in call.args
+        def _is_call_on(node, receiver, method):
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == method
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == receiver
             )
-        ]
+
+        epilogues = self._names_from(tree, "verify_epilogue")
+        self.assertTrue(
+            epilogues,
+            "no local is assigned from a .verify_epilogue attribute; the in-graph "
+            "mask has nowhere to be staged",
+        )
+
+        wired = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "set_fsm_rows"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in epilogues
+            ):
+                continue
+            args = list(node.args) + [kw.value for kw in node.keywords]
+            flags = any(_is_call_on(a, alias, "folded_mask_flags") for a in args)
+            forbidden = any(
+                isinstance(a, ast.Attribute) and a.attr == "reasoning_forbidden"
+                for a in args
+            )
+            if flags and forbidden:
+                wired.append(node)
+
         self.assertTrue(
             wired,
-            "no set_fsm_rows(...) call takes folded_mask_flags(...) as an argument; "
-            "the in-graph verify path builds no reasoning mask",
+            "no set_fsm_rows(...) call on the verify epilogue passes both "
+            f"{alias}.folded_mask_flags(...) and a reasoning_forbidden set; the "
+            "in-graph verify path builds no reasoning mask, or builds one that "
+            "forbids nothing",
         )
 
 
