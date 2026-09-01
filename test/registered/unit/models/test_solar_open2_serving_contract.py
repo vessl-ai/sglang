@@ -264,14 +264,12 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
         The invariant is a proposition, so it is decided by truth table and not
         by the shape of the expression: over every assignment of the guard's
         free names, **FSM active and not masked in-graph must imply the guard
-        holds**. Structural forms of this question were tried and all failed --
-        judging each condition separately passes a gate moved into an early
-        ``return`` or a ternary and rejects the correct if/elif split; judging
-        their union passes ``_solar_fsm_on and _solar_fsm_gate``, which is the
-        defect in full. Truth-table evaluation is immune to all of it, because
-        it never looks at how the condition is written: an equivalent rewrite
-        passes and a narrowing one fails, which is exactly the distinction that
-        matters.
+        holds**. Nothing here inspects how the condition is written, which is
+        what makes it both sound and refactor-tolerant -- an equivalent rewrite
+        passes and a narrowing one fails, and that is the only distinction that
+        matters. Name-mention heuristics over the same expression were tried
+        first and are not sound: `_solar_fsm_on and _solar_fsm_gate` names the
+        activity local, passes every such rule, and is INF-414 in full.
 
         The one thing it assumes is a single guard site, so the count is
         asserted too and a split into several branches fails loudly here rather
@@ -357,21 +355,8 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
         the receiver alone does not, since more than one local in this file is
         assigned from ``.verify_epilogue``.
 
-        **The eager path is deliberately not asserted.** Its invariant -- a step
-        on which the FSM is active is never left unmasked -- is about which
-        condition decides, and every structural form of that question tried was
-        wrong in one direction or the other. Judging each condition separately
-        passes a gate moved into an early ``return`` or a ternary, and fails the
-        correct if/elif split this worker's comment at :695-697 describes.
-        Judging their union fixes both and then passes
-        ``if _solar_fsm_on and _solar_fsm_gate:`` -- INF-414 in full, with the
-        activity name present. Requiring that no conjunct be a bare gate name
-        catches that and brings the if/elif false positive back. A test that
-        passes the defect while claiming to pin it is worse than no test. The
-        eager path's behaviour is covered at the FSM level by
-        ``test/registered/unit/sampling/test_solar_open2_fsm_mask_gate.py``, and
-        the defective tree is caught here regardless: it has no ``set_fsm_rows``
-        call at all.
+        The eager path is asserted separately, by truth table, in the test
+        above.
         """
         tree = _parse(self.WORKER)
         alias = _imported_alias(tree, "sglang.srt.sampling", "solar_open2_fsm")
