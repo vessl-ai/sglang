@@ -2063,14 +2063,13 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     hand in.
 
     When ``<|think:end|>`` never arrives at all — a stop string or the token
-    budget ends generation inside the think block — the whole output is the
-    answer, mirroring the reference parser (UpstageAI/vllm
-    ``SolarOpen2ReasoningParser.extract_reasoning``): a one-time parse returns
-    it as ``normal_text`` with no reasoning; a stream has already emitted it
-    as reasoning deltas, so ``finish`` re-emits the accumulated text once on
-    the content channel. Without the salvage everything up to the missing
-    sentinel is labeled reasoning_content and the client receives an empty
-    answer.
+    budget ends generation inside the think block — nothing was answered, so
+    the text stays reasoning and content is empty. That is the contract
+    Upstage states for this model; the reference parser (UpstageAI/vllm
+    ``SolarOpen2ReasoningParser.extract_reasoning``) instead returns the whole
+    output as content, which presents a thinking fragment as a complete
+    answer. Only a request with reasoning off puts this text on the content
+    channel, and such a request never opens a think block to leave unclosed.
     """
 
     def __init__(
@@ -2095,10 +2094,6 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         # held back because it straddles a streaming chunk boundary.
         self._content_started = False
         self._content_head_hold = ""
-        # Reasoning already emitted this stream, kept only while the think
-        # block is still open: the salvage source when the stream ends
-        # without ``<|think:end|>`` (see ``finish``).
-        self._salvage_parts = []
 
     def _consume_leading_think_end(self, text: str) -> str:
         """Drop the run of ``<|think:end|>`` opening the content region."""
@@ -2152,37 +2147,33 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                 )
             if self.think_end_token not in text:
                 # ``<|think:end|>`` never arrived: a stop string or the token
-                # budget ended generation inside the think block. Mirror the
-                # reference parser (UpstageAI/vllm
-                # ``SolarOpen2ReasoningParser.extract_reasoning``): the whole
-                # output is the answer, not an empty content channel.
-                return StreamingParseResult(normal_text=ret.reasoning_text)
+                # budget ended generation inside the think block. Nothing was
+                # answered, so the text stays on the reasoning channel and
+                # content is empty -- the contract Upstage states for this
+                # model (2026-09-01). The reference parser (UpstageAI/vllm
+                # ``SolarOpen2ReasoningParser.extract_reasoning``) returns it
+                # all as content instead, which presents a few tokens of
+                # thinking preamble as a complete answer: measured through the
+                # proxy, ``stop:["**"]`` returned "Thinking Process:\n\n1.  "
+                # with ``finish_reason: "stop"``. Only a request with reasoning
+                # off puts this text on the content channel, and such a request
+                # never opens a think block to leave unclosed.
+                return StreamingParseResult(reasoning_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        ret = self._scrub_content_head(self._parse_increment(new_text))
-        if self._in_reasoning:
-            if ret.reasoning_text:
-                self._salvage_parts.append(ret.reasoning_text)
-        else:
-            self._salvage_parts.clear()
-        return ret
+        return self._scrub_content_head(self._parse_increment(new_text))
 
     def finish(self) -> StreamingParseResult:
         self._content_head_hold = ""
-        still_in_reasoning = self._in_reasoning
-        ret = super().finish()
-        salvage_parts, self._salvage_parts = self._salvage_parts, []
-        if still_in_reasoning and not ret.normal_text:
-            salvaged = "".join(salvage_parts) + ret.reasoning_text
-            if salvaged:
-                # The stream ended inside the think block: same rule as the
-                # ``detect_and_parse`` salvage. The reasoning deltas are
-                # already out, so the answer is re-emitted whole on the
-                # content channel rather than left empty.
-                return StreamingParseResult(normal_text=salvaged)
-        return ret
+        # A stream that ends inside the think block needs nothing added here.
+        # Its reasoning deltas are already out on the reasoning channel, which
+        # is where the text belongs, and content stays empty -- the same rule
+        # ``detect_and_parse`` applies. Re-emitting the accumulated text once
+        # on the content channel, which this did, put the identical string on
+        # both channels and made a thinking fragment read as the answer.
+        return super().finish()
 
     def _parse_increment(self, new_text: str) -> StreamingParseResult:
         if not self._in_reasoning:

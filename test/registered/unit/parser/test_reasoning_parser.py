@@ -1626,13 +1626,18 @@ class TestSolarOpen2SurplusThinkEnd(CustomTestCase):
         self.assertEqual(ret.normal_text, "Hello")
 
 
-class TestSolarOpen2NoEndTagSalvage(CustomTestCase):
-    """A generation that ends before ``<|think:end|>`` still carries its answer.
+class TestSolarOpen2NoEndTag(CustomTestCase):
+    """A generation that ends before ``<|think:end|>`` answered nothing.
 
     A stop string or the token budget can end generation inside the think
-    block. The reference parser (UpstageAI/vllm) treats the whole output as
-    content in that case; labeling it all reasoning_content hands the client
-    an empty answer.
+    block. The text stays on the reasoning channel and content is empty --
+    the contract Upstage states for this model (2026-09-01). The reference
+    parser (UpstageAI/vllm) returns the whole output as content instead,
+    which this class asserted until the behaviour was measured end to end:
+    ``stop:["**"]`` came back as ``content="Thinking Process:\n\n1.  "``
+    with ``finish_reason: "stop"``, so a caller reads a few tokens of
+    thinking preamble as a complete short answer. Any stop string occurring
+    early in the preamble does the same.
     """
 
     END = "<|think:end|>"
@@ -1648,17 +1653,24 @@ class TestSolarOpen2NoEndTagSalvage(CustomTestCase):
         content.append(ret.normal_text)
         return "".join(reasoning), "".join(content)
 
-    def test_oneshot_no_end_tag_is_content(self):
+    def test_oneshot_no_end_tag_stays_reasoning(self):
         detector = SolarOpen2Detector()
         ret = detector.detect_and_parse("still thinking when the budget ran out")
-        self.assertEqual(ret.reasoning_text, "")
-        self.assertEqual(ret.normal_text, "still thinking when the budget ran out")
+        self.assertEqual(ret.reasoning_text, "still thinking when the budget ran out")
+        self.assertEqual(ret.normal_text, "")
 
     def test_oneshot_no_end_tag_strips_think_start(self):
         detector = SolarOpen2Detector()
         ret = detector.detect_and_parse("<|think:start|>still thinking")
-        self.assertEqual(ret.reasoning_text, "")
-        self.assertEqual(ret.normal_text, "still thinking")
+        self.assertEqual(ret.reasoning_text, "still thinking")
+        self.assertEqual(ret.normal_text, "")
+
+    def test_oneshot_stop_inside_preamble_is_not_an_answer(self):
+        """The reported shape, at the length it actually occurred."""
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse("Thinking Process:\n\n1.  ")
+        self.assertEqual(ret.normal_text, "")
+        self.assertEqual(ret.reasoning_text, "Thinking Process:\n\n1.  ")
 
     def test_oneshot_proper_close_with_empty_answer_stays_reasoning(self):
         """An emitted ``<|think:end|>`` means the model chose to answer
@@ -1678,13 +1690,25 @@ class TestSolarOpen2NoEndTagSalvage(CustomTestCase):
         self.assertEqual(ret.reasoning_text, "need the weather")
         self.assertEqual(ret.normal_text, "<|tool_call:start|>get_weather")
 
-    def test_streaming_no_end_tag_salvaged_at_finish(self):
-        """The reasoning deltas are already out; finish() re-emits the whole
-        text once on the content channel."""
+    def test_streaming_no_end_tag_is_not_re_emitted_as_content(self):
+        """The reasoning deltas are already out on the right channel, so
+        ``finish`` adds nothing. Re-emitting them as content put the identical
+        string on both channels, which is how the fragment reached callers as
+        an answer."""
         detector = SolarOpen2Detector()
         reasoning, content = self._stream(detector, ["still ", "thinking"])
         self.assertEqual(reasoning, "still thinking")
-        self.assertEqual(content, "still thinking")
+        self.assertEqual(content, "")
+
+    def test_streaming_tool_escape_still_splits(self):
+        """Reasoning-off and tool escapes are the paths that legitimately end
+        reasoning without a sentinel, and they must keep claiming content."""
+        detector = SolarOpen2Detector()
+        reasoning, content = self._stream(
+            detector, ["need the weather", "<|tool_call:start|>get_weather"]
+        )
+        self.assertEqual(reasoning, "need the weather")
+        self.assertEqual(content, "<|tool_call:start|>get_weather")
 
     def test_streaming_proper_close_with_empty_answer_not_salvaged(self):
         detector = SolarOpen2Detector()
@@ -1701,3 +1725,52 @@ class TestSolarOpen2NoEndTagSalvage(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
+    """Continuing an assistant turn resumes inside the think block.
+
+    ``_handle_last_assistant_message`` (serving_chat.py) takes the prefix as the
+    raw string the client sent, and the prompt is rendered with
+    ``add_generation_prompt=True`` before the prefix tokens are appended -- so
+    for a reasoning turn the template's ``<|think:start|>`` sits ahead of the
+    prefix and the model resumes inside an open block. ``previous_content``
+    therefore never carries the opener unless a client typed it, and its absence
+    says nothing about whether reasoning is open. Reading it as "this is an
+    answer" would end reasoning early and deliver the model's own
+    ``<|think:end|>`` to the caller as text.
+    """
+
+    END = "<|think:end|>"
+    START = "<|think:start|>"
+
+    def test_plain_prefix_resumes_inside_the_block(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True, previous_content="The answer is "
+        )
+        ret = detector.detect_and_parse(f"let me multiply{self.END}42.")
+        self.assertEqual(ret.reasoning_text, "let me multiply")
+        self.assertEqual(ret.normal_text, "42.")
+
+    def test_plain_prefix_without_a_close_is_all_reasoning(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True, previous_content="The answer is "
+        )
+        ret = detector.detect_and_parse("still working it out")
+        self.assertEqual(ret.reasoning_text, "still working it out")
+        self.assertEqual(ret.normal_text, "")
+
+    def test_prefix_carrying_a_close_continues_the_answer(self):
+        detector = SolarOpen2Detector(
+            continue_final_message=True,
+            previous_content=f"{self.START}th{self.END}The answer is ",
+        )
+        ret = detector.detect_and_parse("42.")
+        self.assertEqual(ret.normal_text, "42.")
+        self.assertEqual(ret.reasoning_text, "")
+
+    def test_no_continuation_is_unaffected(self):
+        detector = SolarOpen2Detector()
+        ret = detector.detect_and_parse("still thinking")
+        self.assertEqual(ret.reasoning_text, "still thinking")
+        self.assertEqual(ret.normal_text, "")
