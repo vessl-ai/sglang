@@ -310,12 +310,12 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
 
         test = guards[0].test
         names = sorted({n.id for n in ast.walk(test) if isinstance(n, ast.Name)})
+        # A guard that never names the in-graph flag cannot depend on it, so the
+        # implication reduces to "active implies guarded" -- which is what
+        # treating every row as not-covered computes. Requiring the name would
+        # reject `if _solar_fsm_on:`, which masks on every active step and is
+        # strictly the safe side.
         in_graph = {n for n in names if "in_graph" in n}
-        self.assertTrue(
-            in_graph,
-            f"the guard {ast.unparse(test)!r} names no in-graph flag, so this "
-            "test cannot tell which steps the epilogue already covers",
-        )
         code = compile(ast.Expression(test), "<guard>", "eval")
 
         counterexamples = []
@@ -348,9 +348,9 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
 
         **What this cannot see.** It reads structure, not reachability: a call
         wrapped in ``if False:`` in the right place still passes. And the
-        forbidden argument is matched on the attribute name, so pointing it at
-        some other object's ``reasoning_forbidden`` passes while an empty
-        literal does not. Scoping the search to the function that calls
+        a call reached only through a runtime condition that is always false
+        still passes; only the statically dead form (``if False:``) is
+        rejected. Scoping the search to the function that calls
         ``plan_verify`` is what rules out a decoy elsewhere in the module --
         the receiver alone does not, since more than one local in this file is
         assigned from ``.verify_epilogue``.
@@ -388,6 +388,41 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
             "in-graph mask has nowhere to be staged",
         )
 
+        def _forbidden_set_of(node, module):
+            """``<module>.<anything>.reasoning_forbidden``.
+
+            The receiver chain is pinned the way the flags argument already is.
+            Matching the attribute name alone accepts some other object's
+            ``reasoning_forbidden``, which can be empty at runtime while the
+            wiring reads as intact.
+            """
+            if not (
+                isinstance(node, ast.Attribute) and node.attr == "reasoning_forbidden"
+            ):
+                return False
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            return isinstance(root, ast.Name) and root.id == module
+
+        def _statically_dead(node, root):
+            """True if `node` sits under a test that is a falsy constant.
+
+            Reachability is not decidable here, but the one form that makes a
+            call look wired while never running -- parking it under ``if
+            False:`` -- is, and leaving it uncaught would let the assertion be
+            satisfied by code that cannot execute.
+            """
+            for parent in ast.walk(root):
+                if not isinstance(parent, (ast.If, ast.IfExp, ast.While)):
+                    continue
+                if not any(n is node for n in ast.walk(parent)):
+                    continue
+                test = parent.test
+                if isinstance(test, ast.Constant) and not test.value:
+                    return True
+            return False
+
         host = None
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
@@ -406,11 +441,13 @@ class TestFsmWiredIntoDsparkVerify(CustomTestCase):
                 continue
             args = list(node.args) + [kw.value for kw in node.keywords]
             flags = any(_call_to(a, "folded_mask_flags", {alias}) for a in args)
-            forbidden = any(
-                isinstance(a, ast.Attribute) and a.attr == "reasoning_forbidden"
-                for a in args
-            )
-            if flags and forbidden and node.lineno < launch:
+            forbidden = any(_forbidden_set_of(a, alias) for a in args)
+            if (
+                flags
+                and forbidden
+                and node.lineno < launch
+                and not _statically_dead(node, host)
+            ):
                 wired.append(node)
 
         self.assertTrue(
