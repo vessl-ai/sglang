@@ -924,18 +924,31 @@ class ServingChatTestCase(unittest.TestCase):
             },
         }
 
+        # (request kwargs, tool_call_parser, expected stop): the stop is
+        # injected only for auto + parallel_tool_calls=False on a Solar parser.
         cases = (
-            ({}, None),
-            ({"parallel_tool_calls": True}, None),
-            ({"parallel_tool_calls": False}, [SOLAR_OPEN2_TOOL_CALL_END]),
+            ({}, "solar_open2", None),
+            ({"parallel_tool_calls": True}, "solar_open2", None),
+            (
+                {"parallel_tool_calls": False},
+                "solar_open2",
+                [SOLAR_OPEN2_TOOL_CALL_END],
+            ),
+            (
+                {"parallel_tool_calls": False, "tool_choice": "none"},
+                "solar_open2",
+                None,
+            ),
+            ({"parallel_tool_calls": False}, "hermes", None),
         )
-        for extra_kwargs, expected_stop in cases:
+        for extra_kwargs, tool_call_parser, expected_stop in cases:
             with (
-                self.subTest(extra_kwargs=extra_kwargs),
+                self.subTest(extra_kwargs=extra_kwargs, parser=tool_call_parser),
                 patch(
                     "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
                 ) as parser_cls,
             ):
+                self.chat.tool_call_parser = tool_call_parser
                 parser = parser_cls.return_value
                 parser.detector.eot_token = SOLAR_OPEN2_TOOL_CALL_END
                 parser.detector.parses_required_natively.return_value = False
@@ -945,8 +958,7 @@ class ServingChatTestCase(unittest.TestCase):
                     model="x",
                     messages=[{"role": "user", "content": "Weather in Paris?"}],
                     tools=[tool],
-                    tool_choice="auto",
-                    **extra_kwargs,
+                    **{"tool_choice": "auto", **extra_kwargs},
                 )
 
                 result = self.chat._process_messages(request, is_multimodal=False)
