@@ -32,10 +32,11 @@ Content rules (what is *not* a call):
   the end of the stream.
 
 Streaming emits complete calls only, and its result does not depend on where
-the chunks are cut: whitespace before the next opener is rstripped, and output
-from an opener that did not parse is held to the end of the stream -- content
-if no call ever parses, dropped otherwise. ``_StreamContent`` owns those rules;
-``_parse_calls`` is pure.
+the chunks are cut: whitespace before the next opener is rstripped; output from
+an opener that did not parse (a blank name included) is dropped once a call has
+been emitted, and before that it is held to the end of the stream -- content if
+no call ever parses. ``_StreamContent`` owns those rules; ``_parse_calls`` is
+pure.
 """
 
 from __future__ import annotations
@@ -93,7 +94,8 @@ class _StreamContent:
     "Content rules"), independent of chunking.
 
     ``pending_ws``: a whitespace run waiting for real text (content) or an
-    opener / the end (not). ``emitted``: real text has been sent, so
+    opener (not); at the end of the stream it is content unless a call was
+    emitted. ``emitted``: real text has been sent, so
     whitespace trailing it before the first call is content. ``unparsed``:
     output from an opener that did not parse, held until a call parses
     (dropped) or the stream ends (content). ``calls``: calls emitted so far
@@ -138,11 +140,10 @@ class _StreamContent:
         from its opener on."""
         out: List[str] = []
         while True:
-            openers = call_openers(segment)
-            if not openers:
+            at = segment.find(TOOL_CALL_START)
+            if at == -1:
                 out.append(self.text(segment, before_opener=before_opener))
                 return "".join(out)
-            at = openers[0]
             out.append(self.text(segment[:at], before_opener=True))
             end = segment.find(TOOL_CALL_END, at)
             if end == -1:
@@ -176,17 +177,16 @@ class _StreamContent:
         self.calls += 1
 
     def end(self, held: str, *, partial_opener: int) -> str:
-        """Content in what the detector still holds at the end of the stream
-        (``partial_opener``: length of a trailing partial ``<|tool_call:start|>``)."""
+        """Content in what the detector still holds at the end of the stream.
+        ``partial_opener``: length of a trailing partial ``<|tool_call:start|>``,
+        cut only after a call (before one it is content, as in non-streaming)."""
         pending, self.pending_ws = self.pending_ws, ""
         unparsed, self.unparsed = self.unparsed, ""
         if self.after_call:
-            openers = call_openers(held)
-            if openers:
-                self._dropped(
-                    "unfinished tool call at stream end", len(held) - openers[0]
-                )
-                return self.text(held[: openers[0]], before_opener=True)
+            at = held.find(TOOL_CALL_START)
+            if at != -1:
+                self._dropped("unfinished tool call at stream end", len(held) - at)
+                return self.text(held[:at], before_opener=True)
             if partial_opener:
                 held = held[:-partial_opener]
             return (pending + held).rstrip()
@@ -222,8 +222,8 @@ class SolarOpen2Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Non-streaming rule (module docstring). Calls carry the tools-list
         index, SGLang's convention for every detector."""
-        openers = call_openers(text)
-        if not openers:
+        first = text.find(TOOL_CALL_START)
+        if first == -1:
             return StreamingParseResult(normal_text=text, calls=[])
         calls, blank_name = _parse_calls(text, tools=tools)
         if not calls or blank_name:
@@ -234,14 +234,15 @@ class SolarOpen2Detector(BaseFormatDetector):
                 len(text),
             )
             return StreamingParseResult(normal_text=text, calls=[])
-        if len(openers) > len(calls):
+        unparsed = text.count(TOOL_CALL_START) - len(calls)
+        if unparsed:
             logger.warning(
                 "Solar Open2: %d opener(s) in the output did not parse as a call "
                 "and are not content",
-                len(openers) - len(calls),
+                unparsed,
             )
         indices = self._get_tool_indices(tools)
-        prefix = text[: openers[0]]
+        prefix = text[:first]
         return StreamingParseResult(
             normal_text=prefix if prefix.strip() else "",
             calls=[
@@ -262,16 +263,16 @@ class SolarOpen2Detector(BaseFormatDetector):
         sequentially across the stream (``current_tool_id``, the index a
         client accumulates deltas by). Content follows ``_StreamContent``."""
         self._buffer += new_text
-        openers = call_openers(self._buffer)
-        if not openers:
+        first = self._buffer.find(TOOL_CALL_START)
+        if first == -1:
             # Hold back a suffix that could be the start of an opener.
             hold = self._ends_with_partial_token(self._buffer, self.bot_token) or 0
             emit = self._buffer[: len(self._buffer) - hold]
             self._buffer = self._buffer[len(self._buffer) - hold :]
             return StreamingParseResult(normal_text=self._content.text(emit), calls=[])
 
-        head = self._content.text(self._buffer[: openers[0]], before_opener=True)
-        rest = self._buffer[openers[0] :]
+        head = self._content.text(self._buffer[:first], before_opener=True)
+        rest = self._buffer[first:]
         if TOOL_CALL_END not in rest:
             self._buffer = rest
             return StreamingParseResult(normal_text=head, calls=[])
@@ -343,11 +344,6 @@ class SolarOpen2Detector(BaseFormatDetector):
 # Utilities
 
 
-def call_openers(text: str) -> List[int]:
-    """Offsets of every ``<|tool_call:start|>`` in ``text``, ascending."""
-    return [m.start() for m in re.finditer(re.escape(TOOL_CALL_START), text)]
-
-
 def _parse_calls(text: str, *, tools: List[Tool]) -> Tuple[List[_ParsedCall], bool]:
     """Every well-formed call in ``text``, in order, with its span, and whether
     a call with a blank name was seen (skipped here). Pure."""
@@ -399,12 +395,8 @@ def _parse_arguments(name: str, *, body: str, tools: List[Tool]) -> Dict[str, An
     return {"__raw": body}
 
 
-def _param_type(
-    func_name: str, param_name: str, *, tools: Optional[List[Tool]]
-) -> Optional[str]:
+def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Optional[str]:
     """JSON-schema ``type`` of a parameter from the request's tools, or None."""
-    if not tools:
-        return None
     for tool in tools:
         fn = getattr(tool, "function", None)
         if fn is None or getattr(fn, "name", None) != func_name:
@@ -423,31 +415,39 @@ def _param_type(
 
 
 def _coerce(value: str, *, arg_type: Optional[str]) -> Any:
-    """Coerce a raw wire string to the JSON-schema type, or keep it as-is."""
+    """Convert a raw wire string to its JSON-schema type. Never raises: a value
+    that does not convert is returned as the string, with a warning, so broken
+    output still reaches the client as something inspectable. ``null`` (any
+    case) is None whatever the type; a ``number`` with no fractional part is
+    an int."""
     if value.strip().lower() == "null":
         return None
-    if arg_type in (None, "string"):
+    pt = (arg_type or "string").strip().lower()
+    if pt in ("string", "str", "text", "varchar", "char", "enum"):
         return value
     try:
-        if arg_type == "integer":
+        if pt in ("integer", "int"):
             return int(value)
-        if arg_type in ("number", "float"):
-            return float(value)
-        if arg_type == "boolean":
+        if pt in ("number", "float", "double"):
+            f = float(value)
+            return int(f) if f - int(f) == 0 else f
+        if pt in ("boolean", "bool"):
             v = value.strip().lower()
             if v in ("true", "1", "yes"):
                 return True
             if v in ("false", "0", "no"):
                 return False
-            logger.warning(
-                "solar_open2: failed to coerce %r to bool; returning as string.",
-                value,
-            )
-            return value
-        if arg_type in ("array", "object"):
+            raise ValueError(v)
+        if pt in ("array", "list", "object", "dict"):
             return json.loads(value)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return value
+        if pt in ("null", "none"):
+            return None
+    except (ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        logger.warning(
+            "solar_open2: failed to coerce %r to %s; returning as string.",
+            value,
+            arg_type,
+        )
     return value
 
 

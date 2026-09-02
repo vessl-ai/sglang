@@ -29,6 +29,7 @@ from types import SimpleNamespace
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -71,7 +72,7 @@ def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
     return req
 
 
-class TestSolarFsmMaskGate(unittest.TestCase):
+class TestSolarFsmMaskGate(CustomTestCase):
     def setUp(self):
         # CFG is module-global. Configuring it here rather than inside each test
         # keeps a fixture built in a loop header -- which Python evaluates before
@@ -264,7 +265,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertTrue(fsm.plan_gate([req], 8))
 
 
-class TestApplyFoldedMask(unittest.TestCase):
+class TestApplyFoldedMask(CustomTestCase):
     """The row-wise mask itself. It is the piece the folded accept path depends
     on, and the piece a live boot cannot check: a row/column transposition or a
     broadcast mistake writes -inf somewhere plausible and the engine keeps

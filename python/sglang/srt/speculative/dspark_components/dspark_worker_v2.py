@@ -693,7 +693,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The reasoning mask does not force the eager path -- it is staged here
         # and applied inside the verify graph, so a thinking batch keeps the
         # folded accept. The gate above stays what it was: the escape for the
-        # two things only plan_verify can do (force <|think:end|>, content sets).
+        # what only plan_verify can do (force <|think:end|>, the content sets).
         # Read once: the staging condition below and the mask block further down
         # must agree, and is_active() resolves lazily, so a second call could
         # answer differently and leave the mask block without a chain.
@@ -782,7 +782,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # is to close the illegal exits from the reasoning block.
         #
         # Runs on two kinds of step. The gate names what only plan_verify can
-        # do -- force <|think:end|> at a spent budget, the content_mask sets.
+        # do -- force <|think:end|> at a spent budget, the content sets.
         # The second condition is the reasoning mask's fallback: the in-graph
         # mask is baked into the verify cuda graph, so a step that does not
         # replay that graph never executes it, and this is the only carrier

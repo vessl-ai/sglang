@@ -21,6 +21,7 @@ import torch
 from sglang.srt.sampling import solar_open2_fsm as fsm
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -104,7 +105,7 @@ _CFG_FIELDS = (
 )
 
 
-class TestSolarFsmRowsSurviveCopy(unittest.TestCase):
+class TestSolarFsmRowsSurviveCopy(CustomTestCase):
     def setUp(self):
         # CFG and _WARNED are module-global; restoring them in tearDown keeps
         # this file from leaving a live FSM (or a spent once-only warning)

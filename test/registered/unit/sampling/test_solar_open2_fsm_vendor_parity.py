@@ -32,6 +32,7 @@ import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -151,7 +152,7 @@ _CFG_FIELDS = (
 )
 
 
-class _FsmCase(unittest.TestCase):
+class _FsmCase(CustomTestCase):
     """Configures the module-global CFG for a test and restores it after, so
     this file leaves no live FSM (with fake ids) behind for the other sampler
     suites in the same process -- the same pattern as the sibling files."""
@@ -518,6 +519,14 @@ class TestInitFromEnv(_FsmCase):
             set(c.content_done_forbidden) | {TOOL_START},
         )
 
+    def test_eos_ids_override_is_a_json_list(self):
+        self._init(SOLAR_OPEN2_EOS_TOKEN_IDS="[3, 5]")
+        self.assertEqual(sorted(fsm.CFG.reasoning_forbidden[:2]), [3, 5][:2])
+        self.assertIn(3, fsm.CFG.reasoning_forbidden)
+        self.assertIn(5, fsm.CFG.reasoning_forbidden)
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_OPEN2_EOS_TOKEN_IDS"):
+            self._init(SOLAR_OPEN2_EOS_TOKEN_IDS="3,5")
+
     def test_per_effort_override_and_hard_limit(self):
         self._init(
             SOLAR_REASONING_BUDGET_MEDIUM="777",
@@ -528,7 +537,7 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(fsm.CFG.effort_budgets["high"], 32 * 1024)
 
     def test_newline_rule_can_be_switched_off(self):
-        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="")
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="[]")
         self.assertEqual(fsm.CFG.leading_newline_forbidden, ())
         self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
 
@@ -573,9 +582,9 @@ class TestInitFromEnv(_FsmCase):
         with self.assertRaisesRegex(
             RuntimeError, "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS"
         ):
-            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="7,x")
-        with self.assertRaisesRegex(RuntimeError, "negative id"):
-            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="-7")
+            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS='[7, "x"]')
+        with self.assertRaisesRegex(RuntimeError, "non-negative ints"):
+            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="[-7]")
 
     def test_explicit_override_above_the_hard_limit_warns_and_clamps(self):
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
@@ -591,7 +600,7 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
 
     def test_explicit_newline_ids_override_the_vocab(self):
-        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="7, 9")
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="[7, 9]")
         self.assertEqual(fsm.CFG.leading_newline_forbidden, (7, 9))
 
     def test_bad_default_effort_fails_loud(self):
@@ -600,23 +609,23 @@ class TestInitFromEnv(_FsmCase):
 
     def test_no_reasoning_efforts_are_configurable(self):
         self._init(SOLAR_REASONING_BUDGET_NO_REASONING_EFFORTS="none, low")
-        self.assertEqual(fsm._budget_for("low", 4096), 0)
-        self.assertEqual(fsm._budget_for("minimal", 4096), 32 * 1024)
+        self.assertEqual(fsm._budget_for("low"), 0)
+        self.assertEqual(fsm._budget_for("minimal"), 32 * 1024)
 
     def test_retired_env_names_warn(self):
-        with self.assertLogs(fsm.logger, level="WARNING") as captured:
-            self._init(SOLAR_FSM_BUDGET_POLICY="legacy", SOLAR_FSM_HARD_LIMIT="1000")
-        joined = "\n".join(captured.output)
-        self.assertIn("SOLAR_FSM_BUDGET_POLICY is not read any more (removed)", joined)
-        self.assertIn(
-            "SOLAR_FSM_HARD_LIMIT is not read any more; use SOLAR_REASONING_BUDGET_HARD_LIMIT",
-            joined,
-        )
+        for name, replacement in fsm._RETIRED_ENV.items():
+            with self.subTest(name=name):
+                with self.assertLogs(fsm.logger, level="WARNING") as captured:
+                    self._init(**{name: "1000"})
+                expected = f"{name} is not read any more" + (
+                    f"; use {replacement}" if replacement else " (removed)"
+                )
+                self.assertIn(expected, "\n".join(captured.output))
         self.assertEqual(fsm.CFG.hard_limit, 128 * 1024)
 
     def test_none_as_default_effort_is_allowed(self):
         self._init(SOLAR_REASONING_BUDGET_DEFAULT_EFFORT="none")
-        self.assertEqual(fsm._budget_for(None, 4096), 0)
+        self.assertEqual(fsm._budget_for(None), 0)
 
     def test_all_fourteen_sentinels_are_controls_and_newline_added_token_is_leading(
         self,
@@ -951,7 +960,7 @@ class TestDifferentialAgainstVendorTranscript(_FsmCase):
         for run in range(150):
             prompt = list(self.PROMPTS[run % len(self.PROMPTS)])
             ref = _VendorTranscript(prompt)
-            ours = fsm.SolarReqFSM(prompt, 4096, "high", True)
+            ours = fsm.SolarReqFSM(prompt, effort="high", tools=True)
             self.assertEqual(
                 (ours.state, ours.content_progress, ours.at_think_open),
                 (ref.state, ref.content_progress, ref.prev_think_start),

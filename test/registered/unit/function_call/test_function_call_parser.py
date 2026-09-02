@@ -5479,9 +5479,7 @@ class TestSolarOpen2Detector(unittest.TestCase):
     def test_blank_name_call_next_to_parsed_calls(self):
         """A blank-name call is an unparsed segment in streaming: the calls
         around it are emitted (dropped after a call, held before one), at
-        any chunking (review round 5: it used to discard the parsed calls
-        that shared its delta). Non-streaming keeps the vendor's whole-output
-        rule."""
+        any chunking. Non-streaming keeps the whole-output rule."""
         good = (
             f"{TOOL_CALL_START}get_weather\n"
             f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
@@ -5590,17 +5588,18 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertEqual((end_text, end_calls), ("", []))
 
     def test_stream_end_releases_held_text(self):
-        """Text held back for a marker that never arrives (a trailing code
-        opener, an unfinished call cut by max_tokens) is released as content
-        at the end of the stream instead of being dropped (review C1)."""
+        """Text held back for a marker that never arrives (a partial opener,
+        an unfinished call cut by max_tokens) is released as content at the
+        end of the stream instead of being dropped."""
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "solar_open2")
-        normal, calls = parser.parse_stream_chunk("Here is the code:\n```")
+        normal, calls = parser.parse_stream_chunk("Here is:\n<|tool_ca")
         self.assertEqual(calls, [])
         end_text, end_calls = parser.parse_stream_end()
-        self.assertEqual(normal + end_text, "Here is the code:\n```")
-        self.assertEqual(end_calls, [])
+        # The trailing whitespace and the partial opener come out at the end.
+        self.assertEqual((normal + end_text, end_calls), ("Here is:\n<|tool_ca", []))
+        self.assertTrue(end_text.endswith("<|tool_ca"))
 
         parser = FunctionCallParser(self.tools, "solar_open2")
         cut = (
@@ -5828,11 +5827,12 @@ class TestSolarOpen2Detector(unittest.TestCase):
 
 
 class TestSolarOpen2VendorDifferential(unittest.TestCase):
-    """Our detector against the vendor's own vLLM tool parser (a verbatim
-    copy in ``solar_open2_vendor_reference.py``), shape by shape: non-stream
-    must agree exactly; streaming must agree on calls and on content (up to
-    whitespace, the one documented streaming delta); and ours must be
-    identical at whole / 5-char / 1-char chunking. Shapes where the vendor
+    """Our detector against the reference tool parser (a verbatim copy in
+    ``solar_open2_vendor_reference.py``), shape by shape: non-stream must
+    agree exactly; streaming must agree on calls and, unless a shape says
+    ``"calls"``, on content up to whitespace (the documented streaming
+    deltas: rstripped whitespace before an opener, held unparsed output);
+    and ours must be identical at whole / 5-char / 1-char chunking. Shapes where the vendor
     itself misbehaves (its lazy name group swallows a following call after
     a call that lacks its newline) or where its streaming parser emits a
     partial call are compared only where a comparison is meaningful, and
@@ -5849,6 +5849,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                     "properties": {
                         "location": {"type": "string"},
                         "days": {"type": "integer"},
+                        "temp": {"type": "number"},
                         "urgent": {"type": "boolean"},
                     },
                 },
@@ -5914,8 +5915,8 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             # The vendor's streaming parser waits for the name's newline and
             # emits nothing for these; ours releases the output as content
             # at stream end (the vendor's non-streaming rule).
-            "bad only": (bad, True, False),
-            "prose then bad": ("Hi " + bad, True, False),
+            "bad only": (bad, True, "calls"),
+            "prose then bad": ("Hi " + bad, True, "calls"),
             "good then bad": (good + "\n" + bad, True, True),
             "empty name": (
                 f"{TOOL_CALL_START}  \n{TOOL_ARG_START}a{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n{TOOL_CALL_END}",
@@ -5923,6 +5924,16 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 True,
             ),
             "null any case": (cls._call(location=" NULL "), True, True),
+            "integral number": (cls._call(location="Paris", temp="3"), True, True),
+            "fractional number": (cls._call(location="Paris", temp="3.5"), True, True),
+            # CRLF line ends: the reference's non-streaming regex backtracks into
+            # a garbage name with no arguments; its streaming parser and ours
+            # parse the call.
+            "crlf": (
+                f"{TOOL_CALL_START}get_weather\r\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\r\n{TOOL_CALL_END}",
+                False,
+                True,
+            ),
             # Whitespace lines inside the body: the vendor's non-streaming regex
             # backtracks into a garbage name with no arguments; its streaming
             # parser and ours parse the call.
@@ -5931,25 +5942,24 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 False,
                 True,
             ),
-            # A blank-name call next to parsed calls: the vendor's non-streaming
-            # parser makes the whole output content (ours too); its streaming
-            # parser emits nothing at all from then on, ours keeps the calls
-            # around it (the blank one is an unparsed segment) -- pinned by
-            # the chunk-invariance half only.
+            # A blank-name call next to parsed calls: both non-streaming parsers
+            # make the whole output content; both streaming parsers keep the
+            # calls around it, but the reference leaks the blank call's sentinel
+            # text as content while ours drops it -- calls compared only.
             "good, blank, good": (
                 good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good2,
                 True,
-                False,
+                "calls",
             ),
             "good then blank": (
                 good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}",
                 True,
-                False,
+                "calls",
             ),
             "blank then good": (
                 f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good,
                 True,
-                False,
+                "calls",
             ),
             # The vendor's lazy name group swallows the following call after a
             # call missing its newline (a fake call): not comparable at all.

@@ -3,8 +3,9 @@
 """Reference copy of the vendor's vLLM tool parser for Solar Open2
 (UpstageAI patch set for vLLM 0.25.0, 2026-09-01: ``01-tool-parser.patch``,
 ``vllm/tool_parsers/solar_open2_tool_parser.py``), kept verbatim apart from
-the vLLM imports, which are replaced by the minimal stand-ins below so the
-parser runs inside this test tree without vLLM. It is the ground truth the
+the vLLM imports (replaced by the minimal stand-ins below so the parser runs
+inside this test tree without vLLM), the two ``timeout=`` keyword arguments of
+its regex ``finditer`` calls, and the line wrapping of one regex literal. It is the ground truth the
 SGLang detector is compared against in ``test_function_call_parser.py``
 (``TestSolarOpen2VendorDifferential``). Do not "fix" it: a difference from
 the detector is either a documented delta or a detector bug.
@@ -16,13 +17,6 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
-
-
-class _Envs:
-    VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS = None
-
-
-envs = _Envs()
 
 
 def init_logger(name):

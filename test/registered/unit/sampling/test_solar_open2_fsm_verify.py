@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.sampling import solar_open2_fsm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -67,7 +68,7 @@ def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     return fsm
 
 
-class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
+class SolarOpen2FsmVerifyTestBase(CustomTestCase):
     """Wires CFG to a tiny fake vocab and undoes it after every test."""
 
     _CFG_FIELDS = (

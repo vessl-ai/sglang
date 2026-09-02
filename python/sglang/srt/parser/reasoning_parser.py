@@ -2006,7 +2006,7 @@ class ReasoningParser:
         return ret.reasoning_text, ret.normal_text
 
 
-# --- solar-open2 reasoning parser (injected) ---
+# --- Solar Open2 reasoning parser ---
 from sglang.srt.function_call import solar_open2_detector as _solar_tool_detector
 
 _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
@@ -2123,14 +2123,15 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     def finish(self) -> StreamingParseResult:
         # A stream that ends inside the think block needs nothing added: its
         # reasoning deltas are already out on the reasoning channel and content
-        # stays empty (the same rule detect_and_parse applies).
+        # stays empty (the same rule detect_and_parse applies). A sentinel
+        # fragment at the head of the content region -- held here or by the
+        # base class -- is never an answer.
         self._content_head_hold = ""
-        return super().finish()
+        ret = super().finish()
+        if not self._content_started and ret.normal_text:
+            if self.think_end_token.startswith(ret.normal_text):
+                ret.normal_text = ""
+        return ret
 
 
 ReasoningParser.DetectorMap["solar_open2"] = SolarOpen2Detector
-import logging as _solar_logging
-
-_solar_logging.getLogger(__name__).info(
-    "[SOLAR-PATCH] registered reasoning parser 'solar_open2'"
-)

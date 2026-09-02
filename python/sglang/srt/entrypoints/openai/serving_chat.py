@@ -67,9 +67,6 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.solar_open2_detector import (
-    TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
-)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -1112,15 +1109,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _normalize_solar_open2_reasoning_effort(
-        self, request: ChatCompletionRequest
-    ) -> None:
-        """solar_open2_serving rule 2 (effort/tools to the FSM, effort for
-        the template)."""
-        solar.normalize_reasoning_effort(
-            request, self._tool_call_parsing_active(request)
-        )
-
     def _solar_single_call_stop_matched(
         self,
         request: ChatCompletionRequest,
@@ -1147,7 +1135,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.reasoning_effort = effort
 
         if solar.is_solar_cell(self.reasoning_parser, self.tool_call_parser):
-            self._normalize_solar_open2_reasoning_effort(request)
+            solar.normalize_reasoning_effort(
+                request, tools_available=self._tool_call_parsing_active(request)
+            )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1166,9 +1156,6 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = False
-        is_required_or_named = request.tool_choice == "required" or isinstance(
-            request.tool_choice, ToolChoice
-        )
         effective_tools = self._effective_tools(request)
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False

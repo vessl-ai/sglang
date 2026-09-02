@@ -30,6 +30,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai import solar_open2_serving as solar_serving
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
@@ -3375,9 +3376,8 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         "<|tool_call:start|>get_weather\n"
         "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>"
     )
-    # What xgrammar writes under the legacy structural_tag: a JSON object
-    # between the call markers instead of <|tool_arg:*|> runs (see
-    # SolarOpen2Detector.structure_info / module docstring).
+    # A JSON object between the call markers instead of <|tool_arg:*|> runs:
+    # an accepted body shape (see the detector module docstring).
     _JSON_BODY_TRIMMED_CALL_TEXT = (
         '<|tool_call:start|>get_weather\n{"location": "Paris"}'
     )
@@ -3389,6 +3389,11 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
     )
 
     _STOP_MATCHED = {"type": "stop", "matched": SOLAR_OPEN2_TOOL_CALL_END}
+
+    def _normalize(self, req):
+        solar_serving.normalize_reasoning_effort(
+            req, tools_available=self.chat._tool_call_parsing_active(req)
+        )
 
     def setUp(self):
         tm = _MockTokenizerManager()
@@ -3734,6 +3739,21 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
                 self.assertIsNotNone(error)
                 self.assertIn("reasoning_effort", error)
         self.assertIsNone(self.chat._validate_request(self.request))
+        # The other request shapes the protocol folds into the field, and an
+        # unknown string in chat_template_kwargs (untyped there).
+        base = self.request.model_dump(exclude_none=True)
+        for extra in (
+            {"reasoning": {"effort": 0.5}},
+            {"reasoning_effort": "0.5"},
+            {"chat_template_kwargs": {"reasoning_effort": "foo"}},
+        ):
+            with self.subTest(extra=extra):
+                request = ChatCompletionRequest.model_validate({**base, **extra})
+                self.assertIsNotNone(self.chat._validate_request(request))
+        request = ChatCompletionRequest.model_validate(
+            {**base, "chat_template_kwargs": {"reasoning_effort": " High "}}
+        )
+        self.assertIsNone(self.chat._validate_request(request))
         # Not a Solar cell: the generic path keeps accepting the extension.
         self.chat.tool_call_parser = self.chat.reasoning_parser = None
         request = self.request.model_copy(update={"reasoning_effort": 0.5})
@@ -3752,7 +3772,7 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ):
-            self.chat._normalize_solar_open2_reasoning_effort(req)
+            self._normalize(req)
         self.assertIsNone(req.reasoning_effort)
         self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
         self.assertNotIn("solar_reasoning_effort", req.custom_params)
@@ -4435,6 +4455,11 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
     KEY = "solar_reasoning_effort"
     TOOLS = "solar_tools_available"
 
+    def _normalize(self, req):
+        solar_serving.normalize_reasoning_effort(
+            req, tools_available=self.chat._tool_call_parsing_active(req)
+        )
+
     def setUp(self):
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
@@ -4449,13 +4474,13 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
 
     def test_effort_is_captured_before_the_fold(self):
         req = self._req(reasoning_effort="xhigh")
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "xhigh", self.TOOLS: False})
         self.assertEqual(req.reasoning_effort, "high")
 
     def test_effort_from_chat_template_kwargs(self):
         req = self._req(chat_template_kwargs={"reasoning_effort": "Max"})
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "max", self.TOOLS: False})
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
 
@@ -4478,7 +4503,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         ``in``; a differently cased value would render the closed think pair
         while the FSM budget (lower-cased) followed the requested tier."""
         req = self._req(chat_template_kwargs={"reasoning_effort": " Medium "})
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
 
@@ -4486,21 +4511,21 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         req = self._req(
             reasoning_effort="medium", custom_params={"foo": 1, self.KEY: "max"}
         )
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(
             req.custom_params, {"foo": 1, self.KEY: "medium", self.TOOLS: False}
         )
         # A client-written key with no effort named is not a budget override.
         req = self._req(custom_params={self.KEY: "max"})
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.TOOLS: False})
 
     def test_missing_or_blank_effort_adds_no_effort_key(self):
         req = self._req()
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.TOOLS: False})
         req = self._req(chat_template_kwargs={"reasoning_effort": "  "})
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.TOOLS: False})
 
     def test_tools_are_reported_to_the_fsm(self):
@@ -4509,17 +4534,17 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
             "function": {"name": "get_weather", "parameters": {"type": "object"}},
         }
         req = self._req(reasoning_effort="medium", tools=[tool])
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: True})
         # tool_choice="none" switches the tool-call parser off, so a tool call
         # could not be answered either.
         req = self._req(reasoning_effort="medium", tools=[tool], tool_choice="none")
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
         # No tool-call parser configured: nothing could consume the call.
         self.chat.tool_call_parser = None
         req = self._req(reasoning_effort="medium", tools=[tool])
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
 
     def test_request_effort_wins_over_a_server_default_in_template_kwargs(self):
@@ -4529,7 +4554,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         req = self._req(
             reasoning_effort="max", chat_template_kwargs={"reasoning_effort": "low"}
         )
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         self.assertEqual(req.custom_params, {self.KEY: "max", self.TOOLS: False})
         self.assertEqual(req.reasoning_effort, "high")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
@@ -4559,7 +4584,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
 
     def test_effort_rides_to_sampling_params(self):
         req = self._req(reasoning_effort="low")
-        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self._normalize(req)
         params = req.to_sampling_params(stop=[], model_generation_config={})
         self.assertEqual(params["custom_params"], {self.KEY: "low", self.TOOLS: False})
 

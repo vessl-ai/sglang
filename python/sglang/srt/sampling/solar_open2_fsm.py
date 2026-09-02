@@ -17,7 +17,8 @@ runs ``<|tool_arg:start|>`` ``<|tool_arg:value|>`` ``<|tool_arg:end|>``,
   (with EOS shut, a model that wants to stop would take it as the exit).
 * Tool-call states (``TOOL_CALL_BEGIN`` .. ``TOOL_CALL_END``): only the
   envelope sentinel(s) the sub-state expects are open, so a call cannot be
-  closed by a turn end or a stray sentinel. When the request carries a
+  cut short by a turn end or a stray sentinel (after ``<|tool_call:end|>``
+  the turn may end). When the request carries a
   grammar (json_schema / regex / ebnf / structural_tag) the grammar owns the
   CONTENT phase and this mask stays out of it.
 
@@ -43,7 +44,8 @@ masking with wrong ids. Optional tunables: ``SOLAR_REASONING_BUDGET_LOW`` ..
 the ceiling), ``SOLAR_REASONING_BUDGET_DEFAULT_EFFORT``,
 ``SOLAR_REASONING_BUDGET_NO_REASONING_EFFORTS`` (comma list),
 ``SOLAR_OPEN2_EOS_TOKEN_IDS`` and ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS``
-(comma lists overriding the tokenizer-derived sets), and
+(JSON lists of ints overriding the tokenizer-derived sets; the sentinel ids
+themselves always come from the tokenizer), and
 ``SOLAR_FSM_SPEC_ALWAYS_EAGER=1`` (speculative decoding: mask every verify step
 instead of only the steps the folded path cannot cover).
 """
@@ -62,9 +64,8 @@ logger = logging.getLogger(__name__)
 
 NEG_INF = float("-inf")
 
-# Control sentinels by field name, resolved from the tokenizer's added tokens
-# (03-logits-processor.patch: _TOKEN_TEXT_BY_FIELD). Every one present in the
-# served tokenizer is a member of ``all_controls``.
+# Control sentinels by field name, resolved from the tokenizer's added tokens.
+# Every one present in the served tokenizer is a member of ``all_controls``.
 _TOKEN_TEXT_BY_FIELD = {
     "im_start": "<|im:start|>",
     "im_end": "<|im:end|>",
@@ -203,7 +204,7 @@ class _Config:
     forbidden_notools: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     # Named views into the tables. reasoning_forbidden / reasoning_open_forbidden
     # are the live REASONING lookups; the content_* four serve logging and the
-    # older tests:
+    # tests:
     #   REASONING            : allow think_end only, EOS masked
     #   CONTENT (no content) : allow tool_call_start only, EOS masked
     #                          <- this is what stops the model from emitting EOS
@@ -257,17 +258,12 @@ def _added_token_ids(tokenizer_dir: str) -> Dict[str, int]:
 def _eos_ids(tokenizer_dir: str) -> List[int]:
     """Turn-terminating ids, masked where ending the turn is illegal: the union
     of ``config.json`` / ``generation_config.json`` ``eos_token_id`` and the
-    tokenizer's ``eos_token`` text; ``SOLAR_OPEN2_EOS_TOKEN_IDS`` (comma list)
-    overrides everything. Sentinels are removed by ``configure_ids`` -- they
+    tokenizer's ``eos_token`` text; ``SOLAR_OPEN2_EOS_TOKEN_IDS`` (JSON list of
+    ints) overrides everything. Sentinels are removed by ``configure_ids`` -- they
     stay state-managed."""
-    raw_env = os.environ.get("SOLAR_OPEN2_EOS_TOKEN_IDS")
-    if raw_env is not None:
-        try:
-            return sorted({int(x) for x in raw_env.split(",") if x.strip()})
-        except ValueError as exc:
-            raise RuntimeError(
-                f"SOLAR_OPEN2_EOS_TOKEN_IDS must be a comma list of ids, got {raw_env!r}"
-            ) from exc
+    override = _env_id_list("SOLAR_OPEN2_EOS_TOKEN_IDS")
+    if override is not None:
+        return sorted(override)
     ids = set()
     for name in ("config.json", "generation_config.json"):
         path = os.path.join(tokenizer_dir, name)
@@ -320,6 +316,25 @@ def _warn_retired_env() -> None:
             )
 
 
+def _env_id_list(name: str) -> Optional[set]:
+    """A JSON list of non-negative token ids from ``name``, or None when the
+    variable is unset or blank. Malformed values fail loud."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be a JSON list of ints, got {raw!r}") from exc
+    if not isinstance(data, list) or not all(
+        isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in data
+    ):
+        raise RuntimeError(
+            f"{name} must be a JSON list of non-negative ints, got {raw!r}"
+        )
+    return set(data)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -336,23 +351,13 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     Every token of ``tokenizer.json``'s vocab and of the added tokens
     (``tokenizer_config.json`` / ``tokenizer.json``) whose text is a pure
     newline run, plus a verbatim newline token;
-    ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`` overrides with a comma list, and an
-    empty value switches the rule off. Like the think ids, a vocab that
-    cannot supply them fails loud rather than silently dropping the rule.
+    ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`` (JSON list of ints) overrides,
+    and ``[]`` switches the rule off. Like the think ids, a vocab that cannot
+    supply them fails loud rather than silently dropping the rule.
     """
-    raw = os.environ.get("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
-    if raw is not None:
-        try:
-            ids = {int(x) for x in raw.split(",") if x.strip()}
-        except ValueError as exc:
-            raise RuntimeError(
-                f"SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS must be a comma list of ids, got {raw!r}"
-            ) from exc
-        if any(i < 0 for i in ids):
-            raise RuntimeError(
-                f"SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS has a negative id: {raw!r}"
-            )
-        return tuple(sorted(ids))
+    override = _env_id_list("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
+    if override is not None:
+        return tuple(sorted(override))
     tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
     vocab = {}
     if os.path.isfile(tk_path):
@@ -373,8 +378,8 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
         raise RuntimeError(
             f"SOLAR_FSM: leading-newline tokens ('Ċ', 'ĊĊ') not found "
             f"in {tokenizer_dir}'s vocab or added tokens; set "
-            "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS to the ids, or to an empty string to "
-            "switch the rule off"
+            "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS to a JSON list of the ids, or "
+            "to [] to switch the rule off"
         )
     return tuple(sorted(ids))
 
@@ -403,7 +408,7 @@ def _warn_unknown_effort(effort) -> None:
     )
 
 
-def _budget_for(effort, max_new_tokens: Optional[int]) -> int:
+def _budget_for(effort) -> int:
     """Reasoning budget (tokens) for one request. ``effort`` is the value the
     entrypoint attached (a string), or None for the default."""
     if effort is None:
@@ -665,7 +670,7 @@ class SolarReqFSM:
     def __init__(
         self,
         prompt_ids: Sequence[int],
-        max_new_tokens: Optional[int],
+        *,
         effort: Optional[str] = None,
         tools: bool = True,
     ):
@@ -684,7 +689,7 @@ class SolarReqFSM:
         self.content_progress = _prompt_completed_tool_call(prompt_ids)
         self.count = 0
         self.consumed = 0
-        self.budget = _budget_for(effort, max_new_tokens)
+        self.budget = _budget_for(effort)
         self.tools = bool(tools)
         self.forced = False
 
@@ -776,9 +781,9 @@ def _has_grammar(req) -> bool:
     array of calls, no ``<|tool_call:start|>``), so the FSM never enters a
     tool state under one. ``SolarOpen2Detector.supports_structural_tag`` is
     False for the same reason: a structural tag constrains *text*, while this
-    FSM tracks sentinel *ids*, and the two were observed to disagree (opener
-    sampled as the sentinel id, closer spelled out as text), which left the
-    FSM inside TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
+    FSM tracks sentinel *ids*, so the two can disagree (opener sampled as the
+    sentinel id, closer spelled out as text), leaving the FSM inside
+    TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
 
     Judged from the request's own constraint (json_schema / regex / ebnf /
     structural_tag), not from ``req.grammar``: ``--enable-strict-thinking``
@@ -813,9 +818,8 @@ def _req_fsm(req) -> SolarReqFSM:
     if fsm is None or _fsm_stale(req):
         fsm = SolarReqFSM(
             getattr(req, "origin_input_ids", ()) or (),
-            getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
-            _req_effort(req),
-            _req_tools(req),
+            effort=_req_effort(req),
+            tools=_req_tools(req),
         )
         req._solar_fsm = fsm
         req._solar_fsm_retractions = req.retraction_count
@@ -895,7 +899,8 @@ def _log_force_conflict(rows, stride: int, rids) -> None:
 
 
 # --------------------------------------------------------------------------
-# Hooks called from patched sglang core (see solar_patch.py)
+# Hooks called from the sampler, the batch-info copy, the batch result
+# processor, the scheduler and the DSpark verify worker.
 # --------------------------------------------------------------------------
 def attach_rows(sampling_info, batch) -> None:
     if not os.environ.get("SOLAR_FSM", "0") == "1":
@@ -999,8 +1004,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
         # from_schedule_batch, which attaches the rows whenever the FSM is on
         # (the one other construction site, the EAGLE draft cuda-graph runner,
         # picks draft tokens itself and never reaches the Sampler). Reaching
-        # here means a copy or a new construction site lost them -- the failure
-        # this module once had silently. Say so, once.
+        # here means a copy or a new construction site lost them. Say so, once.
         if not _WARNED["rows"]:
             logger.warning(
                 "[SOLAR-FSM] sampling_info carries no solar_fsm_rows while the "
@@ -1248,7 +1252,7 @@ def plan_gate(reqs, stride: int) -> bool:
     because the state read here can lag by one accepted run. Known folded-path
     gaps, each <= stride-1 chain rows and closed by the next step's committed
     state: a drafted sentinel on a content-with-progress row or under a grammar
-    (INF-450). Host-only and sync-free: it never touches the draft tokens.
+    Host-only and sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False
@@ -1293,7 +1297,7 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       committed after the answer. It is the cheaper error.
     * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
       that position; these flags stay False, and ``plan_gate`` does not fire on
-      a committed-CONTENT row either. That row goes unmasked. It is the error
+      a content-with-progress row without a grammar. That row goes unmasked. It is the error
       this mask exists to prevent, and closing it needs the chain here.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.

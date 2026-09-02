@@ -1,8 +1,10 @@
 """Serving-side rules for the Solar Open2 chat format (Solar Pro 4), in one
-place; ``OpenAIServingChat`` calls each at one point.
+place; ``OpenAIServingChat`` calls them and adds nothing of its own.
 
-1. ``validate_request`` -- ``reasoning_effort`` must be one of the named tiers
-   (a number would silently pre-close the think block and skip the FSM budget).
+1. ``validate_request`` -- ``reasoning_effort`` must name a tier, in the
+   request field (typed upstream) and in ``chat_template_kwargs`` (untyped):
+   anything else would silently pre-close the think block and skip the FSM
+   budget.
 2. ``normalize_reasoning_effort`` -- hands the requested effort and the tools
    flag to the scheduler-side FSM through ``custom_params`` (budget table in
    ``solar_open2_fsm``), then lower-cases the effort and folds xhigh/max to
@@ -60,7 +62,11 @@ def validate_request(request: ChatCompletionRequest) -> Optional[str]:
         request.reasoning_effort,
         (request.chat_template_kwargs or {}).get("reasoning_effort"),
     )
-    if any(isinstance(e, (int, float)) and not isinstance(e, bool) for e in efforts):
+    for effort in efforts:
+        if effort is None or (
+            isinstance(effort, str) and effort.strip().lower() in EFFORT_TIERS
+        ):
+            continue
         return (
             "reasoning_effort must be one of "
             + ", ".join(EFFORT_TIERS)

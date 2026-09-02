@@ -1774,5 +1774,70 @@ class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
         self.assertEqual(ret.normal_text, "")
 
 
+class TestSolarOpen2ForceReasoning(CustomTestCase):
+    """The chat template opens the think block only for medium/high, so the
+    parser must start inside reasoning exactly then -- through the module
+    function and through ReasoningParser(request=...)."""
+
+    CASES = (
+        (None, True),
+        ("medium", True),
+        ("High", True),
+        (" high ", True),
+        ("low", False),
+        ("none", False),
+        ("minimal", False),
+        ("xhigh", False),  # folded to "high" by the serving layer before here
+    )
+
+    def test_effort_decides_the_initial_state(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.parser.reasoning_parser import (
+            ReasoningParser,
+            solar_open2_force_reasoning,
+        )
+
+        for effort, expected in self.CASES:
+            for route in ("field", "chat_template_kwargs"):
+                with self.subTest(effort=effort, route=route):
+                    if route == "field":
+                        req = SimpleNamespace(
+                            reasoning_effort=effort, chat_template_kwargs=None
+                        )
+                    else:
+                        req = SimpleNamespace(
+                            reasoning_effort=None,
+                            chat_template_kwargs=(
+                                {"reasoning_effort": effort} if effort else None
+                            ),
+                        )
+                    self.assertEqual(solar_open2_force_reasoning(req), expected)
+                    parser = ReasoningParser("solar_open2", request=req)
+                    self.assertEqual(parser.detector._in_reasoning, expected)
+                    text = "answer only"
+                    reasoning, normal = parser.parse_non_stream(text)
+                    self.assertEqual(
+                        (reasoning, normal), (text, "") if expected else ("", text)
+                    )
+
+    def test_split_partial_sentinel_at_eos_is_dropped_too(self):
+        """A sentinel fragment after <|think:end|> is dropped at stream end
+        whether it arrived in the same delta or a later one."""
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        for pieces in (
+            ["thinking", "<|think:end|><|think"],
+            ["thinking", "<|think:end|>", "<|think"],
+        ):
+            with self.subTest(pieces=pieces):
+                detector = SolarOpen2Detector(force_reasoning=True)
+                content = ""
+                for piece in pieces:
+                    content += detector.parse_streaming_increment(piece).normal_text
+                content += detector.finish().normal_text
+                self.assertEqual(content, "")
+
+
 if __name__ == "__main__":
     unittest.main()
