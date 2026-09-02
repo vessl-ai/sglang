@@ -1257,7 +1257,13 @@ def plan_gate(reqs, stride: int) -> bool:
             # tokens; for a request without tools that includes
             # <|tool_call:start|>, benign here because the exit it offers only
             # matters while EOS is shut, i.e. in fresh CONTENT), the same
-            # class of gap as a drafted <|think:start|> (folded_mask_flags). A think_end
+            # class of gap as a drafted <|think:start|> (folded_mask_flags),
+            # and as a drafted <|tool_call:start|> on such a row: the chain
+            # positions after it are TOOL_* states whose envelope set
+            # (EOS / <|im:end|> shut) the folded mask does not carry, so
+            # for up to stride-1 rows a tool call can be closed by a turn
+            # end the eager path would have masked; the next step's
+            # committed state sends the request eager. A think_end
             # accepted in the run this state
             # lags behind is covered by the folded mask's overmask for the EOS
             # / <|im:end|> half of the fresh-content rule (the rest of that

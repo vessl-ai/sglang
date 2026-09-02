@@ -959,8 +959,8 @@ class ServingChatTestCase(unittest.TestCase):
         let the closing marker be spelled as text, see
         SolarOpen2Detector.supports_structural_tag). The call stays
         grammar-forced. parallel_tool_calls=False caps the array at one
-        call and still gets the <|tool_call:end|> stop string, which is
-        what enforces the cap for tool_choice=auto."""
+        call (maxItems=1); the <|tool_call:end|> stop string is injected
+        only for tool_choice=auto, where no grammar can cap the count."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "solar_open2"
@@ -998,7 +998,8 @@ class ServingChatTestCase(unittest.TestCase):
         )
         self.assertEqual(result_no_parallel.tool_call_constraint[0], "json_schema")
         self.assertEqual(result_no_parallel.tool_call_constraint[1]["maxItems"], 1)
-        self.assertEqual(result_no_parallel.stop, [SOLAR_OPEN2_TOOL_CALL_END])
+        # maxItems=1 caps the array; the auto-path stop string is not needed.
+        self.assertFalse(result_no_parallel.stop)
 
         named_request = ChatCompletionRequest(
             model="x",
@@ -4052,14 +4053,22 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.assertEqual(req.reasoning_effort, "high")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
 
-    def test_non_solar_parser_does_not_touch_custom_params(self):
-        """The hook is reached only for the solar_open2 reasoning parser."""
+    def test_non_solar_parsers_do_not_touch_custom_params(self):
+        """The hook is reached when either Solar parser is configured -- the
+        FSM reads custom_params whichever parser marks the cell -- and for
+        neither otherwise."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
-        for parser, expect_key in (("deepseek-r1", False), ("solar_open2", True)):
-            with self.subTest(parser=parser):
-                self.chat.reasoning_parser = parser
+        cases = (
+            ("deepseek-r1", "hermes", False),
+            ("solar_open2", "hermes", True),
+            ("deepseek-r1", "solar_open2", True),
+        )
+        for reasoning_parser, tool_call_parser, expect_key in cases:
+            with self.subTest(reasoning=reasoning_parser, tools=tool_call_parser):
+                self.chat.reasoning_parser = reasoning_parser
+                self.chat.tool_call_parser = tool_call_parser
                 req = self._req(reasoning_effort="medium")
                 self.chat._process_messages(req, is_multimodal=False)
                 if expect_key:

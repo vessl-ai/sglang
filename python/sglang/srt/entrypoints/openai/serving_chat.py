@@ -1128,11 +1128,10 @@ class OpenAIServingChat(OpenAIServingBase):
         finish_reason: Optional[Dict[str, Any]],
     ) -> bool:
         """True when this request injected the Solar Open2 per-call
-        terminator as a stop string (parallel_tool_calls=False; the legacy
-        structural tag built from SolarOpen2Detector.structure_info has no
-        call-count limit — only at_least_one — so the cap is enforced by
-        halting generation at the first call's terminator instead) and
-        generation halted on exactly that stop. The detokenizer trims a
+        terminator as a stop string (parallel_tool_calls=False with
+        tool_choice=auto, which has no grammar to cap the call count;
+        required/named use the JSON-schema array with maxItems=1 instead)
+        and generation halted on exactly that stop. The detokenizer trims a
         matched stop string from the output by default, so the terminator
         the detector requires must be glued back on before parsing -- unless
         no_stop_trim asked to keep it, in which case it is already in the
@@ -1162,7 +1161,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
-        if self.reasoning_parser == "solar_open2":
+        if "solar_open2" in (self.reasoning_parser, self.tool_call_parser):
+            # The FSM (SOLAR_FSM=1) reads its effort budget and tools flag
+            # from custom_params; either Solar parser marks a Solar cell.
             self._normalize_solar_open2_reasoning_effort(request)
 
         # GptOss model needs to keep special tokens for harmony parsing
@@ -1182,6 +1183,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = False
+        is_required_or_named = request.tool_choice == "required" or isinstance(
+            request.tool_choice, ToolChoice
+        )
         effective_tools = self._effective_tools(request)
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
@@ -1210,15 +1214,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 elif (
                     self.tool_call_parser == "solar_open2"
                     and request.parallel_tool_calls is False
+                    and not is_required_or_named
                 ):
-                    # The structural tag (when tool_choice is required/named
-                    # or strict) forces each call's envelope but has no
-                    # call-count knob — only at_least_one — and for auto
-                    # there is no constraint at all, so parallel_tool_calls
+                    # tool_choice=auto has no grammar, so parallel_tool_calls
                     # =False is enforced by halting generation at the first
-                    # call's terminator instead. Unlike kimi_k3's stop (a
-                    # section-envelope closer outside each call, harmless to
-                    # trim), this terminator is required inside every call,
+                    # call's terminator. required/named do not need it: their
+                    # JSON-schema array carries maxItems=1 (SolarOpen2Detector
+                    # .supports_structural_tag is False). Unlike kimi_k3's stop
+                    # (a section-envelope closer outside each call, harmless
+                    # to trim), this terminator is required inside every call,
                     # so _process_tool_calls / _process_tool_call_stream glue
                     # it back onto the text before parsing.
                     tool_call_stop = parser.detector.eot_token
@@ -1745,10 +1749,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
+                matched_stop = finish_reason_data.get("matched")
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
-
-                matched_stop = finish_reason_data.get("matched")
+                    # As on the non-streaming path: a stop that was rewritten
+                    # to tool_calls does not expose the (internal) stop string
+                    # -- for Solar Open2 that is the call terminator itself.
+                    matched_stop = None
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],

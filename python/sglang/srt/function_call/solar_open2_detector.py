@@ -28,26 +28,20 @@ as-is (with a warning) rather than discarded: the client owns name validation
 and can surface the mismatch back to the model, whereas a dropped call yields
 an empty response with no diagnostic.
 
-JSON argument body: this detector inherits the base-class capability defaults
-(``supports_structural_tag()`` True, ``parses_required_natively()`` False), so
-``tool_choice="required"`` or a named choice is grammar-forced rather than
-parsed natively. The legacy structural tag built from ``structure_info()`` is
-the envelope xgrammar forces around each call, and it writes the arguments as
-a JSON object instead of ``<|tool_arg:...|>`` markers::
-
-    <|tool_call:start|>{function_name}
-    {"arg_name": value, ...}<|tool_call:end|>
-
-A call body with no argument markers is therefore parsed as JSON when it
-parses as an object (values arrive already typed, so schema coercion is
-skipped); a non-empty body that is neither marker-formed nor a JSON object is
-kept as ``{"__raw": body}`` with a warning rather than dropped.
-
-The legacy structural tag has no call-count limit (only ``at_least_one``), so
-``parallel_tool_calls=False`` is enforced outside the grammar: serving_chat
-injects ``<|tool_call:end|>`` as a stop string and glues it back before
-parsing, capping generation at the first call (see
+Forced tool calls: ``tool_choice="required"`` or a named choice are constrained
+by the JSON-schema array (``supports_structural_tag()`` is False -- see that
+method), so the output is ``[{"name": ..., "parameters": {...}}]`` parsed on the
+serving layer's JSON path, not by this detector. ``parallel_tool_calls=False``
+is then ``maxItems=1`` in that schema. For ``tool_choice="auto"`` there is no
+grammar, so serving_chat injects ``<|tool_call:end|>`` as a stop string and
+glues it back before parsing, capping generation at the first call (see
 ``OpenAIServingChat._solar_single_call_stop_matched``).
+
+A call body with no argument markers is still accepted as a JSON object when it
+parses as one (the shape the legacy structural tag used to force; values arrive
+already typed, so schema coercion is skipped); a non-empty body that is neither
+marker-formed nor a JSON object is kept as ``{"__raw": body}`` with a warning
+rather than dropped.
 """
 
 from __future__ import annotations
