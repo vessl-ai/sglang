@@ -5476,6 +5476,59 @@ class TestSolarOpen2Detector(unittest.TestCase):
             got_text, got_calls = self._stream_all(text, len(text))
         self.assertEqual((got_text, got_calls), (text, []))
 
+    def test_prose_held_behind_an_unparsed_opener_is_dropped_with_a_warning(self):
+        """Prose after an opener that did not parse is held; when a later call
+        parses it is dropped -- with a warning that names the non-whitespace
+        chars lost, not a debug line (review round 6)."""
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        text = f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\nHere:\n" + good
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            got_text, got_calls = self._stream_all(text, 5)
+        self.assertEqual((got_text, len(got_calls)), ("", 1))
+        self.assertTrue(any("not whitespace" in m for m in logs.output))
+
+    def test_partial_opener_at_stream_end_after_a_call_is_logged(self):
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            got_text, got_calls = self._stream_all(
+                good + "\nSee 5<|tool_", len(good) + 9
+            )
+        self.assertEqual((got_text, len(got_calls)), ("\nSee 5", 1))
+        self.assertTrue(any("partial opener" in m for m in logs.output))
+
+    def test_non_string_schema_type_does_not_raise(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"location": {"type": 5}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Paris"})
+
     def test_blank_name_call_next_to_parsed_calls(self):
         """A blank-name call is an unparsed segment in streaming: the calls
         around it are emitted (dropped after a call, held before one), at

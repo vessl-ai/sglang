@@ -168,10 +168,11 @@ class _StreamContent:
 
     def call_parsed(self) -> None:
         if self.unparsed:
-            logger.debug(
-                "Solar Open2: a call parsed; dropping %d chars of earlier "
-                "unparsed output",
+            logger.warning(
+                "Solar Open2: a call parsed; dropping %d chars held since an "
+                "opener that did not parse (%d of them not whitespace)",
                 len(self.unparsed),
+                len("".join(self.unparsed.split())),
             )
             self.unparsed = ""
         self.calls += 1
@@ -188,6 +189,12 @@ class _StreamContent:
                 self._dropped("unfinished tool call at stream end", len(held) - at)
                 return self.text(held[:at], before_opener=True)
             if partial_opener:
+                logger.warning(
+                    "Solar Open2: stream ended on a partial opener after %d "
+                    "completed call(s); dropping %d chars",
+                    self.calls,
+                    partial_opener,
+                )
                 held = held[:-partial_opener]
             return (pending + held).rstrip()
         if TOOL_CALL_START in held:
@@ -410,7 +417,7 @@ def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Option
         t = prop.get("type")
         if isinstance(t, list):
             t = next((x for x in t if x != "null"), None)
-        return t
+        return None if t is None else str(t)
     return None
 
 

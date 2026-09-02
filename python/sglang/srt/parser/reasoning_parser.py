@@ -2007,7 +2007,11 @@ class ReasoningParser:
 
 
 # --- Solar Open2 reasoning parser ---
+import logging
+
 from sglang.srt.function_call import solar_open2_detector as _solar_tool_detector
+
+_solar_logger = logging.getLogger(__name__)
 
 _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
 
@@ -2130,6 +2134,11 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         ret = super().finish()
         if not self._content_started and ret.normal_text:
             if self.think_end_token.startswith(ret.normal_text):
+                _solar_logger.warning(
+                    "solar_open2: dropping a %d-char sentinel fragment at the end "
+                    "of the stream",
+                    len(ret.normal_text),
+                )
                 ret.normal_text = ""
         return ret
 

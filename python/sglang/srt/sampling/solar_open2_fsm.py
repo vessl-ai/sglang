@@ -282,6 +282,13 @@ def _eos_ids(tokenizer_dir: str) -> List[int]:
             tid = _added_token_ids(tokenizer_dir).get(eos_token)
             if tid is not None:
                 ids.add(tid)
+    if not ids:
+        logger.warning(
+            "[SOLAR-FSM] no EOS id found in %s (config.json / generation_config.json "
+            "eos_token_id, tokenizer eos_token); only the sentinels will be masked "
+            "-- set SOLAR_OPEN2_EOS_TOKEN_IDS if the model has a bare EOS",
+            tokenizer_dir,
+        )
     return sorted(ids)
 
 
