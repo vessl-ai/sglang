@@ -1246,38 +1246,53 @@ def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
     logits[:, forbid_ids] = logits[:, forbid_ids].masked_fill(rows, NEG_INF)
 
 
+def _reasoning_needs_eager(fsm, window: int) -> bool:
+    """Inside the think block: the leading-newline set on the step after
+    ``<|think:start|>`` and the forced ``<|think:end|>`` at a spent budget
+    (also every step of a zero-budget none/minimal block) are plan_verify's
+    alone. Judged only while inside the block -- a spent or zero budget must
+    not keep a request that has left reasoning eager for the rest of its
+    life."""
+    return fsm.at_think_open or fsm.count + window >= fsm.budget
+
+
+def _content_mask_needs_eager(fsm, req) -> bool:
+    """Outside the think block: fresh CONTENT (no content token yet) and every
+    step inside a tool call take their EOS/``<|im:end|>``-shutting sets from
+    plan_verify; the folded mask does not carry them. A CONTENT row under a
+    grammar is exempt: the grammar owns CONTENT (the vendor's rule)."""
+    if not CFG.content_mask:
+        return False
+    if fsm.state != CONTENT:
+        return True
+    return not fsm.content_progress and not _has_grammar(req)
+
+
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    Four things can only be done on the eager path, and this predicate names
-    them: forcing ``<|think:end|>`` on a row whose reasoning budget is spent,
-    the fresh-CONTENT set (``content_mask``) on the step after a think block
-    closes, every step inside a tool call (the envelope sets, which shut EOS
-    and ``<|im:end|>`` until the call closes), and the leading-newline set on
-    the step after a think block opens. All are
-    ``plan_verify``'s work, and ``plan_verify`` runs after the grammar barrier
-    -- too late for the folded epilogue, which accepts inside the cuda graph
-    off its own buffers. Each is judged per row from committed state, so
-    outside a tool call a generation spends only its boundary steps eager.
-    A CONTENT row under a grammar -- fresh or not -- is exempt from the
-    content-mask clause below: the grammar owns CONTENT (the vendor's rule).
-    A batch with a grammar never takes the fold (the worker forces eager
-    independently), so the exemption only stops this predicate from being
-    redundantly True; where the graph did replay, the folded mask writes
-    nothing for such a row and plan_verify is not consulted, so a drafted
-    sentinel could put chain positions 1..stride-1 into TOOL_* states that
-    carry no mask. A JSON-schema grammar (required/named) cannot emit a
-    sentinel, which bounds it; an ebnf/regex grammar could (the general
-    <=stride-1 gap is INF-450).
+    Everything plan_verify does that the folded epilogue cannot -- it accepts
+    inside the cuda graph off its own buffers, and plan_verify runs after the
+    grammar barrier -- is named by the two row predicates above. Each is
+    judged per row from committed state, so outside a tool call a generation
+    spends only its boundary steps eager.
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied
     inside the graph instead (``DsparkVerifyEpilogue._apply_fsm_mask``, fed by
-    :func:`folded_mask_flags`). This predicate therefore stays what its name
-    says: the fold escape, widened to ``2 * stride`` because the state read
-    here can lag by up to one accepted run -- forcing eager on a step that
-    turns out to need nothing costs throughput, missing a needed force costs
-    correctness.
+    :func:`folded_mask_flags`). The budget window is ``2 * stride`` because
+    the state read here can lag by up to one accepted run -- an unneeded eager
+    step costs throughput, a missed force costs correctness.
+
+    Known gaps of the folded path, each bounded to <=stride-1 chain rows and
+    closed by the next step's committed state (INF-450): a drafted
+    ``<|tool_call:start|>`` on a content-with-progress row puts the positions
+    after it into TOOL_* states whose envelope set the folded mask does not
+    carry; a drafted ``<|think:start|>`` lacks the leading-newline set; a
+    CONTENT row under a grammar carries no FSM mask at all (a JSON-schema
+    grammar cannot emit a sentinel, an ebnf/regex one could; a batch with a
+    grammar never takes the fold anyway, the worker forces eager). A think_end
+    accepted in the lagging run is covered by the folded mask's overmask.
 
     Host-only and sync-free: it never touches the draft tokens on device.
     """
@@ -1296,43 +1311,9 @@ def plan_gate(reqs, stride: int) -> bool:
             return True
         fsm.advance(req.output_ids)
         if fsm.in_reasoning:
-            if fsm.at_think_open:
-                # The leading-newline set is not the folded mask's set.
+            if _reasoning_needs_eager(fsm, window):
                 return True
-            if fsm.count + window >= fsm.budget:
-                # Also every step of a zero-budget (none/minimal) block: the
-                # force belongs to plan_verify. Judged only while inside the
-                # block -- a spent or zero budget must not keep a request that
-                # has left reasoning eager for the rest of its life.
-                return True
-        elif (
-            CFG.content_mask
-            and (fsm.state != CONTENT or not fsm.content_progress)
-            and not (fsm.state == CONTENT and _has_grammar(req))
-        ):
-            # Fresh CONTENT (unless a grammar owns it -- see the docstring),
-            # and every step inside a tool call (its envelope set masks
-            # EOS/<|im:end|>, which the folded mask does not carry):
-            # the fresh-content set is plan_verify's alone. Once
-            # the turn has content the folded path is kept -- its unmasked
-            # CONTENT rows then only lack content_done_forbidden (stray control
-            # tokens; for a request without tools that includes
-            # <|tool_call:start|>, benign here because the exit it offers only
-            # matters while EOS is shut, i.e. in fresh CONTENT), the same
-            # class of gap as a drafted <|think:start|> (folded_mask_flags),
-            # and as a drafted <|tool_call:start|> on such a row: the chain
-            # positions after it are TOOL_* states whose envelope set
-            # (EOS / <|im:end|> shut) the folded mask does not carry, so
-            # for up to stride-1 rows a tool call can be closed by a turn
-            # end the eager path would have masked; the next step's
-            # committed state sends the request eager. A think_end
-            # accepted in the run this state
-            # lags behind is covered by the folded mask's overmask for the EOS
-            # / <|im:end|> half of the fresh-content rule (the rest of that
-            # chain is still masked with the reasoning set: it also holds
-            # <|tool_call:start|> back for up to stride-1 rows and lets a
-            # second <|think:end|> through); the same lag leaves a run-final
-            # generated <|think:start|> without the leading-newline set.
+        elif _content_mask_needs_eager(fsm, req):
             return True
     return False
 
