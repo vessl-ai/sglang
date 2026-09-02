@@ -3499,11 +3499,13 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             return chunks
 
         chunks = get_or_create_event_loop().run_until_complete(run())
-        tool_call_deltas = [
-            json.loads(c[len("data: ") :])["choices"][0]["delta"]["tool_calls"][0]
-            for c in chunks
-            if '"tool_calls"' in c
-        ]
+        tool_call_deltas = []
+        for c in chunks:
+            if '"tool_calls"' not in c:
+                continue
+            delta = json.loads(c[len("data: ") :])["choices"][0]["delta"]
+            if delta.get("tool_calls"):
+                tool_call_deltas.append(delta["tool_calls"][0])
         return chunks, tool_call_deltas, has_tool_calls
 
     def test_non_streaming_glue_back_extracts_single_call(self):
@@ -3602,6 +3604,68 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             d["function"].get("arguments") or "" for d in tool_call_deltas
         )
         self.assertEqual(json.loads(arguments), {"location": "Paris"})
+
+    def test_streaming_stop_matched_without_opener_does_not_glue(self):
+        """The injected stop matched but the model never opened a call: there
+        is nothing to close, so the terminator is not fed to the detector --
+        it would come back out as a content delta (round 3 C2) -- and the
+        internal stop string is not reported as matched_stop."""
+        text = "Sure, here it is:"
+        chunks, deltas, has_tool_calls = self._stream(
+            self.request, text, self._STOP_MATCHED
+        )
+        self.assertEqual(deltas, [])
+        self.assertFalse(has_tool_calls.get(0))
+        content = ""
+        for chunk in chunks:
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                for choice in json.loads(chunk[6:]).get("choices", []):
+                    content += (choice.get("delta") or {}).get("content") or ""
+                    self.assertIsNone(choice.get("matched_stop"))
+        self.assertEqual(content, text)
+
+    def test_non_streaming_unparsable_glued_call_keeps_output_hides_stop(self):
+        """Opener present, terminator matched, but the call does not parse (no
+        newline after the name): the whole output stays content (the vendor's
+        non-streaming rule) and the internal stop string is not exposed as
+        matched_stop (round 3 I1)."""
+        text = (
+            "<|tool_call:start|>get_weather"
+            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>"
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            choice = self._build_choice(self.request, text, self._STOP_MATCHED)
+        self.assertEqual(choice.finish_reason, "stop")
+        self.assertIsNone(choice.matched_stop)
+        self.assertIsNone(choice.message.tool_calls)
+        self.assertEqual(choice.message.content, text + SOLAR_OPEN2_TOOL_CALL_END)
+
+    def test_required_streaming_one_tool_three_calls_in_the_last_delta(self):
+        """One tool called three times in the array that lands in the last
+        delta: the stream-end drain is sized by calls, not by the tools list
+        (round 3 C3: a tools-sized cap left the third call's arguments in the
+        buffer and sent its name with empty arguments)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        pieces = [
+            '[{"name": "get_weather", "parameters": {"location": "A"}}, '
+            '{"name": "get_weather", "parameters": {"location": "B"}}, '
+            '{"name": "get_weather", "parameters": {"location": "C"}}]'
+        ]
+        deltas = self._stream_pieces(request, pieces)
+        by_index = {}
+        for d in deltas:
+            entry = by_index.setdefault(d["index"], {"name": None, "args": ""})
+            entry["name"] = entry["name"] or d["function"].get("name")
+            entry["args"] += d["function"].get("arguments") or ""
+        self.assertEqual(sorted(by_index), [0, 1, 2])
+        self.assertEqual(
+            [json.loads(by_index[i]["args"])["location"] for i in (0, 1, 2)],
+            ["A", "B", "C"],
+        )
 
     def test_required_streaming_two_calls_split_over_the_last_delta(self):
         """The last delta closes call a and carries the whole of call b: the

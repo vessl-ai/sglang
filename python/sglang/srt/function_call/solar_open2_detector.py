@@ -154,6 +154,14 @@ class SolarOpen2Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
+        # Streaming only: output from the first opener on that did not parse
+        # as a call, held until a later call parses (then it is not content)
+        # or the stream ends (then it is, as on the non-streaming path).
+        self._unparsed: str = ""
+        # Streaming only, after a call: a whitespace run is held until real
+        # text (then it is content) or the next opener / stream end (then it
+        # is not) -- the vendor's ``_stream_pending_ws``.
+        self._pending_ws: str = ""
         self.bot_token = TOOL_CALL_START
         self.eot_token = TOOL_CALL_END
         self.tool_call_pattern = re.compile(
@@ -189,14 +197,24 @@ class SolarOpen2Detector(BaseFormatDetector):
         return starts
 
     def _parse_calls(
-        self, text: str, tools: List[Tool], streaming: bool = False
+        self,
+        text: str,
+        tools: List[Tool],
+        streaming: bool = False,
+        text_out: Optional[List[str]] = None,
     ) -> List[ToolCallItem]:
         """``streaming``: number the calls sequentially across the stream
         (``current_tool_id``), the index a client accumulates deltas by --
         two calls of the same tool must not share it. Non-streaming keeps
         the tools-list index (SGLang's convention for every detector; the
         serving layer passes it through as ``tool_calls[].index``, which
-        non-streaming clients do not accumulate by)."""
+        non-streaming clients do not accumulate by).
+
+        ``text_out`` (streaming): receives the content found between the
+        parsed calls and after the last one, routed by :meth:`_route_text`
+        so the result does not depend on how many calls one chunk carried.
+        Text before the first parsed call inside ``text`` (an opener that
+        did not parse) is not content, as in non-streaming."""
         indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
         matches = sorted(
@@ -208,6 +226,16 @@ class SolarOpen2Detector(BaseFormatDetector):
         for match in matches:
             if match.start() < consumed_until:
                 continue
+            if streaming and text_out is not None:
+                between = text[consumed_until : match.start()]
+                if calls:
+                    text_out.append(self._route_text(between, before_opener=True))
+                elif between.strip():
+                    logger.debug(
+                        "Solar Open2: dropping %d chars before the first parsed "
+                        "call",
+                        len(between),
+                    )
             consumed_until = match.end()
             name = match.group(1).strip()
             if name not in indices:
@@ -252,16 +280,43 @@ class SolarOpen2Detector(BaseFormatDetector):
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
             )
+        if streaming and text_out is not None and calls:
+            trailing = text[consumed_until:]
+            if self._call_starts(trailing):
+                # A closed call after the last parsed one that did not parse.
+                logger.warning(
+                    "Solar Open2: closed tool call did not parse after %d "
+                    "completed call(s) (%d chars); dropping it",
+                    self.current_tool_id + 1,
+                    len(trailing),
+                )
+            else:
+                text_out.append(self._route_text(trailing))
         return calls
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """The vendor's non-streaming rule: with at least one parsed call,
+        content is what precedes the first opener and the rest belongs to the
+        calls; with none (a start marker alone, a malformed or truncated
+        call) the whole output stays content rather than losing the suffix
+        after the marker (``SolarOpen2ToolParser.extract_tool_calls``)."""
         starts = self._call_starts(text)
         if not starts:
             return StreamingParseResult(normal_text=text, calls=[])
-        normal_text = text[: min(starts)]
-        return StreamingParseResult(
-            normal_text=normal_text, calls=self._parse_calls(text, tools)
-        )
+        calls = self._parse_calls(text, tools)
+        if not calls:
+            logger.warning(
+                "Solar Open2: tool call marker present but no call parsed "
+                "(%d chars); returning the output as content",
+                len(text),
+            )
+            return StreamingParseResult(normal_text=text, calls=[])
+        return StreamingParseResult(normal_text=text[: min(starts)], calls=calls)
+
+    def holding_open_call(self) -> bool:
+        """Streaming: an opener has arrived whose call is not closed yet (the
+        text the serving layer must glue a trimmed terminator onto)."""
+        return bool(self._call_starts(self._buffer))
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -271,6 +326,15 @@ class SolarOpen2Detector(BaseFormatDetector):
         The wire format is not incrementally valid JSON, so per-token argument
         streaming would emit unparsable fragments. Callers get complete
         ToolCallItems one call at a time instead.
+
+        Content is decided as the vendor's streaming parser decides it, and
+        independently of where the chunks are cut: text before the first
+        opener is content; after a call, real text is content but a
+        whitespace run is not when it abuts the next opener or the end (the
+        vendor's ``_stream_pending_ws``; its non-streaming parser keeps only
+        what precedes the first call); output from the first opener on that
+        does not parse is held (``_unparsed``) -- dropped if a later call
+        parses, else released as content by :meth:`finish`.
         """
         self._buffer += new_text
 
@@ -285,58 +349,82 @@ class SolarOpen2Detector(BaseFormatDetector):
                 emit, self._buffer = self._buffer[:-hold], self._buffer[-hold:]
             else:
                 emit, self._buffer = self._buffer, ""
-            if self.current_tool_id >= 0:
-                # Once a call has been emitted, only further calls are read
-                # from the rest of the output: text between or after calls is
-                # not content -- the non-streaming rule (content is what
-                # precedes the first call), applied here so the result does
-                # not depend on where the chunks were cut.
-                if emit.strip():
-                    logger.debug("Solar Open2: dropping text after a call: %r", emit)
-                emit = ""
-            return StreamingParseResult(normal_text=emit, calls=[])
+            return StreamingParseResult(normal_text=self._route_text(emit), calls=[])
 
-        head = self._buffer[: min(starts)]
+        head = self._route_text(self._buffer[: min(starts)], before_opener=True)
         rest = self._buffer[min(starts) :]
-        if self.current_tool_id >= 0:
-            if head.strip():
-                logger.debug("Solar Open2: dropping text between calls: %r", head)
-            head = ""
         if TOOL_CALL_END not in rest:
             self._buffer = rest
             return StreamingParseResult(normal_text=head, calls=[])
 
         cut = rest.rindex(TOOL_CALL_END) + len(TOOL_CALL_END)
         complete, self._buffer = rest[:cut], rest[cut:]
-        calls = self._parse_calls(complete, tools, streaming=True)
+        gap_text: List[str] = []
+        calls = self._parse_calls(complete, tools, streaming=True, text_out=gap_text)
         if not calls:
-            # Closed but not parseable (e.g. no newline after the name): keep
-            # the text instead of dropping it, as the non-streaming path and
-            # finish() do, and say so.
-            logger.warning(
-                "Solar Open2: closed tool call did not parse (%d chars); "
-                "returning it as content",
-                len(complete),
+            # Closed but not parseable (e.g. no newline after the name).
+            if self.current_tool_id >= 0:
+                logger.warning(
+                    "Solar Open2: closed tool call did not parse after %d "
+                    "completed call(s) (%d chars); dropping it",
+                    self.current_tool_id + 1,
+                    len(complete),
+                )
+            else:
+                logger.warning(
+                    "Solar Open2: closed tool call did not parse (%d chars); "
+                    "holding it -- content unless a later call parses",
+                    len(complete),
+                )
+                self._unparsed += complete
+            return StreamingParseResult(normal_text=head, calls=[])
+        if self._unparsed:
+            logger.debug(
+                "Solar Open2: a call parsed; dropping %d chars of earlier "
+                "unparsed output",
+                len(self._unparsed),
             )
-            return StreamingParseResult(normal_text=head + complete, calls=[])
-        return StreamingParseResult(normal_text=head, calls=calls)
+            self._unparsed = ""
+        return StreamingParseResult(normal_text=head + "".join(gap_text), calls=calls)
+
+    def _route_text(self, text: str, before_opener: bool = False) -> str:
+        """Text outside a call, as content or not (see the class rule).
+        ``before_opener``: the text ends where a call opener starts."""
+        if self.current_tool_id < 0:
+            if self._unparsed:
+                self._unparsed += text
+                return ""
+            return text
+        text = self._pending_ws + text
+        self._pending_ws = ""
+        if not text.strip():
+            # Whitespace between or after calls is not content; hold it in
+            # case real text follows in a later chunk.
+            if not before_opener:
+                self._pending_ws = text
+            return ""
+        body = text.rstrip()
+        if not before_opener:
+            self._pending_ws = text[len(body) :]
+        return body
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """The stream is over: release what was held back waiting for a marker
         that can no longer arrive. Before any call was emitted, a partial
-        opener / fence candidate is ordinary text and an unfinished call
-        (opened, never closed -- e.g. cut by max_tokens) is returned as text
-        as well, so nothing is dropped silently (the vendor's non-streaming
-        parser keeps such output as content; its streaming parser has already
-        emitted it as deltas). After a call was emitted, held text is not
-        content (see parse_streaming_increment)."""
+        opener / fence candidate, held unparsed output and an unfinished call
+        (opened, never closed -- e.g. cut by max_tokens) are returned as
+        content, so nothing is dropped silently -- the vendor's non-streaming
+        parser keeps such output as content (its streaming parser has already
+        emitted it as deltas). After a call was emitted, only real trailing
+        text is content (see parse_streaming_increment)."""
         held, self._buffer = self._buffer, ""
-        if not held:
-            return StreamingParseResult()
+        unparsed, self._unparsed = self._unparsed, ""
+        pending_ws, self._pending_ws = self._pending_ws, ""
         if self.current_tool_id >= 0:
-            # A call was already emitted; whatever follows -- an unfinished
-            # later call, or trailing text -- is not content, as on the
-            # non-streaming path (content is what precedes the first call).
+            # A call was already emitted. An unfinished later call is not
+            # content (the non-streaming rule; the vendor's streaming parser
+            # has no end-of-stream hook either), nor is a held partial opener
+            # or whitespace; real trailing text is, as the vendor streams it.
             if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
                 logger.warning(
                     "Solar Open2: stream ended inside an unfinished tool call "
@@ -344,14 +432,20 @@ class SolarOpen2Detector(BaseFormatDetector):
                     self.current_tool_id + 1,
                     len(held),
                 )
-            return StreamingParseResult()
+                return StreamingParseResult()
+            if self._ends_with_partial_token(held, self.bot_token) or (
+                partial_fence_open_len(held)
+            ):
+                return StreamingParseResult()
+            body = (pending_ws + held).rstrip()
+            return StreamingParseResult(normal_text=body, calls=[])
         if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
             logger.warning(
                 "Solar Open2: stream ended inside an unfinished tool call "
                 "(%d chars); returning it as content",
                 len(held),
             )
-        return StreamingParseResult(normal_text=held, calls=[])
+        return StreamingParseResult(normal_text=unparsed + held, calls=[])
 
     def supports_structural_tag(self) -> bool:
         """``required`` / named tool_choice use the JSON-schema constraint

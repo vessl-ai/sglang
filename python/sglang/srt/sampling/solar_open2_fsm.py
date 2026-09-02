@@ -1257,6 +1257,11 @@ def plan_gate(reqs, stride: int) -> bool:
     -- too late for the folded epilogue, which accepts inside the cuda graph
     off its own buffers. Each is judged per row from committed state, so
     outside a tool call a generation spends only its boundary steps eager.
+    A committed-CONTENT row under a grammar folds as well (the grammar owns
+    CONTENT), so a drafted sentinel can put chain positions 1..stride-1 into
+    TOOL_* states the folded mask does not carry; the grammar rejects the
+    sentinel at accept, which bounds it (the general <=stride-1 gap is
+    INF-450).
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied

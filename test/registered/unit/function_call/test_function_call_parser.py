@@ -5268,19 +5268,63 @@ class TestSolarOpen2Detector(unittest.TestCase):
             [json.loads(c.parameters)["location"] for c in calls], ["Paris", "Tokyo"]
         )
 
-    def test_streaming_closed_but_unparsable_call_is_kept_as_text(self):
-        """A call closed by <|tool_call:end|> that the grammar does not match
-        (no newline after the name) is returned as content with a warning
-        instead of vanishing (review round 2, I-1)."""
+    def _stream_all(self, text, size):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "solar_open2")
-        text = f"{TOOL_CALL_START}get_weather{TOOL_CALL_END}"
-        with self.assertLogs(
-            "sglang.srt.function_call.solar_open2_detector", "WARNING"
-        ):
-            normal, calls = parser.parse_stream_chunk(text)
-        self.assertEqual((normal, calls), (text, []))
+        texts, calls = [], []
+        for i in range(0, len(text), size):
+            t, c = parser.parse_stream_chunk(text[i : i + size])
+            texts.append(t or "")
+            calls.extend(c)
+        t, c = parser.parse_stream_end()
+        texts.append(t or "")
+        calls.extend(c)
+        return "".join(texts), calls
+
+    def test_unparsable_call_output_matches_non_stream_whatever_the_chunking(self):
+        """A call closed by <|tool_call:end|> that the grammar does not match
+        (no newline after the name) follows the vendor's non-streaming rule
+        in both modes and at any chunk size: with no parsed call the whole
+        output is content (nothing vanishes, review round 2 I-1); after a
+        parsed call it is not content and no sentinel leaks (round 3 C1)."""
+        bad = f"{TOOL_CALL_START}get_weather{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        cases = {
+            "bad alone": (bad, bad, 0),
+            "prose then bad": ("Sure: " + bad, "Sure: " + bad, 0),
+            "bad, prose, good": (bad + "\nand\n" + good, "", 1),
+            "good then bad": (good + "\n" + bad, "", 1),
+            "prose, good, bad": ("Hi\n" + good + "\n" + bad, "Hi\n", 1),
+        }
+        for name, (text, want_text, want_calls) in cases.items():
+            non_stream = detector.detect_and_parse(text, self.tools)
+            self.assertEqual(
+                (non_stream.normal_text, len(non_stream.calls)),
+                (want_text, want_calls),
+                name,
+            )
+            for size in (len(text), 5):
+                with self.subTest(case=name, size=size):
+                    if want_calls:
+                        # A parsed call makes the malformed one not-content
+                        # silently, as in non-streaming (and the vendor).
+                        got_text, got_calls = self._stream_all(text, size)
+                        self.assertNotIn(TOOL_CALL_START, got_text)
+                    else:
+                        with self.assertLogs(
+                            "sglang.srt.function_call.solar_open2_detector",
+                            "WARNING",
+                        ):
+                            got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual(
+                        (got_text, len(got_calls)), (want_text, want_calls)
+                    )
 
     def test_zero_argument_fence_is_not_a_call(self):
         """The fence-opened form needs at least one argument marker (opener
@@ -5291,11 +5335,13 @@ class TestSolarOpen2Detector(unittest.TestCase):
         result = detector.detect_and_parse(text, self.tools)
         self.assertEqual((result.normal_text, result.calls), (text, []))
 
-    def test_streaming_text_between_calls_is_not_content(self):
-        """Once a call has been emitted, text between or after calls is not
-        content -- the non-streaming rule -- however the chunks are cut
-        (review round 2: a separator newline became a content delta with
-        small chunks while prose vanished with large ones)."""
+    def test_streaming_text_after_a_call_follows_the_vendor_streaming_rule(self):
+        """After a call, real text between or after calls is content and a
+        whitespace run is not when it abuts the next opener or the end (the
+        vendor's streaming parser: pending whitespace, rstripped body) --
+        however the chunks are cut (review round 2: a separator newline
+        became a content delta with small chunks while prose vanished with
+        large ones)."""
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         call = (
@@ -5303,10 +5349,10 @@ class TestSolarOpen2Detector(unittest.TestCase):
             f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
             f"{TOOL_CALL_END}"
         )
-        for sep in ("\n", "\n\n", "\nAlso:\n"):
+        for sep, want in (("\n", ""), ("\n\n", ""), ("\nAlso:\n", "\nAlso:")):
             with self.subTest(sep=repr(sep)):
                 text = call + sep + call
-                for size in (len(text), 5):
+                for size in (len(text), 5, 1):
                     parser = FunctionCallParser(self.tools, "solar_open2")
                     texts, calls = [], []
                     for i in range(0, len(text), size):
@@ -5314,12 +5360,21 @@ class TestSolarOpen2Detector(unittest.TestCase):
                         texts.append(t or "")
                         calls.extend(c)
                     self.assertEqual(len(calls), 2)
-                    self.assertEqual("".join(texts), "")
-                    # And whatever trails the last call is not content either.
-                    t, c = parser.parse_stream_chunk("\nDone." if sep.strip() else "\n")
-                    self.assertEqual((t or "", c), ("", []))
-                    fin = parser.detector.finish(self.tools)
-                    self.assertEqual((fin.normal_text, fin.calls), ("", []))
+                    self.assertEqual("".join(texts), want)
+                    # After the last call: real text is content, whitespace
+                    # (and the whitespace trailing that text) is not.
+                    tail = "\nDone.\n" if sep.strip() else "\n"
+                    tail_texts = []
+                    for i in range(0, len(tail), size):
+                        t, c = parser.parse_stream_chunk(tail[i : i + size])
+                        tail_texts.append(t or "")
+                        self.assertEqual(c, [])
+                    end_text, end_calls = parser.parse_stream_end()
+                    self.assertEqual(end_calls, [])
+                    self.assertEqual(
+                        "".join(tail_texts) + end_text,
+                        tail.rstrip() if sep.strip() else "",
+                    )
 
     def test_stream_end_after_a_call_drops_a_cut_second_call(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser

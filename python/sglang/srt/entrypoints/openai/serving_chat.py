@@ -70,6 +70,9 @@ from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
     TOOL_CALL_START as SOLAR_OPEN2_TOOL_CALL_START,
 )
+
+# Stream-end drain of a required/named JSON array (see _process_tool_call_stream).
+_JSON_ARRAY_DRAIN_MAX_STEPS = 512
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -763,10 +766,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 # this call needs to close (see _solar_single_call_stop_matched)
                 # and the detokenizer trimmed it; feed it back in as one more
                 # increment so the buffered detector emits the completed call,
-                # then flush, before the finish_reason chunk goes out.
+                # then flush, before the finish_reason chunk goes out. Without
+                # an open call to close (the terminator matched with no
+                # opener) there is nothing to glue -- the internal stop string
+                # must not reach the client as content -- so only flush.
+                detector = getattr(parser_dict[index], "detector", None)
+                glue_text = (
+                    SOLAR_OPEN2_TOOL_CALL_END
+                    if detector is not None and detector.holding_open_call()
+                    else ""
+                )
                 async for chunk in self._process_tool_call_stream(
                     index,
-                    SOLAR_OPEN2_TOOL_CALL_END,
+                    glue_text,
                     parser_dict,
                     content,
                     request,
@@ -1960,13 +1972,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if self._solar_single_call_stop_matched(
                 request, effective_tools, finish_reason
             ):
+                # The internal stop string is not part of the response,
+                # whether or not a call parses from the glued text.
+                finish_reason["matched"] = None
                 if SOLAR_OPEN2_TOOL_CALL_START in text:
                     text += SOLAR_OPEN2_TOOL_CALL_END
-                else:
-                    # The terminator matched without an opener (malformed
-                    # generation): nothing to glue, and the internal stop
-                    # string is not part of the response.
-                    finish_reason["matched"] = None
+                # else: the terminator matched without an opener (malformed
+                # generation) -- nothing to glue.
 
             # Handle reasoning content
             reasoning_text = None
@@ -2180,17 +2192,21 @@ class OpenAIServingChat(OpenAIServingBase):
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
+                    raw_text = text
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
                         logger.warning(
                             "Tool call marker present but no complete call parsed "
-                            "from %s output; dropping the incomplete call",
+                            "from %s output; the parser's content (%d of %d chars) "
+                            "is returned",
                             self.tool_call_parser,
+                            len(text),
+                            len(raw_text),
                         )
                         logger.debug(
                             "Unparsed tool call output (%d chars): %r",
-                            len(text),
-                            text[:2000],
+                            len(raw_text),
+                            raw_text[:2000],
                         )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
@@ -2643,15 +2659,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 # the rest of the array -- a short required/named call under
                 # the grammar, or the close of one call plus the whole of the
                 # next -- there is no next increment, so drain with empty
-                # steps until nothing more comes out (bounded: two steps per
-                # possible call plus slack). Whitespace-only text that the
-                # drain releases from the array's tail is not content.
-                for _ in range(2 * max(1, len(effective_tools)) + 2):
+                # steps until a step yields nothing. The cap is a safety net
+                # only: two steps per call, and one tool may be called many
+                # times, so it is not sized by the tools list. Whitespace-only
+                # text the drain releases from the array's tail is not content.
+                for _ in range(_JSON_ARRAY_DRAIN_MAX_STEPS):
                     tail = parser.parse_streaming_increment("", effective_tools)
                     tail_text = tail.normal_text or ""
                     if not tail.calls and not tail_text.strip():
                         break
-                    normal_text = (normal_text or "") + tail_text
+                    if tail_text.strip():
+                        normal_text = (normal_text or "") + tail_text
                     calls = list(calls) + list(tail.calls)
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
