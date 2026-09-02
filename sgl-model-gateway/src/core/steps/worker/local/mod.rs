@@ -376,6 +376,16 @@ mod tests {
     //! the 2026-08-31 solar-pro4-prod decode roll that lost 13 of 26 new
     //! decoders, each one permanently: service discovery keeps a pod whose add
     //! failed in its tracked set, so every later watch event is dedupped away.
+    //!
+    //! INF-432 narrowed what "worth registering" means without weakening that.
+    //! Reaching `create_worker` is still mandatory -- that is the scheduling
+    //! property above, and the first test here. What `create_worker` then does
+    //! is a separate decision: in IGW mode routing selects by model name, so a
+    //! worker registered under `UNKNOWN_MODEL_ID` can never be picked and no
+    //! later pass corrects it, which cost solar-pro4-prod ~40% of its fleet on
+    //! 2026-09-01. It now refuses instead, leaving the pod unregistered -- the
+    //! one state the service-discovery resync retries. Outside IGW the model
+    //! filter is off and an unnamed worker still serves, so the fallback stays.
 
     use std::{
         collections::HashMap,
@@ -386,8 +396,11 @@ mod tests {
     use async_trait::async_trait;
     use wfaas::{
         InMemoryStore, StepExecutor, StepId, StepResult, WorkflowContext, WorkflowEngine,
-        WorkflowError, WorkflowId, WorkflowResult, WorkflowState, WorkflowStatus,
+        WorkflowError, WorkflowId, WorkflowInstanceId, WorkflowResult, WorkflowState,
+        WorkflowStatus,
     };
+
+    use crate::core::ConnectionMode;
 
     use super::*;
 
@@ -525,9 +538,10 @@ mod tests {
         }
     }
 
-    /// The regression itself.
+    /// The regression itself: the scheduling property, with every executor
+    /// scripted, so what is under test is the DAG and not any step's own logic.
     #[tokio::test]
-    async fn optional_metadata_failure_still_registers_the_worker() {
+    async fn optional_metadata_failure_still_schedules_create_worker() {
         let (log, state) = run_local_worker_workflow(Some("discover_metadata")).await;
 
         assert!(
@@ -554,9 +568,56 @@ mod tests {
         assert_eq!(
             state.status,
             WorkflowStatus::Completed,
-            "registration should complete without metadata; ran {:?}",
+            "the workflow must not deadlock when an optional step fails; ran {:?}",
             log.order()
         );
+    }
+
+    /// Build an AppContext that differs from the default only in IGW mode.
+    async fn app_context(enable_igw: bool) -> Arc<AppContext> {
+        let config = RouterConfig {
+            enable_igw,
+            ..RouterConfig::default()
+        };
+        Arc::new(
+            AppContext::from_config(config, 60)
+                .await
+                .expect("a default AppContext should build"),
+        )
+    }
+
+    /// The real `create_worker`, over data that carries no model identity --
+    /// what `discover_metadata` leaves behind when a booting worker answers
+    /// neither `/model_info` nor `/server_info`. No network is involved.
+    async fn create_worker_without_identity(enable_igw: bool) -> WorkflowResult<StepResult> {
+        let mut data = worker_data();
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.app_context = Some(app_context(enable_igw).await);
+        let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        CreateLocalWorkerStep.execute(&mut context).await
+    }
+
+    /// INF-432: registering it would hide a lost worker behind a healthy entry.
+    #[tokio::test]
+    async fn igw_refuses_a_worker_with_no_model_identity() {
+        let error = create_worker_without_identity(true)
+            .await
+            .expect_err("IGW cannot route to an unnamed worker, so it must not register one");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("no model identity"),
+            "the failure has to name its cause, or the operator sees only a failed \
+             AddWorker; got {message}"
+        );
+    }
+
+    /// The other side of the same decision, so the narrowing stays narrow.
+    #[tokio::test]
+    async fn without_igw_an_unnamed_worker_still_registers() {
+        create_worker_without_identity(false)
+            .await
+            .expect("outside IGW the model filter is off, so an unnamed worker still serves");
     }
 
     #[tokio::test]
