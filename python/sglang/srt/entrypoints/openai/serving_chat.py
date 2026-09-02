@@ -77,6 +77,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.solar_open2_fsm import EFFORT_PARAM as SOLAR_OPEN2_EFFORT_PARAM
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1082,9 +1083,19 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest
     ) -> None:
         effort = request.reasoning_effort
+        ctk = request.chat_template_kwargs
+        requested = effort if effort is not None else (ctk or {}).get("reasoning_effort")
+        if isinstance(requested, str) and requested.strip():
+            # The scheduler-side FSM sizes the reasoning budget from the effort
+            # the request asked for (solar_open2_fsm: low 4K .. max 128K), so
+            # hand it over before the fold below hides xhigh/max from the
+            # template. custom_params rides SamplingParams to the Req.
+            request.custom_params = {
+                **(request.custom_params or {}),
+                SOLAR_OPEN2_EFFORT_PARAM: requested.strip().lower(),
+            }
         if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
             request.reasoning_effort = "high"
-        ctk = request.chat_template_kwargs
         if ctk:
             effort = ctk.get("reasoning_effort")
             if (

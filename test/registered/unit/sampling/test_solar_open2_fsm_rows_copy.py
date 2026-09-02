@@ -36,6 +36,9 @@ def _cfg():
     fsm.CFG.content_mask = False
     fsm.CFG.spec_always_eager = False
     fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
+    # These tests are about the rows surviving the copy, not the budget rule;
+    # pin the legacy formula so the budget below is min(3072, 0.75 * 4096).
+    fsm.CFG.budget_policy = "legacy"
     fsm.CFG._mask_cache.clear()
 
 
@@ -92,6 +95,7 @@ _CFG_FIELDS = (
     "spec_always_eager",
     "budget_abs",
     "budget_ratio",
+    "budget_policy",
 )
 
 

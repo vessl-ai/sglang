@@ -1,0 +1,316 @@
+"""Vendor-parity rules of the Solar-Open2 FSM.
+
+The vendor's reference is the UpstageAI vLLM logits processor (Solar Pro 4
+parser/LP patch set for vLLM 0.25.0, 2026-09-01). Three of its rules are
+checked here against ``solar_open2_fsm``:
+
+* the reasoning budget is a fixed table keyed by the request's reasoning
+  effort (low 4K / medium 16K / high 32K / xhigh 64K / max 128K, default
+  high, none/minimal close the block at once, nothing above the hard limit),
+  and does not depend on ``max_tokens``;
+* a fresh CONTENT state may not end the turn (``content_mask`` on by default);
+* the token right after ``<|think:start|>`` may not be a bare newline.
+
+Pure CPU: small float logits tensors and duck-typed requests.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+from sglang.srt.sampling import solar_open2_fsm as fsm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+THINK_START, THINK_END, IM_END, TOOL_START = 100, 101, 102, 103
+EOS = 2
+NL, NLNL = 50, 51
+VOCAB = 128
+NEG_INF = float("-inf")
+
+
+def _cfg(**overrides):
+    c = fsm.CFG
+    c.enabled = True
+    c.think_start, c.think_end = THINK_START, THINK_END
+    c.im_end, c.tool_call_start, c.tool_call_end = IM_END, TOOL_START, None
+    c.all_controls = frozenset({THINK_START, THINK_END, IM_END, TOOL_START})
+    c.reasoning_forbidden = (EOS, IM_END, TOOL_START)
+    c.leading_newline_forbidden = (NL, NLNL)
+    c.reasoning_open_forbidden = tuple(sorted({EOS, IM_END, TOOL_START, NL, NLNL}))
+    c.content_fresh_forbidden = (EOS, IM_END, THINK_START, THINK_END)
+    c.content_done_forbidden = (THINK_START, THINK_END)
+    c.budget_policy = "effort"
+    c.effort_budgets = dict(fsm._EFFORT_BUDGETS)
+    c.default_effort = "high"
+    c.hard_limit = fsm._HARD_LIMIT
+    c.budget_abs, c.budget_ratio = 3072, 0.75
+    c.content_mask = True
+    c.spec_always_eager = False
+    c._mask_cache.clear()
+    for name, value in overrides.items():
+        setattr(c, name, value)
+    fsm._WARNED["effort"] = False
+
+
+def _req(output_ids=(), *, prompt=(1, 2, 3, THINK_START), max_new_tokens=4096, effort=None, rid="r0"):
+    custom = {fsm.EFFORT_PARAM: effort} if effort is not None else None
+    return SimpleNamespace(
+        rid=rid,
+        retraction_count=0,
+        origin_input_ids=list(prompt),
+        output_ids=list(output_ids),
+        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens, custom_params=custom),
+    )
+
+
+def _apply(*reqs):
+    logits = torch.zeros(len(reqs), VOCAB)
+    fsm.apply(logits, SimpleNamespace(solar_fsm_rows=list(reqs)))
+    return logits
+
+
+def _masked(logits, row=0):
+    return {i for i in range(VOCAB) if logits[row, i] == NEG_INF}
+
+
+class TestEffortBudget(unittest.TestCase):
+    def setUp(self):
+        _cfg()
+
+    def test_budget_follows_the_vendor_table(self):
+        for effort, expected in fsm._EFFORT_BUDGETS.items():
+            with self.subTest(effort=effort):
+                self.assertEqual(fsm._req_fsm(_req(effort=effort)).budget, expected)
+
+    def test_no_effort_means_high(self):
+        self.assertEqual(fsm._req_fsm(_req()).budget, 32 * 1024)
+
+    def test_effort_is_case_and_space_insensitive(self):
+        self.assertEqual(fsm._req_fsm(_req(effort=" Medium ")).budget, 16 * 1024)
+
+    def test_budget_ignores_max_new_tokens(self):
+        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=100)).budget, 4 * 1024)
+        self.assertEqual(fsm._req_fsm(_req(effort="max", max_new_tokens=None)).budget, 128 * 1024)
+
+    def test_none_and_minimal_close_the_block_at_once(self):
+        for effort in ("none", "minimal"):
+            with self.subTest(effort=effort):
+                req = _req(effort=effort)
+                self.assertEqual(fsm._req_fsm(req).budget, 0)
+                logits = _apply(req)
+                # Forced: only <|think:end|> survives on the very first step.
+                self.assertEqual(set(range(VOCAB)) - _masked(logits), {THINK_END})
+
+    def test_hard_limit_caps_every_effort(self):
+        _cfg(hard_limit=1000)
+        self.assertEqual(fsm._req_fsm(_req(effort="max")).budget, 1000)
+        self.assertEqual(fsm._req_fsm(_req(effort="low")).budget, 1000)
+
+    def test_unknown_effort_uses_the_default_and_warns_once(self):
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            self.assertEqual(fsm._req_fsm(_req(effort="ultra")).budget, 32 * 1024)
+        self.assertIn("unknown reasoning effort", captured.output[0])
+        self.assertTrue(fsm._WARNED["effort"])
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            fsm._req_fsm(_req(effort="ultra", rid="r1"))
+
+    def test_legacy_policy_keeps_the_old_formula(self):
+        _cfg(budget_policy="legacy")
+        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=4096)).budget, 3072)
+        self.assertEqual(fsm._req_fsm(_req(max_new_tokens=None)).budget, 3072)
+
+    def test_effort_read_only_from_a_string_param(self):
+        req = _req()
+        req.sampling_params.custom_params = {fsm.EFFORT_PARAM: 3}
+        self.assertEqual(fsm._req_fsm(req).budget, 32 * 1024)
+
+
+class TestLeadingNewline(unittest.TestCase):
+    def setUp(self):
+        _cfg()
+
+    def test_first_token_after_the_prompt_think_start_cannot_be_a_newline(self):
+        self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START, NL, NLNL})
+
+    def test_rule_lifts_after_one_token(self):
+        self.assertEqual(_masked(_apply(_req([7]))), {EOS, IM_END, TOOL_START})
+
+    def test_prompt_inside_reasoning_but_not_at_its_start_has_no_rule(self):
+        req = _req(prompt=(1, THINK_START, 5))
+        self.assertEqual(_masked(_apply(req)), {EOS, IM_END, TOOL_START})
+
+    def test_a_generated_think_start_reopens_the_rule(self):
+        opened = _req([7, THINK_START], prompt=(1, 2, 3))
+        self.assertIn(NL, _masked(_apply(opened)))
+        moved_on = _req([7, THINK_START, 8], prompt=(1, 2, 3))
+        self.assertNotIn(NL, _masked(_apply(moved_on)))
+
+    def test_verify_plan_applies_the_rule_along_the_draft_chain(self):
+        req = _req([7], prompt=(1, 2, 3))  # committed: CONTENT with content
+        fsm._req_fsm(req)
+        chain = torch.tensor([[7, THINK_START, 9]])  # anchor, draft_1, draft_2
+        plan = fsm.plan_verify([req], chain, stride=3)
+        # row 0: committed CONTENT (has content) ; row 1: after the drafted
+        # <|think:start|> -> leading-newline set ; row 2: after one reasoning
+        # token -> plain set.
+        self.assertEqual(plan.mask_rows[fsm.CFG.content_done_forbidden], [0])
+        self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_open_forbidden], [1])
+        self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_forbidden], [2])
+        self.assertEqual(plan.force_rows, [])
+
+    def test_sim_state_copies_the_open_flag(self):
+        state = fsm._req_fsm(_req())
+        self.assertTrue(state.at_think_open)
+        self.assertTrue(fsm._SimState(state).at_think_open)
+
+    def test_disabled_rule_leaves_the_plain_set(self):
+        _cfg(leading_newline_forbidden=(), reasoning_open_forbidden=(EOS, IM_END, TOOL_START))
+        self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START})
+
+
+class TestContentMask(unittest.TestCase):
+    def setUp(self):
+        _cfg()
+
+    def test_fresh_content_cannot_end_the_turn(self):
+        req = _req([7, THINK_END])
+        self.assertEqual(_masked(_apply(req)), set(fsm.CFG.content_fresh_forbidden))
+
+    def test_content_with_progress_may_end_the_turn(self):
+        req = _req([7, THINK_END, 8])
+        masked = _masked(_apply(req))
+        self.assertEqual(masked, set(fsm.CFG.content_done_forbidden))
+        self.assertNotIn(EOS, masked)
+
+    def test_forced_close_is_followed_by_the_fresh_content_mask(self):
+        _cfg(effort_budgets={**fsm._EFFORT_BUDGETS, "low": 2})
+        req = _req([7, 8], effort="low")
+        logits = _apply(req)
+        self.assertEqual(set(range(VOCAB)) - _masked(logits), {THINK_END})
+        req.output_ids.append(THINK_END)
+        self.assertIn(EOS, _masked(_apply(req)))
+
+    def test_switch_off_restores_the_unmasked_content(self):
+        _cfg(content_mask=False)
+        self.assertEqual(_masked(_apply(_req([7, THINK_END]))), set())
+
+
+class TestPlanGate(unittest.TestCase):
+    """The fold escape stays row-conditional with content_mask on."""
+
+    STRIDE = 4
+
+    def setUp(self):
+        _cfg()
+
+    def _gate(self, req):
+        fsm._req_fsm(req)
+        return fsm.plan_gate([req], self.STRIDE)
+
+    def test_reasoning_far_from_budget_keeps_the_folded_path(self):
+        self.assertFalse(self._gate(_req([7] * 10, effort="high")))
+
+    def test_right_after_think_start_goes_eager(self):
+        self.assertTrue(self._gate(_req()))
+
+    def test_fresh_content_goes_eager_only_with_content_mask(self):
+        self.assertTrue(self._gate(_req([7, THINK_END])))
+        _cfg(content_mask=False)
+        self.assertFalse(self._gate(_req([7, THINK_END])))
+
+    def test_content_with_progress_keeps_the_folded_path(self):
+        self.assertFalse(self._gate(_req([7, THINK_END, 8])))
+
+    def test_near_budget_and_zero_budget_go_eager(self):
+        _cfg(effort_budgets={**fsm._EFFORT_BUDGETS, "low": 12})
+        self.assertTrue(self._gate(_req([7] * 5, effort="low")))
+        self.assertTrue(self._gate(_req([7] * 5, effort="none")))
+
+
+class TestInitFromEnv(unittest.TestCase):
+    """The env surface: defaults and overrides as read by init_from_env."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        files = {
+            "tokenizer_config.json": {
+                "added_tokens_decoder": {
+                    str(THINK_START): {"content": "<|think:start|>"},
+                    str(THINK_END): {"content": "<|think:end|>"},
+                    str(IM_END): {"content": "<|im:end|>"},
+                }
+            },
+            "generation_config.json": {"eos_token_id": [EOS]},
+            "tokenizer.json": {"model": {"vocab": {"Ċ": NL, "ĊĊ": NLNL, "a": 9}}},
+        }
+        for name, body in files.items():
+            with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+                json.dump(body, f)
+        self.base_env = {"SOLAR_FSM": "1", "SOLAR_FSM_TOKENIZER_DIR": self.dir}
+        self.clear = [
+            k for k in os.environ if k.startswith("SOLAR_FSM_") and k != "SOLAR_FSM_TOKENIZER_DIR"
+        ]
+
+    def _init(self, **env):
+        with mock.patch.dict(os.environ, {**self.base_env, **env}):
+            for k in self.clear:
+                os.environ.pop(k, None)
+            for k in list(os.environ):
+                if k.startswith("SOLAR_FSM_") and k not in env and k not in self.base_env:
+                    os.environ.pop(k)
+            fsm.CFG.enabled = False
+            fsm.init_from_env()
+
+    def tearDown(self):
+        _cfg()
+
+    def test_defaults_are_the_vendor_rules(self):
+        self._init()
+        c = fsm.CFG
+        self.assertTrue(c.content_mask)
+        self.assertEqual(c.budget_policy, "effort")
+        self.assertEqual(c.effort_budgets, fsm._EFFORT_BUDGETS)
+        self.assertEqual(c.default_effort, "high")
+        self.assertEqual(c.hard_limit, 128 * 1024)
+        self.assertEqual(c.leading_newline_forbidden, (NL, NLNL))
+        self.assertEqual(
+            set(c.reasoning_open_forbidden), set(c.reasoning_forbidden) | {NL, NLNL}
+        )
+        self.assertIn(EOS, c.reasoning_forbidden)
+
+    def test_per_effort_override_and_hard_limit(self):
+        self._init(SOLAR_FSM_BUDGET_MEDIUM="777", SOLAR_FSM_HARD_LIMIT="50000")
+        self.assertEqual(fsm.CFG.effort_budgets["medium"], 777)
+        self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
+        self.assertEqual(fsm.CFG.effort_budgets["high"], 32 * 1024)
+
+    def test_content_mask_and_newline_rule_can_be_switched_off(self):
+        self._init(SOLAR_FSM_CONTENT_MASK="0", SOLAR_FSM_LEADING_NEWLINE_IDS="")
+        self.assertFalse(fsm.CFG.content_mask)
+        self.assertEqual(fsm.CFG.leading_newline_forbidden, ())
+        self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
+
+    def test_explicit_newline_ids_override_the_vocab(self):
+        self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7, 9")
+        self.assertEqual(fsm.CFG.leading_newline_forbidden, (7, 9))
+
+    def test_bad_policy_or_default_effort_fails_loud(self):
+        with self.assertRaises(RuntimeError):
+            self._init(SOLAR_FSM_BUDGET_POLICY="ratio")
+        with self.assertRaises(RuntimeError):
+            self._init(SOLAR_FSM_DEFAULT_EFFORT="ultra")
+
+    def test_none_as_default_effort_is_allowed(self):
+        self._init(SOLAR_FSM_DEFAULT_EFFORT="none")
+        self.assertEqual(fsm._budget_for(None, 4096), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
