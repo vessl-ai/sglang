@@ -63,6 +63,7 @@ def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     fsm.forced = False
     fsm.content_progress = False
     fsm.at_think_open = False
+    fsm.tools = True
     return fsm
 
 
@@ -71,7 +72,6 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
 
     _CFG_FIELDS = (
         "enabled",
-        "budget_policy",
         "effort_budgets",
         "default_effort",
         "hard_limit",
@@ -87,9 +87,6 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         "reasoning_forbidden",
         "content_fresh_forbidden",
         "content_done_forbidden",
-        "budget_ratio",
-        "budget_abs",
-        "content_mask",
         "spec_always_eager",
     )
 
@@ -112,12 +109,10 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.content_done_forbidden = ()
         cfg.content_fresh_forbidden_notools = (EOS,)
         cfg.content_done_forbidden_notools = ()
-        # These suites pin the budget by hand; keep the legacy formula so the
-        # per-effort table cannot reach past the fixture's budget_abs.
-        cfg.budget_policy = "legacy"
-        cfg.budget_ratio = 0.75
-        cfg.budget_abs = 1000
-        cfg.content_mask = False
+        # These suites pin the budget by hand: one effort, 1000 tokens.
+        cfg.effort_budgets = {"high": 1000}
+        cfg.default_effort = "high"
+        cfg.hard_limit = 1000
         cfg.spec_always_eager = False
         cfg._mask_cache.clear()
         solar_open2_fsm._CONFLICT_LOG["last"] = 0.0

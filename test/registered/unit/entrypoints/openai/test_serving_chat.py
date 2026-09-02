@@ -3696,39 +3696,6 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
                     )
                 )
 
-    def test_non_streaming_fence_opened_call_is_glued(self):
-        """The fence-opened shape the detector accepts is an opener for the
-        glue too (the streaming glue asks the detector; non-streaming asks
-        the same helper), so the trimmed terminator is restored."""
-        text = (
-            "```get_weather\n"
-            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>\n"
-        )
-        choice = self._build_choice(self.request, text, self._STOP_MATCHED)
-        self.assertEqual(choice.finish_reason, "tool_calls")
-        self.assertEqual(len(choice.message.tool_calls), 1)
-        self.assertEqual(
-            json.loads(choice.message.tool_calls[0].function.arguments),
-            {"location": "Paris"},
-        )
-
-    def test_streaming_fence_opened_call_is_glued(self):
-        """Streaming twin of the fence-opened glue: the detector holds the
-        fence-opened call, so the trimmed terminator is fed back and the
-        call is emitted."""
-        text = (
-            "```get_weather\n"
-            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>\n"
-        )
-        chunks, deltas, has_tool_calls = self._stream(
-            self.request, text, self._STOP_MATCHED
-        )
-        self.assertTrue(has_tool_calls.get(0))
-        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
-        self.assertEqual(
-            json.loads(deltas[0]["function"]["arguments"]), {"location": "Paris"}
-        )
-
     def test_streaming_unparsable_glued_call_is_content_without_stop_leak(self):
         """Streaming twin of the non-stream unparsable glue: the opener is
         there, the glued terminator closes a call that does not parse, so

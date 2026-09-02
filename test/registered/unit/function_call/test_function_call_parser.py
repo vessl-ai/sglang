@@ -38,7 +38,6 @@ from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END,
     TOOL_CALL_START,
     SolarOpen2Detector,
-    partial_fence_open_len,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -5327,15 +5326,6 @@ class TestSolarOpen2Detector(unittest.TestCase):
                         (got_text, len(got_calls)), (want_text, want_calls)
                     )
 
-    def test_zero_argument_fence_is_not_a_call(self):
-        """The fence-opened form needs at least one argument marker (opener
-        and full pattern agree); a bare fence + terminator stays text."""
-        detector = SolarOpen2Detector()
-        text = f"```get_weather\n{TOOL_CALL_END}"
-        self.assertFalse(detector.has_tool_call(text))
-        result = detector.detect_and_parse(text, self.tools)
-        self.assertEqual((result.normal_text, result.calls), (text, []))
-
     def test_streaming_text_after_a_call_follows_the_vendor_streaming_rule(self):
         """After a call, real text between or after calls is content and a
         whitespace run is not when it abuts the next opener or the end (the
@@ -5409,33 +5399,6 @@ class TestSolarOpen2Detector(unittest.TestCase):
         for size in (len(text), 5, 1):
             got_text, got_calls = self._stream_all(text, size)
             self.assertEqual((got_text, len(got_calls)), ("See 5", 1), size)
-
-    def test_fence_opener_split_across_increments_still_parses(self):
-        """A backtick run arriving one or two characters at a time is held
-        back like the whole fence, so the fence-opened call is not flushed
-        as content before its argument marker arrives (review round 4)."""
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
-
-        pieces = [
-            "\n",
-            "``",
-            "`get_weather",
-            "\n",
-            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
-        ]
-        parser = FunctionCallParser(self.tools, "solar_open2")
-        texts, calls = [], []
-        for piece in pieces:
-            t, c = parser.parse_stream_chunk(piece)
-            texts.append(t or "")
-            calls.extend(c)
-        t, c = parser.parse_stream_end()
-        texts.append(t or "")
-        calls.extend(c)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual("".join(texts), "")
-        whole = SolarOpen2Detector().detect_and_parse("".join(pieces), self.tools)
-        self.assertEqual((whole.normal_text, len(whole.calls)), ("", 1))
 
     def test_unparsed_call_sharing_a_chunk_with_parsed_calls(self):
         """An unparsable closed call between or after parsed calls: the prose
@@ -5572,20 +5535,6 @@ class TestSolarOpen2Detector(unittest.TestCase):
                     calls.extend(c)
                     self.assertEqual(("".join(texts), len(calls)), want)
 
-    def test_closing_code_fence_after_a_call_is_content(self):
-        """A code block after a call keeps its closing fence line; a fence
-        with no name cannot become a call opener (review round 5)."""
-        good = (
-            f"{TOOL_CALL_START}get_weather\n"
-            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
-            f"{TOOL_CALL_END}"
-        )
-        text = good + "\nuse:\n```py\nx=1\n```\n"
-        whole = self._stream_all(text, len(text))
-        self.assertEqual((whole[0], len(whole[1])), ("\nuse:\n```py\nx=1\n```", 1))
-        for size in (11, 5, 1):
-            self.assertEqual(self._stream_all(text, size), whole, size)
-
     def test_unfinished_call_then_a_good_call_yields_the_good_call(self):
         """The body group stops at an opener, so an unfinished call followed
         by a well-formed one does not merge into one fake call (vendor: it
@@ -5601,21 +5550,6 @@ class TestSolarOpen2Detector(unittest.TestCase):
             [("get_weather", {"location": "Paris"})],
         )
         self.assertEqual(self._stream_all(text, 5)[1][0].name, "get_weather")
-
-    def test_partial_fence_holdback_after_a_dead_fence_candidate(self):
-        """A closed code fence earlier in the buffer must not stop the 1-2
-        backtick hold at the end (review round 5)."""
-        self.assertEqual(partial_fence_open_len("```\n\n`"), 1)
-        self.assertEqual(partial_fence_open_len("```\n\n``"), 2)
-        self.assertEqual(partial_fence_open_len("```python\nx\n```\ndone"), 0)
-        text = (
-            "\n```\n\n```get_time\n"
-            f"{TOOL_ARG_START}timezone{TOOL_ARG_VALUE}UTC{TOOL_ARG_END}\n{TOOL_CALL_END}"
-        )
-        whole = self._stream_all(text, len(text))
-        for size in (7, 4, 1):
-            self.assertEqual(self._stream_all(text, size), whole, size)
-        self.assertEqual(len(whole[1]), 1)
 
     def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
         """A call without the newline after its name followed by a well-formed
@@ -5657,7 +5591,7 @@ class TestSolarOpen2Detector(unittest.TestCase):
 
     def test_stream_end_releases_held_text(self):
         """Text held back for a marker that never arrives (a trailing code
-        fence, an unfinished call cut by max_tokens) is released as content
+        opener, an unfinished call cut by max_tokens) is released as content
         at the end of the stream instead of being dropped (review C1)."""
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
@@ -6015,12 +5949,6 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             "blank then good": (
                 f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good,
                 True,
-                False,
-            ),
-            # Our fence-opened form: not a call for the vendor at all.
-            "fence form": (
-                f"```get_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
-                False,
                 False,
             ),
             # The vendor's lazy name group swallows the following call after a

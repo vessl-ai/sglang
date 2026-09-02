@@ -1,39 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Solar Open2 chat-envelope FSM enforcer (SGLang port).
+"""Solar Open2 chat-envelope FSM: a per-request logits mask for the Solar Pro 4
+chat template.
 
-Ported from the Upstage vLLM fork's
-``vllm/v1/sample/logits_processor/solar_open2.py``
-(``SolarOpen2TokenFSMEnforcer``), the vendor's vLLM 0.25.0 patch set (opted in
-there with ``--logits-processors``, per-request disable via ``vllm_xargs``).
-It structurally closes the illegal exits from the REASONING block so the turn
-can only end through ``<|think:end|>``, force-emits ``<|think:end|>`` once the
-reasoning budget is spent, and keeps the tool-call envelope well-formed.
+The template wraps a reply in ``<|think:start|>`` ... ``<|think:end|>`` followed
+by content that may hold tool calls (``<|tool_call:start|>`` name, argument
+runs ``<|tool_arg:start|>`` ``<|tool_arg:value|>`` ``<|tool_arg:end|>``,
+``<|tool_call:end|>``). This module keeps a generation inside that envelope:
 
-Scope of this port:
-  * REASONING state: sentinel/EOS mask + ``_FORCE_THINK_END`` on budget, and
-    the vendor's leading-newline rule on the first token of the block.
-  * CONTENT and the tool-call envelope: the vendor's per-state sentinel
-    tables (``_MASK_SPEC_BY_STATE`` / ``_MASK_SPEC_CONTENT``), walked by the
-    same transitions as ``SolarOpen2TokenFSMEnforcer._process_token`` -- a
-    turn that has produced no content may not end, and inside
-    ``<|tool_call:start|>`` .. ``<|tool_call:end|>`` only the envelope
-    sentinel(s) the current sub-state expects are open. ``SOLAR_FSM_CONTENT_MASK=0``
-    (not a vendor switch) turns every non-REASONING mask off.
+* REASONING: EOS, ``<|im:end|>`` and every control sentinel but ``<|think:end|>``
+  are masked, so the block can only end through ``<|think:end|>``; once the
+  reasoning budget is spent the next token is forced to ``<|think:end|>``; the
+  token right after ``<|think:start|>`` may not be a newline run.
+* CONTENT: a turn that has produced no content token yet may not end (EOS and
+  ``<|im:end|>`` masked); after the first content token only stray sentinels
+  are masked. A request that offers no tools also loses ``<|tool_call:start|>``
+  (with EOS shut, a model that wants to stop would take it as the exit).
+* Tool-call states (``TOOL_CALL_BEGIN`` .. ``TOOL_CALL_END``): only the
+  envelope sentinel(s) the sub-state expects are open, so a call cannot be
+  closed by a turn end or a stray sentinel. When the request carries a
+  grammar (json_schema / regex / ebnf / structural_tag) the grammar owns the
+  CONTENT phase and this mask stays out of it.
 
-Budget and ids follow the vendor's vLLM 0.25.0 logits processor (Solar Pro 4
-parser/LP patch set, 2026-09-01): a fixed budget per reasoning effort
-(``_EFFORT_BUDGETS``, default ``high``), ids resolved from the served
-tokenizer rather than hardcoded. The effort reaches the FSM through
-``custom_params[EFFORT_PARAM]``, set by the chat entrypoint; ``/generate``
-and ``/v1/completions`` carry no effort and get the default budget. The
-served chat template opens a think block only for ``medium``/``high``
-(``low``/``none``/``minimal`` pre-close it), so the ``low`` budget only
-applies to a block the model opens itself, e.g. after a tool result. The
-earlier port's ``min(SOLAR_FSM_BUDGET_ABS, max_new_tokens *
-SOLAR_FSM_BUDGET_RATIO)`` remains behind ``SOLAR_FSM_BUDGET_POLICY=legacy``.
+The states, their allowed-sentinel tables, the transitions and the budget table
+(``_MASK_SPEC_BY_STATE``, ``_MASK_SPEC_CONTENT``, ``_TRANSITIONS``,
+``_EFFORT_BUDGETS``) are the ones the model was trained against. Ids are
+resolved from the served tokenizer at first use, never hardcoded.
 
-Enabled by ``SOLAR_FSM=1``; a resolution failure fails loud at first use
-rather than masking with wrong ids.
+The reasoning budget is a fixed number of tokens per ``reasoning_effort``
+(``none`` / ``minimal`` close the block at once; nothing above the hard limit;
+default effort ``high``), independent of ``max_tokens``. The chat entrypoint
+hands the request's effort and whether it offers tools to the scheduler through
+``custom_params`` (``EFFORT_PARAM``, ``TOOLS_PARAM``); ``/generate`` and
+``/v1/completions`` carry neither and get the defaults. The chat template opens
+a think block only for ``medium`` / ``high`` (other efforts pre-close it), so
+the ``low`` budget only applies to a block the model opens itself, e.g. after a
+tool result.
+
+Enabled by ``SOLAR_FSM=1`` with ``SOLAR_FSM_TOKENIZER_DIR`` pointing at the
+served tokenizer; a resolution failure fails loud at first use rather than
+masking with wrong ids. Optional tunables: ``SOLAR_REASONING_BUDGET_LOW`` ..
+``_MAX`` (per-effort budgets), ``SOLAR_REASONING_BUDGET_HARD_LIMIT`` (0 disables
+the ceiling), ``SOLAR_REASONING_BUDGET_DEFAULT_EFFORT``,
+``SOLAR_REASONING_BUDGET_NO_REASONING_EFFORTS`` (comma list),
+``SOLAR_OPEN2_EOS_TOKEN_IDS`` and ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS``
+(comma lists overriding the tokenizer-derived sets), and
+``SOLAR_FSM_SPEC_ALWAYS_EAGER=1`` (speculative decoding: mask every verify step
+instead of only the steps the folded path cannot cover).
 """
 
 from __future__ import annotations
@@ -50,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 NEG_INF = float("-inf")
 
-# Control sentinels by field name -- the vendor's SolarOpen2TokenIds layout
+# Control sentinels by field name, resolved from the tokenizer's added tokens
 # (03-logits-processor.patch: _TOKEN_TEXT_BY_FIELD). Every one present in the
 # served tokenizer is a member of ``all_controls``.
 _TOKEN_TEXT_BY_FIELD = {
@@ -71,7 +83,7 @@ _TOKEN_TEXT_BY_FIELD = {
 }
 _SENTINEL_TOKENS = tuple(_TOKEN_TEXT_BY_FIELD.values())
 
-# FSM states -- the vendor's SolarOpen2State, as small ints (they live in
+# FSM states, as small ints (they live in
 # __slots__ and are compared on every decode step).
 REASONING = 0
 CONTENT = 1
@@ -97,7 +109,7 @@ _STATE_NAMES = (
 )
 _TOOL_STATES = frozenset(range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1))
 
-# Per-state mask specification, verbatim from the vendor: (allowed sentinel
+# Per-state mask specification: (allowed sentinel
 # fields, eos_masked). Bare EOS is forbidden wherever ending the turn is
 # template-illegal -- everywhere except CONTENT-with-progress and
 # TOOL_CALL_END. CONTENT is keyed by the content-progress flag instead.
@@ -118,7 +130,7 @@ _MASK_SPEC_CONTENT = {
     # Fresh CONTENT (no content yet): turn end (im_end + bare EOS) forbidden.
     False: (("tool_call_start",), True),
 }
-# Sentinel -> next state (the vendor's _sentinel_transitions), and the
+# Sentinel -> next state, and the
 # states a non-transition token advances by itself.
 _TRANSITIONS = (
     ("think_start", REASONING),
@@ -136,14 +148,7 @@ _AUTO_ADVANCE = {
     TOOL_CALL_END: CONTENT,
 }
 
-_FORK_ABS_BUDGET = 128 * 1024
-
-# Vendor budget table (UpstageAI vllm solar_open2 logits processor, Pro 4
-# parser/LP patch set for vLLM 0.25.0, 2026-09-01: _REASONING_BUDGET_BY_EFFORT).
-# The budget is fixed per reasoning effort and does not depend on max_tokens;
-# "none"/"minimal" close a think block the moment it opens; nothing may exceed
-# the hard limit. The chat template defaults to "high" when the request names
-# no effort, and so does the table.
+# Reasoning budget per effort (tokens).
 _EFFORT_BUDGETS: Dict[str, int] = {
     "low": 4 * 1024,
     "medium": 16 * 1024,
@@ -154,15 +159,13 @@ _EFFORT_BUDGETS: Dict[str, int] = {
 _NO_REASONING_EFFORTS = frozenset({"none", "minimal"})
 _DEFAULT_EFFORT = "high"
 _HARD_LIMIT = 128 * 1024
-_NO_HARD_LIMIT = 1 << 62  # SOLAR_FSM_HARD_LIMIT=0: no server-wide ceiling
+_NO_HARD_LIMIT = 1 << 62  # SOLAR_REASONING_BUDGET_HARD_LIMIT=0: no ceiling
 # The token right after <|think:start|> may not be a newline run: every vocab
 # token whose text is only byte-level "\n" ("Ċ", "ĊĊ", ...) plus a verbatim
-# "\n" / "\n\n" (the vendor's resolve_solar_open2_think_leading_forbidden_ids;
-# its last-resort default is the shipped tokenizer's ids 4294 / 4372).
+# "\n" / "\n\n" (ids 4294 / 4372 in the shipped tokenizer).
 _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
-_LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")  # named in the fail-loud message only
 # custom_params key the chat entrypoint uses to hand the request's reasoning
-# effort to the scheduler-side FSM (serving_chat._normalize_solar_open2_reasoning_effort).
+# effort to the scheduler-side FSM (solar_open2_serving.normalize_reasoning_effort).
 EFFORT_PARAM = "solar_reasoning_effort"
 # custom_params key: whether the request offers tools (chat entrypoint). A
 # request without tools can never have a <|tool_call:start|> answered, so the
@@ -193,12 +196,9 @@ class _Config:
     all_controls: frozenset = frozenset()
     # sentinel id -> next state (_TRANSITIONS resolved against the tokenizer).
     transitions: Dict[int, int] = {}
-    # (state, content_progress) -> forbidden ids, the vendor's _forbidden_table.
-    # ``forbidden_notools`` is the same table with <|tool_call:start|> forbidden
-    # in every state -- built like the vendor's block_tool_call_start variant,
-    # which the vendor switches to after the first completed call of a
-    # parallel_tool_calls=false turn (not ported: that mode uses a stop string
-    # here, INF-450); we use the table for a request that offers no tools.
+    # (state, content_progress) -> forbidden ids: the control sentinels the
+    # state does not allow, plus EOS where ending the turn is illegal. The
+    # no-tools variant forbids <|tool_call:start|> in every state as well.
     forbidden: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     forbidden_notools: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     # Named views into the tables. reasoning_forbidden / reasoning_open_forbidden
@@ -220,32 +220,15 @@ class _Config:
     # joins them.
     content_fresh_forbidden_notools: Tuple[int, ...] = ()
     content_done_forbidden_notools: Tuple[int, ...] = ()
-    # Reasoning budget. "effort" (default) is the vendor rule: a fixed budget per
-    # reasoning effort (effort_budgets, hard_limit). "legacy" keeps the earlier
-    # port's min(budget_abs, max_new_tokens * budget_ratio).
-    budget_policy: str = "effort"
+    # Reasoning budget: a fixed number of tokens per effort, clamped by hard_limit.
     effort_budgets: Dict[str, int] = dict(_EFFORT_BUDGETS)
     default_effort: str = _DEFAULT_EFFORT
     hard_limit: int = _HARD_LIMIT
-    budget_ratio: float = 0.75
-    # Vendor rule (_MASK_SPEC_CONTENT): a turn may not end before it has
-    # produced content, so the step right after <|think:end|> cannot sample
-    # EOS/<|im:end|>. R4 measured this OFF as the better setting (GPQA 74.0% ->
-    # 68.0% with it on), but on a port whose budget force never fired: the rows
-    # were lost in copy_for_forward (sampling_batch_info.py), so the mask only
-    # ever acted on requests the model had closed itself. With the force alive,
-    # leaving it off makes every budget-forced request finish with an empty
-    # answer (2026-09-01 KMMLU-Pro rerun: 26 of 49 forced rows). Default ON for
-    # parity; SOLAR_FSM_CONTENT_MASK=0 (not a vendor switch) turns off every
-    # mask outside REASONING: this rule, the tool-call envelope sets, and the
-    # no-tools <|tool_call:start|> ban -- the pre-#61 production behaviour.
-    content_mask: bool = True
-    # R5-8: masking the verify logits costs the folded in-graph accept, so by
-    # default we only leave the folded path on steps where the reasoning budget
-    # actually falls inside the draft chain. Set 1 to mask every verify step
-    # (fuller enforcement, measurable throughput cost -- BUILDLOG §[R5-8] ⑤).
+    no_reasoning_efforts: frozenset = _NO_REASONING_EFFORTS
+    # Speculative decoding: masking the verify logits costs the folded in-graph
+    # accept, so by default only the steps the folded path cannot cover leave
+    # it (plan_gate). True masks every verify step (fuller enforcement, slower).
     spec_always_eager: bool = False
-    budget_abs: int = _FORK_ABS_BUDGET
     _mask_cache: Dict[Tuple[Tuple[int, ...], int, str], torch.Tensor] = {}
 
 
@@ -272,18 +255,18 @@ def _added_token_ids(tokenizer_dir: str) -> Dict[str, int]:
 
 
 def _eos_ids(tokenizer_dir: str) -> List[int]:
-    """Turn-terminating ids the vendor masks where ending the turn is illegal:
-    the union of ``config.json`` / ``generation_config.json`` ``eos_token_id``
-    and the tokenizer's ``eos_token`` text, ``SOLAR_FSM_EOS_IDS`` (comma list)
-    overriding everything. Sentinels are removed by ``configure_ids`` -- they
+    """Turn-terminating ids, masked where ending the turn is illegal: the union
+    of ``config.json`` / ``generation_config.json`` ``eos_token_id`` and the
+    tokenizer's ``eos_token`` text; ``SOLAR_OPEN2_EOS_TOKEN_IDS`` (comma list)
+    overrides everything. Sentinels are removed by ``configure_ids`` -- they
     stay state-managed."""
-    raw_env = os.environ.get("SOLAR_FSM_EOS_IDS")
+    raw_env = os.environ.get("SOLAR_OPEN2_EOS_TOKEN_IDS")
     if raw_env is not None:
         try:
             return sorted({int(x) for x in raw_env.split(",") if x.strip()})
         except ValueError as exc:
             raise RuntimeError(
-                f"SOLAR_FSM_EOS_IDS must be a comma list of ids, got {raw_env!r}"
+                f"SOLAR_OPEN2_EOS_TOKEN_IDS must be a comma list of ids, got {raw_env!r}"
             ) from exc
     ids = set()
     for name in ("config.json", "generation_config.json"):
@@ -306,6 +289,37 @@ def _eos_ids(tokenizer_dir: str) -> List[int]:
     return sorted(ids)
 
 
+_RETIRED_ENV = {
+    "SOLAR_FSM_EOS_IDS": "SOLAR_OPEN2_EOS_TOKEN_IDS",
+    "SOLAR_FSM_LEADING_NEWLINE_IDS": "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS",
+    "SOLAR_FSM_HARD_LIMIT": "SOLAR_REASONING_BUDGET_HARD_LIMIT",
+    "SOLAR_FSM_DEFAULT_EFFORT": "SOLAR_REASONING_BUDGET_DEFAULT_EFFORT",
+    "SOLAR_FSM_BUDGET_LOW": "SOLAR_REASONING_BUDGET_LOW",
+    "SOLAR_FSM_BUDGET_MEDIUM": "SOLAR_REASONING_BUDGET_MEDIUM",
+    "SOLAR_FSM_BUDGET_HIGH": "SOLAR_REASONING_BUDGET_HIGH",
+    "SOLAR_FSM_BUDGET_XHIGH": "SOLAR_REASONING_BUDGET_XHIGH",
+    "SOLAR_FSM_BUDGET_MAX": "SOLAR_REASONING_BUDGET_MAX",
+    "SOLAR_FSM_CONTENT_MASK": None,
+    "SOLAR_FSM_BUDGET_POLICY": None,
+    "SOLAR_FSM_BUDGET_RATIO": None,
+    "SOLAR_FSM_BUDGET_ABS": None,
+}
+
+
+def _warn_retired_env() -> None:
+    """Names an earlier version read and this one does not: renamed knobs point
+    at their replacement; removed ones (the content-mask switch, the
+    max_tokens-relative budget) are ignored -- the envelope is always enforced
+    and the budget always follows the effort table."""
+    for name, replacement in _RETIRED_ENV.items():
+        if name in os.environ:
+            logger.warning(
+                "[SOLAR-FSM] %s is not read any more%s",
+                name,
+                f"; use {replacement}" if replacement else " (removed)",
+            )
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -316,37 +330,27 @@ def _env_int(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return float(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be a number, got {raw!r}") from exc
-
-
 def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     """Ids forbidden as the first token after ``<|think:start|>``.
 
     Every token of ``tokenizer.json``'s vocab and of the added tokens
     (``tokenizer_config.json`` / ``tokenizer.json``) whose text is a pure
-    newline run, plus a verbatim newline token -- the vendor's rule;
-    ``SOLAR_FSM_LEADING_NEWLINE_IDS`` overrides with a comma list, and an
+    newline run, plus a verbatim newline token;
+    ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`` overrides with a comma list, and an
     empty value switches the rule off. Like the think ids, a vocab that
     cannot supply them fails loud rather than silently dropping the rule.
     """
-    raw = os.environ.get("SOLAR_FSM_LEADING_NEWLINE_IDS")
+    raw = os.environ.get("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
     if raw is not None:
         try:
             ids = {int(x) for x in raw.split(",") if x.strip()}
         except ValueError as exc:
             raise RuntimeError(
-                f"SOLAR_FSM_LEADING_NEWLINE_IDS must be a comma list of ids, got {raw!r}"
+                f"SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS must be a comma list of ids, got {raw!r}"
             ) from exc
         if any(i < 0 for i in ids):
             raise RuntimeError(
-                f"SOLAR_FSM_LEADING_NEWLINE_IDS has a negative id: {raw!r}"
+                f"SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS has a negative id: {raw!r}"
             )
         return tuple(sorted(ids))
     tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
@@ -355,7 +359,7 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
         with open(tk_path, encoding="utf-8") as f:
             model = json.load(f).get("model") or {}
         vocab = model.get("vocab") if isinstance(model.get("vocab"), dict) else {}
-    # The vendor's rule: every vocab token whose text is a pure newline run
+    # Every vocab token whose text is a pure newline run
     # (byte-level "Ċ" repeated), plus a verbatim "\n" / "\n\n".
     table = dict(vocab)
     table.update(_added_token_ids(tokenizer_dir))
@@ -367,9 +371,9 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     ids |= {int(table[t]) for t in ("\n", "\n\n") if t in table}
     if not ids:
         raise RuntimeError(
-            f"SOLAR_FSM: leading-newline tokens {_LEADING_NEWLINE_TEXTS} not found "
+            f"SOLAR_FSM: leading-newline tokens ('Ċ', 'ĊĊ') not found "
             f"in {tokenizer_dir}'s vocab or added tokens; set "
-            "SOLAR_FSM_LEADING_NEWLINE_IDS to the ids, or to an empty string to "
+            "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS to the ids, or to an empty string to "
             "switch the rule off"
         )
     return tuple(sorted(ids))
@@ -402,24 +406,20 @@ def _warn_unknown_effort(effort) -> None:
 def _budget_for(effort, max_new_tokens: Optional[int]) -> int:
     """Reasoning budget (tokens) for one request. ``effort`` is the value the
     entrypoint attached (a string), or None for the default."""
-    if CFG.budget_policy == "legacy":
-        if max_new_tokens and max_new_tokens > 0:
-            return min(CFG.budget_abs, int(max_new_tokens * CFG.budget_ratio))
-        return CFG.budget_abs
     if effort is None:
         key = CFG.default_effort
     elif isinstance(effort, str):
         key = effort.strip().lower()
     else:
         key = None
-    if key in _NO_REASONING_EFFORTS:
+    if key in CFG.no_reasoning_efforts:
         return 0
     budget = CFG.effort_budgets.get(key) if key is not None else None
     if budget is None:
         _warn_unknown_effort(effort)
         budget = (
             0
-            if CFG.default_effort in _NO_REASONING_EFFORTS
+            if CFG.default_effort in CFG.no_reasoning_efforts
             else (CFG.effort_budgets[CFG.default_effort])
         )
     return min(budget, CFG.hard_limit)
@@ -436,7 +436,7 @@ def _req_effort(req):
 
 def _req_tools(req) -> bool:
     """Whether the request offers tools (``TOOLS_PARAM``); True when the
-    entrypoint did not say (the vendor's sets, which allow a tool call)."""
+    entrypoint did not say (the tables that allow a tool call)."""
     params = getattr(getattr(req, "sampling_params", None), "custom_params", None)
     if isinstance(params, dict) and TOOLS_PARAM in params:
         value = params[TOOLS_PARAM]
@@ -454,7 +454,7 @@ def _req_tools(req) -> bool:
 
 
 def _forbidden_for(state: int, content_progress: bool, tools: bool) -> Tuple[int, ...]:
-    """The vendor's ``advance_mask_ids`` lookup for a non-REASONING step: the
+    """The forbidden set for a non-REASONING step: the
     (state, content_progress) entry of the forbidden table, or of the
     no-tools variant when the request offers no tools."""
     table = CFG.forbidden if tools else CFG.forbidden_notools
@@ -478,10 +478,10 @@ def configure_ids(
 ) -> None:
     """Resolve the sentinel ids and build every derived table from them.
 
-    ``ids`` maps the vendor's field names (``_TOKEN_TEXT_BY_FIELD``) to token
-    ids, ``None`` for a sentinel the tokenizer does not carry. Mirrors the
-    vendor's ``_forbidden_table``: per (state, content_progress) the control
-    sentinels the state does not allow, plus the bare EOS ids wherever ending
+    ``ids`` maps the field names of ``_TOKEN_TEXT_BY_FIELD`` to token ids,
+    ``None`` for a sentinel the tokenizer does not carry. Per (state,
+    content_progress) the forbidden set holds the control sentinels the state
+    does not allow, plus the bare EOS ids wherever ending
     the turn is template-illegal. The unit tests configure the module through
     this as well, so a test and the server can never disagree on how a set is
     derived from the spec.
@@ -553,33 +553,23 @@ def init_from_env() -> None:
         _leading_newline_ids(tok_dir),
     )
 
-    CFG.budget_policy = (
-        os.environ.get("SOLAR_FSM_BUDGET_POLICY", "effort").strip().lower()
-    )
-    if CFG.budget_policy not in ("effort", "legacy"):
-        raise RuntimeError(
-            "SOLAR_FSM_BUDGET_POLICY must be 'effort' or 'legacy', got "
-            f"{CFG.budget_policy!r}"
-        )
-    # Vendor semantics (SOLAR_REASONING_BUDGET_HARD_LIMIT): 0 disables the
-    # server-wide ceiling; a negative value is a configuration error.
-    CFG.hard_limit = _env_int("SOLAR_FSM_HARD_LIMIT", _HARD_LIMIT)
+    # A hard limit of 0 disables the server-wide ceiling; a negative value is a
+    # configuration error.
+    CFG.hard_limit = _env_int("SOLAR_REASONING_BUDGET_HARD_LIMIT", _HARD_LIMIT)
     if CFG.hard_limit < 0:
         raise RuntimeError(
-            f"SOLAR_FSM_HARD_LIMIT must be >= 0 (0 disables), got {CFG.hard_limit}"
+            f"SOLAR_REASONING_BUDGET_HARD_LIMIT must be >= 0 (0 disables), got {CFG.hard_limit}"
         )
     if CFG.hard_limit == 0:
         CFG.hard_limit = _NO_HARD_LIMIT
     budgets = {}
     for effort, default in _EFFORT_BUDGETS.items():
-        name = f"SOLAR_FSM_BUDGET_{effort.upper()}"
+        name = f"SOLAR_REASONING_BUDGET_{effort.upper()}"
         value = _env_int(name, default)
         if value < 0:
-            # Vendor: a negative per-effort budget falls back to the built-in
-            # default with a warning rather than failing every request (a
-            # non-integer value still fails loud in _env_int, unlike the
-            # vendor, which warns for every malformed value; a blank value
-            # takes the default silently here, with a warning there).
+            # A negative per-effort budget falls back to the built-in default
+            # with a warning rather than failing every request; a non-integer
+            # fails loud in _env_int; a blank value takes the default.
             logger.warning(
                 "[SOLAR-FSM] ignoring %s=%d (must be >= 0); using the built-in "
                 "%s budget %d.",
@@ -592,7 +582,7 @@ def init_from_env() -> None:
         if value > CFG.hard_limit:
             if name in os.environ:
                 logger.warning(
-                    "[SOLAR-FSM] %s=%d exceeds SOLAR_FSM_HARD_LIMIT=%d; clamped.",
+                    "[SOLAR-FSM] %s=%d exceeds SOLAR_REASONING_BUDGET_HARD_LIMIT=%d; clamped.",
                     name,
                     value,
                     CFG.hard_limit,
@@ -600,49 +590,37 @@ def init_from_env() -> None:
             value = CFG.hard_limit
         budgets[effort] = value
     CFG.effort_budgets = budgets
+    raw = os.environ.get("SOLAR_REASONING_BUDGET_NO_REASONING_EFFORTS")
+    if raw is not None:
+        CFG.no_reasoning_efforts = frozenset(
+            e.strip().lower() for e in raw.split(",") if e.strip()
+        )
     CFG.default_effort = (
-        os.environ.get("SOLAR_FSM_DEFAULT_EFFORT", _DEFAULT_EFFORT).strip().lower()
+        os.environ.get("SOLAR_REASONING_BUDGET_DEFAULT_EFFORT", _DEFAULT_EFFORT)
+        .strip()
+        .lower()
     )
     if (
         CFG.default_effort not in CFG.effort_budgets
-        and CFG.default_effort not in _NO_REASONING_EFFORTS
+        and CFG.default_effort not in CFG.no_reasoning_efforts
     ):
         raise RuntimeError(
-            f"SOLAR_FSM_DEFAULT_EFFORT={CFG.default_effort!r} is not a known "
+            f"SOLAR_REASONING_BUDGET_DEFAULT_EFFORT={CFG.default_effort!r} is not a known "
             f"reasoning effort: {sorted(CFG.effort_budgets)} / "
-            f"{sorted(_NO_REASONING_EFFORTS)}"
+            f"{sorted(CFG.no_reasoning_efforts)}"
         )
-    CFG.budget_ratio = _env_float("SOLAR_FSM_BUDGET_RATIO", 0.75)
-    CFG.budget_abs = _env_int("SOLAR_FSM_BUDGET_ABS", _FORK_ABS_BUDGET)
-    legacy_vars = [
-        v for v in ("SOLAR_FSM_BUDGET_RATIO", "SOLAR_FSM_BUDGET_ABS") if v in os.environ
-    ]
-    if legacy_vars and CFG.budget_policy == "effort":
-        logger.warning(
-            "[SOLAR-FSM] %s set but SOLAR_FSM_BUDGET_POLICY is 'effort': the "
-            "reasoning budget follows the per-effort table and these values are "
-            "ignored. Set SOLAR_FSM_BUDGET_POLICY=legacy to keep "
-            "min(SOLAR_FSM_BUDGET_ABS, max_new_tokens * SOLAR_FSM_BUDGET_RATIO).",
-            ", ".join(legacy_vars),
-        )
-    CFG.content_mask = os.environ.get("SOLAR_FSM_CONTENT_MASK", "1") == "1"
     CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
+    _warn_retired_env()
     CFG.enabled = True
-    if CFG.budget_policy == "legacy":
-        budget_desc = "legacy min(%d, max_new_tokens*%.2f)" % (
-            CFG.budget_abs,
-            CFG.budget_ratio,
-        )
-    else:
-        budget_desc = "per effort %s default=%s hard_limit=%s" % (
-            CFG.effort_budgets,
-            CFG.default_effort,
-            "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
-        )
+    budget_desc = "per effort %s default=%s hard_limit=%s" % (
+        CFG.effort_budgets,
+        CFG.default_effort,
+        "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
+    )
     logger.info(
         "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
         "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
-        "content_done=%s (no tools: %s / %s) tool states=%s | content_mask=%s "
+        "content_done=%s (no tools: %s / %s) tool states=%s "
         "budget=%s",
         CFG.think_start,
         CFG.think_end,
@@ -654,7 +632,6 @@ def init_from_env() -> None:
         CFG.content_fresh_forbidden_notools,
         CFG.content_done_forbidden_notools,
         {_STATE_NAMES[st]: CFG.forbidden[(st, False)] for st in sorted(_TOOL_STATES)},
-        CFG.content_mask,
         budget_desc,
     )
 
@@ -670,7 +647,7 @@ def is_active() -> bool:
 
 
 class SolarReqFSM:
-    """Per-request walk of the vendor's ten-state envelope machine. Lives on
+    """Per-request walk of the ten-state envelope machine. Lives on
     the Req, so a row permutation
     can never hand one request another request's state."""
 
@@ -692,7 +669,7 @@ class SolarReqFSM:
         effort: Optional[str] = None,
         tools: bool = True,
     ):
-        # The vendor's _initial_state: inside reasoning iff the last
+        # Initial state: inside reasoning iff the last
         # think_start in the prompt is not followed by a think_end.
         self.state = REASONING if _starts_in_reasoning(prompt_ids) else CONTENT
         # True while the next token is the first one after <|think:start|>
@@ -702,7 +679,7 @@ class SolarReqFSM:
             and len(prompt_ids) > 0
             and prompt_ids[-1] == CFG.think_start
         )
-        # The vendor's _initial_completed_tool_call_state: a tool call the
+        # Completed-call seed: a tool call the
         # prompt's *current* assistant turn already completed counts as content.
         self.content_progress = _prompt_completed_tool_call(prompt_ids)
         self.count = 0
@@ -716,7 +693,7 @@ class SolarReqFSM:
         walks a throwaway copy of this state over a speculative chain, so the
         two can never drift. Touches only ``state`` / ``at_think_open`` /
         ``count`` / ``content_progress`` -- the slots ``_SimState`` also
-        carries. The transition is the vendor's ``_process_token``."""
+        carries."""
         state = self.state
         if tok not in CFG.all_controls:
             # Ordinary token: state-implied bookkeeping only.
@@ -793,22 +770,20 @@ class SolarReqFSM:
 def _has_grammar(req) -> bool:
     """Whether structured outputs (a grammar) constrain this request.
 
-    The vendor leaves the CONTENT phase to the grammar (``advance_mask_ids``
-    returns None there) and keeps masking the tool states. That only holds
-    when the grammar never produces a sentinel: in vLLM a required / named
-    tool call is a JSON-schema grammar (JSON array of calls, no
-    ``<|tool_call:start|>``), so the FSM never enters a tool state under a
-    grammar. ``SolarOpen2Detector.supports_structural_tag`` is False for the
-    same reason -- the legacy structural tag constrains *text*, while this
-    FSM tracks sentinel *ids*; the observed combination (opener sampled as
-    the sentinel id, closer spelled out as text) left the FSM inside
-    TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
+    A grammar owns the CONTENT phase: this FSM masks nothing there and keeps
+    masking the tool states. That holds because a grammar never produces a
+    sentinel -- a required / named tool call is a JSON-schema grammar (a JSON
+    array of calls, no ``<|tool_call:start|>``), so the FSM never enters a
+    tool state under one. ``SolarOpen2Detector.supports_structural_tag`` is
+    False for the same reason: a structural tag constrains *text*, while this
+    FSM tracks sentinel *ids*, and the two were observed to disagree (opener
+    sampled as the sentinel id, closer spelled out as text), which left the
+    FSM inside TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
 
     Judged from the request's own constraint (json_schema / regex / ebnf /
-    structural_tag), as the vendor's ``_has_structured_outputs`` does -- not
-    from ``req.grammar``: ``--enable-strict-thinking`` hangs a server-side
-    reasoning grammar with no inner grammar on every reasoning request, and
-    that must not switch the CONTENT rules off.
+    structural_tag), not from ``req.grammar``: ``--enable-strict-thinking``
+    hangs a server-side reasoning grammar with no inner grammar on every
+    reasoning request, and that must not switch the CONTENT rules off.
     """
     sp = getattr(req, "sampling_params", None)
     return sp is not None and any(
@@ -869,7 +844,7 @@ def _prompt_completed_tool_call(prompt_ids: Sequence[int]) -> bool:
     (a ``<|tool_call:end|>`` after the last ``<|im:start|>``). Earlier turns'
     calls are always followed by a newer message start, so they never seed
     the flag; with no ``<|im:start|>`` id the boundary is unknown and the flag
-    conservatively stays False (the vendor's rule)."""
+    conservatively stays False."""
     if CFG.tool_call_end is None or CFG.im_start is None:
         return False
     last_call_end = _rindex(prompt_ids, CFG.tool_call_end)
@@ -1064,20 +1039,15 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 force_rows.append(i)
             else:
                 mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
-        elif not CFG.content_mask:
-            continue  # SOLAR_FSM_CONTENT_MASK=0: nothing outside REASONING
         elif fsm.state == CONTENT and _has_grammar(req):
-            continue  # structured outputs own the CONTENT phase (vendor rule)
+            continue  # structured outputs own the CONTENT phase
         else:
-            # The vendor's per-state table. Fresh CONTENT forbids EOS/im_end
-            # until real content exists (otherwise the model leaves reasoning
-            # and immediately stops with an empty answer: 6/13 GPQA errors in
-            # R2-3rd had content_len == 0); inside a tool call only the
-            # envelope sentinel(s) the sub-state expects are open. A request
-            # without tools also loses <|tool_call:start|>: with EOS shut, a
-            # model that wanted to stop takes it as the exit instead (KMMLU-Pro
-            # medium rerun: 13 of 35 no-answer rows ended on
-            # "<|tool_call:start|>think").
+            # Fresh CONTENT forbids EOS/im_end until real content exists
+            # (otherwise the model leaves reasoning and stops at once with an
+            # empty answer); inside a tool call only the envelope sentinel(s)
+            # the sub-state expects are open; a request without tools also
+            # loses <|tool_call:start|> (with EOS shut, a model that wants to
+            # stop takes it as the exit instead).
             mask_rows.setdefault(
                 _forbidden_for(fsm.state, fsm.content_progress, fsm.tools), []
             ).append(i)
@@ -1117,7 +1087,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 
 
 # --------------------------------------------------------------------------
-# Speculative verify path (R5-8). See BUILDLOG §[R5-8].
+# Speculative verify path (DSpark).
 #
 # `apply()` above is injected into layers/sampler.py, which the DSpark verify
 # path never reaches, so these helpers mask the *verify* logits instead.
@@ -1256,13 +1226,11 @@ def _reasoning_needs_eager(fsm, window: int) -> bool:
     return fsm.at_think_open or fsm.count + window >= fsm.budget
 
 
-def _content_mask_needs_eager(fsm, req) -> bool:
+def _content_needs_eager(fsm, req) -> bool:
     """Outside the think block: fresh CONTENT (no content token yet) and every
     step inside a tool call take their EOS/``<|im:end|>``-shutting sets from
     plan_verify; the folded mask does not carry them. A CONTENT row under a
-    grammar is exempt: the grammar owns CONTENT (the vendor's rule)."""
-    if not CFG.content_mask:
-        return False
+    grammar is exempt: the grammar owns CONTENT."""
     if fsm.state != CONTENT:
         return True
     return not fsm.content_progress and not _has_grammar(req)
@@ -1271,30 +1239,16 @@ def _content_mask_needs_eager(fsm, req) -> bool:
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    Everything plan_verify does that the folded epilogue cannot -- it accepts
-    inside the cuda graph off its own buffers, and plan_verify runs after the
-    grammar barrier -- is named by the two row predicates above. Each is
-    judged per row from committed state, so outside a tool call a generation
-    spends only its boundary steps eager.
-
-    The reasoning mask is **not** in that list. It is the common case and it
-    would cost the folded path for most of a generation, so it is applied
-    inside the graph instead (``DsparkVerifyEpilogue._apply_fsm_mask``, fed by
-    :func:`folded_mask_flags`). The budget window is ``2 * stride`` because
-    the state read here can lag by up to one accepted run -- an unneeded eager
-    step costs throughput, a missed force costs correctness.
-
-    Known gaps of the folded path, each bounded to <=stride-1 chain rows and
-    closed by the next step's committed state (INF-450): a drafted
-    ``<|tool_call:start|>`` on a content-with-progress row puts the positions
-    after it into TOOL_* states whose envelope set the folded mask does not
-    carry; a drafted ``<|think:start|>`` lacks the leading-newline set; a
-    CONTENT row under a grammar carries no FSM mask at all (a JSON-schema
-    grammar cannot emit a sentinel, an ebnf/regex one could; a batch with a
-    grammar never takes the fold anyway, the worker forces eager). A think_end
-    accepted in the lagging run is covered by the folded mask's overmask.
-
-    Host-only and sync-free: it never touches the draft tokens on device.
+    The folded epilogue accepts inside the cuda graph off its own buffers and
+    ``plan_verify`` runs after the grammar barrier, so what only plan_verify
+    can do -- named by the two row predicates above -- must be decided here,
+    per row, from committed state. Outside a tool call a generation spends
+    only its boundary steps eager. The reasoning mask itself is applied inside
+    the graph (``folded_mask_flags``), and the budget window is ``2 * stride``
+    because the state read here can lag by one accepted run. Known folded-path
+    gaps, each <= stride-1 chain rows and closed by the next step's committed
+    state: a drafted sentinel on a content-with-progress row or under a grammar
+    (INF-450). Host-only and sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False
@@ -1313,7 +1267,7 @@ def plan_gate(reqs, stride: int) -> bool:
         if fsm.in_reasoning:
             if _reasoning_needs_eager(fsm, window):
                 return True
-        elif _content_mask_needs_eager(fsm, req):
+        elif _content_needs_eager(fsm, req):
             return True
     return False
 
@@ -1412,10 +1366,8 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                         )
                 else:
                     mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
-            elif not CFG.content_mask:
-                continue  # SOLAR_FSM_CONTENT_MASK=0: nothing outside REASONING
             elif sim.state == CONTENT and _has_grammar(reqs[i]):
-                continue  # structured outputs own the CONTENT phase (vendor rule)
+                continue  # structured outputs own the CONTENT phase
             else:
                 mask_rows.setdefault(
                     _forbidden_for(sim.state, sim.content_progress, fsm.tools), []

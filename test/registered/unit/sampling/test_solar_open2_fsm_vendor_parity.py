@@ -15,7 +15,7 @@ against ``solar_open2_fsm``:
   effort (low 4K / medium 16K / high 32K / xhigh 64K / max 128K, default
   high, none/minimal close the block at once, nothing above the hard limit),
   and does not depend on ``max_tokens``;
-* a fresh CONTENT state may not end the turn (``content_mask`` on by default);
+* a fresh CONTENT state may not end the turn;
 * the token right after ``<|think:start|>`` may not be a bare newline.
 
 Pure CPU: small float logits tensors and duck-typed requests.
@@ -63,12 +63,10 @@ def _cfg(**overrides):
     # The same builder the server uses: every set is derived from the vendor's
     # spec, so a test can only pass against what init_from_env would produce.
     fsm.configure_ids(IDS, eos=[EOS], leading_newline=[NL, NLNL])
-    c.budget_policy = "effort"
     c.effort_budgets = dict(fsm._EFFORT_BUDGETS)
     c.default_effort = "high"
     c.hard_limit = fsm._HARD_LIMIT
-    c.budget_abs, c.budget_ratio = 3072, 0.75
-    c.content_mask = True
+    c.no_reasoning_efforts = fsm._NO_REASONING_EFFORTS
     c.spec_always_eager = False
     c._mask_cache.clear()
     for name, value in overrides.items():
@@ -145,13 +143,10 @@ _CFG_FIELDS = (
     "content_done_forbidden",
     "content_fresh_forbidden_notools",
     "content_done_forbidden_notools",
-    "budget_policy",
     "effort_budgets",
     "default_effort",
     "hard_limit",
-    "budget_abs",
-    "budget_ratio",
-    "content_mask",
+    "no_reasoning_efforts",
     "spec_always_eager",
 )
 
@@ -222,13 +217,6 @@ class TestEffortBudget(_FsmCase):
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
             fsm._req_fsm(_req(effort="ultra", rid="r2"))
         self.assertIn("1 earlier occurrence(s) suppressed", captured.output[0])
-
-    def test_legacy_policy_keeps_the_old_formula(self):
-        _cfg(budget_policy="legacy")
-        self.assertEqual(
-            fsm._req_fsm(_req(effort="low", max_new_tokens=1000)).budget, 750
-        )
-        self.assertEqual(fsm._req_fsm(_req(max_new_tokens=None)).budget, 3072)
 
     def test_non_string_effort_is_unknown(self):
         """A value the entrypoint would never write (an int) is a client
@@ -401,13 +389,9 @@ class TestContentMask(_FsmCase):
         self.assertEqual(plan.mask_rows[fsm.CFG.content_fresh_forbidden_notools], [1])
         self.assertEqual(plan.mask_rows[fsm.CFG.content_done_forbidden_notools], [2])
 
-    def test_switch_off_restores_the_unmasked_content(self):
-        _cfg(content_mask=False)
-        self.assertEqual(_masked(_apply(_req([7, THINK_END]))), set())
-
 
 class TestPlanGate(_FsmCase):
-    """The fold escape stays row-conditional with content_mask on."""
+    """The fold escape stays row-conditional."""
 
     STRIDE = 4
 
@@ -421,10 +405,8 @@ class TestPlanGate(_FsmCase):
     def test_right_after_think_start_goes_eager(self):
         self.assertTrue(self._gate(_req()))
 
-    def test_fresh_content_goes_eager_only_with_content_mask(self):
+    def test_fresh_content_goes_eager(self):
         self.assertTrue(self._gate(_req([7, THINK_END])))
-        _cfg(content_mask=False)
-        self.assertFalse(self._gate(_req([7, THINK_END])))
 
     def test_content_with_progress_keeps_the_folded_path(self):
         self.assertFalse(self._gate(_req([7, THINK_END, 8])))
@@ -483,7 +465,8 @@ class TestInitFromEnv(_FsmCase):
         self.clear = [
             k
             for k in os.environ
-            if k.startswith("SOLAR_FSM_") and k != "SOLAR_FSM_TOKENIZER_DIR"
+            if k.startswith(("SOLAR_FSM_", "SOLAR_REASONING_BUDGET_", "SOLAR_OPEN2_"))
+            and k != "SOLAR_FSM_TOKENIZER_DIR"
         ]
 
     def _init(self, **env):
@@ -492,7 +475,9 @@ class TestInitFromEnv(_FsmCase):
                 os.environ.pop(k, None)
             for k in list(os.environ):
                 if (
-                    k.startswith("SOLAR_FSM_")
+                    k.startswith(
+                        ("SOLAR_FSM_", "SOLAR_REASONING_BUDGET_", "SOLAR_OPEN2_")
+                    )
                     and k not in env
                     and k not in self.base_env
                 ):
@@ -503,8 +488,6 @@ class TestInitFromEnv(_FsmCase):
     def test_defaults_are_the_vendor_rules(self):
         self._init()
         c = fsm.CFG
-        self.assertTrue(c.content_mask)
-        self.assertEqual(c.budget_policy, "effort")
         self.assertEqual(c.effort_budgets, fsm._EFFORT_BUDGETS)
         self.assertEqual(c.default_effort, "high")
         self.assertEqual(c.hard_limit, 128 * 1024)
@@ -536,14 +519,16 @@ class TestInitFromEnv(_FsmCase):
         )
 
     def test_per_effort_override_and_hard_limit(self):
-        self._init(SOLAR_FSM_BUDGET_MEDIUM="777", SOLAR_FSM_HARD_LIMIT="50000")
+        self._init(
+            SOLAR_REASONING_BUDGET_MEDIUM="777",
+            SOLAR_REASONING_BUDGET_HARD_LIMIT="50000",
+        )
         self.assertEqual(fsm.CFG.effort_budgets["medium"], 777)
         self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
         self.assertEqual(fsm.CFG.effort_budgets["high"], 32 * 1024)
 
-    def test_content_mask_and_newline_rule_can_be_switched_off(self):
-        self._init(SOLAR_FSM_CONTENT_MASK="0", SOLAR_FSM_LEADING_NEWLINE_IDS="")
-        self.assertFalse(fsm.CFG.content_mask)
+    def test_newline_rule_can_be_switched_off(self):
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="")
         self.assertEqual(fsm.CFG.leading_newline_forbidden, ())
         self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
 
@@ -569,53 +554,68 @@ class TestInitFromEnv(_FsmCase):
             self._init()
 
     def test_bad_values_fail_loud_by_name(self):
-        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT"):
-            self._init(SOLAR_FSM_HARD_LIMIT="abc")
-        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT must be >= 0"):
-            self._init(SOLAR_FSM_HARD_LIMIT="-1")
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_REASONING_BUDGET_HARD_LIMIT"):
+            self._init(SOLAR_REASONING_BUDGET_HARD_LIMIT="abc")
+        with self.assertRaisesRegex(
+            RuntimeError, "SOLAR_REASONING_BUDGET_HARD_LIMIT must be >= 0"
+        ):
+            self._init(SOLAR_REASONING_BUDGET_HARD_LIMIT="-1")
         # Vendor: 0 disables the server-wide ceiling ...
-        self._init(SOLAR_FSM_HARD_LIMIT="0", SOLAR_FSM_BUDGET_MAX="200000")
+        self._init(
+            SOLAR_REASONING_BUDGET_HARD_LIMIT="0", SOLAR_REASONING_BUDGET_MAX="200000"
+        )
         self.assertEqual(fsm._req_fsm(_req(effort="max")).budget, 200000)
         # ... and a negative per-effort budget warns and keeps the default.
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
-            self._init(SOLAR_FSM_BUDGET_LOW="-1")
-        self.assertIn("SOLAR_FSM_BUDGET_LOW", captured.output[0])
+            self._init(SOLAR_REASONING_BUDGET_LOW="-1")
+        self.assertIn("SOLAR_REASONING_BUDGET_LOW", captured.output[0])
         self.assertEqual(fsm.CFG.effort_budgets["low"], 4 * 1024)
-        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_LEADING_NEWLINE_IDS"):
-            self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7,x")
+        with self.assertRaisesRegex(
+            RuntimeError, "SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS"
+        ):
+            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="7,x")
         with self.assertRaisesRegex(RuntimeError, "negative id"):
-            self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="-7")
+            self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="-7")
 
     def test_explicit_override_above_the_hard_limit_warns_and_clamps(self):
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
-            self._init(SOLAR_FSM_BUDGET_MAX="200000", SOLAR_FSM_HARD_LIMIT="131072")
-        self.assertIn("SOLAR_FSM_BUDGET_MAX=200000 exceeds", captured.output[0])
+            self._init(
+                SOLAR_REASONING_BUDGET_MAX="200000",
+                SOLAR_REASONING_BUDGET_HARD_LIMIT="131072",
+            )
+        self.assertIn("SOLAR_REASONING_BUDGET_MAX=200000 exceeds", captured.output[0])
         self.assertEqual(fsm.CFG.effort_budgets["max"], 131072)
         # A table default clamped by a lower hard limit is silent.
         with self.assertNoLogs(fsm.logger, level="WARNING"):
-            self._init(SOLAR_FSM_HARD_LIMIT="50000")
+            self._init(SOLAR_REASONING_BUDGET_HARD_LIMIT="50000")
         self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
 
     def test_explicit_newline_ids_override_the_vocab(self):
-        self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7, 9")
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="7, 9")
         self.assertEqual(fsm.CFG.leading_newline_forbidden, (7, 9))
 
-    def test_bad_policy_or_default_effort_fails_loud(self):
+    def test_bad_default_effort_fails_loud(self):
         with self.assertRaises(RuntimeError):
-            self._init(SOLAR_FSM_BUDGET_POLICY="ratio")
-        with self.assertRaises(RuntimeError):
-            self._init(SOLAR_FSM_DEFAULT_EFFORT="ultra")
+            self._init(SOLAR_REASONING_BUDGET_DEFAULT_EFFORT="ultra")
 
-    def test_legacy_budget_vars_warn_when_inert(self):
+    def test_no_reasoning_efforts_are_configurable(self):
+        self._init(SOLAR_REASONING_BUDGET_NO_REASONING_EFFORTS="none, low")
+        self.assertEqual(fsm._budget_for("low", 4096), 0)
+        self.assertEqual(fsm._budget_for("minimal", 4096), 32 * 1024)
+
+    def test_retired_env_names_warn(self):
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
-            self._init(SOLAR_FSM_BUDGET_RATIO="0.5")
-        self.assertIn("SOLAR_FSM_BUDGET_RATIO set but", captured.output[0])
-        self.assertEqual(fsm.CFG.budget_policy, "effort")
-        with self.assertNoLogs(fsm.logger, level="WARNING"):
-            self._init(SOLAR_FSM_BUDGET_RATIO="0.5", SOLAR_FSM_BUDGET_POLICY="legacy")
+            self._init(SOLAR_FSM_BUDGET_POLICY="legacy", SOLAR_FSM_HARD_LIMIT="1000")
+        joined = "\n".join(captured.output)
+        self.assertIn("SOLAR_FSM_BUDGET_POLICY is not read any more (removed)", joined)
+        self.assertIn(
+            "SOLAR_FSM_HARD_LIMIT is not read any more; use SOLAR_REASONING_BUDGET_HARD_LIMIT",
+            joined,
+        )
+        self.assertEqual(fsm.CFG.hard_limit, 128 * 1024)
 
     def test_none_as_default_effort_is_allowed(self):
-        self._init(SOLAR_FSM_DEFAULT_EFFORT="none")
+        self._init(SOLAR_REASONING_BUDGET_DEFAULT_EFFORT="none")
         self.assertEqual(fsm._budget_for(None, 4096), 0)
 
     def test_all_fourteen_sentinels_are_controls_and_newline_added_token_is_leading(
@@ -759,10 +759,6 @@ class TestToolCallEnvelope(_FsmCase):
 
     def test_a_request_without_tools_cannot_open_a_tool_call(self):
         self.assertIn(TOOL_START, _masked(_apply(_req((THINK_END,), tools=False))))
-
-    def test_content_mask_off_leaves_the_tool_call_unmasked(self):
-        _cfg(content_mask=False)
-        self.assertEqual(_masked(_apply(_req(self.CALL[:2], tools=True))), set())
 
     def test_structured_outputs_own_the_content_phase(self):
         req = _req((THINK_END,), tools=True)

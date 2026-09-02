@@ -36,12 +36,12 @@ def _cfg():
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
-    fsm.CFG.content_mask = False
     fsm.CFG.spec_always_eager = False
-    fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
-    # These tests are about the rows surviving the copy, not the budget rule;
-    # pin the legacy formula so the budget below is min(3072, 0.75 * 4096).
-    fsm.CFG.budget_policy = "legacy"
+    # These tests are about the rows surviving the copy, not the budget rule:
+    # one effort, 3072 tokens.
+    fsm.CFG.effort_budgets = {"high": 3072}
+    fsm.CFG.default_effort = "high"
+    fsm.CFG.hard_limit = 3072
     fsm.CFG._mask_cache.clear()
 
 
@@ -95,11 +95,10 @@ _CFG_FIELDS = (
     "all_controls",
     "transitions",
     "reasoning_forbidden",
-    "content_mask",
     "spec_always_eager",
-    "budget_abs",
-    "budget_ratio",
-    "budget_policy",
+    "effort_budgets",
+    "default_effort",
+    "hard_limit",
     "leading_newline_forbidden",
     "reasoning_open_forbidden",
 )
@@ -153,7 +152,7 @@ class TestSolarFsmRowsSurviveCopy(unittest.TestCase):
         """With the reasoning budget spent, ``apply`` on the copy forces
         ``<|think:end|>`` -- everything else goes to -inf."""
         info = _minimal_sampling_info()
-        budget = int(4096 * fsm.CFG.budget_ratio)
+        budget = 3072
         info.solar_fsm_rows = [_req([10] * budget)]
         copied = _forward_copy(info)
         logits = torch.zeros(1, VOCAB)

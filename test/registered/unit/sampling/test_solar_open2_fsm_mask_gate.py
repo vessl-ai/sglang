@@ -9,7 +9,7 @@ Two mechanisms cover it, and the invariant is that together they leave no gap:
 
 * ``plan_gate`` sends the step to the eager path, where ``plan_verify`` writes
   the mask. It fires only for what the eager path is *needed* for -- a forced
-  ``<|think:end|>`` at a spent budget, the ``content_mask`` sets (a fresh
+  ``<|think:end|>`` at a spent budget, the content sets (a fresh
   CONTENT row and every step inside a tool call), and the leading-newline set
   right after ``<|think:start|>`` -- because forcing eager on every thinking
   step would cost the folded in-graph accept for most of a generation.
@@ -43,12 +43,11 @@ def _cfg(**over):
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
-    fsm.CFG.content_mask = False
     fsm.CFG.spec_always_eager = False
-    # Budgets here are pinned by hand: keep the legacy formula so the
-    # per-effort table cannot reach past budget_abs.
-    fsm.CFG.budget_policy = "legacy"
-    fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
+    # Budgets here are pinned by hand: one effort, 3072 tokens.
+    fsm.CFG.effort_budgets = {"high": 3072}
+    fsm.CFG.default_effort = "high"
+    fsm.CFG.hard_limit = 3072
     for k, v in over.items():
         setattr(fsm.CFG, k, v)
 
@@ -88,11 +87,10 @@ class TestSolarFsmMaskGate(unittest.TestCase):
                 "all_controls",
                 "transitions",
                 "reasoning_forbidden",
-                "content_mask",
                 "spec_always_eager",
-                "budget_abs",
-                "budget_ratio",
-                "budget_policy",
+                "effort_budgets",
+                "default_effort",
+                "hard_limit",
                 "leading_newline_forbidden",
                 "reasoning_open_forbidden",
             )
@@ -217,11 +215,11 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
         self.assertFalse(fsm.plan_gate([req], 8))
 
-    def test_content_mask_gates_a_fresh_content_row(self):
+    def test_fresh_content_row_gates(self):
         """The content sets have no in-graph carrier, so a row whose turn has
         no content yet must go eager; once it has content the fold is kept
         (its rows then only lack the content_done set, a documented gap)."""
-        _cfg(content_mask=True)
+        _cfg()
         self.assertTrue(fsm.plan_gate([_req([7, THINK_END])], 8))
         self.assertFalse(fsm.plan_gate([_req([7, THINK_END, 7])], 8))
 

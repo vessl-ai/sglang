@@ -1,12 +1,8 @@
-"""Serving-side rules for Solar Open2 (Solar Pro 4), in one place.
+"""Serving-side rules for the Solar Open2 chat format (Solar Pro 4), in one
+place; ``OpenAIServingChat`` calls each at one point.
 
-``OpenAIServingChat`` calls these at five points; each is a one-liner there.
-The rules mirror the vendor's vLLM serving of the same checkpoint (Upstage
-patch set for vLLM 0.25.0, 2026-09-01) unless a comment says otherwise.
-
-1. ``validate_request`` -- a float ``reasoning_effort`` (an SGLang extension)
-   is rejected: the vendor's request model accepts the named tiers only (422),
-   and here a float would silently pre-close the think block.
+1. ``validate_request`` -- ``reasoning_effort`` must be one of the named tiers
+   (a number would silently pre-close the think block and skip the FSM budget).
 2. ``normalize_reasoning_effort`` -- hands the requested effort and the tools
    flag to the scheduler-side FSM through ``custom_params`` (budget table in
    ``solar_open2_fsm``), then lower-cases the effort and folds xhigh/max to
@@ -26,16 +22,18 @@ patch set for vLLM 0.25.0, 2026-09-01) unless a comment says otherwise.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, get_args
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ReasoningEffortTier,
     Tool,
     ToolChoice,
 )
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END,
-    has_call_opener,
+    TOOL_CALL_START,
 )
 from sglang.srt.sampling.solar_open2_fsm import EFFORT_PARAM, TOOLS_PARAM
 
@@ -45,7 +43,7 @@ PARSER_NAME = "solar_open2"
 # The template opens thinking only for medium/high; an effort above high would
 # otherwise silently disable reasoning (the FSM still budgets the requested one).
 EFFORT_FOLD = ("xhigh", "max")
-EFFORT_TIERS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORT_TIERS = get_args(ReasoningEffortTier)
 
 
 def is_solar_cell(
@@ -56,8 +54,8 @@ def is_solar_cell(
 
 
 def validate_request(request: ChatCompletionRequest) -> Optional[str]:
-    """Rule 1. The chat_template_kwargs copy is checked too: the message
-    pipeline moves it into the request field after validation."""
+    """Rule 1. ``chat_template_kwargs`` is checked too: the message pipeline
+    moves its copy into the request field after validation."""
     efforts = (
         request.reasoning_effort,
         (request.chat_template_kwargs or {}).get("reasoning_effort"),
@@ -168,13 +166,11 @@ def single_call_stop_matched(
 
 def glue_for_text(text: str) -> str:
     """Non-streaming: the terminator to append before parsing, or nothing when
-    the stop matched without an opener (marker or fence form)."""
-    return TOOL_CALL_END if has_call_opener(text) else ""
+    the stop matched without an opener."""
+    return TOOL_CALL_END if TOOL_CALL_START in text else ""
 
 
-def glue_for_stream(parser: Any) -> str:
+def glue_for_stream(parser: FunctionCallParser) -> str:
     """Streaming: the terminator to feed the detector before the stream-end
     flush, or nothing when it holds no open call."""
-    detector = getattr(parser, "detector", None)
-    holding = getattr(detector, "holding_open_call", None)
-    return TOOL_CALL_END if holding is not None and holding() else ""
+    return TOOL_CALL_END if parser.detector.holding_open_call() else ""
