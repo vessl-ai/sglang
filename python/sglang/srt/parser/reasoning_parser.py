@@ -2058,18 +2058,22 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     consumes exactly one sentinel, so every extra one opens ``content`` and
     reaches the client verbatim -- ``<|think:end|>`` is ``special=False`` in the
     tokenizer, so nothing downstream strips it. This detector consumes the
-    whole run instead. CONTENT is deliberately unmasked by the FSM ("parser
-    owns it"), and doing this here also covers surplus sentinels the FSM had no
-    hand in.
+    whole run instead. With the FSM's content mask on (the default) a fresh
+    CONTENT step forbids the second sentinel, so the scrub matters where that
+    mask is absent: ``SOLAR_FSM_CONTENT_MASK=0``, the speculative fold path
+    (a drafted ``<|think:end|>`` leaves the rest of the chain on the reasoning
+    set), and text produced outside the FSM.
 
-    When ``<|think:end|>`` never arrives at all — a stop string or the token
-    budget ends generation inside the think block — nothing was answered, so
+    When ``<|think:end|>`` never arrives at all -- a stop string or the token
+    budget ends generation inside the think block -- nothing was answered, so
     the text stays reasoning and content is empty. That is the contract
-    Upstage states for this model; the reference parser (UpstageAI/vllm
-    ``SolarOpen2ReasoningParser.extract_reasoning``) instead returns the whole
-    output as content, which presents a thinking fragment as a complete
-    answer. Only a request with reasoning off puts this text on the content
-    channel, and such a request never opens a think block to leave unclosed.
+    Upstage states for this model, and what the vendor's current parser
+    (``SolarOpen2ReasoningParser.extract_reasoning``, 2026-09-01 patch set)
+    does whenever the request's effort opened the think block: the whole
+    output is returned as reasoning, with only complete embedded tool-call
+    blocks promoted to content. Only a request with reasoning off puts this
+    text on the content channel, and such a request never opens a think block
+    to leave unclosed.
     """
 
     def __init__(
@@ -2150,14 +2154,13 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                 # budget ended generation inside the think block. Nothing was
                 # answered, so the text stays on the reasoning channel and
                 # content is empty -- the contract Upstage states for this
-                # model (2026-09-01). The reference parser (UpstageAI/vllm
-                # ``SolarOpen2ReasoningParser.extract_reasoning``) returns it
-                # all as content instead, which presents a few tokens of
-                # thinking preamble as a complete answer: measured through the
-                # proxy, ``stop:["**"]`` returned "Thinking Process:\n\n1.  "
-                # with ``finish_reason: "stop"``. Only a request with reasoning
-                # off puts this text on the content channel, and such a request
-                # never opens a think block to leave unclosed.
+                # model and the vendor's current parser rule (its older
+                # parser returned the text as content: measured through the
+                # proxy before the 2026-09-01 patch set, ``stop:["**"]``
+                # returned "Thinking Process:\n\n1.  " with ``finish_reason:
+                # "stop"``). Only a request with reasoning off puts this text
+                # on the content channel, and such a request never opens a
+                # think block to leave unclosed.
                 return StreamingParseResult(reasoning_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret

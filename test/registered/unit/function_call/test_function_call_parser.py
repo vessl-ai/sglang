@@ -5189,13 +5189,14 @@ class TestGemma4Detector(unittest.TestCase):
 
 
 class TestSolarOpen2Detector(unittest.TestCase):
-    """Grammar-forced tool_choice="required"/named relies on SolarOpen2Detector
-    inheriting the base-class capability defaults (supports_structural_tag()
-    True, parses_required_natively() False) so FunctionCallParser routes
-    required/named tool_choice through the legacy structural tag instead of
-    best-effort prompting. Under that tag xgrammar fills a JSON object
-    between the call markers instead of ``<|tool_arg:*|>`` runs; these tests
-    cover both the capability defaults and that JSON-body envelope.
+    """Grammar-forced tool_choice="required"/named: SolarOpen2Detector
+    overrides supports_structural_tag() to False (parses_required_natively()
+    stays False), so FunctionCallParser routes required/named through the
+    JSON-schema array constraint -- the vendor's vLLM path -- and never
+    through best-effort prompting. The detector still accepts a JSON-object
+    call body (the shape the legacy structural tag used to force); these
+    tests cover the capability flags, the json_schema constraints and that
+    JSON-body envelope.
     """
 
     def setUp(self):

@@ -938,7 +938,7 @@ class ServingChatTestCase(unittest.TestCase):
                 parser = parser_cls.return_value
                 parser.detector.eot_token = SOLAR_OPEN2_TOOL_CALL_END
                 parser.detector.parses_required_natively.return_value = False
-                parser.detector.supports_structural_tag.return_value = True
+                parser.detector.supports_structural_tag.return_value = False
                 parser.get_structure_constraint.return_value = None
                 request = ChatCompletionRequest(
                     model="x",
@@ -3623,6 +3623,39 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             {"location": "Paris"},
         )
 
+    def test_named_non_streaming_json_array_single_call(self):
+        """A named tool_choice takes the same JSON-array path as required."""
+        request = self.request.model_copy(
+            update={
+                "tool_choice": ToolChoice(
+                    type="function", function=ToolChoiceFuncName(name="get_weather")
+                )
+            }
+        )
+        choice = self._build_choice(
+            request, self._JSON_ARRAY_CALL_TEXT, {"type": "stop"}
+        )
+        # OpenAI reports "stop" for a named choice; SGLang (and this fork)
+        # report "tool_calls" for both -- pinned here so a change is deliberate.
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        self.assertEqual(choice.message.tool_calls[0].function.name, "get_weather")
+
+    def test_named_streaming_json_array_emits_completed_call(self):
+        request = self.request.model_copy(
+            update={
+                "tool_choice": ToolChoice(
+                    type="function", function=ToolChoiceFuncName(name="get_weather")
+                ),
+                "parallel_tool_calls": True,
+            }
+        )
+        chunks, tool_call_deltas, has_tool_calls = self._stream(
+            request, self._JSON_ARRAY_CALL_TEXT, {"type": "stop"}
+        )
+        self.assertTrue(has_tool_calls.get(0))
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+
     def test_required_non_streaming_json_array_parallel_calls(self):
         """required with parallel_tool_calls (default): the array may carry
         several calls; every element becomes a tool call."""
@@ -3854,9 +3887,10 @@ class TestSolarOpen2TruncatedReasoning(unittest.TestCase):
     """A generation that ends before ``<|think:end|>`` answered nothing.
 
     The text stays on the reasoning channel and content is empty, which is the
-    contract Upstage states for this model. The reference implementation
-    (UpstageAI/vllm) returns the whole output as content instead, which
-    presents a few tokens of thinking preamble as a complete answer.
+    contract Upstage states for this model and the vendor's current parser
+    rule (2026-09-01 patch set: an unclosed think block opened by the request's
+    effort is returned as reasoning; its older parser returned it as content,
+    which presented a few tokens of thinking preamble as a complete answer).
 
     The engine-reported finish_reason passes through untouched either way. A
     caller that supplied the stop string that cut the block reads the empty

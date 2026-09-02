@@ -153,10 +153,13 @@ _EFFORT_BUDGETS: Dict[str, int] = {
 _NO_REASONING_EFFORTS = frozenset({"none", "minimal"})
 _DEFAULT_EFFORT = "high"
 _HARD_LIMIT = 128 * 1024
-# The token right after <|think:start|> may not be a bare newline (vendor
-# _DEFAULT_LEADING_NEWLINE_IDS: "\n", "\n\n"). Byte-level BPE spells them so.
+_NO_HARD_LIMIT = 1 << 62  # SOLAR_FSM_HARD_LIMIT=0: no server-wide ceiling
+# The token right after <|think:start|> may not be a newline run: every vocab
+# token whose text is only byte-level "\n" ("Ċ", "ĊĊ", ...) plus a verbatim
+# "\n" / "\n\n" (the vendor's resolve_solar_open2_think_leading_forbidden_ids;
+# its last-resort default is the shipped tokenizer's ids 4294 / 4372).
 _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
-_LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")  # the shipped tokenizer's ids 4294 / 4372
+_LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")  # named in the fail-loud message only
 # custom_params key the chat entrypoint uses to hand the request's reasoning
 # effort to the scheduler-side FSM (serving_chat._normalize_solar_open2_reasoning_effort).
 EFFORT_PARAM = "solar_reasoning_effort"
@@ -194,7 +197,9 @@ class _Config:
     # request that offers no tools.
     forbidden: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     forbidden_notools: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
-    # Named views into the tables, kept for logging and the older tests:
+    # Named views into the tables. reasoning_forbidden / reasoning_open_forbidden
+    # are the live REASONING lookups; the content_* four serve logging and the
+    # older tests:
     #   REASONING            : allow think_end only, EOS masked
     #   CONTENT (no content) : allow tool_call_start only, EOS masked
     #                          <- this is what stops the model from emitting EOS
@@ -227,7 +232,9 @@ class _Config:
     # ever acted on requests the model had closed itself. With the force alive,
     # leaving it off makes every budget-forced request finish with an empty
     # answer (2026-09-01 KMMLU-Pro rerun: 26 of 49 forced rows). Default ON for
-    # parity; SOLAR_FSM_CONTENT_MASK=0 restores the earlier rule.
+    # parity; SOLAR_FSM_CONTENT_MASK=0 (not a vendor switch) turns off every
+    # mask outside REASONING: this rule, the tool-call envelope sets, and the
+    # no-tools <|tool_call:start|> ban -- the pre-#61 production behaviour.
     content_mask: bool = True
     # R5-8: masking the verify logits costs the folded in-graph accept, so by
     # default we only leave the folded path on steps where the reasoning budget
@@ -318,7 +325,9 @@ def _env_float(name: str, default: float) -> float:
 def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     """Ids forbidden as the first token after ``<|think:start|>``.
 
-    Resolved from the tokenizer's vocab (``_LEADING_NEWLINE_TEXTS``);
+    Every token of ``tokenizer.json``'s vocab and of the added tokens
+    (``tokenizer_config.json`` / ``tokenizer.json``) whose text is a pure
+    newline run, plus a verbatim newline token -- the vendor's rule;
     ``SOLAR_FSM_LEADING_NEWLINE_IDS`` overrides with a comma list, and an
     empty value switches the rule off. Like the think ids, a vocab that
     cannot supply them fails loud rather than silently dropping the rule.
@@ -344,12 +353,14 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
         vocab = model.get("vocab") if isinstance(model.get("vocab"), dict) else {}
     # The vendor's rule: every vocab token whose text is a pure newline run
     # (byte-level "Ċ" repeated), plus a verbatim "\n" / "\n\n".
+    table = dict(vocab)
+    table.update(_added_token_ids(tokenizer_dir))
     ids = {
         int(tid)
-        for text, tid in vocab.items()
+        for text, tid in table.items()
         if text and set(text) == {_NEWLINE_BYTELEVEL}
     }
-    ids |= {int(vocab[t]) for t in ("\n", "\n\n") if t in vocab}
+    ids |= {int(table[t]) for t in ("\n", "\n\n") if t in table}
     if not ids:
         raise RuntimeError(
             f"SOLAR_FSM: leading-newline tokens {_LEADING_NEWLINE_TEXTS} not found "
@@ -545,17 +556,31 @@ def init_from_env() -> None:
             "SOLAR_FSM_BUDGET_POLICY must be 'effort' or 'legacy', got "
             f"{CFG.budget_policy!r}"
         )
+    # Vendor semantics (SOLAR_REASONING_BUDGET_HARD_LIMIT): 0 disables the
+    # server-wide ceiling; a negative value is a configuration error.
     CFG.hard_limit = _env_int("SOLAR_FSM_HARD_LIMIT", _HARD_LIMIT)
-    if CFG.hard_limit <= 0:
+    if CFG.hard_limit < 0:
         raise RuntimeError(
-            f"SOLAR_FSM_HARD_LIMIT must be positive, got {CFG.hard_limit}"
+            f"SOLAR_FSM_HARD_LIMIT must be >= 0 (0 disables), got {CFG.hard_limit}"
         )
+    if CFG.hard_limit == 0:
+        CFG.hard_limit = _NO_HARD_LIMIT
     budgets = {}
     for effort, default in _EFFORT_BUDGETS.items():
         name = f"SOLAR_FSM_BUDGET_{effort.upper()}"
         value = _env_int(name, default)
         if value < 0:
-            raise RuntimeError(f"{name} must be >= 0, got {value}")
+            # Vendor: a malformed per-effort budget falls back to the built-in
+            # default with a warning rather than failing every request.
+            logger.warning(
+                "[SOLAR-FSM] ignoring %s=%d (must be >= 0); using the built-in "
+                "%s budget %d.",
+                name,
+                value,
+                effort,
+                default,
+            )
+            value = default
         if value > CFG.hard_limit:
             if name in os.environ:
                 logger.warning(
@@ -601,10 +626,10 @@ def init_from_env() -> None:
             CFG.budget_ratio,
         )
     else:
-        budget_desc = "per effort %s default=%s hard_limit=%d" % (
+        budget_desc = "per effort %s default=%s hard_limit=%s" % (
             CFG.effort_budgets,
             CFG.default_effort,
-            CFG.hard_limit,
+            "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
         )
     logger.info(
         "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
@@ -1204,10 +1229,12 @@ def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    Three things can only be done on the eager path, and this predicate names
+    Four things can only be done on the eager path, and this predicate names
     them: forcing ``<|think:end|>`` on a row whose reasoning budget is spent,
     the fresh-CONTENT set (``content_mask``) on the step after a think block
-    closes, and the leading-newline set on the step after one opens. All are
+    closes, every step inside a tool call (the envelope sets, which shut EOS
+    and ``<|im:end|>`` until the call closes), and the leading-newline set on
+    the step after a think block opens. All are
     ``plan_verify``'s work, and ``plan_verify`` runs after the grammar barrier
     -- too late for the folded epilogue, which accepts inside the cuda graph
     off its own buffers. Each is judged per row from committed state, so a

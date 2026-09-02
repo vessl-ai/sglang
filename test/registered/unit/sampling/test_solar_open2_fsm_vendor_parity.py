@@ -537,12 +537,16 @@ class TestInitFromEnv(_FsmCase):
     def test_bad_values_fail_loud_by_name(self):
         with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT"):
             self._init(SOLAR_FSM_HARD_LIMIT="abc")
-        with self.assertRaisesRegex(
-            RuntimeError, "SOLAR_FSM_HARD_LIMIT must be positive"
-        ):
-            self._init(SOLAR_FSM_HARD_LIMIT="0")
-        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_BUDGET_LOW must be >= 0"):
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT must be >= 0"):
+            self._init(SOLAR_FSM_HARD_LIMIT="-1")
+        # Vendor: 0 disables the server-wide ceiling ...
+        self._init(SOLAR_FSM_HARD_LIMIT="0", SOLAR_FSM_BUDGET_MAX="200000")
+        self.assertEqual(fsm._req_fsm(_req(effort="max")).budget, 200000)
+        # ... and a malformed per-effort budget warns and keeps the default.
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
             self._init(SOLAR_FSM_BUDGET_LOW="-1")
+        self.assertIn("SOLAR_FSM_BUDGET_LOW", captured.output[0])
+        self.assertEqual(fsm.CFG.effort_budgets["low"], 4 * 1024)
         with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_LEADING_NEWLINE_IDS"):
             self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7,x")
         with self.assertRaisesRegex(RuntimeError, "negative id"):
@@ -674,9 +678,10 @@ class TestToolCallEnvelope(_FsmCase):
                 req = _req(self.CALL[:n], tools=True)
                 logits = _apply(req)
                 self.assertEqual(req._solar_fsm.state, state)
-                progress = state == fsm.CONTENT and False
+                # step 1 is fresh CONTENT (no progress yet); tool states
+                # ignore the flag.
                 self.assertEqual(
-                    _masked(logits), set(fsm.CFG.forbidden[(state, progress)])
+                    _masked(logits), set(fsm.CFG.forbidden[(state, False)])
                 )
 
     def test_the_function_name_may_be_followed_by_an_argument(self):
@@ -911,3 +916,67 @@ class TestDifferentialAgainstVendorTranscript(_FsmCase):
                 )
                 self.assertEqual(got, ref.mask(), (prompt, seq))
         self.assertGreater(steps, 2000)
+
+
+class TestBudgetCountingAndReset(_FsmCase):
+    """Vendor accounting: a control token that keeps the FSM in REASONING
+    counts toward the budget, <|think:start|> resets it, and a reopened block
+    gets a fresh budget."""
+
+    def test_reasoning_preserving_control_token_counts(self):
+        req = _req((7, IM_START, 8), tools=True)
+        state = fsm._req_fsm(req)
+        state.advance(req.output_ids)
+        self.assertTrue(state.in_reasoning)
+        self.assertEqual(state.count, 3)  # 7, <|im:start|>, 8
+
+    def test_think_start_resets_a_nonzero_count_and_the_budget_reapplies(self):
+        req = _req((7, 8, 9, THINK_END, 10, THINK_START), tools=True, effort="low")
+        state = fsm._req_fsm(req)
+        state.advance(req.output_ids)
+        self.assertTrue(state.in_reasoning)
+        self.assertEqual(state.count, 0)
+        state.commit([11] * (4 * 1024))
+        self.assertTrue(state.budget_exhausted())
+
+
+class TestRetractionRebuildSeeds(_FsmCase):
+    def test_rebuild_keeps_seeded_progress_and_tools(self):
+        prompt = (1, IM_START, 2, TOOL_START, 7, TOOL_END, 3)
+        req = _req((), prompt=prompt, tools=False)
+        first = fsm._req_fsm(req)
+        self.assertTrue(first.content_progress)
+        self.assertFalse(first.tools)
+        req.retraction_count += 1
+        second = fsm._req_fsm(req)
+        self.assertIsNot(first, second)
+        self.assertTrue(second.content_progress)
+        self.assertFalse(second.tools)
+        self.assertIn(TOOL_START, _masked(_apply(req)))
+
+
+class TestSpecPathToolStates(_FsmCase):
+    """The speculative path with the content mask on: a committed tool state
+    leaves the folded path, and plan_verify masks each chain row with the
+    row's own tool-state table."""
+
+    def test_plan_gate_goes_eager_inside_a_tool_call(self):
+        req = _req((THINK_END, TOOL_START, 7), tools=True)
+        self.assertTrue(fsm.plan_gate([req], stride=3))
+
+    def test_plan_verify_walks_the_envelope_per_row(self):
+        req = _req((THINK_END, TOOL_START, 7), tools=True)
+        fsm._req_fsm(req).advance(req.output_ids)
+        chain = torch.tensor([[7, ARG_START, 8]])  # anchor, then two drafts
+        plan = fsm.plan_verify([req], chain, stride=3)
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.mask_rows[fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)]], [0]
+        )
+        self.assertEqual(
+            plan.mask_rows[fsm.CFG.forbidden[(fsm.TOOL_ARG_BEGIN, False)]], [1]
+        )
+        self.assertEqual(
+            plan.mask_rows[fsm.CFG.forbidden[(fsm.TOOL_ARG_NAME, False)]], [2]
+        )
+        self.assertEqual(plan.force_rows, [])

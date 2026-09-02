@@ -206,9 +206,9 @@ class SolarOpen2Detector(BaseFormatDetector):
                     raw = arg_match.group(2)
                     args[key] = _coerce(raw, _param_type(name, key, tools))
             elif body.strip():
-                # Structural-tag constrained output (tool_choice required or
-                # named): JSON object between the name line and the end
-                # marker, values already typed (see module docstring).
+                # Tolerated JSON-object body (the shape the legacy structural
+                # tag used to force; required/named now take the JSON-array
+                # path and never reach this detector), values already typed.
                 try:
                     parsed = json.loads(body)
                 except json.JSONDecodeError:
