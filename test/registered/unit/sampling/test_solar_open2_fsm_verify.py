@@ -83,6 +83,7 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         "think_end",
         "im_end",
         "all_controls",
+        "transitions",
         "reasoning_forbidden",
         "content_fresh_forbidden",
         "content_done_forbidden",
@@ -100,6 +101,10 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.think_end = THINK_END
         cfg.im_end = IM_END
         cfg.all_controls = frozenset({THINK_START, THINK_END, IM_END})
+        cfg.transitions = {
+            THINK_START: solar_open2_fsm.REASONING,
+            THINK_END: solar_open2_fsm.CONTENT,
+        }
         cfg.reasoning_forbidden = (EOS, IM_END)
         cfg.leading_newline_forbidden = ()
         cfg.reasoning_open_forbidden = (EOS, IM_END)

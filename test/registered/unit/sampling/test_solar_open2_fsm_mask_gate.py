@@ -38,6 +38,7 @@ def _cfg(**over):
     fsm.CFG.enabled = True
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
     fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
+    fsm.CFG.transitions = {THINK_START: fsm.REASONING, THINK_END: fsm.CONTENT}
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
@@ -84,6 +85,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
                 "think_start",
                 "think_end",
                 "all_controls",
+                "transitions",
                 "reasoning_forbidden",
                 "content_mask",
                 "spec_always_eager",

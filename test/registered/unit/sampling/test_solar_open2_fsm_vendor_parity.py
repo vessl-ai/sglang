@@ -29,31 +29,33 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 THINK_START, THINK_END, IM_END, TOOL_START = 100, 101, 102, 103
+TOOL_END, ARG_START, ARG_VALUE, ARG_END, IM_START = 104, 105, 106, 107, 108
+TOOL_ENVELOPE = (TOOL_END, ARG_START, ARG_VALUE, ARG_END)
 EOS = 2
 NL, NLNL = 50, 51
 VOCAB = 128
 NEG_INF = float("-inf")
 
 
+IDS = {
+    "im_start": IM_START,
+    "im_end": IM_END,
+    "think_start": THINK_START,
+    "think_end": THINK_END,
+    "tool_call_start": TOOL_START,
+    "tool_call_end": TOOL_END,
+    "tool_arg_start": ARG_START,
+    "tool_arg_value": ARG_VALUE,
+    "tool_arg_end": ARG_END,
+}
+
+
 def _cfg(**overrides):
     c = fsm.CFG
     c.enabled = True
-    c.think_start, c.think_end = THINK_START, THINK_END
-    c.im_end, c.tool_call_start, c.tool_call_end = IM_END, TOOL_START, None
-    c.all_controls = frozenset({THINK_START, THINK_END, IM_END, TOOL_START})
-    c.reasoning_forbidden = (EOS, IM_END, TOOL_START)
-    c.leading_newline_forbidden = (NL, NLNL)
-    c.reasoning_open_forbidden = tuple(sorted({EOS, IM_END, TOOL_START, NL, NLNL}))
-    c.content_fresh_forbidden = (EOS, IM_END, THINK_START, THINK_END)
-    c.content_done_forbidden = (THINK_START, THINK_END)
-    c.content_fresh_forbidden_notools = (
-        EOS,
-        IM_END,
-        THINK_START,
-        THINK_END,
-        TOOL_START,
-    )
-    c.content_done_forbidden_notools = (THINK_START, THINK_END, TOOL_START)
+    # The same builder the server uses: every set is derived from the vendor's
+    # spec, so a test can only pass against what init_from_env would produce.
+    fsm.configure_ids(IDS, eos=[EOS], leading_newline=[NL, NLNL])
     c.budget_policy = "effort"
     c.effort_budgets = dict(fsm._EFFORT_BUDGETS)
     c.default_effort = "high"
@@ -109,9 +111,21 @@ _CFG_FIELDS = (
     "think_start",
     "think_end",
     "im_end",
+    "im_start",
+    "im_content",
+    "tool_start",
+    "tool_end",
     "tool_call_start",
     "tool_call_end",
+    "tool_arg_start",
+    "tool_arg_value",
+    "tool_arg_end",
+    "tool_response_start",
+    "tool_response_end",
     "all_controls",
+    "transitions",
+    "forbidden",
+    "forbidden_notools",
     "reasoning_forbidden",
     "leading_newline_forbidden",
     "reasoning_open_forbidden",
@@ -226,14 +240,14 @@ class TestEffortBudget(_FsmCase):
 class TestLeadingNewline(_FsmCase):
 
     def test_first_token_after_the_prompt_think_start_cannot_be_a_newline(self):
-        self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START, NL, NLNL})
+        self.assertEqual(_masked(_apply(_req())), set(fsm.CFG.reasoning_open_forbidden))
 
     def test_rule_lifts_after_one_token(self):
-        self.assertEqual(_masked(_apply(_req([7]))), {EOS, IM_END, TOOL_START})
+        self.assertEqual(_masked(_apply(_req([7]))), set(fsm.CFG.reasoning_forbidden))
 
     def test_prompt_inside_reasoning_but_not_at_its_start_has_no_rule(self):
         req = _req(prompt=(1, THINK_START, 5))
-        self.assertEqual(_masked(_apply(req)), {EOS, IM_END, TOOL_START})
+        self.assertEqual(_masked(_apply(req)), set(fsm.CFG.reasoning_forbidden))
 
     def test_a_generated_think_start_reopens_the_rule(self):
         opened = _req([7, THINK_START], prompt=(1, 2, 3))
@@ -569,3 +583,329 @@ class TestInitFromEnv(_FsmCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The vendor's tables, verbatim (03-logits-processor.patch _MASK_SPEC_BY_STATE /
+# _MASK_SPEC_CONTENT), spelled with this file's ids. If our derivation drifts
+# from the vendor's, these literals catch it.
+VENDOR_ALLOWED = {
+    fsm.REASONING: ({THINK_END}, True),
+    fsm.TOOL_CALL_BEGIN: (set(), True),
+    fsm.TOOL_CALL_NAME: ({ARG_START, TOOL_END}, True),
+    fsm.TOOL_ARG_BEGIN: (set(), True),
+    fsm.TOOL_ARG_NAME: ({ARG_VALUE}, True),
+    fsm.TOOL_ARG_VALUE_BEGIN: ({ARG_END}, True),
+    fsm.TOOL_ARG_VALUE: ({ARG_END}, True),
+    fsm.TOOL_ARG_END: ({ARG_START, TOOL_END}, True),
+    fsm.TOOL_CALL_END: ({TOOL_START, IM_END}, False),
+}
+VENDOR_CONTENT = {True: ({TOOL_START, IM_END}, False), False: ({TOOL_START}, True)}
+ALL_CONTROLS = set(IDS.values())
+
+
+class TestVendorTables(_FsmCase):
+    """The forbidden tables equal the vendor's spec: all controls minus the
+    state's allowed sentinels, plus bare EOS where the turn may not end."""
+
+    def test_tables_match_the_vendor_spec(self):
+        for state, (allowed, eos_masked) in VENDOR_ALLOWED.items():
+            expect = ALL_CONTROLS - allowed
+            if eos_masked:
+                expect.add(EOS)
+            with self.subTest(state=fsm._STATE_NAMES[state]):
+                self.assertEqual(set(fsm.CFG.forbidden[(state, False)]), expect)
+                self.assertEqual(set(fsm.CFG.forbidden[(state, True)]), expect)
+        for progress, (allowed, eos_masked) in VENDOR_CONTENT.items():
+            expect = ALL_CONTROLS - allowed
+            if eos_masked:
+                expect.add(EOS)
+            self.assertEqual(set(fsm.CFG.forbidden[(fsm.CONTENT, progress)]), expect)
+
+    def test_no_tools_variant_forbids_tool_call_start_everywhere(self):
+        for key, ids in fsm.CFG.forbidden.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    set(fsm.CFG.forbidden_notools[key]), set(ids) | {TOOL_START}
+                )
+
+    def test_sentinels_are_never_bare_eos(self):
+        fsm.configure_ids(IDS, eos=[EOS, IM_END], leading_newline=[])
+        # <|im:end|> is a sentinel: state-managed, not part of the EOS mask.
+        self.assertNotIn(IM_END, fsm.CFG.forbidden[(fsm.TOOL_CALL_END, False)])
+
+    def test_transitions_match_the_vendor(self):
+        self.assertEqual(
+            fsm.CFG.transitions,
+            {
+                THINK_START: fsm.REASONING,
+                THINK_END: fsm.CONTENT,
+                TOOL_START: fsm.TOOL_CALL_BEGIN,
+                TOOL_END: fsm.TOOL_CALL_END,
+                ARG_START: fsm.TOOL_ARG_BEGIN,
+                ARG_VALUE: fsm.TOOL_ARG_VALUE_BEGIN,
+                ARG_END: fsm.TOOL_ARG_END,
+            },
+        )
+
+
+class TestToolCallEnvelope(_FsmCase):
+    """A tool call walks the vendor's TOOL_CALL_* states; each step masks
+    exactly that state's table (2026-09-02 fleet regression: the envelope
+    sentinels were masked, so no tool call could complete)."""
+
+    # <|think:end|> <|tool_call:start|> name <|tool_arg:start|> key
+    # <|tool_arg:value|> val <|tool_arg:end|> <|tool_call:end|>
+    CALL = (THINK_END, TOOL_START, 7, ARG_START, 8, ARG_VALUE, 9, ARG_END, TOOL_END)
+    EXPECT = (
+        fsm.CONTENT,  # after think_end: fresh content
+        fsm.TOOL_CALL_BEGIN,
+        fsm.TOOL_CALL_NAME,
+        fsm.TOOL_ARG_BEGIN,
+        fsm.TOOL_ARG_NAME,
+        fsm.TOOL_ARG_VALUE_BEGIN,
+        fsm.TOOL_ARG_VALUE,
+        fsm.TOOL_ARG_END,
+        fsm.TOOL_CALL_END,
+    )
+
+    def test_every_step_of_a_tool_call_masks_its_own_state(self):
+        for n, state in enumerate(self.EXPECT, start=1):
+            with self.subTest(step=n, state=fsm._STATE_NAMES[state]):
+                req = _req(self.CALL[:n], tools=True)
+                logits = _apply(req)
+                self.assertEqual(req._solar_fsm.state, state)
+                progress = state == fsm.CONTENT and False
+                self.assertEqual(
+                    _masked(logits), set(fsm.CFG.forbidden[(state, progress)])
+                )
+
+    def test_the_function_name_may_be_followed_by_an_argument(self):
+        masked = _masked(_apply(_req(self.CALL[:3], tools=True)))
+        self.assertNotIn(ARG_START, masked)
+        self.assertNotIn(TOOL_END, masked)  # a call without arguments
+        for tok in (EOS, IM_END, TOOL_START, ARG_VALUE, ARG_END, THINK_START):
+            self.assertIn(tok, masked)
+
+    def test_a_completed_tool_call_may_end_the_turn(self):
+        masked = _masked(_apply(_req(self.CALL, tools=True)))
+        self.assertEqual(masked, set(fsm.CFG.forbidden[(fsm.TOOL_CALL_END, False)]))
+        self.assertNotIn(IM_END, masked)
+        self.assertNotIn(EOS, masked)
+        self.assertNotIn(TOOL_START, masked)  # a second (parallel) call
+        # The token after the closed call is content: the turn has progress.
+        req = _req(self.CALL + (11,), tools=True)
+        masked = _masked(_apply(req))
+        self.assertEqual(req._solar_fsm.state, fsm.CONTENT)
+        self.assertTrue(req._solar_fsm.content_progress)
+        self.assertEqual(masked, set(fsm.CFG.forbidden[(fsm.CONTENT, True)]))
+
+    def test_fresh_content_forbids_the_envelope_outside_a_call(self):
+        masked = _masked(_apply(_req((THINK_END,), tools=True)))
+        for tok in TOOL_ENVELOPE:
+            self.assertIn(tok, masked)
+        self.assertNotIn(TOOL_START, masked)
+
+    def test_a_request_without_tools_cannot_open_a_tool_call(self):
+        self.assertIn(TOOL_START, _masked(_apply(_req((THINK_END,), tools=False))))
+
+    def test_content_mask_off_leaves_the_tool_call_unmasked(self):
+        _cfg(content_mask=False)
+        self.assertEqual(_masked(_apply(_req(self.CALL[:2], tools=True))), set())
+
+    def test_structured_outputs_own_everything_after_reasoning(self):
+        req = _req((THINK_END,), tools=True)
+        req.grammar = object()
+        self.assertEqual(_masked(_apply(req)), set())
+        # SGLang's structural tag may spell the closing marker as text, so a
+        # grammar-constrained request is never held inside a tool state either.
+        req = _req(self.CALL[:3], tools=True, rid="r1")
+        req.grammar = object()
+        self.assertEqual(_masked(_apply(req)), set())
+        # ... but not the reasoning phase.
+        req = _req((), tools=True)
+        req.grammar = object()
+        self.assertEqual(_masked(_apply(req)), set(fsm.CFG.reasoning_open_forbidden))
+
+    def test_think_start_reopens_reasoning_from_inside_a_call(self):
+        req = _req(self.CALL[:3] + (THINK_START,), tools=True)
+        state = fsm._req_fsm(req)
+        state.advance(req.output_ids)
+        self.assertEqual(state.state, fsm.REASONING)
+        self.assertEqual(state.count, 0)
+
+    def test_a_completed_call_in_the_prompt_turn_counts_as_content(self):
+        # ... <|im:start|> assistant <|tool_call:start|> f <|tool_call:end|>
+        # <|tool_response:...|> then the continued turn: the turn may end.
+        prompt = (1, IM_START, 2, TOOL_START, 7, TOOL_END, 3)
+        req = _req((), prompt=prompt, tools=True)
+        self.assertEqual(
+            _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.CONTENT, True)])
+        )
+        # A call from an *earlier* turn does not.
+        prompt = (1, TOOL_START, 7, TOOL_END, IM_START, 2)
+        req = _req((), prompt=prompt, tools=True, rid="r1")
+        self.assertEqual(
+            _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.CONTENT, False)])
+        )
+
+    def test_sim_state_walks_the_envelope_like_the_committed_state(self):
+        req = _req((THINK_END,), tools=True)
+        state = fsm._req_fsm(req)
+        state.advance(req.output_ids)
+        sim = fsm._SimState(state)
+        for tok, expect in zip(self.CALL[1:], self.EXPECT[1:]):
+            sim.step(tok)
+            self.assertEqual(sim.state, expect)
+        self.assertTrue(sim.content_progress)
+        self.assertEqual(state.state, fsm.CONTENT)  # the committed state is untouched
+        self.assertEqual(
+            fsm._forbidden_for(sim.state, sim.content_progress, True),
+            fsm.CFG.forbidden[(fsm.TOOL_CALL_END, False)],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Differential check against a transcript of the vendor's enforcer.
+# ---------------------------------------------------------------------------
+class _VendorTranscript:
+    """SolarOpen2TokenFSMEnforcer's state walk and table lookup, transcribed
+    from the vendor's logits processor (03-logits-processor.patch:
+    _initial_state, _initial_completed_tool_call_state, _process_token,
+    _forbidden_table, advance_mask_ids) with this file's ids. Kept as a
+    separate, deliberately literal implementation so a drift in the port
+    shows up as a per-step mismatch rather than a failed hand-written case."""
+
+    TRANSITIONS = (
+        ("think_start", fsm.REASONING),
+        ("think_end", fsm.CONTENT),
+        ("tool_call_start", fsm.TOOL_CALL_BEGIN),
+        ("tool_call_end", fsm.TOOL_CALL_END),
+        ("tool_arg_start", fsm.TOOL_ARG_BEGIN),
+        ("tool_arg_value", fsm.TOOL_ARG_VALUE_BEGIN),
+        ("tool_arg_end", fsm.TOOL_ARG_END),
+    )
+
+    def __init__(self, prompt):
+        ts, te = IDS["think_start"], IDS["think_end"]
+        last_start, last_end = fsm._rindex(prompt, ts), fsm._rindex(prompt, te)
+        self.state = (
+            fsm.CONTENT
+            if last_start is None or (last_end is not None and last_start < last_end)
+            else fsm.REASONING
+        )
+        last_call_end = fsm._rindex(prompt, IDS["tool_call_end"])
+        last_im_start = fsm._rindex(prompt, IDS["im_start"])
+        self.content_progress = (
+            last_call_end is not None
+            and last_im_start is not None
+            and last_im_start < last_call_end
+        )
+        self.count = 0
+        self.prev_think_start = bool(prompt) and prompt[-1] == ts
+        self.controls = frozenset(IDS.values())
+        self.transitions = {}
+        for field, state in self.TRANSITIONS:
+            self.transitions.setdefault(IDS[field], state)
+
+    def process(self, tok):
+        if tok not in self.controls:
+            st = self.state
+            if st == fsm.REASONING:
+                self.count += 1
+            elif st == fsm.CONTENT:
+                self.content_progress = True
+            elif st == fsm.TOOL_CALL_BEGIN:
+                self.state = fsm.TOOL_CALL_NAME
+            elif st == fsm.TOOL_ARG_BEGIN:
+                self.state = fsm.TOOL_ARG_NAME
+            elif st == fsm.TOOL_ARG_VALUE_BEGIN:
+                self.state = fsm.TOOL_ARG_VALUE
+            elif st == fsm.TOOL_CALL_END:
+                self.state = fsm.CONTENT
+                self.content_progress = True
+            self.prev_think_start = False
+            return
+        prev = self.state
+        nxt = self.transitions.get(tok)
+        if nxt is not None:
+            self.state = nxt
+        elif self.state == fsm.TOOL_CALL_BEGIN:
+            self.state = fsm.TOOL_CALL_NAME
+        elif self.state == fsm.TOOL_ARG_BEGIN:
+            self.state = fsm.TOOL_ARG_NAME
+        elif self.state == fsm.TOOL_ARG_VALUE_BEGIN:
+            self.state = fsm.TOOL_ARG_VALUE
+        elif self.state == fsm.TOOL_CALL_END:
+            self.state = fsm.CONTENT
+        if tok == IDS["think_start"]:
+            self.count = 0
+        elif prev == fsm.REASONING and self.state == fsm.REASONING:
+            self.count += 1
+        if tok == IDS["tool_call_end"]:
+            self.content_progress = True
+        self.prev_think_start = tok == IDS["think_start"]
+
+    def mask(self):
+        allowed, eos_masked = (
+            VENDOR_CONTENT[self.content_progress]
+            if self.state == fsm.CONTENT
+            else VENDOR_ALLOWED[self.state]
+        )
+        forbidden = ALL_CONTROLS - allowed
+        if eos_masked:
+            forbidden.add(EOS)
+        return tuple(sorted(forbidden))
+
+
+class TestDifferentialAgainstVendorTranscript(_FsmCase):
+    """Random token walks (sentinel-heavy) over several prompt shapes: after
+    every step the port and the transcript must agree on state, reasoning
+    count, content progress, the leading-token flag and the mask."""
+
+    ORDINARY = tuple(range(1000, 1040))
+    PROMPTS = (
+        (1, 5, THINK_START),  # reasoning open (the chat template's shape)
+        (1, 5, THINK_START, THINK_END),  # pre-closed think block (low/none)
+        (1, IM_START, 7, TOOL_START, 8, TOOL_END, 9),  # completed call this turn
+        (1, TOOL_START, 8, TOOL_END, IM_START, 9),  # a call in an earlier turn
+        (1, 5),  # no think block at all
+    )
+
+    def test_random_walks_agree_step_by_step(self):
+        import random
+
+        rng = random.Random(20260902)
+        sentinels = list(IDS.values())
+        steps = 0
+        for run in range(150):
+            prompt = list(self.PROMPTS[run % len(self.PROMPTS)])
+            ref = _VendorTranscript(prompt)
+            ours = fsm.SolarReqFSM(prompt, 4096, "high", True)
+            self.assertEqual(
+                (ours.state, ours.content_progress, ours.at_think_open),
+                (ref.state, ref.content_progress, ref.prev_think_start),
+                prompt,
+            )
+            seq = []
+            for _ in range(rng.randint(1, 40)):
+                tok = (
+                    rng.choice(sentinels)
+                    if rng.random() < 0.45
+                    else rng.choice(self.ORDINARY)
+                )
+                seq.append(tok)
+                ref.process(tok)
+                ours._step(tok)
+                steps += 1
+                self.assertEqual(
+                    (ours.state, ours.count, ours.content_progress, ours.at_think_open),
+                    (ref.state, ref.count, ref.content_progress, ref.prev_think_start),
+                    (prompt, seq),
+                )
+                got = (
+                    fsm.CFG.reasoning_forbidden
+                    if ours.state == fsm.REASONING
+                    else fsm._forbidden_for(ours.state, ours.content_progress, True)
+                )
+                self.assertEqual(got, ref.mask(), (prompt, seq))
+        self.assertGreater(steps, 2000)
