@@ -102,9 +102,12 @@ FENCE_CALL_OPEN = re.compile(
 # "<name><|tool_call:end|>..." (a fake call, no log). Newlines before the name
 # are accepted as the vendor's lazy group plus ``strip()`` accepts them
 # (FSM-legal: TOOL_CALL_BEGIN advances on any ordinary token).
+# The body cannot run across another opener: an unfinished call followed by a
+# well-formed one would otherwise parse as one call with the first name and
+# the second body (the vendor's ``(.*?)`` does; ours yields the second call).
 _MARKER_CALL = re.compile(
     rf"{re.escape(TOOL_CALL_START)}\n*((?:(?!<\|)[^\n])+?)\n"
-    rf"(.*?)"
+    rf"((?:(?!{re.escape(TOOL_CALL_START)}).)*?)"
     rf"{re.escape(TOOL_CALL_END)}",
     re.DOTALL,
 )
@@ -150,10 +153,13 @@ def partial_fence_open_len(text: str) -> int:
         tail = text
     else:
         tail = ""
-    m = re.fullmatch(r"```[\w.-]*[ \t]*(?:\n(.*))?", tail, re.DOTALL) if tail else None
+    m = re.fullmatch(r"```([\w.-]*)[ \t]*(\n(.*))?", tail, re.DOTALL) if tail else None
     if m is not None:
-        after_newline = m.group(1)
-        if not after_newline or TOOL_ARG_START.startswith(after_newline):
+        name, newline, after_newline = m.group(1), m.group(2), m.group(3)
+        # A fence line whose name is still being written is a candidate; one
+        # already closed by a newline is only a candidate with a name and an
+        # argument marker (or its prefix) following.
+        if not newline or (name and TOOL_ARG_START.startswith(after_newline)):
             return len(tail)
     # No live fence candidate: a run of one or two backticks at a line start
     # may still grow into one (the backticks can arrive split across
@@ -370,17 +376,19 @@ class _StreamContent:
             self._dropped("closed tool call that did not parse", end - at)
             segment = segment[end:]
 
-    def unparsed_call(self, complete: str) -> None:
-        """A closed call that did not parse (e.g. no newline after the name)."""
+    def unparsed_call(self, complete: str) -> str:
+        """Closed output from an opener on, with no parsed call in it (e.g. no
+        newline after a name). After a call the segment rule applies (the
+        prose around the unparsed calls is content); before one it is held."""
         if self.after_call:
-            self._dropped("closed tool call that did not parse", len(complete))
-            return
+            return self.segment(complete)
         logger.warning(
             "Solar Open2: closed tool call did not parse (%d chars); holding it "
             "-- content unless a later call parses",
             len(complete),
         )
         self.unparsed += complete
+        return ""
 
     def call_parsed(self) -> None:
         if self.unparsed:
@@ -406,7 +414,7 @@ class _StreamContent:
                 return self.text(held[: openers[0]], before_opener=True)
             if partial_opener:
                 held = held[:-partial_opener]
-            return (pending + held).rstrip()
+            return (pending + held).rstrip()  # a partial marker is not text
         if has_call_opener(held):
             logger.warning(
                 "Solar Open2: stream ended inside an unfinished tool call "
@@ -501,20 +509,24 @@ class SolarOpen2Detector(BaseFormatDetector):
         # the non-streaming whole-output rule cannot apply.
         calls, _ = _parse_calls(complete, tools)
         if not calls:
-            self._content.unparsed_call(complete)
-            return StreamingParseResult(normal_text=head, calls=[])
+            text = head + self._content.unparsed_call(complete)
+            return StreamingParseResult(normal_text=text, calls=[])
 
-        # Text inside ``complete`` around the parsed calls: before the first
-        # one it starts at an opener that did not parse (not content); between
-        # and after them the segment rule applies.
-        if complete[: calls[0].start].strip():
+        # Text inside ``complete`` before the first parsed call starts at an
+        # opener that did not parse: after an earlier call the segment rule
+        # applies (prose around it is content); before any call it is not
+        # content, as the calls that follow rule out the whole-output rule.
+        leading = complete[: calls[0].start]
+        text_out = [head]
+        if self._content.after_call:
+            text_out.append(self._content.segment(leading, before_opener=True))
+        elif leading.strip():
             logger.warning(
                 "Solar Open2: dropping %d chars of output before the first "
                 "parsed call (an opener that did not parse)",
-                calls[0].start,
+                len(leading),
             )
         items: List[ToolCallItem] = []
-        text_out = [head]
         for i, call in enumerate(calls):
             if i:
                 text_out.append(
@@ -532,7 +544,10 @@ class SolarOpen2Detector(BaseFormatDetector):
         """The stream is over: release what was held back waiting for a marker
         that can no longer arrive (``_StreamContent.end``)."""
         held, self._buffer = self._buffer, ""
-        text = self._content.end(held, self._partial_opener_len(held))
+        # A fence candidate at the end is ordinary text (the vendor has no
+        # fence form); only a partial marker is not.
+        partial_marker = self._ends_with_partial_token(held, self.bot_token) or 0
+        text = self._content.end(held, partial_marker)
         return StreamingParseResult(normal_text=text, calls=[])
 
     def _partial_opener_len(self, text: str) -> int:

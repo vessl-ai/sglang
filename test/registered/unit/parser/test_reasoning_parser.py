@@ -1774,5 +1774,35 @@ class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
         self.assertEqual(ret.normal_text, "")
 
 
+class TestSolarOpen2FenceScanWindow(CustomTestCase):
+    """With stream_reasoning=False the base holds the whole think block; the
+    fence-opener scan must still find an opener after a long block and must
+    look only at a bounded window (review round 5, S-3)."""
+
+    def test_fence_opener_after_a_long_unstreamed_block_escapes(self):
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        detector = SolarOpen2Detector(stream_reasoning=False, force_reasoning=True)
+        long_block = "thinking line\n" * 5000
+        for i in range(0, len(long_block), 4096):
+            ret = detector.parse_streaming_increment(long_block[i : i + 4096])
+            self.assertEqual(ret.normal_text, "")
+        ret = detector.parse_streaming_increment(
+            "```get_weather\n<|tool_arg:start|>location<|tool_arg:value|>Paris"
+        )
+        self.assertTrue(ret.normal_text.startswith("```get_weather\n"))
+        self.assertTrue(ret.reasoning_text.endswith("thinking line\n"))
+
+    def test_scan_start_is_a_line_start_before_the_new_text(self):
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        self.assertEqual(SolarOpen2Detector._scan_start("short", 3), 0)
+        pending = ("x" * 100 + "\n") * 20
+        start = SolarOpen2Detector._scan_start(pending, 10)
+        self.assertGreater(start, 0)
+        self.assertEqual(pending[start - 1], "\n")
+        self.assertGreaterEqual(len(pending) - start, 10 + 512)
+
+
 if __name__ == "__main__":
     unittest.main()

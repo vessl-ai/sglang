@@ -2191,13 +2191,31 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         # both channels and made a thinking fragment read as the answer.
         return super().finish()
 
+    # A fence opener that appears with this increment ends inside it; its
+    # start is at most a name and a fence line earlier. Scanning only that
+    # window keeps the per-token cost flat when the base holds the whole
+    # unstreamed think block in ``_buffer`` (``stream_reasoning=False``).
+    _FENCE_SCAN_SLACK = 512
+
+    @classmethod
+    def _scan_start(cls, pending: str, new_len: int) -> int:
+        """Offset of a line start at least ``_FENCE_SCAN_SLACK`` chars before
+        the new text, or 0."""
+        at = len(pending) - new_len - cls._FENCE_SCAN_SLACK
+        if at <= 0:
+            return 0
+        return pending.rfind("\n", 0, at) + 1
+
     def _parse_increment(self, new_text: str) -> StreamingParseResult:
         if not self._in_reasoning:
             return super().parse_streaming_increment(new_text)
         pending = self._buffer + new_text
         if self.think_end_token not in pending:
-            cut = self._fence_escape_offset(pending)
+            scan_start = self._scan_start(pending, len(new_text))
+            window = pending[scan_start:]
+            cut = self._fence_escape_offset(window)
             if cut is not None:
+                cut += scan_start
                 self._buffer = ""
                 self._in_reasoning = False
                 reasoning_text = pending[:cut]
@@ -2211,7 +2229,7 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
             # Hold back a trailing possible fence opener so the fence line is
             # not streamed away as reasoning before its argument marker
             # arrives.
-            hold = _solar_tool_detector.partial_fence_open_len(pending)
+            hold = _solar_tool_detector.partial_fence_open_len(window)
             if hold:
                 if len(pending) == hold:
                     self._buffer = pending

@@ -5539,6 +5539,69 @@ class TestSolarOpen2Detector(unittest.TestCase):
                 (non_stream.normal_text, non_stream.calls), (text, []), name
             )
 
+    def test_prose_around_an_unparsed_call_after_an_earlier_delta_call(self):
+        """A call was emitted in an earlier delta; the next delta carries an
+        unparsed call with prose around it (and maybe a parsed call): the
+        prose is content whatever the chunking (review round 5)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        for name, rest, want in (
+            ("bad, prose, good", "\n" + bad + "\nand\n" + good, ("\nand", 2)),
+            ("bad, prose, bad", "\n" + bad + "\nand\n" + bad, ("\nand", 1)),
+            ("bad, prose", "\n" + bad + "\nand", ("\nand", 1)),
+        ):
+            for size in (len(rest), 5, 1):
+                with self.subTest(case=name, size=size):
+                    parser = FunctionCallParser(self.tools, "solar_open2")
+                    texts, calls = [], []
+                    t, c = parser.parse_stream_chunk(good)
+                    texts.append(t or "")
+                    calls.extend(c)
+                    for i in range(0, len(rest), size):
+                        t, c = parser.parse_stream_chunk(rest[i : i + size])
+                        texts.append(t or "")
+                        calls.extend(c)
+                    t, c = parser.parse_stream_end()
+                    texts.append(t or "")
+                    calls.extend(c)
+                    self.assertEqual(("".join(texts), len(calls)), want)
+
+    def test_closing_code_fence_after_a_call_is_content(self):
+        """A code block after a call keeps its closing fence line; a fence
+        with no name cannot become a call opener (review round 5)."""
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        text = good + "\nuse:\n```py\nx=1\n```\n"
+        whole = self._stream_all(text, len(text))
+        self.assertEqual((whole[0], len(whole[1])), ("\nuse:\n```py\nx=1\n```", 1))
+        for size in (11, 5, 1):
+            self.assertEqual(self._stream_all(text, size), whole, size)
+
+    def test_unfinished_call_then_a_good_call_yields_the_good_call(self):
+        """The body group stops at an opener, so an unfinished call followed
+        by a well-formed one does not merge into one fake call (vendor: it
+        does); reachable only with the FSM off."""
+        text = (
+            f"{TOOL_CALL_START}get_time\n"
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in result.calls],
+            [("get_weather", {"location": "Paris"})],
+        )
+        self.assertEqual(self._stream_all(text, 5)[1][0].name, "get_weather")
+
     def test_partial_fence_holdback_after_a_dead_fence_candidate(self):
         """A closed code fence earlier in the buffer must not stop the 1-2
         backtick hold at the end (review round 5)."""
@@ -6085,8 +6148,14 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                     self.assertEqual(whole[1], v_calls, size)
                     if comparable == "calls":
                         continue
-                    # Content up to whitespace (the documented streaming
-                    # delta), but whitespace-only vs none must not hide.
+                    if size == 1:
+                        # Token by token the vendor cuts whitespace before an
+                        # opener as we do: content must match exactly.
+                        self.assertEqual(whole[0], v_content, size)
+                        continue
+                    # Larger deltas: content up to whitespace (the documented
+                    # streaming delta), but whitespace-only vs none must not
+                    # hide.
                     self.assertEqual(self._ws(whole[0]), self._ws(v_content), size)
                     self.assertEqual(bool(whole[0]), bool(v_content), size)
 
