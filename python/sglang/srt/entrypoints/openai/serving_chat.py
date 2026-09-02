@@ -2615,6 +2615,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
+            if flush:
+                # The base JSON detector sends a call's name on the increment
+                # that completes it and its arguments only on the *next*
+                # increment. When the whole array lands in the last delta
+                # (a short required/named call under a grammar) there is no
+                # next increment, so drive one empty step to release the
+                # arguments before the finish chunk.
+                tail = parser.parse_streaming_increment("", effective_tools)
+                normal_text = (normal_text or "") + (tail.normal_text or "")
+                calls = list(calls) + list(tail.calls)
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

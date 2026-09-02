@@ -3544,6 +3544,24 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             json.loads(tool_call.function.arguments), {"location": "Paris"}
         )
 
+    def test_required_streaming_json_array_in_one_delta_emits_arguments(self):
+        """A short required call under the JSON grammar arrives in a single
+        delta together with the finish: the name and the complete arguments
+        must both be streamed (providercheck tool_choice_required_streaming
+        _agnostic; the base JSON detector alone stops after the name)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        chunks, tool_call_deltas, has_tool_calls = self._stream(
+            request, self._JSON_ARRAY_CALL_TEXT, {"type": "stop"}
+        )
+        self.assertTrue(has_tool_calls.get(0))
+        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        arguments = "".join(
+            d["function"].get("arguments") or "" for d in tool_call_deltas
+        )
+        self.assertEqual(json.loads(arguments), {"location": "Paris"})
+
     def test_required_streaming_json_array_emits_completed_call(self):
         """The JSON array arrives token by token; the JsonArrayParser streams
         the name first and the argument fragments as they complete, so the
