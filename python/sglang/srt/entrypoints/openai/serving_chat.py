@@ -763,8 +763,8 @@ class OpenAIServingChat(OpenAIServingBase):
             glue_terminator = finish_reason_type is not None and (
                 self._solar_single_call_stop_matched(
                     request,
-                    self._effective_tools(request),
-                    content["meta_info"].get("finish_reason"),
+                    effective_tools=self._effective_tools(request),
+                    finish_reason=content["meta_info"].get("finish_reason"),
                 )
             )
             async for chunk in self._process_tool_call_stream(
@@ -1112,13 +1112,17 @@ class OpenAIServingChat(OpenAIServingBase):
     def _solar_single_call_stop_matched(
         self,
         request: ChatCompletionRequest,
+        *,
         effective_tools: List[Tool],
         finish_reason: Optional[Dict[str, Any]],
     ) -> bool:
         """solar_open2_serving rule 4 (the injected terminator halted
         generation and was trimmed)."""
         return solar.single_call_stop_matched(
-            self.tool_call_parser, request, effective_tools, finish_reason
+            self.tool_call_parser,
+            request=request,
+            effective_tools=effective_tools,
+            finish_reason=finish_reason,
         )
 
     def _process_messages(
@@ -1182,7 +1186,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
                 elif solar.injects_single_call_stop(
-                    self.tool_call_parser, request, effective_tools
+                    self.tool_call_parser,
+                    request=request,
+                    effective_tools=effective_tools,
                 ):
                     # solar_open2_serving rule 3. Unlike kimi_k3's stop (a
                     # section-envelope closer outside each call, harmless to
@@ -1720,7 +1726,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     # -- for Solar Open2 that is the call terminator itself.
                     matched_stop = None
                 elif self._solar_single_call_stop_matched(
-                    request, self._effective_tools(request), finish_reason_data
+                    request,
+                    effective_tools=self._effective_tools(request),
+                    finish_reason=finish_reason_data,
                 ):
                     # The injected terminator halted generation but nothing
                     # parsed as a call: still not a client-visible stop string.
@@ -1904,7 +1912,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
 
             if self._solar_single_call_stop_matched(
-                request, effective_tools, finish_reason
+                request, effective_tools=effective_tools, finish_reason=finish_reason
             ):
                 # solar_open2_serving rule 4: the internal stop is never
                 # reported as matched_stop; the terminator is glued back only

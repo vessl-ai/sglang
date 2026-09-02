@@ -3691,7 +3691,9 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         tools = self.chat._effective_tools(self.request)
         self.assertTrue(
             self.chat._solar_single_call_stop_matched(
-                self.request, tools, dict(self._STOP_MATCHED)
+                self.request,
+                effective_tools=tools,
+                finish_reason=dict(self._STOP_MATCHED),
             )
         )
         for choice in (
@@ -3709,7 +3711,9 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
                 )
                 self.assertFalse(
                     self.chat._solar_single_call_stop_matched(
-                        request, tools, dict(self._STOP_MATCHED)
+                        request,
+                        effective_tools=tools,
+                        finish_reason=dict(self._STOP_MATCHED),
                     )
                 )
 
@@ -3758,6 +3762,8 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             {"reasoning": {"effort": 0.5}},
             {"reasoning_effort": "0.5"},
             {"chat_template_kwargs": {"reasoning_effort": "foo"}},
+            {"chat_template_kwargs": {"reasoning_effort": ""}},
+            {"chat_template_kwargs": {"reasoning_effort": "  "}},
         ):
             with self.subTest(extra=extra):
                 request = ChatCompletionRequest.model_validate({**base, **extra})
@@ -3771,23 +3777,29 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         request = self.request.model_copy(update={"reasoning_effort": 0.5})
         self.assertIsNone(self.chat._validate_request(request))
 
-    def test_server_default_float_effort_falls_back_to_the_template_default(self):
-        """A float in --default-chat-template-kwargs reaches the request after
-        validation; it is dropped with a warning instead of silently
-        pre-closing the think block (review round 5)."""
-        req = self.request.model_copy(
-            update={
-                "reasoning_effort": 0.5,
-                "chat_template_kwargs": {"reasoning_effort": 0.5},
-            }
-        )
-        with self.assertLogs(
-            "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
-        ):
-            self._normalize(req)
-        self.assertIsNone(req.reasoning_effort)
-        self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
-        self.assertNotIn("solar_reasoning_effort", req.custom_params)
+    def test_server_default_non_tier_effort_falls_back_to_the_template_default(self):
+        """A value that only --default-chat-template-kwargs can supply past
+        validate_request (a float, a non-tier string) is dropped with a
+        warning instead of silently pre-closing the think block."""
+        for bad in (0.5, "foo"):
+            with self.subTest(bad=bad):
+                req = self.request.model_copy(
+                    update={
+                        "reasoning_effort": bad,
+                        "chat_template_kwargs": {"reasoning_effort": bad},
+                    }
+                )
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
+                ):
+                    self._normalize(req)
+                self.assertIsNone(req.reasoning_effort)
+                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+                if isinstance(bad, str):
+                    # A string still reaches the FSM, which warns itself.
+                    self.assertEqual(req.custom_params["solar_reasoning_effort"], bad)
+                else:
+                    self.assertNotIn("solar_reasoning_effort", req.custom_params)
 
     def test_required_streaming_whitespace_after_the_array_in_its_own_delta(self):
         """Whitespace that follows the closing bracket in a later delta is not
@@ -4090,7 +4102,9 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         )
         self.assertFalse(
             self.chat._solar_single_call_stop_matched(
-                request, self.chat._effective_tools(request), self._STOP_MATCHED
+                request,
+                effective_tools=self.chat._effective_tools(request),
+                finish_reason=self._STOP_MATCHED,
             )
         )
         choice = self._build_choice(
@@ -4536,9 +4550,15 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         req = self._req()
         self._normalize(req)
         self.assertEqual(req.custom_params, {self.TOOLS: False})
+        # A blank value only reaches here from --default-chat-template-kwargs
+        # (validate_request rejects it from a client).
         req = self._req(chat_template_kwargs={"reasoning_effort": "  "})
-        self._normalize(req)
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
+        ):
+            self._normalize(req)
         self.assertEqual(req.custom_params, {self.TOOLS: False})
+        self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
 
     def test_tools_are_reported_to_the_fsm(self):
         tool = {

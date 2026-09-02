@@ -140,10 +140,10 @@ class TestParallelToolCalls(unittest.TestCase):
 class TestSolarOpen2ParallelToolCallsFalse(unittest.TestCase):
     """required/named tool_choice use the JSON-schema array constraint, whose
     ``maxItems=1`` caps the call count for ``parallel_tool_calls=False``. For
-    ``auto`` (no grammar) OpenAIServingChat._solar_single_call_stop_matched
-    enforces it instead, by injecting ``<|tool_call:end|>`` as a stop string
-    and gluing it back onto the trimmed text before handing it to the
-    detector.
+    ``auto`` (no grammar) OpenAIServingChat enforces it instead: it injects
+    ``<|tool_call:end|>`` as a stop string (solar_open2_serving rule 3) and
+    glues it back onto the trimmed text before handing it to the detector
+    (rule 4).
     """
 
     def setUp(self):

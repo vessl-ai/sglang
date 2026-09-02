@@ -32,11 +32,11 @@ Content rules (what is *not* a call):
   the end of the stream.
 
 Streaming emits complete calls only, and its result does not depend on where
-the chunks are cut: whitespace before the next opener is rstripped; output from
-an opener that did not parse (a blank name included) is dropped once a call has
-been emitted, and before that it is held to the end of the stream -- content if
-no call ever parses. ``_StreamContent`` owns those rules; ``_parse_calls`` is
-pure.
+the chunks are cut: whitespace before the next opener is rstripped; everything
+from an opener that did not parse (a blank name included) onward, prose
+included, is dropped once a call has been emitted, and before that it is held
+to the end of the stream -- content if no call ever parses. ``_StreamContent``
+owns those rules; ``_parse_calls`` is pure.
 """
 
 from __future__ import annotations
@@ -97,8 +97,9 @@ class _StreamContent:
     opener (not); at the end of the stream it is content unless a call was
     emitted. ``emitted``: real text has been sent, so
     whitespace trailing it before the first call is content. ``unparsed``:
-    output from an opener that did not parse, held until a call parses
-    (dropped) or the stream ends (content). ``calls``: calls emitted so far
+    everything from an opener that did not parse onward, prose included, held
+    until a call parses (dropped) or the stream ends (content). ``calls``:
+    calls emitted so far
     -- after the first, prose is content but whitespace and unparsed calls
     are not."""
 
@@ -187,6 +188,7 @@ class _StreamContent:
             at = held.find(TOOL_CALL_START)
             if at != -1:
                 self._dropped("unfinished tool call at stream end", len(held) - at)
+                self.pending_ws = pending
                 return self.text(held[:at], before_opener=True)
             if partial_opener:
                 logger.warning(
@@ -405,10 +407,9 @@ def _parse_arguments(name: str, *, body: str, tools: List[Tool]) -> Dict[str, An
 def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Optional[str]:
     """JSON-schema ``type`` of a parameter from the request's tools, or None."""
     for tool in tools:
-        fn = getattr(tool, "function", None)
-        if fn is None or getattr(fn, "name", None) != func_name:
+        if tool.function.name != func_name:
             continue
-        params = getattr(fn, "parameters", None)
+        params = tool.function.parameters
         if not isinstance(params, dict):
             return None
         prop = (params.get("properties") or {}).get(param_name)
@@ -424,9 +425,9 @@ def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Option
 def _coerce(value: str, *, arg_type: Optional[str]) -> Any:
     """Convert a raw wire string to its JSON-schema type. Never raises: a value
     that does not convert is returned as the string, with a warning, so broken
-    output still reaches the client as something inspectable. ``null`` (any
-    case) is None whatever the type; a ``number`` with no fractional part is
-    an int."""
+    output still reaches the client as something inspectable; an unknown type
+    is the string as well, without one. ``null`` (any case) is None whatever
+    the type; a ``number`` with no fractional part is an int."""
     if value.strip().lower() == "null":
         return None
     pt = (arg_type or "string").strip().lower()

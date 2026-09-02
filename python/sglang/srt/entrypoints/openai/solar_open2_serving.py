@@ -1,5 +1,6 @@
 """Serving-side rules for the Solar Open2 chat format (Solar Pro 4), in one
-place; ``OpenAIServingChat`` calls them and adds nothing of its own.
+place; ``OpenAIServingChat`` calls them. Only the ``finish_reason`` rewrite
+and the glue-before-flush order of rule 4 sit at the call sites.
 
 1. ``validate_request`` -- ``reasoning_effort`` must name a tier, in the
    request field (typed upstream) and in ``chat_template_kwargs`` (untyped):
@@ -30,7 +31,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ReasoningEffortTier,
     Tool,
-    ToolChoice,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.solar_open2_detector import (
@@ -75,9 +75,22 @@ def validate_request(request: ChatCompletionRequest) -> Optional[str]:
     return None
 
 
-def _for_template(effort: str) -> str:
-    effort = effort.strip().lower()
-    return "high" if effort in EFFORT_FOLD else effort
+def _template_effort(value: Any) -> Optional[str]:
+    """The effort handed to the chat template: lower-cased, xhigh/max folded to
+    high. Anything that is not a tier -- only a server default can get here
+    past ``validate_request`` -- falls back to the template default, with a
+    warning."""
+    tier = value.strip().lower() if isinstance(value, str) else None
+    if tier in EFFORT_FOLD:
+        return "high"
+    if tier in EFFORT_TIERS:
+        return tier
+    logger.warning(
+        "solar_open2: ignoring reasoning_effort %r from the server defaults "
+        "(not a tier); using the template default",
+        value,
+    )
+    return None
 
 
 def normalize_reasoning_effort(
@@ -102,24 +115,15 @@ def normalize_reasoning_effort(
     custom[TOOLS_PARAM] = tools_available
     request.custom_params = custom
 
-    if isinstance(request.reasoning_effort, str):
-        request.reasoning_effort = _for_template(request.reasoning_effort)
-    elif request.reasoning_effort is not None:
-        # Only a server default (--default-chat-template-kwargs) can put a
-        # non-string here past validate_request: not silently no reasoning,
-        # but the template default, with a warning.
-        logger.warning(
-            "solar_open2: ignoring non-string reasoning_effort %r from the "
-            "server defaults; using the template default",
-            request.reasoning_effort,
-        )
-        request.reasoning_effort = None
+    if request.reasoning_effort is not None:
+        request.reasoning_effort = _template_effort(request.reasoning_effort)
     if ctk:
-        effort = ctk.get("reasoning_effort")
-        if isinstance(effort, str) and effort.strip():
-            ctk["reasoning_effort"] = _for_template(effort)
-        elif effort is not None and not isinstance(effort, str):
-            ctk.pop("reasoning_effort")
+        if ctk.get("reasoning_effort") is not None:
+            effort = _template_effort(ctk["reasoning_effort"])
+            if effort is None:
+                ctk.pop("reasoning_effort")
+            else:
+                ctk["reasoning_effort"] = effort
         if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
             # One source for the template: the request's (folded) effort. A
             # server default (--default-chat-template-kwargs) lands in ctk
@@ -128,31 +132,24 @@ def normalize_reasoning_effort(
             ctk["reasoning_effort"] = request.reasoning_effort
 
 
-def _auto_single_call(
-    request: ChatCompletionRequest, effective_tools: List[Tool]
-) -> bool:
-    return bool(
-        effective_tools
-        and request.tool_choice != "none"
-        and request.tool_choice != "required"
-        and not isinstance(request.tool_choice, ToolChoice)
-        and request.parallel_tool_calls is False
-    )
-
-
 def injects_single_call_stop(
     tool_call_parser: Optional[str],
+    *,
     request: ChatCompletionRequest,
     effective_tools: List[Tool],
 ) -> bool:
     """Rule 3: whether ``<|tool_call:end|>`` is added to the request's stops."""
-    return tool_call_parser == PARSER_NAME and _auto_single_call(
-        request, effective_tools
+    return bool(
+        tool_call_parser == PARSER_NAME
+        and effective_tools
+        and request.tool_choice == "auto"
+        and request.parallel_tool_calls is False
     )
 
 
 def single_call_stop_matched(
     tool_call_parser: Optional[str],
+    *,
     request: ChatCompletionRequest,
     effective_tools: List[Tool],
     finish_reason: Optional[Dict[str, Any]],
@@ -162,7 +159,9 @@ def single_call_stop_matched(
     (``no_stop_trim`` keeps it in the text, where the parser consumes it, so
     gluing it back would leak a second copy)."""
     return bool(
-        injects_single_call_stop(tool_call_parser, request, effective_tools)
+        injects_single_call_stop(
+            tool_call_parser, request=request, effective_tools=effective_tools
+        )
         and not request.no_stop_trim
         and finish_reason
         and finish_reason.get("type") == "stop"

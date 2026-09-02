@@ -1835,7 +1835,8 @@ class TestSolarOpen2ForceReasoning(CustomTestCase):
                 content = ""
                 for piece in pieces:
                     content += detector.parse_streaming_increment(piece).normal_text
-                content += detector.finish().normal_text
+                with self.assertLogs("sglang.srt.parser.reasoning_parser", "WARNING"):
+                    content += detector.finish().normal_text
                 self.assertEqual(content, "")
 
 

@@ -684,7 +684,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
-        # --- solar-open2 FSM fold gate (injected) ---
+        # --- solar-open2 FSM fold gate ---
         # Decided before the target launch: the folded epilogue accepts inside
         # the cuda graph, where the FSM mask below would never land.
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
@@ -692,8 +692,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         _solar_fsm_gate = _solar_fsm.plan_gate(batch.reqs, verify_ids_2d.shape[1])
         # The reasoning mask does not force the eager path -- it is staged here
         # and applied inside the verify graph, so a thinking batch keeps the
-        # folded accept. The gate above stays what it was: the escape for the
-        # what only plan_verify can do (force <|think:end|>, the content sets).
+        # folded accept. The gate above stays what it was: the escape for what
+        # only plan_verify can do (`_reasoning_needs_eager` /
+        # `_content_needs_eager`).
         # Read once: the staging condition below and the mask block further down
         # must agree, and is_active() resolves lazily, so a second call could
         # answer differently and leave the mask block without a chain.
@@ -734,7 +735,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
-            # --- solar-open2 FSM fold gate (injected) ---
+            # --- solar-open2 FSM fold gate ---
             and not _solar_fsm_gate
         )
         prepare_mamba_track_for_verify(batch)
@@ -774,7 +775,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        # --- solar-open2 FSM verify mask (injected) ---
+        # --- solar-open2 FSM verify mask ---
         # Planned after the grammar barrier has fed the previous step's
         # committed run to the FSMs, so the row states here and the grammar
         # bitmask above describe the same committed prefix. Applied after the
@@ -782,7 +783,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # is to close the illegal exits from the reasoning block.
         #
         # Runs on two kinds of step. The gate names what only plan_verify can
-        # do -- force <|think:end|> at a spent budget, the content sets.
+        # do (`_reasoning_needs_eager` / `_content_needs_eager`).
         # The second condition is the reasoning mask's fallback: the in-graph
         # mask is baked into the verify cuda graph, so a step that does not
         # replay that graph never executes it, and this is the only carrier

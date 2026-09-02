@@ -5904,6 +5904,14 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                         "days": {"type": "integer"},
                         "temp": {"type": "number"},
                         "urgent": {"type": "boolean"},
+                        # One alias per family, plus array/object/none.
+                        "note": {"type": "text"},
+                        "count": {"type": "int"},
+                        "ratio": {"type": "float"},
+                        "flag": {"type": "bool"},
+                        "tags": {"type": "array"},
+                        "opts": {"type": "object"},
+                        "nothing": {"type": "none"},
                     },
                 },
             ),
@@ -5966,8 +5974,9 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             # does. Calls-only in streaming.
             "whitespace only": ("\n \n", True, "calls"),
             # The vendor's streaming parser waits for the name's newline and
-            # emits nothing for these; ours releases the output as content
-            # at stream end (the vendor's non-streaming rule).
+            # emits nothing from the opener on (prose before it streams); ours
+            # releases the output as content at stream end (the vendor's
+            # non-streaming rule).
             "bad only": (bad, True, "calls"),
             "prose then bad": ("Hi " + bad, True, "calls"),
             "good then bad": (good + "\n" + bad, True, True),
@@ -5978,6 +5987,24 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             ),
             "null any case": (cls._call(location=" NULL "), True, True),
             "integral number": (cls._call(location="Paris", temp="3"), True, True),
+            "alias args": (
+                cls._call(
+                    note="hi",
+                    count="2",
+                    ratio="1.5",
+                    flag="true",
+                    tags="[1, 2]",
+                    opts='{"a": 1}',
+                    nothing="x",
+                ),
+                True,
+                True,
+            ),
+            "bad typed args": (
+                cls._call(days="abc", temp="x", tags="[1,", opts="{", urgent="maybe"),
+                True,
+                True,
+            ),
             "fractional number": (cls._call(location="Paris", temp="3.5"), True, True),
             # CRLF line ends: the reference's non-streaming regex backtracks into
             # a garbage name with no arguments; its streaming parser and ours

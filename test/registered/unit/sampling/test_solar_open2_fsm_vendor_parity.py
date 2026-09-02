@@ -541,6 +541,24 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(fsm.CFG.leading_newline_forbidden, ())
         self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
 
+    def test_blank_newline_ids_env_is_unset(self):
+        self._init()
+        from_tokenizer = fsm.CFG.leading_newline_forbidden
+        self.assertTrue(from_tokenizer)
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="")
+        self.assertEqual(fsm.CFG.leading_newline_forbidden, from_tokenizer)
+
+    def test_no_bare_eos_warns(self):
+        with open(
+            os.path.join(self.dir, "generation_config.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump({}, f)
+        with self.assertLogs("sglang.srt.sampling.solar_open2_fsm", "WARNING") as logs:
+            self._init()
+        self.assertTrue(any("no EOS id found" in line for line in logs.output))
+        # Only the sentinels are masked: the bare EOS is not in any set.
+        self.assertNotIn(EOS, fsm.CFG.reasoning_forbidden)
+
     def test_missing_newline_tokens_fail_loud(self):
         # Neither the vocab nor the added tokens may carry a newline run.
         with open(

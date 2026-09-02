@@ -1,4 +1,5 @@
 import inspect
+import logging
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -45,6 +46,8 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_CONTROL_TOKENS,
     MESSAGE_MODEL,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingParseResult:
@@ -2007,11 +2010,7 @@ class ReasoningParser:
 
 
 # --- Solar Open2 reasoning parser ---
-import logging
-
 from sglang.srt.function_call import solar_open2_detector as _solar_tool_detector
-
-_solar_logger = logging.getLogger(__name__)
 
 _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
 
@@ -2127,19 +2126,18 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     def finish(self) -> StreamingParseResult:
         # A stream that ends inside the think block needs nothing added: its
         # reasoning deltas are already out on the reasoning channel and content
-        # stays empty (the same rule detect_and_parse applies). A sentinel
-        # fragment at the head of the content region -- held here or by the
-        # base class -- is never an answer.
-        self._content_head_hold = ""
-        ret = super().finish()
-        if not self._content_started and ret.normal_text:
-            if self.think_end_token.startswith(ret.normal_text):
-                _solar_logger.warning(
-                    "solar_open2: dropping a %d-char sentinel fragment at the end "
-                    "of the stream",
-                    len(ret.normal_text),
-                )
-                ret.normal_text = ""
+        # stays empty (the same rule detect_and_parse applies). Whatever is
+        # still held after the last scrub is a sentinel fragment at the head of
+        # the content region, and a fragment of a control sentinel is never an
+        # answer.
+        ret = self._scrub_content_head(super().finish())
+        if self._content_head_hold:
+            logger.warning(
+                "solar_open2: dropping a %d-char sentinel fragment at the end of "
+                "the stream",
+                len(self._content_head_hold),
+            )
+            self._content_head_hold = ""
         return ret
 
 

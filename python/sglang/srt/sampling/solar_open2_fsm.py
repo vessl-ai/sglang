@@ -359,7 +359,7 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     (``tokenizer_config.json`` / ``tokenizer.json``) whose text is a pure
     newline run, plus a verbatim newline token;
     ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`` (JSON list of ints) overrides,
-    and ``[]`` switches the rule off. Like the think ids, a vocab that cannot
+    ``[]`` switches the rule off, and a blank value is the same as unset. Like the think ids, a vocab that cannot
     supply them fails loud rather than silently dropping the rule.
     """
     override = _env_id_list("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
@@ -553,6 +553,34 @@ def init_from_env() -> None:
             "SOLAR_FSM=1 but SOLAR_FSM_TOKENIZER_DIR is unset or not a directory: "
             f"{tok_dir!r}"
         )
+    _configure_from_tokenizer(tok_dir)
+    _configure_budget_from_env()
+    CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
+    _warn_retired_env()
+    CFG.enabled = True
+    logger.info(
+        "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
+        "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
+        "content_done=%s (no tools: %s / %s) tool states=%s | "
+        "budget per effort %s default=%s hard_limit=%s",
+        CFG.think_start,
+        CFG.think_end,
+        CFG.im_end,
+        CFG.reasoning_forbidden,
+        CFG.reasoning_open_forbidden,
+        CFG.content_fresh_forbidden,
+        CFG.content_done_forbidden,
+        CFG.content_fresh_forbidden_notools,
+        CFG.content_done_forbidden_notools,
+        {_STATE_NAMES[st]: CFG.forbidden[(st, False)] for st in sorted(_TOOL_STATES)},
+        CFG.effort_budgets,
+        CFG.default_effort,
+        "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
+    )
+
+
+def _configure_from_tokenizer(tok_dir: str) -> None:
+    """Sentinel, EOS and leading-newline ids from the served tokenizer."""
     table = _added_token_ids(tok_dir)
     missing = [t for t in ("<|think:start|>", "<|think:end|>") if t not in table]
     if missing:
@@ -561,10 +589,14 @@ def init_from_env() -> None:
         )
     configure_ids(
         {field: table.get(text) for field, text in _TOKEN_TEXT_BY_FIELD.items()},
-        _eos_ids(tok_dir),
-        _leading_newline_ids(tok_dir),
+        eos=_eos_ids(tok_dir),
+        leading_newline=_leading_newline_ids(tok_dir),
     )
 
+
+def _configure_budget_from_env() -> None:
+    """Hard limit, per-effort budgets, no-reasoning efforts and the default
+    effort from ``SOLAR_REASONING_BUDGET_*``."""
     # A hard limit of 0 disables the server-wide ceiling; a negative value is a
     # configuration error.
     CFG.hard_limit = _env_int("SOLAR_REASONING_BUDGET_HARD_LIMIT", _HARD_LIMIT)
@@ -621,31 +653,6 @@ def init_from_env() -> None:
             f"reasoning effort: {sorted(CFG.effort_budgets)} / "
             f"{sorted(CFG.no_reasoning_efforts)}"
         )
-    CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
-    _warn_retired_env()
-    CFG.enabled = True
-    budget_desc = "per effort %s default=%s hard_limit=%s" % (
-        CFG.effort_budgets,
-        CFG.default_effort,
-        "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
-    )
-    logger.info(
-        "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
-        "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
-        "content_done=%s (no tools: %s / %s) tool states=%s "
-        "budget=%s",
-        CFG.think_start,
-        CFG.think_end,
-        CFG.im_end,
-        CFG.reasoning_forbidden,
-        CFG.reasoning_open_forbidden,
-        CFG.content_fresh_forbidden,
-        CFG.content_done_forbidden,
-        CFG.content_fresh_forbidden_notools,
-        CFG.content_done_forbidden_notools,
-        {_STATE_NAMES[st]: CFG.forbidden[(st, False)] for st in sorted(_TOOL_STATES)},
-        budget_desc,
-    )
 
 
 def is_active() -> bool:
@@ -907,7 +914,7 @@ def _log_force_conflict(rows, stride: int, rids) -> None:
 
 # --------------------------------------------------------------------------
 # Hooks called from the sampler, the batch-info copy, the batch result
-# processor, the scheduler and the DSpark verify worker.
+# processor, the scheduler, and the DSpark verify worker and verify graph.
 # --------------------------------------------------------------------------
 def attach_rows(sampling_info, batch) -> None:
     if not os.environ.get("SOLAR_FSM", "0") == "1":
@@ -1258,8 +1265,8 @@ def plan_gate(reqs, stride: int) -> bool:
     the graph (``folded_mask_flags``), and the budget window is ``2 * stride``
     because the state read here can lag by one accepted run. Known folded-path
     gaps, each <= stride-1 chain rows and closed by the next step's committed
-    state: a drafted sentinel on a content-with-progress row or under a grammar
-    Host-only and sync-free: it never touches the draft tokens.
+    state: a drafted sentinel on a content-with-progress row or under a
+    grammar. Host-only and sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False
@@ -1303,9 +1310,10 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       model may legitimately want it, so a non-EOS token is accepted and
       committed after the answer. It is the cheaper error.
     * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
-      that position; these flags stay False, and ``plan_gate`` does not fire on
-      a content-with-progress row without a grammar. That row goes unmasked. It is the error
-      this mask exists to prevent, and closing it needs the chain here.
+      that position; these flags stay False, and ``plan_gate`` does not fire
+      on a content-with-progress row without a grammar. That row goes
+      unmasked -- the error this mask exists to prevent, and closing it needs
+      the chain here.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
