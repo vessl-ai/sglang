@@ -373,8 +373,10 @@ def filter_rows(sampling_info, keep_indices: List[int]) -> None:
 def merge_rows(sampling_info, other) -> None:
     rows = getattr(sampling_info, "solar_fsm_rows", None)
     other_rows = getattr(other, "solar_fsm_rows", None)
-    if rows is not None and other_rows is not None:
-        sampling_info.solar_fsm_rows = rows + other_rows
+    if rows is None and other_rows is None:
+        return
+    # One side without rows would otherwise drop the other's rows silently.
+    sampling_info.solar_fsm_rows = list(rows or []) + list(other_rows or [])
 
 
 def advance_committed(result, batch) -> None:
@@ -431,7 +433,7 @@ def advance_committed(result, batch) -> None:
     result.solar_fsm_advanced = True
 
 
-_WARNED = {"shape": False}
+_WARNED = {"shape": False, "rows": False}
 
 
 def apply(logits: torch.Tensor, sampling_info) -> None:
@@ -440,6 +442,19 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
         return
 
     rows = getattr(sampling_info, "solar_fsm_rows", None)
+    if rows is None:
+        # Every SamplingBatchInfo on the sampler path comes from
+        # from_schedule_batch, which attaches the rows whenever the FSM is on.
+        # Reaching here means a copy or a new construction site lost them --
+        # the failure this module once had silently. Say so, once.
+        if not _WARNED["rows"]:
+            logger.warning(
+                "[SOLAR-FSM] sampling_info carries no solar_fsm_rows while the "
+                "FSM is active: think-block masks are NOT applied on this path. "
+                "This warning is logged once."
+            )
+            _WARNED["rows"] = True
+        return
     if not rows:
         return
     if logits.shape[0] != len(rows):

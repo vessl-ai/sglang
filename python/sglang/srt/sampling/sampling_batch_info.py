@@ -56,20 +56,17 @@ class SamplingBatchInfo:
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    # Solar-Open2 FSM (sampling/solar_open2_fsm.py): the per-row ``Req`` handles
-    # the sampler reads to build the reasoning/content masks. Declared as a
-    # field so ``copy_for_forward`` -- ``dataclasses.replace`` -- carries it to
-    # the forward-only copy the sampler actually receives. As an ad-hoc
-    # attribute it was dropped by that copy, and ``solar_open2_fsm.apply`` then
-    # returned early on every non-speculative sampler step: no sentinel/EOS
-    # mask inside the think block and no ``<|think:end|>`` forced at the
-    # reasoning budget, so a request could ride its think block to
-    # ``max_new_tokens``.
-    solar_fsm_rows: Optional[List[Any]] = None
     acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+
+    # Solar-Open2 FSM (sampling/solar_open2_fsm.py): per-row ``Req`` handles the
+    # sampler reads to build the think-block masks. A declared field so that
+    # ``copy_for_forward`` (``dataclasses.replace``) carries it to the forward-only
+    # copy the sampler receives; as an ad-hoc attribute it was dropped there and
+    # ``solar_open2_fsm.apply`` silently skipped every non-speculative step.
+    solar_fsm_rows: Optional[List[Any]] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
