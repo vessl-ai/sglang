@@ -3673,6 +3673,42 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         )
         self.assertTrue(has_tool_calls.get(0))
         self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
+        arguments = "".join(
+            d["function"].get("arguments") or "" for d in tool_call_deltas
+        )
+        self.assertEqual(json.loads(arguments), {"location": "Paris"})
+        self.assertEqual(len({d["index"] for d in tool_call_deltas}), 1)
+
+    def test_required_with_client_stop_on_the_terminator_is_not_glued(self):
+        """A client may pass stop=["<|tool_call:end|>"] itself; on the JSON
+        path the array never contains the marker, and the glue must not
+        append it to the JSON (parallel_tool_calls=False, review round 2)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": False}
+        )
+        self.assertFalse(
+            self.chat._solar_single_call_stop_matched(
+                request, self.chat._effective_tools(request), self._STOP_MATCHED
+            )
+        )
+        choice = self._build_choice(
+            request, self._JSON_ARRAY_CALL_TEXT, dict(self._STOP_MATCHED)
+        )
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+
+    def test_auto_stop_matched_without_an_opener_hides_the_internal_stop(self):
+        """The injected terminator halted generation but no call was opened
+        (malformed output): nothing is glued, the text is served as-is, and
+        the internal stop string is not exposed as matched_stop (review
+        round 2, I-2/I-3)."""
+        choice = self._build_choice(
+            self.request, "Sure, here it is:", dict(self._STOP_MATCHED)
+        )
+        self.assertEqual(choice.finish_reason, "stop")
+        self.assertIsNone(choice.matched_stop)
+        self.assertEqual(choice.message.content, "Sure, here it is:")
+        self.assertFalse(choice.message.tool_calls)
 
     def test_required_non_streaming_json_array_parallel_calls(self):
         """required with parallel_tool_calls (default): the array may carry

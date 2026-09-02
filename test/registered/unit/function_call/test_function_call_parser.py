@@ -5268,6 +5268,29 @@ class TestSolarOpen2Detector(unittest.TestCase):
             [json.loads(c.parameters)["location"] for c in calls], ["Paris", "Tokyo"]
         )
 
+    def test_streaming_closed_but_unparsable_call_is_kept_as_text(self):
+        """A call closed by <|tool_call:end|> that the grammar does not match
+        (no newline after the name) is returned as content with a warning
+        instead of vanishing (review round 2, I-1)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        text = f"{TOOL_CALL_START}get_weather{TOOL_CALL_END}"
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            normal, calls = parser.parse_stream_chunk(text)
+        self.assertEqual((normal, calls), (text, []))
+
+    def test_zero_argument_fence_is_not_a_call(self):
+        """The fence-opened form needs at least one argument marker (opener
+        and full pattern agree); a bare fence + terminator stays text."""
+        detector = SolarOpen2Detector()
+        text = f"```get_weather\n{TOOL_CALL_END}"
+        self.assertFalse(detector.has_tool_call(text))
+        result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual((result.normal_text, result.calls), (text, []))
+
     def test_stream_end_releases_held_text(self):
         """Text held back for a marker that never arrives (a trailing code
         fence, an unfinished call cut by max_tokens) is released as content

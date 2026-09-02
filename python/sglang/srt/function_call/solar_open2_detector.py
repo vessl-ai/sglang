@@ -21,8 +21,8 @@ code fence carrying the function name instead of the start marker::
 
 A fence line is treated as a call opener only when the next line begins with
 ``<|tool_arg:start|>``, so ordinary fenced code blocks in model output are
-unaffected (the fence form carries at least one argument; a zero-argument call uses the
-real start marker).
+unaffected (a fence line not followed by an argument marker is never a call opener, so
+a zero-argument call must use the real start marker).
 
 A call whose function name is not in ``request.tools`` is emitted to the client
 as-is (with a warning) rather than discarded: the client owns name validation
@@ -164,7 +164,7 @@ class SolarOpen2Detector(BaseFormatDetector):
         )
         self.fence_call_pattern = re.compile(
             rf"(?:^|\n)```([\w.-]+)[ \t]*\n"
-            rf"((?:{re.escape(TOOL_ARG_START)}.*?{re.escape(TOOL_ARG_END)}\s*)*)"
+            rf"((?:{re.escape(TOOL_ARG_START)}.*?{re.escape(TOOL_ARG_END)}\s*)+)"
             rf"{re.escape(TOOL_CALL_END)}",
             re.DOTALL,
         )
@@ -194,7 +194,9 @@ class SolarOpen2Detector(BaseFormatDetector):
         """``streaming``: number the calls sequentially across the stream
         (``current_tool_id``), the index a client accumulates deltas by --
         two calls of the same tool must not share it. Non-streaming keeps
-        the tools-list index, which the serving layer replaces anyway."""
+        the tools-list index (SGLang's convention for every detector; the
+        serving layer passes it through as ``tool_calls[].index``, which
+        non-streaming clients do not accumulate by)."""
         indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
         matches = sorted(
@@ -293,16 +295,26 @@ class SolarOpen2Detector(BaseFormatDetector):
 
         cut = rest.rindex(TOOL_CALL_END) + len(TOOL_CALL_END)
         complete, self._buffer = rest[:cut], rest[cut:]
-        return StreamingParseResult(
-            normal_text=head, calls=self._parse_calls(complete, tools, streaming=True)
-        )
+        calls = self._parse_calls(complete, tools, streaming=True)
+        if not calls:
+            # Closed but not parseable (e.g. no newline after the name): keep
+            # the text instead of dropping it, as the non-streaming path and
+            # finish() do, and say so.
+            logger.warning(
+                "Solar Open2: closed tool call did not parse (%d chars); "
+                "returning it as content",
+                len(complete),
+            )
+            return StreamingParseResult(normal_text=head + complete, calls=[])
+        return StreamingParseResult(normal_text=head, calls=calls)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """The stream is over: release what was held back waiting for a marker
         that can no longer arrive. A partial opener / fence candidate is
         ordinary text; an unfinished call (opened, never closed -- e.g. cut by
         max_tokens) is returned as text as well, so nothing is dropped
-        silently (the vendor keeps such output as content too)."""
+        silently (the vendor's non-streaming parser keeps such output as
+        content; its streaming parser has already emitted it as deltas)."""
         held, self._buffer = self._buffer, ""
         if not held:
             return StreamingParseResult()

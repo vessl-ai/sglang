@@ -453,6 +453,17 @@ class TestInitFromEnv(_FsmCase):
                     str(THINK_END): {"content": "<|think:end|>"},
                     str(IM_END): {"content": "<|im:end|>"},
                     str(TOOL_START): {"content": "<|tool_call:start|>"},
+                    str(TOOL_END): {"content": "<|tool_call:end|>"},
+                    str(ARG_START): {"content": "<|tool_arg:start|>"},
+                    str(ARG_VALUE): {"content": "<|tool_arg:value|>"},
+                    str(ARG_END): {"content": "<|tool_arg:end|>"},
+                    str(IM_START): {"content": "<|im:start|>"},
+                    "110": {"content": "<|im:content|>"},
+                    "111": {"content": "<|tool:start|>"},
+                    "112": {"content": "<|tool:end|>"},
+                    "113": {"content": "<|tool_response:start|>"},
+                    "114": {"content": "<|tool_response:end|>"},
+                    "115": {"content": "ĊĊĊ"},
                 }
             },
             "generation_config.json": {"eos_token_id": [EOS]},
@@ -490,9 +501,10 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(c.effort_budgets, fsm._EFFORT_BUDGETS)
         self.assertEqual(c.default_effort, "high")
         self.assertEqual(c.hard_limit, 128 * 1024)
-        self.assertEqual(c.leading_newline_forbidden, (NL, NLNL))
+        self.assertEqual(c.leading_newline_forbidden, (NL, NLNL, 115))
         self.assertEqual(
-            set(c.reasoning_open_forbidden), set(c.reasoning_forbidden) | {NL, NLNL}
+            set(c.reasoning_open_forbidden),
+            set(c.reasoning_forbidden) | {NL, NLNL, 115},
         )
         self.assertIn(EOS, c.reasoning_forbidden)
 
@@ -529,6 +541,16 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
 
     def test_missing_newline_tokens_fail_loud(self):
+        # Neither the vocab nor the added tokens may carry a newline run.
+        with open(
+            os.path.join(self.dir, "tokenizer_config.json"), encoding="utf-8"
+        ) as f:
+            cfg = json.load(f)
+        cfg["added_tokens_decoder"].pop("115")
+        with open(
+            os.path.join(self.dir, "tokenizer_config.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(cfg, f)
         with open(os.path.join(self.dir, "tokenizer.json"), "w", encoding="utf-8") as f:
             json.dump({"model": {"vocab": {"a": 9}}}, f)
         with self.assertRaisesRegex(RuntimeError, "leading-newline tokens"):
@@ -547,7 +569,7 @@ class TestInitFromEnv(_FsmCase):
         # Vendor: 0 disables the server-wide ceiling ...
         self._init(SOLAR_FSM_HARD_LIMIT="0", SOLAR_FSM_BUDGET_MAX="200000")
         self.assertEqual(fsm._req_fsm(_req(effort="max")).budget, 200000)
-        # ... and a malformed per-effort budget warns and keeps the default.
+        # ... and a negative per-effort budget warns and keeps the default.
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
             self._init(SOLAR_FSM_BUDGET_LOW="-1")
         self.assertIn("SOLAR_FSM_BUDGET_LOW", captured.output[0])
@@ -592,6 +614,23 @@ class TestInitFromEnv(_FsmCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_all_fourteen_sentinels_are_controls_and_newline_added_token_is_leading(
+        self,
+    ):
+        self._init()
+        controls = fsm.CFG.all_controls
+        self.assertEqual(len(controls), 14)
+        for tid in (110, 111, 112, 113, 114):
+            self.assertIn(tid, controls)
+            # a control the state does not allow is forbidden everywhere
+            self.assertIn(tid, fsm.CFG.forbidden[(fsm.CONTENT, True)])
+            self.assertIn(tid, fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])
+            self.assertIn(tid, fsm.CFG.reasoning_forbidden)
+        # a pure newline-run added token joins the leading-newline set
+        self.assertIn(115, fsm.CFG.leading_newline_forbidden)
+        self.assertIn(NL, fsm.CFG.leading_newline_forbidden)
+        self.assertNotIn(9, fsm.CFG.leading_newline_forbidden)  # "a"
 
 
 # The vendor's tables, verbatim (03-logits-processor.patch _MASK_SPEC_BY_STATE /
@@ -740,6 +779,17 @@ class TestToolCallEnvelope(_FsmCase):
         self.assertEqual(
             _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.CONTENT, False)])
         )
+        # Every request-level constraint counts, on the eager and the
+        # speculative (plan_verify) path alike.
+        for field in ("regex", "ebnf", "structural_tag"):
+            with self.subTest(field=field):
+                req = _req((THINK_END,), tools=True, rid=f"g-{field}")
+                setattr(req.sampling_params, field, "x")
+                self.assertEqual(_masked(_apply(req)), set())
+                fsm._req_fsm(req).advance(req.output_ids)
+                plan = fsm.plan_verify([req], torch.tensor([[7, 8]]), stride=2)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan.mask_rows, {})
         # ... but not the reasoning phase.
         req = _req((), tools=True)
         req.sampling_params.json_schema = "{}"
@@ -790,9 +840,12 @@ class _VendorTranscript:
     """SolarOpen2TokenFSMEnforcer's state walk and table lookup, transcribed
     from the vendor's logits processor (03-logits-processor.patch:
     _initial_state, _initial_completed_tool_call_state, _process_token,
-    _forbidden_table, advance_mask_ids) with this file's ids. Kept as a
-    separate, deliberately literal implementation so a drift in the port
-    shows up as a per-step mismatch rather than a failed hand-written case."""
+    _forbidden_table, and the table lookup of advance_mask_ids) with this
+    file's ids -- the budget force, the leading-newline set and the
+    structured-outputs exemption are not modelled, and only 9 of the 14
+    control sentinels are drawn. Kept as a separate, deliberately literal
+    implementation so a drift in the port shows up as a per-step mismatch
+    rather than a failed hand-written case."""
 
     TRANSITIONS = (
         ("think_start", fsm.REASONING),
@@ -948,7 +1001,9 @@ class TestBudgetCountingAndReset(_FsmCase):
         state.advance(req.output_ids)
         self.assertTrue(state.in_reasoning)
         self.assertEqual(state.count, 0)
-        state.commit([11] * (4 * 1024))
+        state.commit([11] * (4 * 1024 - 1))
+        self.assertFalse(state.budget_exhausted())  # the earlier 3 do not count
+        state.commit([11])
         self.assertTrue(state.budget_exhausted())
 
 
@@ -972,9 +1027,32 @@ class TestSpecPathToolStates(_FsmCase):
     leaves the folded path, and plan_verify masks each chain row with the
     row's own tool-state table."""
 
+    CALL = TestToolCallEnvelope.CALL
+
     def test_plan_gate_goes_eager_inside_a_tool_call(self):
-        req = _req((THINK_END, TOOL_START, 7), tools=True)
-        self.assertTrue(fsm.plan_gate([req], stride=3))
+        """With a committed FSM: a row in any TOOL_* state leaves the folded
+        path; content-with-progress stays on it."""
+        for output, state in (
+            ((THINK_END, TOOL_START), fsm.TOOL_CALL_BEGIN),
+            ((THINK_END, TOOL_START, 7), fsm.TOOL_CALL_NAME),
+            (
+                (THINK_END, TOOL_START, 7, ARG_START, 8, ARG_VALUE),
+                fsm.TOOL_ARG_VALUE_BEGIN,
+            ),
+            (self.CALL[:-1], fsm.TOOL_ARG_END),
+        ):
+            with self.subTest(state=fsm._STATE_NAMES[state]):
+                req = _req(output, tools=True, rid=f"r{state}")
+                committed = fsm._req_fsm(req)
+                committed.advance(req.output_ids)
+                self.assertEqual(committed.state, state)
+                self.assertTrue(fsm.plan_gate([req], stride=3))
+        req = _req(self.CALL + (11,), tools=True, rid="done")
+        committed = fsm._req_fsm(req)
+        committed.advance(req.output_ids)
+        self.assertEqual(committed.state, fsm.CONTENT)
+        self.assertTrue(committed.content_progress)
+        self.assertFalse(fsm.plan_gate([req], stride=3))
 
     def test_plan_verify_walks_the_envelope_per_row(self):
         req = _req((THINK_END, TOOL_START, 7), tools=True)

@@ -17,7 +17,7 @@ Scope of this port:
     same transitions as ``SolarOpen2TokenFSMEnforcer._process_token`` -- a
     turn that has produced no content may not end, and inside
     ``<|tool_call:start|>`` .. ``<|tool_call:end|>`` only the envelope
-    sentinel the current sub-state expects is open. ``SOLAR_FSM_CONTENT_MASK=0``
+    sentinel(s) the current sub-state expects are open. ``SOLAR_FSM_CONTENT_MASK=0``
     (not a vendor switch) turns every non-REASONING mask off.
 
 Budget and ids follow the vendor's vLLM 0.25.0 logits processor (Solar Pro 4
@@ -367,8 +367,9 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     if not ids:
         raise RuntimeError(
             f"SOLAR_FSM: leading-newline tokens {_LEADING_NEWLINE_TEXTS} not found "
-            f"in {tk_path} (model.vocab); set SOLAR_FSM_LEADING_NEWLINE_IDS to the "
-            "ids, or to an empty string to switch the rule off"
+            f"in {tokenizer_dir}'s vocab or added tokens; set "
+            "SOLAR_FSM_LEADING_NEWLINE_IDS to the ids, or to an empty string to "
+            "switch the rule off"
         )
     return tuple(sorted(ids))
 
@@ -573,8 +574,10 @@ def init_from_env() -> None:
         name = f"SOLAR_FSM_BUDGET_{effort.upper()}"
         value = _env_int(name, default)
         if value < 0:
-            # Vendor: a malformed per-effort budget falls back to the built-in
-            # default with a warning rather than failing every request.
+            # Vendor: a negative per-effort budget falls back to the built-in
+            # default with a warning rather than failing every request (a
+            # non-integer value still fails loud in _env_int, unlike the
+            # vendor, which warns for every malformed value).
             logger.warning(
                 "[SOLAR-FSM] ignoring %s=%d (must be >= 0); using the built-in "
                 "%s budget %d.",
@@ -1252,8 +1255,8 @@ def plan_gate(reqs, stride: int) -> bool:
     the step after a think block opens. All are
     ``plan_verify``'s work, and ``plan_verify`` runs after the grammar barrier
     -- too late for the folded epilogue, which accepts inside the cuda graph
-    off its own buffers. Each is judged per row from committed state, so a
-    generation spends only its boundary steps eager.
+    off its own buffers. Each is judged per row from committed state, so
+    outside a tool call a generation spends only its boundary steps eager.
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied

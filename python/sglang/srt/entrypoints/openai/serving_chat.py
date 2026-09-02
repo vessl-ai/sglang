@@ -68,6 +68,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
+    TOOL_CALL_START as SOLAR_OPEN2_TOOL_CALL_START,
 )
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
@@ -1147,6 +1148,8 @@ class OpenAIServingChat(OpenAIServingBase):
         return bool(
             self.tool_call_parser == "solar_open2"
             and request.tool_choice != "none"
+            and request.tool_choice != "required"
+            and not isinstance(request.tool_choice, ToolChoice)
             and effective_tools
             and request.parallel_tool_calls is False
             and not request.no_stop_trim
@@ -1230,7 +1233,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # .supports_structural_tag is False). Unlike kimi_k3's stop
                     # (a section-envelope closer outside each call, harmless
                     # to trim), this terminator is required inside every call,
-                    # so _process_tool_calls / _process_tool_call_stream glue
+                    # so _build_chat_response / _generate_stream_content glue
                     # it back onto the text before parsing.
                     tool_call_stop = parser.detector.eot_token
             if (
@@ -1763,6 +1766,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     # to tool_calls does not expose the (internal) stop string
                     # -- for Solar Open2 that is the call terminator itself.
                     matched_stop = None
+                elif self._solar_single_call_stop_matched(
+                    request, self._effective_tools(request), finish_reason_data
+                ):
+                    # The injected terminator halted generation but nothing
+                    # parsed as a call: still not a client-visible stop string.
+                    matched_stop = None
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
@@ -1944,7 +1953,13 @@ class OpenAIServingChat(OpenAIServingBase):
             if self._solar_single_call_stop_matched(
                 request, effective_tools, finish_reason
             ):
-                text += SOLAR_OPEN2_TOOL_CALL_END
+                if SOLAR_OPEN2_TOOL_CALL_START in text:
+                    text += SOLAR_OPEN2_TOOL_CALL_END
+                else:
+                    # The terminator matched without an opener (malformed
+                    # generation): nothing to glue, and the internal stop
+                    # string is not part of the response.
+                    finish_reason["matched"] = None
 
             # Handle reasoning content
             reasoning_text = None
