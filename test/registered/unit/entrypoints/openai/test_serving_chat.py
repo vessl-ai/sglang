@@ -4001,6 +4001,21 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.assertEqual(req.reasoning_effort, "high")
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
 
+    def test_non_solar_parser_does_not_touch_custom_params(self):
+        """The hook is reached only for the solar_open2 reasoning parser."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        for parser, expect_key in (("deepseek-r1", False), ("solar_open2", True)):
+            with self.subTest(parser=parser):
+                self.chat.reasoning_parser = parser
+                req = self._req(reasoning_effort="medium")
+                self.chat._process_messages(req, is_multimodal=False)
+                if expect_key:
+                    self.assertEqual(req.custom_params[self.KEY], "medium")
+                else:
+                    self.assertIsNone(req.custom_params)
+
     def test_effort_rides_to_sampling_params(self):
         req = self._req(reasoning_effort="low")
         self.chat._normalize_solar_open2_reasoning_effort(req)

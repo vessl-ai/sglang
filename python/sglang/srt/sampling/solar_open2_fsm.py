@@ -300,10 +300,18 @@ def _req_tools(req) -> bool:
     """Whether the request offers tools (``TOOLS_PARAM``); True when the
     entrypoint did not say (the vendor's sets, which allow a tool call)."""
     params = getattr(getattr(req, "sampling_params", None), "custom_params", None)
-    if isinstance(params, dict):
-        value = params.get(TOOLS_PARAM)
+    if isinstance(params, dict) and TOOLS_PARAM in params:
+        value = params[TOOLS_PARAM]
         if isinstance(value, bool):
             return value
+        if not _WARNED["tools"]:
+            logger.warning(
+                "[SOLAR-FSM] custom_params[%r] is %r, not a bool; treating the "
+                "request as offering tools. This warning is logged once.",
+                TOOLS_PARAM,
+                value,
+            )
+            _WARNED["tools"] = True
     return True
 
 
@@ -418,6 +426,17 @@ def init_from_env() -> None:
         )
     CFG.budget_ratio = _env_float("SOLAR_FSM_BUDGET_RATIO", 0.75)
     CFG.budget_abs = _env_int("SOLAR_FSM_BUDGET_ABS", _FORK_ABS_BUDGET)
+    legacy_vars = [
+        v for v in ("SOLAR_FSM_BUDGET_RATIO", "SOLAR_FSM_BUDGET_ABS") if v in os.environ
+    ]
+    if legacy_vars and CFG.budget_policy == "effort":
+        logger.warning(
+            "[SOLAR-FSM] %s set but SOLAR_FSM_BUDGET_POLICY is 'effort': the "
+            "reasoning budget follows the per-effort table and these values are "
+            "ignored. Set SOLAR_FSM_BUDGET_POLICY=legacy to keep "
+            "min(SOLAR_FSM_BUDGET_ABS, max_new_tokens * SOLAR_FSM_BUDGET_RATIO).",
+            ", ".join(legacy_vars),
+        )
     CFG.content_mask = os.environ.get("SOLAR_FSM_CONTENT_MASK", "1") == "1"
     CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
     CFG.enabled = True
@@ -728,7 +747,7 @@ def advance_committed(result, batch) -> None:
     result.solar_fsm_advanced = True
 
 
-_WARNED = {"shape": False, "rows": False, "merge": False}
+_WARNED = {"shape": False, "rows": False, "merge": False, "tools": False}
 
 
 def apply(logits: torch.Tensor, sampling_info) -> None:
@@ -1009,8 +1028,9 @@ def plan_gate(reqs, stride: int) -> bool:
             # CONTENT rows then only lack content_done_forbidden (stray control
             # tokens; for a request without tools that includes
             # <|tool_call:start|>, benign here because the exit it offers only
-            # matters while EOS is shut, i.e. in fresh CONTENT), the same class
-            # of gap as a drafted <|think:start|> (folded_mask_flags). A think_end accepted in the run this state
+            # matters while EOS is shut, i.e. in fresh CONTENT), the same
+            # class of gap as a drafted <|think:start|> (folded_mask_flags). A think_end
+            # accepted in the run this state
             # lags behind is covered by the folded mask's overmask for the EOS
             # / <|im:end|> half of the fresh-content rule (the rest of that
             # chain is still masked with the reasoning set: it also holds

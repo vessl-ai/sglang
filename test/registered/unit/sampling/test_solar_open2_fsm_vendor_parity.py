@@ -104,9 +104,51 @@ def _masked(logits, row=0):
     return {i for i in range(VOCAB) if logits[row, i] == NEG_INF}
 
 
-class TestEffortBudget(unittest.TestCase):
+_CFG_FIELDS = (
+    "enabled",
+    "think_start",
+    "think_end",
+    "im_end",
+    "tool_call_start",
+    "tool_call_end",
+    "all_controls",
+    "reasoning_forbidden",
+    "leading_newline_forbidden",
+    "reasoning_open_forbidden",
+    "content_fresh_forbidden",
+    "content_done_forbidden",
+    "content_fresh_forbidden_notools",
+    "content_done_forbidden_notools",
+    "budget_policy",
+    "effort_budgets",
+    "default_effort",
+    "hard_limit",
+    "budget_abs",
+    "budget_ratio",
+    "content_mask",
+    "spec_always_eager",
+)
+
+
+class _FsmCase(unittest.TestCase):
+    """Configures the module-global CFG for a test and restores it after, so
+    this file leaves no live FSM (with fake ids) behind for the other sampler
+    suites in the same process -- the same pattern as the sibling files."""
+
     def setUp(self):
+        self._saved = {k: getattr(fsm.CFG, k) for k in _CFG_FIELDS}
+        self._saved_warned = dict(fsm._WARNED)
         _cfg()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(fsm.CFG, k, v)
+        fsm._WARNED.clear()
+        fsm._WARNED.update(self._saved_warned)
+        fsm.CFG._mask_cache.clear()
+
+
+class TestEffortBudget(_FsmCase):
 
     def test_budget_follows_the_vendor_table(self):
         for effort, expected in fsm._EFFORT_BUDGETS.items():
@@ -181,9 +223,7 @@ class TestEffortBudget(unittest.TestCase):
         self.assertTrue(rebuilt.at_think_open)
 
 
-class TestLeadingNewline(unittest.TestCase):
-    def setUp(self):
-        _cfg()
+class TestLeadingNewline(_FsmCase):
 
     def test_first_token_after_the_prompt_think_start_cannot_be_a_newline(self):
         self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START, NL, NLNL})
@@ -278,9 +318,7 @@ class TestLeadingNewline(unittest.TestCase):
         self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START})
 
 
-class TestContentMask(unittest.TestCase):
-    def setUp(self):
-        _cfg()
+class TestContentMask(_FsmCase):
 
     def test_fresh_content_cannot_end_the_turn(self):
         req = _req([7, THINK_END])
@@ -313,6 +351,14 @@ class TestContentMask(unittest.TestCase):
         )
         self.assertIn(TOOL_START, _masked(_apply(done)))
 
+    def test_non_bool_tools_value_is_permissive_and_loud_once(self):
+        req = _req([7, THINK_END])
+        req.sampling_params.custom_params = {fsm.TOOLS_PARAM: 0}
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            masked = _masked(_apply(req))
+        self.assertIn("not a bool", captured.output[0])
+        self.assertNotIn(TOOL_START, masked)
+
     def test_tools_present_or_unstated_keep_the_vendor_sets(self):
         for tools in (True, None):
             with self.subTest(tools=tools):
@@ -334,13 +380,10 @@ class TestContentMask(unittest.TestCase):
         self.assertEqual(_masked(_apply(_req([7, THINK_END]))), set())
 
 
-class TestPlanGate(unittest.TestCase):
+class TestPlanGate(_FsmCase):
     """The fold escape stays row-conditional with content_mask on."""
 
     STRIDE = 4
-
-    def setUp(self):
-        _cfg()
 
     def _gate(self, req):
         fsm._req_fsm(req)
@@ -376,10 +419,11 @@ class TestPlanGate(unittest.TestCase):
         self.assertFalse(self._gate(forced_then_content))
 
 
-class TestInitFromEnv(unittest.TestCase):
+class TestInitFromEnv(_FsmCase):
     """The env surface: defaults and overrides as read by init_from_env."""
 
     def setUp(self):
+        super().setUp()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = tmp.name
@@ -418,9 +462,6 @@ class TestInitFromEnv(unittest.TestCase):
                     os.environ.pop(k)
             fsm.CFG.enabled = False
             fsm.init_from_env()
-
-    def tearDown(self):
-        _cfg()
 
     def test_defaults_are_the_vendor_rules(self):
         self._init()
@@ -512,6 +553,14 @@ class TestInitFromEnv(unittest.TestCase):
             self._init(SOLAR_FSM_BUDGET_POLICY="ratio")
         with self.assertRaises(RuntimeError):
             self._init(SOLAR_FSM_DEFAULT_EFFORT="ultra")
+
+    def test_legacy_budget_vars_warn_when_inert(self):
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            self._init(SOLAR_FSM_BUDGET_RATIO="0.5")
+        self.assertIn("SOLAR_FSM_BUDGET_RATIO set but", captured.output[0])
+        self.assertEqual(fsm.CFG.budget_policy, "effort")
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            self._init(SOLAR_FSM_BUDGET_RATIO="0.5", SOLAR_FSM_BUDGET_POLICY="legacy")
 
     def test_none_as_default_effort_is_allowed(self):
         self._init(SOLAR_FSM_DEFAULT_EFFORT="none")
