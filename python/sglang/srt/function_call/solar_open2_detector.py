@@ -282,9 +282,26 @@ class SolarOpen2Detector(BaseFormatDetector):
             normal_text=head, calls=self._parse_calls(complete, tools)
         )
 
+    def supports_structural_tag(self) -> bool:
+        """``required`` / named tool_choice use the JSON-schema constraint
+        (a JSON array of calls, parsed by the JSON path), as the vendor's vLLM
+        serving does (``ToolParser.adjust_request`` -> ``StructuredOutputsParams
+        (json=...)``; ``SolarOpen2ToolParser`` keeps the default
+        ``supports_required_and_named``). The legacy structural tag built from
+        :meth:`structure_info` forces only the opening ``<|tool_call:start|>``
+        as a token; xgrammar matches the closing marker as a *string*, so the
+        model may spell ``<|tool_call:end|>`` out in text, and the Solar
+        Open2 FSM (``srt/sampling/solar_open2_fsm.py``), which tracks the
+        tool-call envelope by sentinel id, would then never see the call
+        close. With JSON output no sentinel is emitted at all and the FSM
+        stays in CONTENT, where the grammar owns the phase -- the vendor's
+        exact rule."""
+        return False
+
     def structure_info(self) -> _GetInfoFunc:
-        """Envelope the legacy structural tag forces for ``required``/named
-        tool_choice: xgrammar fills a JSON object between ``begin`` and
+        """Envelope of the legacy structural tag (kept for reference; not
+        used for ``required``/named since :meth:`supports_structural_tag`
+        is False): xgrammar fills a JSON object between ``begin`` and
         ``end``, which ``_parse_calls`` accepts as the argument body."""
         return lambda name: StructureInfo(
             begin=f"{TOOL_CALL_START}{name}\n",

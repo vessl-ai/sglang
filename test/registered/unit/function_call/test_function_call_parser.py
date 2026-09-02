@@ -5229,15 +5229,18 @@ class TestSolarOpen2Detector(unittest.TestCase):
             ),
         ]
 
-    def test_capability_defaults_are_inherited(self):
-        """No override of supports_structural_tag/parses_required_natively:
-        reintroducing either override silently brings back the bug this
-        issue fixes (required/named tool_choice skipping grammar
-        constraints and falling back to best-effort prompting)."""
+    def test_required_named_take_the_json_schema_path(self):
+        """supports_structural_tag is False on purpose: required/named
+        tool_choice are constrained by the JSON-schema array (the JSON path
+        the vendor's vLLM serving uses), not by the legacy structural tag,
+        whose closing marker xgrammar matches as a string and the model may
+        spell out as text -- which leaves the sentinel-tracking FSM inside
+        the call. parses_required_natively stays False: the call is still
+        grammar-forced, never prompt-driven best-effort (INF-373)."""
         detector = SolarOpen2Detector()
-        self.assertTrue(detector.supports_structural_tag())
+        self.assertFalse(detector.supports_structural_tag())
         self.assertFalse(detector.parses_required_natively())
-        self.assertNotIn("supports_structural_tag", SolarOpen2Detector.__dict__)
+        self.assertIn("supports_structural_tag", SolarOpen2Detector.__dict__)
         self.assertNotIn("parses_required_natively", SolarOpen2Detector.__dict__)
 
     def test_structure_info_envelope(self):
@@ -5247,31 +5250,31 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertEqual(info.end, TOOL_CALL_END)
         self.assertEqual(info.trigger, TOOL_CALL_START)
 
-    def test_required_tool_choice_uses_structural_tag(self):
+    def test_required_tool_choice_uses_json_schema(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "solar_open2")
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
-        self.assertEqual(result[0], "structural_tag")
-        tag = result[1]
-        self.assertTrue(tag.at_least_one)
-        self.assertEqual(tag.triggers, [TOOL_CALL_START])
-        begins = {s.begin for s in tag.structures}
-        ends = {s.end for s in tag.structures}
-        self.assertIn(f"{TOOL_CALL_START}get_weather\n", begins)
-        self.assertIn(f"{TOOL_CALL_START}get_time\n", begins)
-        self.assertEqual(ends, {TOOL_CALL_END})
+        self.assertEqual(result[0], "json_schema")
+        schema = result[1]
+        self.assertEqual(schema["type"], "array")
+        self.assertEqual(schema["minItems"], 1)
+        names = {
+            item["properties"]["name"]["enum"][0]
+            for item in schema["items"].get("anyOf", [schema["items"]])
+        }
+        self.assertEqual(names, {"get_weather", "get_time"})
 
-        named_choice = ToolChoice(
-            type="function", function=ToolChoiceFuncName(name="get_weather")
+    def test_named_tool_choice_uses_json_schema(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        result = parser.get_structure_constraint(
+            ToolChoice(type="function", function=ToolChoiceFuncName(name="get_time"))
         )
-        named_result = parser.get_structure_constraint(named_choice)
-        self.assertIsNotNone(named_result)
-        self.assertEqual(named_result[0], "structural_tag")
-        self.assertTrue(named_result[1].at_least_one)
-
-        self.assertIsNone(parser.get_structure_constraint("auto"))
+        self.assertEqual(result[0], "json_schema")
+        self.assertEqual(result[1]["items"]["properties"]["name"]["enum"], ["get_time"])
 
     def test_json_body_envelope_parses_non_stream(self):
         detector = SolarOpen2Detector()

@@ -760,15 +760,14 @@ def _has_grammar(req) -> bool:
     """Whether structured outputs (a grammar) constrain this request.
 
     The vendor leaves the CONTENT phase to the grammar (``advance_mask_ids``
-    returns None there). In vLLM that covers the whole answer: a required /
-    named tool call is a JSON-schema grammar with no sentinels, so the FSM
-    never enters a tool state. SGLang's ``solar_open2`` structural tag emits
-    the real ``<|tool_call:start|>`` but lets the closing marker be spelled
-    out as text (xgrammar matches the string, not the id), so a FSM that kept
-    masking after the tag would sit in TOOL_CALL_NAME with ``<|im:end|>``
-    forbidden and the turn could never end (D2 of the provider contract:
-    ``finish_reason=length`` with a hallucinated tool result). Hence every
-    non-REASONING step of a grammar-constrained request is the grammar's.
+    returns None there) and keeps masking the tool states. That only holds
+    when the grammar never produces a sentinel: in vLLM a required / named
+    tool call is a JSON-schema grammar (JSON array of calls, no
+    ``<|tool_call:start|>``), so the FSM never enters a tool state under a
+    grammar. ``SolarOpen2Detector.supports_structural_tag`` is False for the
+    same reason -- the legacy structural tag forced the opening sentinel as
+    a token but let the closing marker be spelled out as text, which would
+    leave this FSM inside TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
     """
     return getattr(req, "grammar", None) is not None
 
@@ -1022,8 +1021,8 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
         elif not CFG.content_mask:
             continue  # SOLAR_FSM_CONTENT_MASK=0: nothing outside REASONING
-        elif _has_grammar(req):
-            continue  # structured outputs own everything after reasoning
+        elif fsm.state == CONTENT and _has_grammar(req):
+            continue  # structured outputs own the CONTENT phase (vendor rule)
         else:
             # The vendor's per-state table. Fresh CONTENT forbids EOS/im_end
             # until real content exists (otherwise the model leaves reasoning
@@ -1366,8 +1365,8 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                     mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
             elif not CFG.content_mask:
                 continue  # SOLAR_FSM_CONTENT_MASK=0: nothing outside REASONING
-            elif _has_grammar(reqs[i]):
-                continue  # structured outputs own everything after reasoning
+            elif sim.state == CONTENT and _has_grammar(reqs[i]):
+                continue  # structured outputs own the CONTENT phase (vendor rule)
             else:
                 mask_rows.setdefault(
                     _forbidden_for(sim.state, sim.content_progress, fsm.tools), []

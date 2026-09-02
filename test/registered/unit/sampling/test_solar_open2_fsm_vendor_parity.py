@@ -712,15 +712,17 @@ class TestToolCallEnvelope(_FsmCase):
         _cfg(content_mask=False)
         self.assertEqual(_masked(_apply(_req(self.CALL[:2], tools=True))), set())
 
-    def test_structured_outputs_own_everything_after_reasoning(self):
+    def test_structured_outputs_own_the_content_phase(self):
         req = _req((THINK_END,), tools=True)
         req.grammar = object()
         self.assertEqual(_masked(_apply(req)), set())
-        # SGLang's structural tag may spell the closing marker as text, so a
-        # grammar-constrained request is never held inside a tool state either.
+        # ... but not the tool states (the vendor's rule; under a grammar the
+        # JSON tool-call output never opens one).
         req = _req(self.CALL[:3], tools=True, rid="r1")
         req.grammar = object()
-        self.assertEqual(_masked(_apply(req)), set())
+        self.assertEqual(
+            _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])
+        )
         # ... but not the reasoning phase.
         req = _req((), tools=True)
         req.grammar = object()

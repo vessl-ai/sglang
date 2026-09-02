@@ -952,14 +952,15 @@ class ServingChatTestCase(unittest.TestCase):
 
                 self.assertEqual(result.stop, expected_stop)
 
-    def test_solar_open2_required_uses_structural_tag_constraint(self):
+    def test_solar_open2_required_uses_json_schema_constraint(self):
         """required/named tool_choice must route through the real
-        FunctionCallParser (no mocking here) and land on the legacy
-        structural_tag built from SolarOpen2Detector.structure_info -- the
-        grammar-forced constraint this issue restores. parallel_tool_calls
-        =False keeps the same constraint and additionally gets the
-        <|tool_call:end|> stop string, since the tag itself cannot cap the
-        call count (see _solar_single_call_stop_matched)."""
+        FunctionCallParser (no mocking here) and land on the JSON-schema
+        array constraint (the vendor's vLLM path; the legacy structural tag
+        let the closing marker be spelled as text, see
+        SolarOpen2Detector.supports_structural_tag). The call stays
+        grammar-forced. parallel_tool_calls=False caps the array at one
+        call and still gets the <|tool_call:end|> stop string, which is
+        what enforces the cap for tool_choice=auto."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "solar_open2"
@@ -984,24 +985,19 @@ class ServingChatTestCase(unittest.TestCase):
         )
         result = self.chat._process_messages(request, is_multimodal=False)
 
-        self.assertEqual(result.tool_call_constraint[0], "structural_tag")
-        tag = result.tool_call_constraint[1]
-        self.assertTrue(tag.at_least_one)
-        self.assertTrue(
-            any(
-                s.begin == "<|tool_call:start|>get_weather\n"
-                and s.end == "<|tool_call:end|>"
-                for s in tag.structures
-            )
-        )
+        self.assertEqual(result.tool_call_constraint[0], "json_schema")
+        schema = result.tool_call_constraint[1]
+        self.assertEqual(schema["type"], "array")
+        self.assertEqual(schema["minItems"], 1)
+        self.assertNotIn("maxItems", schema)
         self.assertFalse(result.stop)
 
         request_no_parallel = request.model_copy(update={"parallel_tool_calls": False})
         result_no_parallel = self.chat._process_messages(
             request_no_parallel, is_multimodal=False
         )
-        self.assertEqual(result_no_parallel.tool_call_constraint[0], "structural_tag")
-        self.assertTrue(result_no_parallel.tool_call_constraint[1].at_least_one)
+        self.assertEqual(result_no_parallel.tool_call_constraint[0], "json_schema")
+        self.assertEqual(result_no_parallel.tool_call_constraint[1]["maxItems"], 1)
         self.assertEqual(result_no_parallel.stop, [SOLAR_OPEN2_TOOL_CALL_END])
 
         named_request = ChatCompletionRequest(
@@ -1013,7 +1009,12 @@ class ServingChatTestCase(unittest.TestCase):
             ),
         )
         named_result = self.chat._process_messages(named_request, is_multimodal=False)
-        self.assertEqual(named_result.tool_call_constraint[0], "structural_tag")
+        self.assertEqual(named_result.tool_call_constraint[0], "json_schema")
+        self.assertEqual(
+            named_result.tool_call_constraint[1]["items"]["properties"]["name"]["enum"],
+            ["get_weather"],
+        )
+        self.assertFalse(named_result.stop)
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
@@ -3379,6 +3380,12 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
     _JSON_BODY_TRIMMED_CALL_TEXT = (
         '<|tool_call:start|>get_weather\n{"location": "Paris"}'
     )
+    # What xgrammar writes under the JSON-schema array constraint that
+    # required/named tool_choice use (see SolarOpen2Detector
+    # .supports_structural_tag): no call markers at all.
+    _JSON_ARRAY_CALL_TEXT = (
+        '[{"name": "get_weather", "parameters": {"location": "Paris"}}]'
+    )
 
     _STOP_MATCHED = {"type": "stop", "matched": SOLAR_OPEN2_TOOL_CALL_END}
 
@@ -3517,10 +3524,14 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         for chunk in chunks:
             self.assertNotIn(SOLAR_OPEN2_TOOL_CALL_END, chunk)
 
-    def test_required_non_streaming_json_body_glue_back_extracts_single_call(self):
+    def test_required_non_streaming_json_array_single_call(self):
+        """required + parallel_tool_calls=False: the JSON-schema array
+        (maxItems=1) constrains the output, so the text is a one-element
+        JSON array and the stop string never matches; the JSON path parses
+        it (no detector, no glue-back)."""
         request = self.request.model_copy(update={"tool_choice": "required"})
         choice = self._build_choice(
-            request, self._JSON_BODY_TRIMMED_CALL_TEXT, self._STOP_MATCHED
+            request, self._JSON_ARRAY_CALL_TEXT, {"type": "stop"}
         )
 
         self.assertEqual(choice.finish_reason, "tool_calls")
@@ -3532,19 +3543,58 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             json.loads(tool_call.function.arguments), {"location": "Paris"}
         )
 
-    def test_required_streaming_json_body_glue_back_emits_completed_call(self):
+    def test_required_streaming_json_array_emits_completed_call(self):
+        """The JSON array arrives token by token; the JsonArrayParser streams
+        the name first and the argument fragments as they complete, so the
+        deltas assemble into the full call."""
         request = self.request.model_copy(update={"tool_choice": "required"})
-        chunks, tool_call_deltas, has_tool_calls = self._stream(
-            request, self._JSON_BODY_TRIMMED_CALL_TEXT, self._STOP_MATCHED
-        )
+        pieces = [
+            '[{"name": "get_weather", "par',
+            'ameters": {"location": "Par',
+            'is"}}]',
+        ]
+        parser_dict, has_tool_calls, deltas = {}, {}, []
+
+        async def run():
+            for n, piece in enumerate(pieces):
+                last = n == len(pieces) - 1
+                content = {
+                    "text": piece,
+                    "meta_info": {
+                        "id": "chatcmpl-solar-stream-test",
+                        "finish_reason": {"type": "stop"} if last else None,
+                    },
+                }
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=request,
+                    stream_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict=parser_dict,
+                    has_tool_calls=has_tool_calls,
+                    choice_logprobs=None,
+                    finish_reason_type="stop" if last else None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 5},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 10},
+                ):
+                    if not chunk.startswith("data: ") or chunk.startswith(
+                        "data: [DONE]"
+                    ):
+                        continue
+                    payload = json.loads(chunk[len("data: ") :])
+                    for choice in payload.get("choices", []):
+                        for tc in (choice.get("delta") or {}).get("tool_calls") or []:
+                            deltas.append(tc)
+
+        get_or_create_event_loop().run_until_complete(run())
 
         self.assertTrue(has_tool_calls.get(0))
-        self.assertEqual(len(tool_call_deltas), 1)
-        self.assertEqual(tool_call_deltas[0]["function"]["name"], "get_weather")
-        self.assertEqual(
-            json.loads(tool_call_deltas[0]["function"]["arguments"]),
-            {"location": "Paris"},
-        )
+        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
+        arguments = "".join(d["function"].get("arguments") or "" for d in deltas)
+        self.assertEqual(json.loads(arguments), {"location": "Paris"})
 
     def test_auto_non_streaming_json_body_glue_back_extracts_single_call(self):
         choice = self._build_choice(
@@ -3572,25 +3622,26 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             {"location": "Paris"},
         )
 
-    def test_required_non_streaming_json_body_full_text_no_glue_back_needed(self):
-        """Same JSON-body envelope without the stop-string path: the call's
-        own terminator is already in the text (parallel_tool_calls default,
-        finish_reason plain stop with no `matched`)."""
+    def test_required_non_streaming_json_array_parallel_calls(self):
+        """required with parallel_tool_calls (default): the array may carry
+        several calls; every element becomes a tool call."""
         request = self.request.model_copy(
             update={"tool_choice": "required", "parallel_tool_calls": True}
         )
-        choice = self._build_choice(
-            request,
-            self._JSON_BODY_TRIMMED_CALL_TEXT + SOLAR_OPEN2_TOOL_CALL_END,
-            {"type": "stop"},
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Paris"}}, '
+            '{"name": "get_weather", "parameters": {"location": "Tokyo"}}]'
         )
+        choice = self._build_choice(request, text, {"type": "stop"})
 
         self.assertEqual(choice.finish_reason, "tool_calls")
-        self.assertEqual(len(choice.message.tool_calls), 1)
-        tool_call = choice.message.tool_calls[0]
-        self.assertEqual(tool_call.function.name, "get_weather")
+        self.assertEqual(len(choice.message.tool_calls), 2)
         self.assertEqual(
-            json.loads(tool_call.function.arguments), {"location": "Paris"}
+            [
+                json.loads(t.function.arguments)["location"]
+                for t in choice.message.tool_calls
+            ],
+            ["Paris", "Tokyo"],
         )
 
 
