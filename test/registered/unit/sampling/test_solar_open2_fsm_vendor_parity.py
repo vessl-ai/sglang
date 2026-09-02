@@ -91,7 +91,12 @@ def _req(
         origin_input_ids=list(prompt),
         output_ids=list(output_ids),
         sampling_params=SimpleNamespace(
-            max_new_tokens=max_new_tokens, custom_params=custom
+            max_new_tokens=max_new_tokens,
+            custom_params=custom,
+            json_schema=None,
+            regex=None,
+            ebnf=None,
+            structural_tag=None,
         ),
     )
 
@@ -719,18 +724,25 @@ class TestToolCallEnvelope(_FsmCase):
 
     def test_structured_outputs_own_the_content_phase(self):
         req = _req((THINK_END,), tools=True)
-        req.grammar = object()
+        req.sampling_params.json_schema = "{}"
         self.assertEqual(_masked(_apply(req)), set())
         # ... but not the tool states (the vendor's rule; under a grammar the
         # JSON tool-call output never opens one).
         req = _req(self.CALL[:3], tools=True, rid="r1")
-        req.grammar = object()
+        req.sampling_params.json_schema = "{}"
         self.assertEqual(
             _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])
         )
+        # A server-side grammar object alone (--enable-strict-thinking) is
+        # not a structured-outputs request: the CONTENT rules stay on.
+        req = _req((THINK_END,), tools=True, rid="r2")
+        req.grammar = object()
+        self.assertEqual(
+            _masked(_apply(req)), set(fsm.CFG.forbidden[(fsm.CONTENT, False)])
+        )
         # ... but not the reasoning phase.
         req = _req((), tools=True)
-        req.grammar = object()
+        req.sampling_params.json_schema = "{}"
         self.assertEqual(_masked(_apply(req)), set(fsm.CFG.reasoning_open_forbidden))
 
     def test_think_start_reopens_reasoning_from_inside_a_call(self):

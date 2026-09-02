@@ -5244,6 +5244,92 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertIn("supports_structural_tag", SolarOpen2Detector.__dict__)
         self.assertNotIn("parses_required_natively", SolarOpen2Detector.__dict__)
 
+    def test_streaming_two_calls_of_the_same_tool_get_distinct_indices(self):
+        """A client accumulates streamed tool-call deltas by index; two calls
+        of one tool must not share it (2026-09-03 review C2)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}\n"
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Tokyo{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        calls = []
+        for i in range(0, len(text), 7):
+            _, chunk_calls = parser.parse_stream_chunk(text[i : i + 7])
+            calls.extend(chunk_calls)
+        self.assertEqual([c.name for c in calls], ["get_weather", "get_weather"])
+        self.assertEqual([c.tool_index for c in calls], [0, 1])
+        self.assertEqual(
+            [json.loads(c.parameters)["location"] for c in calls], ["Paris", "Tokyo"]
+        )
+
+    def test_stream_end_releases_held_text(self):
+        """Text held back for a marker that never arrives (a trailing code
+        fence, an unfinished call cut by max_tokens) is released as content
+        at the end of the stream instead of being dropped (review C1)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        normal, calls = parser.parse_stream_chunk("Here is the code:\n```")
+        self.assertEqual(calls, [])
+        end_text, end_calls = parser.parse_stream_end()
+        self.assertEqual(normal + end_text, "Here is the code:\n```")
+        self.assertEqual(end_calls, [])
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        cut = (
+            f"{TOOL_CALL_START}get_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Par"
+        )
+        normal, calls = parser.parse_stream_chunk(cut)
+        self.assertEqual((normal, calls), ("", []))
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            end_text, end_calls = parser.parse_stream_end()
+        self.assertEqual(end_text, cut)
+        self.assertEqual(end_calls, [])
+
+    def test_boolean_argument_that_is_not_a_boolean_keeps_the_string(self):
+        """Vendor _coerce: an unrecognised boolean literal is returned as the
+        original string with a warning, not collapsed to False."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="set_flag",
+                    parameters={
+                        "type": "object",
+                        "properties": {"on": {"type": "boolean"}},
+                    },
+                ),
+            )
+        ]
+        detector = SolarOpen2Detector()
+        text = (
+            f"{TOOL_CALL_START}set_flag\n"
+            f"{TOOL_ARG_START}on{TOOL_ARG_VALUE}maybe{TOOL_ARG_END}\n{TOOL_CALL_END}"
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            result = detector.detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"on": "maybe"})
+        for literal, expect in (("Yes", True), ("0", False), ("TRUE", True)):
+            text = (
+                f"{TOOL_CALL_START}set_flag\n"
+                f"{TOOL_ARG_START}on{TOOL_ARG_VALUE}{literal}{TOOL_ARG_END}\n"
+                f"{TOOL_CALL_END}"
+            )
+            self.assertEqual(
+                json.loads(detector.detect_and_parse(text, tools).calls[0].parameters),
+                {"on": expect},
+            )
+
     def test_structure_info_envelope(self):
         detector = SolarOpen2Detector()
         info = detector.structure_info()("get_weather")

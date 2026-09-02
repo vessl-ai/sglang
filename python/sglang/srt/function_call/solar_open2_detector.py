@@ -21,7 +21,8 @@ code fence carrying the function name instead of the start marker::
 
 A fence line is treated as a call opener only when the next line begins with
 ``<|tool_arg:start|>``, so ordinary fenced code blocks in model output are
-unaffected (a zero-argument call must use the real start marker).
+unaffected (the fence form carries at least one argument; a zero-argument call uses the
+real start marker).
 
 A call whose function name is not in ``request.tools`` is emitted to the client
 as-is (with a warning) rather than discarded: the client owns name validation
@@ -109,7 +110,16 @@ def _coerce(value: str, arg_type: Optional[str]) -> Any:
         if arg_type in ("number", "float"):
             return float(value)
         if arg_type == "boolean":
-            return value.strip().lower() in ("true", "1", "yes")
+            v = value.strip().lower()
+            if v in ("true", "1", "yes"):
+                return True
+            if v in ("false", "0", "no"):
+                return False
+            logger.warning(
+                "solar_open2: failed to coerce %r to bool; returning as string.",
+                value,
+            )
+            return value
         if arg_type in ("array", "object"):
             return json.loads(value)
     except (ValueError, TypeError, json.JSONDecodeError):
@@ -178,7 +188,13 @@ class SolarOpen2Detector(BaseFormatDetector):
             starts.append(m.start() + (1 if text[m.start()] == "\n" else 0))
         return starts
 
-    def _parse_calls(self, text: str, tools: List[Tool]) -> List[ToolCallItem]:
+    def _parse_calls(
+        self, text: str, tools: List[Tool], streaming: bool = False
+    ) -> List[ToolCallItem]:
+        """``streaming``: number the calls sequentially across the stream
+        (``current_tool_id``), the index a client accumulates deltas by --
+        two calls of the same tool must not share it. Non-streaming keeps
+        the tools-list index, which the serving layer replaces anyway."""
         indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
         matches = sorted(
@@ -222,9 +238,14 @@ class SolarOpen2Detector(BaseFormatDetector):
                         name,
                     )
                     args = {"__raw": body}
+            if streaming:
+                self.current_tool_id += 1
+                tool_index = self.current_tool_id
+            else:
+                tool_index = indices.get(name, len(calls))
             calls.append(
                 ToolCallItem(
-                    tool_index=indices.get(name, len(calls)),
+                    tool_index=tool_index,
                     name=name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
@@ -273,8 +294,25 @@ class SolarOpen2Detector(BaseFormatDetector):
         cut = rest.rindex(TOOL_CALL_END) + len(TOOL_CALL_END)
         complete, self._buffer = rest[:cut], rest[cut:]
         return StreamingParseResult(
-            normal_text=head, calls=self._parse_calls(complete, tools)
+            normal_text=head, calls=self._parse_calls(complete, tools, streaming=True)
         )
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """The stream is over: release what was held back waiting for a marker
+        that can no longer arrive. A partial opener / fence candidate is
+        ordinary text; an unfinished call (opened, never closed -- e.g. cut by
+        max_tokens) is returned as text as well, so nothing is dropped
+        silently (the vendor keeps such output as content too)."""
+        held, self._buffer = self._buffer, ""
+        if not held:
+            return StreamingParseResult()
+        if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
+            logger.warning(
+                "Solar Open2: stream ended inside an unfinished tool call "
+                "(%d chars); returning it as content",
+                len(held),
+            )
+        return StreamingParseResult(normal_text=held, calls=[])
 
     def supports_structural_tag(self) -> bool:
         """``required`` / named tool_choice use the JSON-schema constraint
@@ -293,10 +331,11 @@ class SolarOpen2Detector(BaseFormatDetector):
         return False
 
     def structure_info(self) -> _GetInfoFunc:
-        """Envelope of the legacy structural tag (kept for reference; not
-        used for ``required``/named since :meth:`supports_structural_tag`
-        is False): xgrammar fills a JSON object between ``begin`` and
-        ``end``, which ``_parse_calls`` accepts as the argument body."""
+        """Envelope of the legacy structural tag. Required by the base class;
+        not reached for ``solar_open2`` since :meth:`supports_structural_tag`
+        is False (required/named take the JSON-array path). If it were used,
+        xgrammar would fill a JSON object between ``begin`` and ``end``, the
+        body shape ``_parse_calls`` still accepts."""
         return lambda name: StructureInfo(
             begin=f"{TOOL_CALL_START}{name}\n",
             end=TOOL_CALL_END,

@@ -3,10 +3,11 @@
 
 Ported from the Upstage vLLM fork's
 ``vllm/v1/sample/logits_processor/solar_open2.py``
-(``SolarOpen2TokenFSMEnforcer``). The fork ships this as part of *serving* the
-model, not as an optional extra: it structurally closes the illegal exits from
-the REASONING block so the turn can only end through ``<|think:end|>``, and it
-force-emits ``<|think:end|>`` once the reasoning budget is spent.
+(``SolarOpen2TokenFSMEnforcer``), the vendor's vLLM 0.25.0 patch set (opted in
+there with ``--logits-processors``, per-request disable via ``vllm_xargs``).
+It structurally closes the illegal exits from the REASONING block so the turn
+can only end through ``<|think:end|>``, force-emits ``<|think:end|>`` once the
+reasoning budget is spent, and keeps the tool-call envelope well-formed.
 
 Scope of this port:
   * REASONING state: sentinel/EOS mask + ``_FORCE_THINK_END`` on budget, and
@@ -193,8 +194,10 @@ class _Config:
     transitions: Dict[int, int] = {}
     # (state, content_progress) -> forbidden ids, the vendor's _forbidden_table.
     # ``forbidden_notools`` is the same table with <|tool_call:start|> forbidden
-    # in every state (the vendor's block_tool_call_start variant), used for a
-    # request that offers no tools.
+    # in every state -- built like the vendor's block_tool_call_start variant,
+    # which the vendor switches to after the first completed call of a
+    # parallel_tool_calls=false turn (not ported: that mode uses a stop string
+    # here, INF-450); we use the table for a request that offers no tools.
     forbidden: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     forbidden_notools: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
     # Named views into the tables. reasoning_forbidden / reasoning_open_forbidden
@@ -662,7 +665,8 @@ def is_active() -> bool:
 
 
 class SolarReqFSM:
-    """Per-request REASONING tracker. Lives on the Req, so a row permutation
+    """Per-request walk of the vendor's ten-state envelope machine. Lives on
+    the Req, so a row permutation
     can never hand one request another request's state."""
 
     __slots__ = (
@@ -790,11 +794,22 @@ def _has_grammar(req) -> bool:
     tool call is a JSON-schema grammar (JSON array of calls, no
     ``<|tool_call:start|>``), so the FSM never enters a tool state under a
     grammar. ``SolarOpen2Detector.supports_structural_tag`` is False for the
-    same reason -- the legacy structural tag forced the opening sentinel as
-    a token but let the closing marker be spelled out as text, which would
-    leave this FSM inside TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
+    same reason -- the legacy structural tag constrains *text*, while this
+    FSM tracks sentinel *ids*; the observed combination (opener sampled as
+    the sentinel id, closer spelled out as text) left the FSM inside
+    TOOL_CALL_NAME with ``<|im:end|>`` forbidden.
+
+    Judged from the request's own constraint (json_schema / regex / ebnf /
+    structural_tag), as the vendor's ``_has_structured_outputs`` does -- not
+    from ``req.grammar``: ``--enable-strict-thinking`` hangs a server-side
+    reasoning grammar with no inner grammar on every reasoning request, and
+    that must not switch the CONTENT rules off.
     """
-    return getattr(req, "grammar", None) is not None
+    sp = getattr(req, "sampling_params", None)
+    return sp is not None and any(
+        getattr(sp, name, None) is not None
+        for name in ("json_schema", "regex", "ebnf", "structural_tag")
+    )
 
 
 def _fsm_stale(req) -> bool:

@@ -733,6 +733,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
+            finishing = finish_reason_type is not None and finish_reason_type != "abort"
+            glue_terminator = finish_reason_type is not None and (
+                self._solar_single_call_stop_matched(
+                    request,
+                    self._effective_tools(request),
+                    content["meta_info"].get("finish_reason"),
+                )
+            )
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -741,36 +749,35 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
+                # The stream-end flush runs after the glue below: the detector
+                # is still holding the trimmed call, and the terminator must
+                # reach it before finish() releases held text as content.
+                flush=finishing and not glue_terminator,
             ):
                 if chunk:
                     yield chunk
 
+            if glue_terminator and index in parser_dict:
+                # The stop string that halted generation was the terminator
+                # this call needs to close (see _solar_single_call_stop_matched)
+                # and the detokenizer trimmed it; feed it back in as one more
+                # increment so the buffered detector emits the completed call,
+                # then flush, before the finish_reason chunk goes out.
+                async for chunk in self._process_tool_call_stream(
+                    index,
+                    SOLAR_OPEN2_TOOL_CALL_END,
+                    parser_dict,
+                    content,
+                    request,
+                    has_tool_calls,
+                    continuous_usage_stats,
+                    flush=finishing,
+                ):
+                    if chunk:
+                        yield chunk
+
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
-                if self._solar_single_call_stop_matched(
-                    request,
-                    self._effective_tools(request),
-                    content["meta_info"].get("finish_reason"),
-                ):
-                    # The stop string that halted generation was the
-                    # terminator this call needs to close (see
-                    # _solar_single_call_stop_matched) and the detokenizer
-                    # trimmed it; feed it back in as one more increment so
-                    # the buffered detector emits the completed call before
-                    # the finish_reason chunk goes out.
-                    async for chunk in self._process_tool_call_stream(
-                        index,
-                        SOLAR_OPEN2_TOOL_CALL_END,
-                        parser_dict,
-                        content,
-                        request,
-                        has_tool_calls,
-                        continuous_usage_stats,
-                    ):
-                        if chunk:
-                            yield chunk
-
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
