@@ -3757,11 +3757,38 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
     def test_float_reasoning_effort_is_rejected_for_solar(self):
         """The vendor's request model accepts the named tiers only; a float
         would silently pre-close the think block here (review round 4)."""
-        request = self.request.model_copy(update={"reasoning_effort": 0.5})
-        error = self.chat._validate_request(request)
-        self.assertIsNotNone(error)
-        self.assertIn("reasoning_effort", error)
+        for update in (
+            {"reasoning_effort": 0.5},
+            {"chat_template_kwargs": {"reasoning_effort": 0.5}},
+        ):
+            with self.subTest(update=update):
+                request = self.request.model_copy(update=update)
+                error = self.chat._validate_request(request)
+                self.assertIsNotNone(error)
+                self.assertIn("reasoning_effort", error)
         self.assertIsNone(self.chat._validate_request(self.request))
+        # Not a Solar cell: the generic path keeps accepting the extension.
+        self.chat.tool_call_parser = self.chat.reasoning_parser = None
+        request = self.request.model_copy(update={"reasoning_effort": 0.5})
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_server_default_float_effort_falls_back_to_the_template_default(self):
+        """A float in --default-chat-template-kwargs reaches the request after
+        validation; it is dropped with a warning instead of silently
+        pre-closing the think block (review round 5)."""
+        req = self.request.model_copy(
+            update={
+                "reasoning_effort": 0.5,
+                "chat_template_kwargs": {"reasoning_effort": 0.5},
+            }
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
+        ):
+            self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertIsNone(req.reasoning_effort)
+        self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+        self.assertNotIn("solar_reasoning_effort", req.custom_params)
 
     def test_required_streaming_whitespace_after_the_array_in_its_own_delta(self):
         """Whitespace that follows the closing bracket in a later delta is not

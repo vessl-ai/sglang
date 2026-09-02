@@ -38,6 +38,7 @@ from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END,
     TOOL_CALL_START,
     SolarOpen2Detector,
+    partial_fence_open_len,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -5512,6 +5513,47 @@ class TestSolarOpen2Detector(unittest.TestCase):
             got_text, got_calls = self._stream_all(text, len(text))
         self.assertEqual((got_text, got_calls), (text, []))
 
+    def test_blank_name_call_next_to_parsed_calls(self):
+        """A blank-name call is an unparsed segment in streaming: the calls
+        around it are emitted (dropped after a call, held before one), at
+        any chunking (review round 5: it used to discard the parsed calls
+        that shared its delta). Non-streaming keeps the vendor's whole-output
+        rule."""
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        blank = f"{TOOL_CALL_START}  \n{TOOL_CALL_END}"
+        for name, text, want_calls in (
+            ("good, blank, good", good + "\n" + blank + "\n" + good, 2),
+            ("good then blank", good + "\n" + blank, 1),
+            ("blank then good", blank + "\n" + good, 1),
+        ):
+            for size in (len(text), 5, 1):
+                with self.subTest(case=name, size=size):
+                    got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual((got_text, len(got_calls)), ("", want_calls))
+            non_stream = SolarOpen2Detector().detect_and_parse(text, self.tools)
+            self.assertEqual(
+                (non_stream.normal_text, non_stream.calls), (text, []), name
+            )
+
+    def test_partial_fence_holdback_after_a_dead_fence_candidate(self):
+        """A closed code fence earlier in the buffer must not stop the 1-2
+        backtick hold at the end (review round 5)."""
+        self.assertEqual(partial_fence_open_len("```\n\n`"), 1)
+        self.assertEqual(partial_fence_open_len("```\n\n``"), 2)
+        self.assertEqual(partial_fence_open_len("```python\nx\n```\ndone"), 0)
+        text = (
+            "\n```\n\n```get_time\n"
+            f"{TOOL_ARG_START}timezone{TOOL_ARG_VALUE}UTC{TOOL_ARG_END}\n{TOOL_CALL_END}"
+        )
+        whole = self._stream_all(text, len(text))
+        for size in (7, 4, 1):
+            self.assertEqual(self._stream_all(text, size), whole, size)
+        self.assertEqual(len(whole[1]), 1)
+
     def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
         """A call without the newline after its name followed by a well-formed
         call: with the vendor's ``(.+?)`` name group the two parse as one
@@ -5868,16 +5910,54 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 False,
             ),
             "no call": ("Just text.", True, True),
-            "whitespace only": ("\n \n", True, True),
+            # The vendor's streaming parser never flushes a trailing whitespace
+            # run (no end-of-stream hook); ours releases it as non-streaming
+            # does. Calls-only in streaming.
+            "whitespace only": ("\n \n", True, "calls"),
             # The vendor's streaming parser waits for the name's newline and
             # emits nothing for these; ours releases the output as content
             # at stream end (the vendor's non-streaming rule).
             "bad only": (bad, True, False),
             "prose then bad": ("Hi " + bad, True, False),
-            "good then bad": (good + "\n" + bad, True, False),
+            "good then bad": (good + "\n" + bad, True, True),
             "empty name": (
                 f"{TOOL_CALL_START}  \n{TOOL_ARG_START}a{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n{TOOL_CALL_END}",
                 True,
+                True,
+            ),
+            "null any case": (cls._call(location=" NULL "), True, True),
+            # Whitespace lines inside the body: the vendor's non-streaming regex
+            # backtracks into a garbage name with no arguments; its streaming
+            # parser and ours parse the call.
+            "whitespace in body": (
+                f"{TOOL_CALL_START}get_weather\n  \n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n  \n{TOOL_CALL_END}",
+                False,
+                True,
+            ),
+            # A blank-name call next to parsed calls: the vendor's non-streaming
+            # parser makes the whole output content (ours too); its streaming
+            # parser emits nothing at all from then on, ours keeps the calls
+            # around it (the blank one is an unparsed segment) -- pinned by
+            # the chunk-invariance half only.
+            "good, blank, good": (
+                good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good2,
+                True,
+                False,
+            ),
+            "good then blank": (
+                good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}",
+                True,
+                False,
+            ),
+            "blank then good": (
+                f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good,
+                True,
+                False,
+            ),
+            # Our fence-opened form: not a call for the vendor at all.
+            "fence form": (
+                f"```get_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                False,
                 False,
             ),
             # The vendor's lazy name group swallows the following call after a
@@ -5928,8 +6008,9 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
 
     @staticmethod
     def _args(raw):
+        """Arguments as a canonical JSON string (3 and 3.0 must differ)."""
         try:
-            return json.loads(raw) if raw else {}
+            return json.dumps(json.loads(raw) if raw else {}, sort_keys=True)
         except json.JSONDecodeError:
             return raw
 
@@ -6002,10 +6083,21 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 for size in (max(1, len(text)), 5, 1):
                     v_content, v_calls = self._vendor_stream(text, size)
                     self.assertEqual(whole[1], v_calls, size)
+                    if comparable == "calls":
+                        continue
+                    # Content up to whitespace (the documented streaming
+                    # delta), but whitespace-only vs none must not hide.
                     self.assertEqual(self._ws(whole[0]), self._ws(v_content), size)
+                    self.assertEqual(bool(whole[0]), bool(v_content), size)
+
+    # Shapes with a blank-name call: non-streaming follows the vendor's
+    # whole-output rule (no calls), streaming keeps the calls around it.
+    _STREAM_KEEPS_CALLS = ("good, blank, good", "good then blank", "blank then good")
 
     def test_streaming_calls_match_non_stream(self):
         for name, (text, _, _) in self.shapes().items():
+            if name in self._STREAM_KEEPS_CALLS:
+                continue
             with self.subTest(shape=name):
                 self.assertEqual(
                     self._ours_stream(text, 5)[1], self._ours_nonstream(text)[1]

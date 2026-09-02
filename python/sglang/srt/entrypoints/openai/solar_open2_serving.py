@@ -25,6 +25,7 @@ patch set for vLLM 0.25.0, 2026-09-01) unless a comment says otherwise.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -37,6 +38,8 @@ from sglang.srt.function_call.solar_open2_detector import (
     has_call_opener,
 )
 from sglang.srt.sampling.solar_open2_fsm import EFFORT_PARAM, TOOLS_PARAM
+
+logger = logging.getLogger(__name__)
 
 PARSER_NAME = "solar_open2"
 # The template opens thinking only for medium/high; an effort above high would
@@ -53,7 +56,13 @@ def is_solar_cell(
 
 
 def validate_request(request: ChatCompletionRequest) -> Optional[str]:
-    if isinstance(request.reasoning_effort, float):
+    """Rule 1. The chat_template_kwargs copy is checked too: the message
+    pipeline moves it into the request field after validation."""
+    efforts = (
+        request.reasoning_effort,
+        (request.chat_template_kwargs or {}).get("reasoning_effort"),
+    )
+    if any(isinstance(e, (int, float)) and not isinstance(e, bool) for e in efforts):
         return (
             "reasoning_effort must be one of "
             + ", ".join(EFFORT_TIERS)
@@ -91,10 +100,22 @@ def normalize_reasoning_effort(
 
     if isinstance(request.reasoning_effort, str):
         request.reasoning_effort = _for_template(request.reasoning_effort)
+    elif request.reasoning_effort is not None:
+        # Only a server default (--default-chat-template-kwargs) can put a
+        # non-string here past validate_request: not silently no reasoning,
+        # but the template default, with a warning.
+        logger.warning(
+            "solar_open2: ignoring non-string reasoning_effort %r from the "
+            "server defaults; using the template default",
+            request.reasoning_effort,
+        )
+        request.reasoning_effort = None
     if ctk:
         effort = ctk.get("reasoning_effort")
         if isinstance(effort, str) and effort.strip():
             ctk["reasoning_effort"] = _for_template(effort)
+        elif effort is not None and not isinstance(effort, str):
+            ctk.pop("reasoning_effort")
         if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
             # One source for the template: the request's (folded) effort. A
             # server default (--default-chat-template-kwargs) lands in ctk

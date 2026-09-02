@@ -72,7 +72,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -145,27 +145,28 @@ def partial_fence_open_len(text: str) -> int:
     marker arrives."""
     at = text.rfind("\n```")
     if at != -1:
-        start = at + 1
+        tail = text[at + 1 :]
     elif text.startswith("```"):
-        start = 0
+        tail = text
     else:
-        # A run of one or two backticks at a line start may still grow into
-        # the fence (the backticks can arrive split across increments).
-        m = re.search(r"(?:^|\n)(`{1,2})$", text)
-        return len(m.group(1)) if m else 0
-    tail = text[start:]
-    m = re.fullmatch(r"```[\w.-]*[ \t]*(?:\n(.*))?", tail, re.DOTALL)
-    if m is None:
-        return 0
-    after_newline = m.group(1)
-    if not after_newline:
-        return len(tail)
-    return len(tail) if TOOL_ARG_START.startswith(after_newline) else 0
+        tail = ""
+    m = re.fullmatch(r"```[\w.-]*[ \t]*(?:\n(.*))?", tail, re.DOTALL) if tail else None
+    if m is not None:
+        after_newline = m.group(1)
+        if not after_newline or TOOL_ARG_START.startswith(after_newline):
+            return len(tail)
+    # No live fence candidate: a run of one or two backticks at a line start
+    # may still grow into one (the backticks can arrive split across
+    # increments).
+    m = re.search(r"(?:^|\n)(`{1,2})$", text)
+    return len(m.group(1)) if m else 0
 
 
 def _coerce(value: str, arg_type: Optional[str]) -> Any:
-    """Coerce a raw wire string to the JSON-schema type, or keep it as-is."""
-    if value == "null":
+    """Coerce a raw wire string to the JSON-schema type, or keep it as-is.
+    The literal ``null`` (any case, surrounding whitespace ignored) is None
+    whatever the declared type, as in the vendor."""
+    if value.strip().lower() == "null":
         return None
     if arg_type in (None, "string"):
         return value
@@ -249,17 +250,19 @@ def _parse_arguments(name: str, body: str, tools: List[Tool]) -> Dict[str, Any]:
     return {"__raw": body}
 
 
-def _parse_calls(text: str, tools: List[Tool]) -> Optional[List[_ParsedCall]]:
-    """Every well-formed call in ``text``, in order, with its span. Returns
-    ``None`` when a call has a blank name: the vendor then treats the whole
-    output as content (no call at all) rather than emitting a call named
-    ``""``. Pure: no streaming state, no indices."""
+def _parse_calls(text: str, tools: List[Tool]) -> Tuple[List[_ParsedCall], bool]:
+    """Every well-formed call in ``text``, in order, with its span, and whether
+    a call with a blank name was seen (skipped here; the vendor's
+    non-streaming parser then treats the whole output as content, while its
+    streaming parser and ours keep the calls around it -- see the callers).
+    Pure: no streaming state, no indices."""
     known = {t.function.name for t in tools}
     matches = sorted(
         list(_MARKER_CALL.finditer(text)) + list(_FENCE_CALL.finditer(text)),
         key=lambda m: m.start(),
     )
     calls: List[_ParsedCall] = []
+    blank_name = False
     consumed_until = 0
     for match in matches:
         if match.start() < consumed_until:
@@ -267,11 +270,9 @@ def _parse_calls(text: str, tools: List[Tool]) -> Optional[List[_ParsedCall]]:
         consumed_until = match.end()
         name = match.group(1).strip()
         if not name:
-            logger.warning(
-                "Solar Open2: tool call with an empty name; treating the output "
-                "as content"
-            )
-            return None
+            logger.warning("Solar Open2: tool call with an empty name; not a call")
+            blank_name = True
+            continue
         if name not in known:
             logger.warning(
                 "Solar Open2: tool name %r not in request.tools; emitting the "
@@ -287,7 +288,7 @@ def _parse_calls(text: str, tools: List[Tool]) -> Optional[List[_ParsedCall]]:
                 _parse_arguments(name, match.group(2) or "", tools),
             )
         )
-    return calls
+    return calls, blank_name
 
 
 def _item(call: _ParsedCall, index: int) -> ToolCallItem:
@@ -441,11 +442,14 @@ class SolarOpen2Detector(BaseFormatDetector):
         openers = call_openers(text)
         if not openers:
             return StreamingParseResult(normal_text=text, calls=[])
-        calls = _parse_calls(text, tools) or []
-        if not calls:
+        calls, blank_name = _parse_calls(text, tools)
+        if not calls or blank_name:
+            # The vendor: no parsed call, or any call with a blank name, makes
+            # the whole output content.
             logger.warning(
-                "Solar Open2: tool call marker present but no call parsed "
-                "(%d chars); returning the output as content",
+                "Solar Open2: tool call marker present but %s (%d chars); "
+                "returning the output as content",
+                "a call has a blank name" if blank_name else "no call parsed",
                 len(text),
             )
             return StreamingParseResult(normal_text=text, calls=[])
@@ -492,7 +496,10 @@ class SolarOpen2Detector(BaseFormatDetector):
 
         cut = rest.rindex(TOOL_CALL_END) + len(TOOL_CALL_END)
         complete, self._buffer = rest[:cut], rest[cut:]
-        calls = _parse_calls(complete, tools) or []
+        # A blank-name call is an unparsed segment here (dropped after a call,
+        # held before one): the calls around it were or will be emitted, so
+        # the non-streaming whole-output rule cannot apply.
+        calls, _ = _parse_calls(complete, tools)
         if not calls:
             self._content.unparsed_call(complete)
             return StreamingParseResult(normal_text=head, calls=[])
