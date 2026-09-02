@@ -3774,6 +3774,32 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             ["A", "B", "C"],
         )
 
+    def test_required_streaming_drain_cap_is_logged(self):
+        """Reaching the drain cap truncates the call list; that must not be
+        silent (review round 4)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        pieces = [
+            "["
+            + ", ".join(
+                '{"name": "get_weather", "parameters": {"location": "%s"}}' % c
+                for c in "ABCD"
+            )
+            + "]"
+        ]
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat._JSON_ARRAY_DRAIN_MAX_STEPS",
+                2,
+            ),
+            self.assertLogs(
+                "sglang.srt.entrypoints.openai.serving_chat", "WARNING"
+            ) as logs,
+        ):
+            self._stream_pieces(request, pieces)
+        self.assertTrue(any("drain stopped" in m for m in logs.output))
+
     def test_required_streaming_two_calls_split_over_the_last_delta(self):
         """The last delta closes call a and carries the whole of call b: the
         stream-end drain must release b's arguments too (review round 2:

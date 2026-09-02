@@ -5376,6 +5376,66 @@ class TestSolarOpen2Detector(unittest.TestCase):
                         tail.rstrip() if sep.strip() else "",
                     )
 
+    def test_whitespace_only_prefix_before_the_first_call_is_not_content(self):
+        """The vendor drops a prefix that is all whitespace (content None)
+        but keeps whitespace that trails real text before the first call;
+        both modes, any chunking (review round 4)."""
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        for prefix, want in (("\n\n", ""), ("Sure.\n", "Sure.\n"), ("", "")):
+            with self.subTest(prefix=repr(prefix)):
+                text = prefix + call
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual((result.normal_text, len(result.calls)), (want, 1))
+                for size in (len(text), 5, 1):
+                    got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual((got_text, len(got_calls)), (want, 1), size)
+
+    def test_stream_end_after_a_call_keeps_text_before_a_partial_opener(self):
+        """The last increment closes a call and ends in a partial sentinel:
+        only the partial is dropped, the text before it is content, however
+        the bytes were cut (review round 4)."""
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        text = call + "See 5<"
+        for size in (len(text), 5, 1):
+            got_text, got_calls = self._stream_all(text, size)
+            self.assertEqual((got_text, len(got_calls)), ("See 5", 1), size)
+
+    def test_fence_opener_split_across_increments_still_parses(self):
+        """A backtick run arriving one or two characters at a time is held
+        back like the whole fence, so the fence-opened call is not flushed
+        as content before its argument marker arrives (review round 4)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        pieces = [
+            "\n",
+            "``",
+            "`get_weather",
+            "\n",
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
+        ]
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        texts, calls = [], []
+        for piece in pieces:
+            t, c = parser.parse_stream_chunk(piece)
+            texts.append(t or "")
+            calls.extend(c)
+        t, c = parser.parse_stream_end()
+        texts.append(t or "")
+        calls.extend(c)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual("".join(texts), "")
+        whole = SolarOpen2Detector().detect_and_parse("".join(pieces), self.tools)
+        self.assertEqual((whole.normal_text, len(whole.calls)), ("", 1))
+
     def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
         """A call without the newline after its name followed by a well-formed
         call: with the vendor's ``(.+?)`` name group the two parse as one

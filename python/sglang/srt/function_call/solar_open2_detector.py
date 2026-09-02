@@ -87,7 +87,10 @@ def partial_fence_open_len(text: str) -> int:
     elif text.startswith("```"):
         start = 0
     else:
-        return 0
+        # A run of one or two backticks at a line start may still grow into
+        # the fence (the backticks can arrive split across increments).
+        m = re.search(r"(?:^|\n)(`{1,2})$", text)
+        return len(m.group(1)) if m else 0
     tail = text[start:]
     m = re.fullmatch(r"```[\w.-]*[ \t]*(?:\n(.*))?", tail, re.DOTALL)
     if m is None:
@@ -168,6 +171,10 @@ class SolarOpen2Detector(BaseFormatDetector):
         # text (then it is content) or the next opener / stream end (then it
         # is not) -- the vendor's ``_stream_pending_ws``.
         self._pending_ws: str = ""
+        # Streaming only: real (non-whitespace) content has been emitted; the
+        # vendor's ``_stream_content_emitted`` -- whitespace that trails it
+        # before the first call is content, a whitespace-only prefix is not.
+        self._content_emitted: bool = False
         self.bot_token = TOOL_CALL_START
         self.eot_token = TOOL_CALL_END
         # The name group excludes a sentinel prefix: with the vendor's ``(.+?)``
@@ -322,10 +329,11 @@ class SolarOpen2Detector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """The vendor's non-streaming rule: with at least one parsed call,
-        content is what precedes the first opener and the rest belongs to the
-        calls; with none (a start marker alone, a malformed or truncated
-        call) the whole output stays content rather than losing the suffix
-        after the marker (``SolarOpen2ToolParser.extract_tool_calls``)."""
+        content is what precedes the first opener -- nothing if that is only
+        whitespace -- and the rest belongs to the calls; with none (a start
+        marker alone, a malformed or truncated call) the whole output stays
+        content rather than losing the suffix after the marker
+        (``SolarOpen2ToolParser.extract_tool_calls``)."""
         starts = self._call_starts(text)
         if not starts:
             return StreamingParseResult(normal_text=text, calls=[])
@@ -337,7 +345,10 @@ class SolarOpen2Detector(BaseFormatDetector):
                 len(text),
             )
             return StreamingParseResult(normal_text=text, calls=[])
-        return StreamingParseResult(normal_text=text[: min(starts)], calls=calls)
+        prefix = text[: min(starts)]
+        return StreamingParseResult(
+            normal_text=prefix if prefix.strip() else "", calls=calls
+        )
 
     def holding_open_call(self) -> bool:
         """Streaming: an opener has arrived whose call is not closed yet (the
@@ -355,13 +366,15 @@ class SolarOpen2Detector(BaseFormatDetector):
         client never assembles a partial call.
 
         Content is decided as the vendor's streaming parser decides it, and
-        independently of where the chunks are cut: text before the first
-        opener is content; after a call, real text is content but a
-        whitespace run is not when it abuts the next opener or the end (the
-        vendor's ``_stream_pending_ws``; its non-streaming parser keeps only
-        what precedes the first call); output from the first opener on that
-        does not parse is held (``_unparsed``) -- dropped if a later call
-        parses, else released as content by :meth:`finish`.
+        independently of where the chunks are cut: real text is content
+        wherever it is; a whitespace run is content only when it trails real
+        text before the first opener -- not as the whole prefix, not between
+        or after calls when it abuts the next opener or the end (the
+        vendor's ``_stream_pending_ws`` / ``_stream_content_emitted``; its
+        non-streaming parser keeps what precedes the first call unless that
+        is only whitespace); output from the first opener on that does not
+        parse is held (``_unparsed``) -- dropped if a later call parses, else
+        released as content by :meth:`finish`.
         """
         self._buffer += new_text
 
@@ -417,22 +430,33 @@ class SolarOpen2Detector(BaseFormatDetector):
     def _route_text(self, text: str, before_opener: bool = False) -> str:
         """Text outside a call, as content or not (see the class rule).
         ``before_opener``: the text ends where a call opener starts."""
-        if self.current_tool_id < 0:
-            if self._unparsed:
-                self._unparsed += text
-                return ""
-            return text
+        if self.current_tool_id < 0 and self._unparsed:
+            self._unparsed += text
+            return ""
         text = self._pending_ws + text
         self._pending_ws = ""
-        if not text.strip():
-            # Whitespace between or after calls is not content; hold it in
-            # case real text follows in a later chunk.
-            if not before_opener:
-                self._pending_ws = text
+        if not text:
             return ""
+        if not text.strip():
+            if before_opener:
+                # Whitespace abutting an opener is content only when it trails
+                # real text before the first call ("text\n" + call keeps the
+                # newline, as in non-streaming); a whitespace-only prefix and
+                # whitespace between calls are not.
+                if self.current_tool_id < 0 and self._content_emitted:
+                    return text
+                return ""
+            # Hold it: real text may follow in a later chunk.
+            self._pending_ws = text
+            return ""
+        self._content_emitted = True
+        if before_opener:
+            # Before the first call the whole prefix is content (vendor).
+            # Between calls the vendor emits whatever share of the run its
+            # chunking put before the opener; rstrip makes ours cut-invariant.
+            return text if self.current_tool_id < 0 else text.rstrip()
         body = text.rstrip()
-        if not before_opener:
-            self._pending_ws = text[len(body) :]
+        self._pending_ws = text[len(body) :]
         return body
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
@@ -444,15 +468,15 @@ class SolarOpen2Detector(BaseFormatDetector):
         parser keeps such output as content (its streaming parser has already
         emitted as deltas whatever it had parsed; a call cut inside its name
         is emitted by neither). After a call was emitted, only real trailing
-        text is content (see parse_streaming_increment)."""
+        text is content (see parse_streaming_increment); a trailing partial
+        opener and trailing whitespace are not."""
         held, self._buffer = self._buffer, ""
         unparsed, self._unparsed = self._unparsed, ""
         pending_ws, self._pending_ws = self._pending_ws, ""
         if self.current_tool_id >= 0:
             # A call was already emitted. An unfinished later call is not
             # content (the non-streaming rule; the vendor's streaming parser
-            # has no end-of-stream hook either), nor is a held partial opener
-            # or whitespace; real trailing text is, as the vendor streams it.
+            # has no end-of-stream hook either).
             if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
                 logger.warning(
                     "Solar Open2: stream ended inside an unfinished tool call "
@@ -461,10 +485,12 @@ class SolarOpen2Detector(BaseFormatDetector):
                     len(held),
                 )
                 return StreamingParseResult()
-            if self._ends_with_partial_token(held, self.bot_token) or (
-                partial_fence_open_len(held)
-            ):
-                return StreamingParseResult()
+            hold = max(
+                self._ends_with_partial_token(held, self.bot_token) or 0,
+                partial_fence_open_len(held),
+            )
+            if hold:
+                held = held[:-hold]
             body = (pending_ws + held).rstrip()
             return StreamingParseResult(normal_text=body, calls=[])
         if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
@@ -473,7 +499,7 @@ class SolarOpen2Detector(BaseFormatDetector):
                 "(%d chars); returning it as content",
                 len(held),
             )
-        return StreamingParseResult(normal_text=unparsed + held, calls=[])
+        return StreamingParseResult(normal_text=pending_ws + unparsed + held, calls=[])
 
     def supports_structural_tag(self) -> bool:
         """``required`` / named tool_choice use the JSON-schema constraint

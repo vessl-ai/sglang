@@ -2674,6 +2674,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     if tail_text.strip():
                         normal_text = (normal_text or "") + tail_text
                     calls = list(calls) + list(tail.calls)
+                else:
+                    logger.warning(
+                        "Tool-call array drain stopped at %d steps with output "
+                        "still buffered; the client receives a truncated call list",
+                        _JSON_ARRAY_DRAIN_MAX_STEPS,
+                    )
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:
