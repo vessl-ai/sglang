@@ -84,6 +84,11 @@ _LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")
 # custom_params key the chat entrypoint uses to hand the request's reasoning
 # effort to the scheduler-side FSM (serving_chat._normalize_solar_open2_reasoning_effort).
 EFFORT_PARAM = "solar_reasoning_effort"
+# custom_params key: whether the request offers tools (chat entrypoint). A
+# request without tools can never have a <|tool_call:start|> answered, so its
+# CONTENT states forbid the token; with EOS shut in fresh CONTENT the model
+# otherwise takes it as the exit ("<|tool_call:start|>think" then stop).
+TOOLS_PARAM = "solar_tools_available"
 
 
 class _Config:
@@ -110,6 +115,10 @@ class _Config:
     leading_newline_forbidden: Tuple[int, ...] = ()
     content_fresh_forbidden: Tuple[int, ...] = ()
     content_done_forbidden: Tuple[int, ...] = ()
+    # The same two sets for a request that offers no tools: tool_call_start
+    # joins them.
+    content_fresh_forbidden_notools: Tuple[int, ...] = ()
+    content_done_forbidden_notools: Tuple[int, ...] = ()
     # Reasoning budget. "effort" (default) is the vendor rule: a fixed budget per
     # reasoning effort (effort_budgets, hard_limit). "legacy" keeps the earlier
     # port's min(budget_abs, max_new_tokens * budget_ratio).
@@ -283,6 +292,25 @@ def _req_effort(req):
     return None
 
 
+def _req_tools(req) -> bool:
+    """Whether the request offers tools (``TOOLS_PARAM``); True when the
+    entrypoint did not say (the vendor's sets, which allow a tool call)."""
+    params = getattr(getattr(req, "sampling_params", None), "custom_params", None)
+    if isinstance(params, dict):
+        value = params.get(TOOLS_PARAM)
+        if isinstance(value, bool):
+            return value
+    return True
+
+
+def _content_forbidden(fsm: "SolarReqFSM", has_content: bool) -> Tuple[int, ...]:
+    """CONTENT forbid set for a request: the vendor's (tool call allowed), or
+    the no-tools variant that also forbids ``<|tool_call:start|>``."""
+    if has_content:
+        return CFG.content_done_forbidden if fsm.tools else CFG.content_done_forbidden_notools
+    return CFG.content_fresh_forbidden if fsm.tools else CFG.content_fresh_forbidden_notools
+
+
 def _reasoning_forbidden(state) -> Tuple[int, ...]:
     """REASONING forbid set for ``state`` (a ``SolarReqFSM`` or ``_SimState``):
     the leading-newline ids join it on the token right after ``<|think:start|>``."""
@@ -325,6 +353,8 @@ def init_from_env() -> None:
     CFG.reasoning_forbidden = build({CFG.think_end}, True)
     CFG.content_fresh_forbidden = build({CFG.tool_call_start}, True)
     CFG.content_done_forbidden = build({CFG.tool_call_start, CFG.im_end}, False)
+    CFG.content_fresh_forbidden_notools = build(set(), True)
+    CFG.content_done_forbidden_notools = build({CFG.im_end}, False)
     CFG.leading_newline_forbidden = _leading_newline_ids(tok_dir)
     CFG.reasoning_open_forbidden = tuple(
         sorted(set(CFG.reasoning_forbidden) | set(CFG.leading_newline_forbidden))
@@ -387,7 +417,7 @@ def init_from_env() -> None:
     logger.info(
         "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
         "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
-        "content_done=%s | content_mask=%s budget=%s",
+        "content_done=%s (no tools: %s / %s) | content_mask=%s budget=%s",
         CFG.think_start,
         CFG.think_end,
         CFG.im_end,
@@ -395,6 +425,8 @@ def init_from_env() -> None:
         CFG.reasoning_open_forbidden,
         CFG.content_fresh_forbidden,
         CFG.content_done_forbidden,
+        CFG.content_fresh_forbidden_notools,
+        CFG.content_done_forbidden_notools,
         CFG.content_mask,
         budget_desc,
     )
@@ -422,6 +454,7 @@ class SolarReqFSM:
         "budget",
         "forced",
         "content_progress",
+        "tools",
     )
 
     def __init__(
@@ -429,6 +462,7 @@ class SolarReqFSM:
         prompt_ids: Sequence[int],
         max_new_tokens: Optional[int],
         effort: Optional[str] = None,
+        tools: bool = True,
     ):
         # Mirrors the fork's _initial_state: inside reasoning iff the last
         # think_start in the prompt is not followed by a think_end.
@@ -442,6 +476,7 @@ class SolarReqFSM:
         self.count = 0
         self.consumed = 0
         self.budget = _budget_for(effort, max_new_tokens)
+        self.tools = bool(tools)
         self.forced = False
 
     def _step(self, tok: int) -> None:
@@ -518,6 +553,7 @@ def _req_fsm(req) -> SolarReqFSM:
             getattr(req, "origin_input_ids", ()) or (),
             getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
             _req_effort(req),
+            _req_tools(req),
         )
         req._solar_fsm = fsm
         req._solar_fsm_retractions = req.retraction_count
@@ -728,14 +764,15 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
         elif not CFG.content_mask:
             continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
-        elif fsm.content_progress:
-            mask_rows.setdefault(CFG.content_done_forbidden, []).append(i)
         else:
             # Fresh CONTENT: EOS/im_end forbidden until real content exists.
             # Without this the model leaves reasoning and immediately stops,
             # yielding finish=stop with an empty answer (observed: 6/13 GPQA
-            # errors in R2-3rd had content_len == 0).
-            mask_rows.setdefault(CFG.content_fresh_forbidden, []).append(i)
+            # errors in R2-3rd had content_len == 0). A request without tools
+            # also loses <|tool_call:start|>: with EOS shut, a model that
+            # wanted to stop takes it as the exit instead (KMMLU-Pro medium
+            # rerun: 13 of 35 no-answer rows ended on "<|tool_call:start|>think").
+            mask_rows.setdefault(_content_forbidden(fsm, fsm.content_progress), []).append(i)
 
     for ids, rows_i in mask_rows.items():
         if not ids:
@@ -1056,9 +1093,9 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                     mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
             elif not CFG.content_mask:
                 continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
-            elif sim.content_progress:
-                mask_rows.setdefault(CFG.content_done_forbidden, []).append(row)
             else:
-                mask_rows.setdefault(CFG.content_fresh_forbidden, []).append(row)
+                mask_rows.setdefault(
+                    _content_forbidden(fsm, sim.content_progress), []
+                ).append(row)
 
     return VerifyPlan(force_rows, mask_rows, stride, bs, rids)

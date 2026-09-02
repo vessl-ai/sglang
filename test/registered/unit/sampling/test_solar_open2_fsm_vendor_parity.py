@@ -46,6 +46,8 @@ def _cfg(**overrides):
     c.reasoning_open_forbidden = tuple(sorted({EOS, IM_END, TOOL_START, NL, NLNL}))
     c.content_fresh_forbidden = (EOS, IM_END, THINK_START, THINK_END)
     c.content_done_forbidden = (THINK_START, THINK_END)
+    c.content_fresh_forbidden_notools = (EOS, IM_END, THINK_START, THINK_END, TOOL_START)
+    c.content_done_forbidden_notools = (THINK_START, THINK_END, TOOL_START)
     c.budget_policy = "effort"
     c.effort_budgets = dict(fsm._EFFORT_BUDGETS)
     c.default_effort = "high"
@@ -60,8 +62,21 @@ def _cfg(**overrides):
     fsm._EFFORT_LOG["num_suppressed"] = 0
 
 
-def _req(output_ids=(), *, prompt=(1, 2, 3, THINK_START), max_new_tokens=4096, effort=None, rid="r0"):
-    custom = {fsm.EFFORT_PARAM: effort} if effort is not None else None
+def _req(
+    output_ids=(),
+    *,
+    prompt=(1, 2, 3, THINK_START),
+    max_new_tokens=4096,
+    effort=None,
+    tools=None,
+    rid="r0",
+):
+    custom = {}
+    if effort is not None:
+        custom[fsm.EFFORT_PARAM] = effort
+    if tools is not None:
+        custom[fsm.TOOLS_PARAM] = tools
+    custom = custom or None
     return SimpleNamespace(
         rid=rid,
         retraction_count=0,
@@ -267,6 +282,31 @@ class TestContentMask(unittest.TestCase):
         self.assertEqual(set(range(VOCAB)) - _masked(logits), {THINK_END})
         req.output_ids.append(THINK_END)
         self.assertIn(EOS, _masked(_apply(req)))
+
+    def test_no_tools_forbids_a_tool_call_in_content(self):
+        """With EOS shut in fresh CONTENT a model that wanted to stop takes
+        <|tool_call:start|> as the exit; a request without tools loses it."""
+        fresh = _req([7, THINK_END], tools=False)
+        self.assertEqual(_masked(_apply(fresh)), set(fsm.CFG.content_fresh_forbidden_notools))
+        done = _req([7, THINK_END, 8], tools=False)
+        self.assertEqual(_masked(_apply(done)), set(fsm.CFG.content_done_forbidden_notools))
+        self.assertIn(TOOL_START, _masked(_apply(done)))
+
+    def test_tools_present_or_unstated_keep_the_vendor_sets(self):
+        for tools in (True, None):
+            with self.subTest(tools=tools):
+                req = _req([7, THINK_END], tools=tools)
+                masked = _masked(_apply(req))
+                self.assertEqual(masked, set(fsm.CFG.content_fresh_forbidden))
+                self.assertNotIn(TOOL_START, masked)
+
+    def test_no_tools_applies_along_the_verify_chain(self):
+        req = _req([7], tools=False)
+        fsm._req_fsm(req)
+        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_END, 9]]), stride=3)
+        self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_forbidden], [0])
+        self.assertEqual(plan.mask_rows[fsm.CFG.content_fresh_forbidden_notools], [1])
+        self.assertEqual(plan.mask_rows[fsm.CFG.content_done_forbidden_notools], [2])
 
     def test_switch_off_restores_the_unmasked_content(self):
         _cfg(content_mask=False)

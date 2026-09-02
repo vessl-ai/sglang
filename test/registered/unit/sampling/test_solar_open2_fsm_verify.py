@@ -77,6 +77,8 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         "hard_limit",
         "leading_newline_forbidden",
         "reasoning_open_forbidden",
+        "content_fresh_forbidden_notools",
+        "content_done_forbidden_notools",
         "think_start",
         "think_end",
         "im_end",
@@ -103,6 +105,8 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.reasoning_open_forbidden = (EOS, IM_END)
         cfg.content_fresh_forbidden = (EOS,)
         cfg.content_done_forbidden = ()
+        cfg.content_fresh_forbidden_notools = (EOS,)
+        cfg.content_done_forbidden_notools = ()
         # These suites pin the budget by hand; keep the legacy formula so the
         # per-effort table cannot reach past the fixture's budget_abs.
         cfg.budget_policy = "legacy"

@@ -78,6 +78,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.solar_open2_fsm import EFFORT_PARAM as SOLAR_OPEN2_EFFORT_PARAM
+from sglang.srt.sampling.solar_open2_fsm import TOOLS_PARAM as SOLAR_OPEN2_TOOLS_PARAM
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1094,7 +1095,11 @@ class OpenAIServingChat(OpenAIServingBase):
         custom.pop(SOLAR_OPEN2_EFFORT_PARAM, None)
         if isinstance(requested, str) and requested.strip():
             custom[SOLAR_OPEN2_EFFORT_PARAM] = requested.strip().lower()
-        request.custom_params = custom or None
+        # Whether a tool call can be answered at all: without tools the FSM
+        # forbids <|tool_call:start|> in CONTENT, where a model shut out of
+        # EOS otherwise takes it as the exit.
+        custom[SOLAR_OPEN2_TOOLS_PARAM] = bool(self._effective_tools(request))
+        request.custom_params = custom
         if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
             request.reasoning_effort = "high"
         if ctk:
