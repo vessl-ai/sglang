@@ -52,7 +52,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -275,7 +274,7 @@ class SolarOpen2Detector(BaseFormatDetector):
         first = self._buffer.find(TOOL_CALL_START)
         if first == -1:
             # Hold back a suffix that could be the start of an opener.
-            hold = self._ends_with_partial_token(self._buffer, self.bot_token) or 0
+            hold = self._ends_with_partial_token(self._buffer, self.bot_token)
             emit = self._buffer[: len(self._buffer) - hold]
             self._buffer = self._buffer[len(self._buffer) - hold :]
             return StreamingParseResult(normal_text=self._content.text(emit), calls=[])
@@ -308,27 +307,22 @@ class SolarOpen2Detector(BaseFormatDetector):
                 "parsed call (an opener that did not parse)",
                 len(leading),
             )
-        items = [_item(call, index=i) for call, i in zip(calls, self._next_ids(calls))]
+        items = []
+        for call in calls:
+            self._content.call_parsed()
+            self.current_tool_id += 1
+            items.append(_item(call, index=self.current_tool_id))
         for prev, call in zip(calls, calls[1:]):
             between = complete[prev.end : call.start]
             head += self._content.segment(between, before_opener=True)
         head += self._content.segment(complete[calls[-1].end :])
         return StreamingParseResult(normal_text=head, calls=items)
 
-    def _next_ids(self, calls: List[_ParsedCall]) -> List[int]:
-        """Sequential stream-wide indices for ``calls``, in order."""
-        ids = []
-        for _ in calls:
-            self._content.call_parsed()
-            self.current_tool_id += 1
-            ids.append(self.current_tool_id)
-        return ids
-
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """The stream is over: release what was held back waiting for a marker
         that can no longer arrive (``_StreamContent.end``)."""
         held, self._buffer = self._buffer, ""
-        partial = self._ends_with_partial_token(held, self.bot_token) or 0
+        partial = self._ends_with_partial_token(held, self.bot_token)
         text = self._content.end(held, partial_opener=partial)
         return StreamingParseResult(normal_text=text, calls=[])
 
@@ -340,13 +334,7 @@ class SolarOpen2Detector(BaseFormatDetector):
         return False
 
     def structure_info(self) -> _GetInfoFunc:
-        """Required by the base class; unused since ``supports_structural_tag``
-        is False."""
-        return lambda name: StructureInfo(
-            begin=f"{TOOL_CALL_START}{name}\n",
-            end=TOOL_CALL_END,
-            trigger=TOOL_CALL_START,
-        )
+        raise NotImplementedError("structure_info not used: no structural tag")
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +359,7 @@ def _parse_calls(text: str, *, tools: List[Tool]) -> Tuple[List[_ParsedCall], bo
                 "call for the client to handle",
                 name,
             )
-        arguments = _parse_arguments(name, body=match.group(2) or "", tools=tools)
+        arguments = _parse_arguments(name, body=match.group(2), tools=tools)
         calls.append(
             _ParsedCall(
                 start=match.start(), end=match.end(), name=name, arguments=arguments

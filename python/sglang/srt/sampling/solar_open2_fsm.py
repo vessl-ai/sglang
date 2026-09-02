@@ -230,7 +230,7 @@ class _Config:
     # accept, so by default only the steps the folded path cannot cover leave
     # it (plan_gate). True masks every verify step (fuller enforcement, slower).
     spec_always_eager: bool = False
-    _mask_cache: Dict[Tuple[Tuple[int, ...], int, str], torch.Tensor] = {}
+    _mask_cache: Dict[Tuple[Tuple[int, ...], str], torch.Tensor] = {}
 
 
 CFG = _Config()
@@ -470,9 +470,7 @@ def _forbidden_for(state: int, content_progress: bool, tools: bool) -> Tuple[int
     (state, content_progress) entry of the forbidden table, or of the
     no-tools variant when the request offers no tools."""
     table = CFG.forbidden if tools else CFG.forbidden_notools
-    if state == CONTENT:
-        return table.get((CONTENT, bool(content_progress)), ())
-    return table.get((state, False), ())
+    return table.get((state, bool(content_progress)), ())
 
 
 def _reasoning_forbidden(state) -> Tuple[int, ...]:
@@ -720,9 +718,6 @@ class SolarReqFSM:
                 self.count += 1
             elif state == CONTENT:
                 self.content_progress = True
-            elif state == TOOL_CALL_END:
-                self.state = CONTENT
-                self.content_progress = True
             else:
                 nxt = _AUTO_ADVANCE.get(state)
                 if nxt is not None:
@@ -873,12 +868,42 @@ def _prompt_completed_tool_call(prompt_ids: Sequence[int]) -> bool:
 
 
 def _mask_tensor(ids: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-    key = (ids, 0, str(device))
+    key = (ids, str(device))
     t = CFG._mask_cache.get(key)
     if t is None:
         t = torch.tensor(ids, dtype=torch.long, device=device)
         CFG._mask_cache[key] = t
     return t
+
+
+def _mask_and_force(
+    logits: torch.Tensor,
+    mask_rows: Dict[Tuple[int, ...], List[int]],
+    force_rows: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Write ``NEG_INF`` over each forbidden set in its rows, then force
+    ``<|think:end|>`` on ``force_rows``. A row the grammar has already closed
+    to ``<|think:end|>`` would become fully -inf if forced -- the sampler then
+    returns an arbitrary id that the grammar rejects on accept -- so it is left
+    to the grammar. Returns ``(forced rows, rows left to the grammar)``."""
+    for ids, rows_i in mask_rows.items():
+        if not ids or not rows_i:
+            continue
+        idx = _mask_tensor(ids, logits.device)
+        rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
+        logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
+    if not force_rows:
+        return [], []
+    rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
+    allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
+    forced = [r for r, ok in zip(force_rows, allowed) if ok]
+    blocked = [r for r, ok in zip(force_rows, allowed) if not ok]
+    if forced:
+        rsel = torch.tensor(forced, dtype=torch.long, device=logits.device)
+        keep = logits[rsel, CFG.think_end].clone()
+        logits[rsel, :] = NEG_INF
+        logits[rsel, CFG.think_end] = keep
+    return forced, blocked
 
 
 _CONFLICT_LOG = {"last": 0.0, "num_suppressed": 0}
@@ -1070,38 +1095,19 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 _forbidden_for(fsm.state, fsm.content_progress, fsm.tools), []
             ).append(i)
 
-    for ids, rows_i in mask_rows.items():
-        if not ids:
-            continue
-        idx = _mask_tensor(ids, logits.device)
-        rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
-        logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
-
-    if force_rows:
-        rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
-        # A row the grammar has already closed to <|think:end|> would become
-        # fully -inf if forced; the sampler then returns an arbitrary id that
-        # the grammar rejects on accept. Leave those rows to the grammar.
-        allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
-        blocked = [r for r, ok in zip(force_rows, allowed) if not ok]
-        force_rows = [r for r, ok in zip(force_rows, allowed) if ok]
-        if blocked:
-            _log_force_conflict(blocked, 1, [r.rid for r in rows])
-        if force_rows:
-            rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
-            keep = logits[rsel, CFG.think_end].clone()
-            logits[rsel, :] = NEG_INF
-            logits[rsel, CFG.think_end] = keep
-            for i in force_rows:
-                fsm = rows[i]._solar_fsm
-                if not fsm.forced:
-                    fsm.forced = True
-                    logger.info(
-                        "[SOLAR-FSM] reasoning budget %d exhausted -> forcing "
-                        "<|think:end|> (req %s)",
-                        fsm.budget,
-                        rows[i].rid,
-                    )
+    forced, blocked = _mask_and_force(logits, mask_rows, force_rows)
+    if blocked:
+        _log_force_conflict(blocked, 1, [r.rid for r in rows])
+    for i in forced:
+        fsm = rows[i]._solar_fsm
+        if not fsm.forced:
+            fsm.forced = True
+            logger.info(
+                "[SOLAR-FSM] reasoning budget %d exhausted -> forcing "
+                "<|think:end|> (req %s)",
+                fsm.budget,
+                rows[i].rid,
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1185,31 +1191,13 @@ class VerifyPlan:
                     valid.add(i * self.stride + w)
 
         keep = lambda rs: [r for r in rs if valid is None or r in valid]
-
-        for ids, rows_i in self.mask_rows.items():
-            rows_i = keep(rows_i)
-            if not ids or not rows_i:
-                continue
-            idx = _mask_tensor(ids, logits.device)
-            rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
-            logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
-
-        force = keep(self.force_rows)
-        if force:
-            rsel = torch.tensor(force, dtype=torch.long, device=logits.device)
-            # A row the grammar has already closed to <|think:end|> would become
-            # fully -inf if forced; the sampler then returns an arbitrary id that
-            # the grammar rejects on accept. Leave those rows to the grammar.
-            allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
-            blocked = [r for r, ok in zip(force, allowed) if not ok]
-            force = [r for r, ok in zip(force, allowed) if ok]
-            if blocked:
-                _log_force_conflict(blocked, self.stride, self.rids)
-            if force:
-                rsel = torch.tensor(force, dtype=torch.long, device=logits.device)
-                kept = logits[rsel, CFG.think_end].clone()
-                logits[rsel, :] = NEG_INF
-                logits[rsel, CFG.think_end] = kept
+        _, blocked = _mask_and_force(
+            logits,
+            {ids: keep(rows_i) for ids, rows_i in self.mask_rows.items()},
+            keep(self.force_rows),
+        )
+        if blocked:
+            _log_force_conflict(blocked, self.stride, self.rids)
 
 
 def apply_folded_mask(logits, row_flags, forbid_ids) -> None:

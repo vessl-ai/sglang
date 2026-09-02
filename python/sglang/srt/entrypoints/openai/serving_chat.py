@@ -74,7 +74,10 @@ from sglang.srt.function_call.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import (
+    ReasoningParser,
+    solar_open2_force_reasoning,
+)
 
 # Safety cap for the stream-end drain of a required/named JSON array (see
 # _drain_json_array); the loop stops earlier as soon as a step yields nothing.
@@ -2462,10 +2465,6 @@ class OpenAIServingChat(OpenAIServingBase):
             # scheduler's usage counter (Req.update_reasoning_tokens) would
             # then label every completion token as reasoning. Same rule as
             # the reasoning parser (solar_open2_force_reasoning).
-            from sglang.srt.parser.reasoning_parser import (
-                solar_open2_force_reasoning,
-            )
-
             return solar_open2_force_reasoning(request)
 
         if self.reasoning_parser == "minimax-m3":

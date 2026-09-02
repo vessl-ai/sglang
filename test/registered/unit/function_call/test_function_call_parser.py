@@ -5703,12 +5703,11 @@ class TestSolarOpen2Detector(unittest.TestCase):
                 {"on": expect},
             )
 
-    def test_structure_info_envelope(self):
-        detector = SolarOpen2Detector()
-        info = detector.structure_info()("get_weather")
-        self.assertEqual(info.begin, f"{TOOL_CALL_START}get_weather\n")
-        self.assertEqual(info.end, TOOL_CALL_END)
-        self.assertEqual(info.trigger, TOOL_CALL_START)
+    def test_structure_info_is_not_used(self):
+        # required/named tool_choice go through the JSON-schema array
+        # (supports_structural_tag is False), so no structural tag exists.
+        with self.assertRaises(NotImplementedError):
+            SolarOpen2Detector().structure_info()
 
     def test_required_tool_choice_uses_json_schema(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
