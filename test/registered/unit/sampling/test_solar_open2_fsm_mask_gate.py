@@ -39,8 +39,13 @@ def _cfg(**over):
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
     fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
     fsm.CFG.reasoning_forbidden = (EOS,)
+    fsm.CFG.leading_newline_forbidden = ()
+    fsm.CFG.reasoning_open_forbidden = (EOS,)
     fsm.CFG.content_mask = False
     fsm.CFG.spec_always_eager = False
+    # Budgets here are pinned by hand: keep the legacy formula so the
+    # per-effort table cannot reach past budget_abs.
+    fsm.CFG.budget_policy = "legacy"
     fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
     for k, v in over.items():
         setattr(fsm.CFG, k, v)
@@ -84,6 +89,9 @@ class TestSolarFsmMaskGate(unittest.TestCase):
                 "spec_always_eager",
                 "budget_abs",
                 "budget_ratio",
+                "budget_policy",
+                "leading_newline_forbidden",
+                "reasoning_open_forbidden",
             )
         }
         _cfg()
@@ -206,12 +214,13 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
         self.assertFalse(fsm.plan_gate([req], 8))
 
-    def test_content_mask_still_takes_the_eager_path(self):
-        """The content sets have no in-graph carrier, so content_mask must gate
-        unconditionally or those rows go unmasked."""
+    def test_content_mask_gates_only_a_fresh_content_row(self):
+        """The content sets have no in-graph carrier, so a row whose turn has
+        no content yet must go eager; once it has content the fold is kept
+        (its rows then only lack the content_done set, a documented gap)."""
         _cfg(content_mask=True)
-        req = _req([7, THINK_END, 7])
-        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertTrue(fsm.plan_gate([_req([7, THINK_END])], 8))
+        self.assertFalse(fsm.plan_gate([_req([7, THINK_END, 7])], 8))
 
     def test_flags_are_per_request_not_per_batch(self):
         """The fold is per-step but the mask is per-row: one thinking request

@@ -1085,15 +1085,16 @@ class OpenAIServingChat(OpenAIServingBase):
         effort = request.reasoning_effort
         ctk = request.chat_template_kwargs
         requested = effort if effort is not None else (ctk or {}).get("reasoning_effort")
+        # The scheduler-side FSM sizes the reasoning budget from the effort the
+        # request asked for (solar_open2_fsm: low 4K .. max 128K), so hand it
+        # over before the fold below hides xhigh/max from the template.
+        # custom_params rides SamplingParams to the Req. The entrypoint owns
+        # the key: a value a client put there itself is not a budget override.
+        custom = dict(request.custom_params or {})
+        custom.pop(SOLAR_OPEN2_EFFORT_PARAM, None)
         if isinstance(requested, str) and requested.strip():
-            # The scheduler-side FSM sizes the reasoning budget from the effort
-            # the request asked for (solar_open2_fsm: low 4K .. max 128K), so
-            # hand it over before the fold below hides xhigh/max from the
-            # template. custom_params rides SamplingParams to the Req.
-            request.custom_params = {
-                **(request.custom_params or {}),
-                SOLAR_OPEN2_EFFORT_PARAM: requested.strip().lower(),
-            }
+            custom[SOLAR_OPEN2_EFFORT_PARAM] = requested.strip().lower()
+        request.custom_params = custom or None
         if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
             request.reasoning_effort = "high"
         if ctk:
@@ -1103,6 +1104,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD
             ):
                 ctk["reasoning_effort"] = "high"
+            if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
+                # One source for the template: the request's (folded) effort.
+                # A server default in --default-chat-template-kwargs lands in
+                # ctk after the client's own value was moved to the request
+                # field, and the template reads ctk last -- without this the
+                # template would follow the server default while the budget
+                # follows the client.
+                ctk["reasoning_effort"] = request.reasoning_effort
 
     def _solar_single_call_stop_matched(
         self,

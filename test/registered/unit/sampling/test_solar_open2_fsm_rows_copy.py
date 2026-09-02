@@ -33,6 +33,8 @@ def _cfg():
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
     fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
     fsm.CFG.reasoning_forbidden = (EOS,)
+    fsm.CFG.leading_newline_forbidden = ()
+    fsm.CFG.reasoning_open_forbidden = (EOS,)
     fsm.CFG.content_mask = False
     fsm.CFG.spec_always_eager = False
     fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
@@ -96,6 +98,8 @@ _CFG_FIELDS = (
     "budget_abs",
     "budget_ratio",
     "budget_policy",
+    "leading_newline_forbidden",
+    "reasoning_open_forbidden",
 )
 
 

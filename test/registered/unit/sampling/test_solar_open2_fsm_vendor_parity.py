@@ -56,7 +56,8 @@ def _cfg(**overrides):
     c._mask_cache.clear()
     for name, value in overrides.items():
         setattr(c, name, value)
-    fsm._WARNED["effort"] = False
+    fsm._EFFORT_LOG["last"] = 0.0
+    fsm._EFFORT_LOG["num_suppressed"] = 0
 
 
 def _req(output_ids=(), *, prompt=(1, 2, 3, THINK_START), max_new_tokens=4096, effort=None, rid="r0"):
@@ -113,23 +114,42 @@ class TestEffortBudget(unittest.TestCase):
         self.assertEqual(fsm._req_fsm(_req(effort="max")).budget, 1000)
         self.assertEqual(fsm._req_fsm(_req(effort="low")).budget, 1000)
 
-    def test_unknown_effort_uses_the_default_and_warns_once(self):
+    def test_unknown_effort_uses_the_default_and_warns_rate_limited(self):
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
             self.assertEqual(fsm._req_fsm(_req(effort="ultra")).budget, 32 * 1024)
         self.assertIn("unknown reasoning effort", captured.output[0])
-        self.assertTrue(fsm._WARNED["effort"])
+        # Inside the interval: counted, not logged.
         with self.assertNoLogs(fsm.logger, level="WARNING"):
             fsm._req_fsm(_req(effort="ultra", rid="r1"))
+        self.assertEqual(fsm._EFFORT_LOG["num_suppressed"], 1)
+        # After the interval: logged again, with the suppressed count.
+        fsm._EFFORT_LOG["last"] = 0.0
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            fsm._req_fsm(_req(effort="ultra", rid="r2"))
+        self.assertIn("1 earlier occurrence(s) suppressed", captured.output[0])
 
     def test_legacy_policy_keeps_the_old_formula(self):
         _cfg(budget_policy="legacy")
-        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=4096)).budget, 3072)
+        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=1000)).budget, 750)
         self.assertEqual(fsm._req_fsm(_req(max_new_tokens=None)).budget, 3072)
 
-    def test_effort_read_only_from_a_string_param(self):
+    def test_non_string_effort_is_unknown(self):
+        """A value the entrypoint would never write (an int) is a client
+        misuse: default budget, and the same warning as an unknown string."""
         req = _req()
         req.sampling_params.custom_params = {fsm.EFFORT_PARAM: 3}
-        self.assertEqual(fsm._req_fsm(req).budget, 32 * 1024)
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            self.assertEqual(fsm._req_fsm(req).budget, 32 * 1024)
+        self.assertIn("unknown reasoning effort 3", captured.output[0])
+
+    def test_rebuild_after_retraction_keeps_the_effort_budget(self):
+        req = _req(effort="low")
+        first = fsm._req_fsm(req)
+        req.retraction_count = 1
+        rebuilt = fsm._req_fsm(req)
+        self.assertIsNot(rebuilt, first)
+        self.assertEqual(rebuilt.budget, 4 * 1024)
+        self.assertTrue(rebuilt.at_think_open)
 
 
 class TestLeadingNewline(unittest.TestCase):
@@ -165,10 +185,61 @@ class TestLeadingNewline(unittest.TestCase):
         self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_forbidden], [2])
         self.assertEqual(plan.force_rows, [])
 
+    def test_verify_plan_writes_the_open_set(self):
+        req = _req([7], prompt=(1, 2, 3))
+        fsm._req_fsm(req)
+        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_START, 9]]), stride=3)
+        logits = torch.zeros(3, VOCAB)
+        plan.apply(logits)
+        self.assertEqual(logits[1, NL].item(), NEG_INF)
+        self.assertEqual(logits[1, NLNL].item(), NEG_INF)
+        self.assertEqual(logits[2, NL].item(), 0.0)
+        self.assertEqual(logits[2, EOS].item(), NEG_INF)
+        # Rows past verify_lens are padding and stay untouched.
+        logits = torch.zeros(3, VOCAB)
+        plan.apply(logits, verify_lens=torch.tensor([2]))
+        self.assertEqual(logits[1, NL].item(), NEG_INF)
+        self.assertTrue(torch.isfinite(logits[2]).all())
+
+    def test_commit_run_ending_in_think_start_arms_the_rule(self):
+        """The speculative commit path, not only the prompt walk."""
+        req = _req([], prompt=(1, 2, 3))
+        state = fsm._req_fsm(req)
+        state.commit([7, THINK_START])
+        self.assertTrue(state.at_think_open)
+        req.output_ids.extend([7, THINK_START])
+        state.advance(req.output_ids)  # already consumed: a no-op
+        self.assertTrue(state.at_think_open)
+        state.commit([8])
+        self.assertFalse(state.at_think_open)
+
     def test_sim_state_copies_the_open_flag(self):
         state = fsm._req_fsm(_req())
         self.assertTrue(state.at_think_open)
         self.assertTrue(fsm._SimState(state).at_think_open)
+
+    def test_pre_closed_prompt_starts_in_fresh_content(self):
+        """What the served template renders for none/minimal/low: the block
+        is already closed, so the first token is fresh CONTENT."""
+        req = _req([], prompt=(1, 2, 3, THINK_START, THINK_END), effort="none")
+        state = fsm._req_fsm(req)
+        self.assertFalse(state.in_reasoning)
+        self.assertFalse(state.at_think_open)
+        self.assertEqual(_masked(_apply(req)), set(fsm.CFG.content_fresh_forbidden))
+
+    def test_each_batch_row_gets_its_own_set(self):
+        _cfg(effort_budgets={**fsm._EFFORT_BUDGETS, "low": 2})
+        rows = [
+            _req([], rid="open"),
+            _req([7], rid="mid"),
+            _req([7, THINK_END], rid="fresh"),
+            _req([7, 8], effort="low", rid="forced"),
+        ]
+        logits = _apply(*rows)
+        self.assertEqual(_masked(logits, 0), set(fsm.CFG.reasoning_open_forbidden))
+        self.assertEqual(_masked(logits, 1), set(fsm.CFG.reasoning_forbidden))
+        self.assertEqual(_masked(logits, 2), set(fsm.CFG.content_fresh_forbidden))
+        self.assertEqual(set(range(VOCAB)) - _masked(logits, 3), {THINK_END})
 
     def test_disabled_rule_leaves_the_plain_set(self):
         _cfg(leading_newline_forbidden=(), reasoning_open_forbidden=(EOS, IM_END, TOOL_START))
@@ -233,12 +304,22 @@ class TestPlanGate(unittest.TestCase):
         self.assertTrue(self._gate(_req([7] * 5, effort="low")))
         self.assertTrue(self._gate(_req([7] * 5, effort="none")))
 
+    def test_zero_budget_does_not_pin_a_closed_block_eager(self):
+        """A none/minimal request whose block is closed (pre-closed by the
+        template, or forced) must not keep the batch off the folded path."""
+        pre_closed = _req([7, 8], prompt=(1, 2, 3, THINK_START, THINK_END), effort="none")
+        self.assertFalse(self._gate(pre_closed))
+        forced_then_content = _req([THINK_END, 7], effort="minimal")
+        self.assertFalse(self._gate(forced_then_content))
+
 
 class TestInitFromEnv(unittest.TestCase):
     """The env surface: defaults and overrides as read by init_from_env."""
 
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
         files = {
             "tokenizer_config.json": {
                 "added_tokens_decoder": {
@@ -296,6 +377,39 @@ class TestInitFromEnv(unittest.TestCase):
         self.assertFalse(fsm.CFG.content_mask)
         self.assertEqual(fsm.CFG.leading_newline_forbidden, ())
         self.assertEqual(fsm.CFG.reasoning_open_forbidden, fsm.CFG.reasoning_forbidden)
+
+    def test_missing_newline_tokens_fail_loud(self):
+        with open(os.path.join(self.dir, "tokenizer.json"), "w", encoding="utf-8") as f:
+            json.dump({"model": {"vocab": {"a": 9}}}, f)
+        with self.assertRaisesRegex(RuntimeError, "leading-newline tokens"):
+            self._init()
+        # A Unigram-style layout (vocab as a list) counts as not found too.
+        with open(os.path.join(self.dir, "tokenizer.json"), "w", encoding="utf-8") as f:
+            json.dump({"model": {"vocab": [["Ċ", -1.0]]}}, f)
+        with self.assertRaisesRegex(RuntimeError, "leading-newline tokens"):
+            self._init()
+
+    def test_bad_values_fail_loud_by_name(self):
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT"):
+            self._init(SOLAR_FSM_HARD_LIMIT="abc")
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT must be positive"):
+            self._init(SOLAR_FSM_HARD_LIMIT="0")
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_BUDGET_LOW must be >= 0"):
+            self._init(SOLAR_FSM_BUDGET_LOW="-1")
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_LEADING_NEWLINE_IDS"):
+            self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7,x")
+        with self.assertRaisesRegex(RuntimeError, "negative id"):
+            self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="-7")
+
+    def test_explicit_override_above_the_hard_limit_warns_and_clamps(self):
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            self._init(SOLAR_FSM_BUDGET_MAX="200000", SOLAR_FSM_HARD_LIMIT="131072")
+        self.assertIn("SOLAR_FSM_BUDGET_MAX=200000 exceeds", captured.output[0])
+        self.assertEqual(fsm.CFG.effort_budgets["max"], 131072)
+        # A table default clamped by a lower hard limit is silent.
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            self._init(SOLAR_FSM_HARD_LIMIT="50000")
+        self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
 
     def test_explicit_newline_ids_override_the_vocab(self):
         self._init(SOLAR_FSM_LEADING_NEWLINE_IDS="7, 9")

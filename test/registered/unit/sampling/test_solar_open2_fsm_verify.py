@@ -62,6 +62,7 @@ def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     fsm.budget = budget
     fsm.forced = False
     fsm.content_progress = False
+    fsm.at_think_open = False
     return fsm
 
 
@@ -70,6 +71,12 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
 
     _CFG_FIELDS = (
         "enabled",
+        "budget_policy",
+        "effort_budgets",
+        "default_effort",
+        "hard_limit",
+        "leading_newline_forbidden",
+        "reasoning_open_forbidden",
         "think_start",
         "think_end",
         "im_end",
@@ -92,8 +99,13 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.im_end = IM_END
         cfg.all_controls = frozenset({THINK_START, THINK_END, IM_END})
         cfg.reasoning_forbidden = (EOS, IM_END)
+        cfg.leading_newline_forbidden = ()
+        cfg.reasoning_open_forbidden = (EOS, IM_END)
         cfg.content_fresh_forbidden = (EOS,)
         cfg.content_done_forbidden = ()
+        # These suites pin the budget by hand; keep the legacy formula so the
+        # per-effort table cannot reach past the fixture's budget_abs.
+        cfg.budget_policy = "legacy"
         cfg.budget_ratio = 0.75
         cfg.budget_abs = 1000
         cfg.content_mask = False
@@ -264,7 +276,9 @@ class TestRetractionRebuildsFsm(SolarOpen2FsmVerifyTestBase):
         self.assertFalse(fsm.in_reasoning)
 
     def test_plan_gate_is_conservative_after_a_retraction(self):
-        req = _req(rid="r0", origin_input_ids=[THINK_START], max_new_tokens=100)
+        # One token past <|think:start|>: at the block's first token the gate
+        # fires for the leading-newline set regardless of a retraction.
+        req = _req(rid="r0", origin_input_ids=[THINK_START, 5], max_new_tokens=100)
         solar_open2_fsm._req_fsm(req)  # seed the persistent FSM
         self.assertFalse(solar_open2_fsm.plan_gate([req], 3))
 

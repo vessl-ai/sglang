@@ -3915,5 +3915,75 @@ class TestSolarOpen2TruncatedReasoning(unittest.TestCase):
         self.assertEqual(normal, "")
 
 
+class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
+    """The effort a chat request asks for reaches the scheduler-side Solar FSM
+    through ``custom_params`` (``solar_open2_fsm.EFFORT_PARAM``), captured
+    before the xhigh/max -> high fold the chat template needs. A plain
+    TestCase on the shared mocks (not a ServingChatTestCase subclass, which
+    would re-run that suite's tests here)."""
+
+    KEY = "solar_reasoning_effort"
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat.reasoning_parser = "solar_open2"
+
+    def _req(self, **kwargs):
+        return ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}], **kwargs
+        )
+
+    def test_effort_is_captured_before_the_fold(self):
+        req = self._req(reasoning_effort="xhigh")
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "xhigh"})
+        self.assertEqual(req.reasoning_effort, "high")
+
+    def test_effort_from_chat_template_kwargs(self):
+        req = self._req(chat_template_kwargs={"reasoning_effort": "Max"})
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "max"})
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+
+    def test_existing_custom_params_are_kept_and_the_key_is_owned(self):
+        req = self._req(
+            reasoning_effort="medium", custom_params={"foo": 1, self.KEY: "max"}
+        )
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {"foo": 1, self.KEY: "medium"})
+        # A client-written key with no effort named is not a budget override.
+        req = self._req(custom_params={self.KEY: "max"})
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertIsNone(req.custom_params)
+
+    def test_missing_or_blank_effort_adds_no_key(self):
+        req = self._req()
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertIsNone(req.custom_params)
+        req = self._req(chat_template_kwargs={"reasoning_effort": "  "})
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertIsNone(req.custom_params)
+
+    def test_request_effort_wins_over_a_server_default_in_template_kwargs(self):
+        # --default-chat-template-kwargs lands in ctk after the client's own
+        # value moved to the request field; the template must follow the
+        # request (folded), as the budget does.
+        req = self._req(
+            reasoning_effort="max", chat_template_kwargs={"reasoning_effort": "low"}
+        )
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "max"})
+        self.assertEqual(req.reasoning_effort, "high")
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+
+    def test_effort_rides_to_sampling_params(self):
+        req = self._req(reasoning_effort="low")
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        params = req.to_sampling_params(stop=[], model_generation_config={})
+        self.assertEqual(params["custom_params"], {self.KEY: "low"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
