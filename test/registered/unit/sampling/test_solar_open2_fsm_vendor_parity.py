@@ -46,7 +46,13 @@ def _cfg(**overrides):
     c.reasoning_open_forbidden = tuple(sorted({EOS, IM_END, TOOL_START, NL, NLNL}))
     c.content_fresh_forbidden = (EOS, IM_END, THINK_START, THINK_END)
     c.content_done_forbidden = (THINK_START, THINK_END)
-    c.content_fresh_forbidden_notools = (EOS, IM_END, THINK_START, THINK_END, TOOL_START)
+    c.content_fresh_forbidden_notools = (
+        EOS,
+        IM_END,
+        THINK_START,
+        THINK_END,
+        TOOL_START,
+    )
     c.content_done_forbidden_notools = (THINK_START, THINK_END, TOOL_START)
     c.budget_policy = "effort"
     c.effort_budgets = dict(fsm._EFFORT_BUDGETS)
@@ -82,7 +88,9 @@ def _req(
         retraction_count=0,
         origin_input_ids=list(prompt),
         output_ids=list(output_ids),
-        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens, custom_params=custom),
+        sampling_params=SimpleNamespace(
+            max_new_tokens=max_new_tokens, custom_params=custom
+        ),
     )
 
 
@@ -112,8 +120,12 @@ class TestEffortBudget(unittest.TestCase):
         self.assertEqual(fsm._req_fsm(_req(effort=" Medium ")).budget, 16 * 1024)
 
     def test_budget_ignores_max_new_tokens(self):
-        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=100)).budget, 4 * 1024)
-        self.assertEqual(fsm._req_fsm(_req(effort="max", max_new_tokens=None)).budget, 128 * 1024)
+        self.assertEqual(
+            fsm._req_fsm(_req(effort="low", max_new_tokens=100)).budget, 4 * 1024
+        )
+        self.assertEqual(
+            fsm._req_fsm(_req(effort="max", max_new_tokens=None)).budget, 128 * 1024
+        )
 
     def test_none_and_minimal_close_the_block_at_once(self):
         for effort in ("none", "minimal"):
@@ -145,7 +157,9 @@ class TestEffortBudget(unittest.TestCase):
 
     def test_legacy_policy_keeps_the_old_formula(self):
         _cfg(budget_policy="legacy")
-        self.assertEqual(fsm._req_fsm(_req(effort="low", max_new_tokens=1000)).budget, 750)
+        self.assertEqual(
+            fsm._req_fsm(_req(effort="low", max_new_tokens=1000)).budget, 750
+        )
         self.assertEqual(fsm._req_fsm(_req(max_new_tokens=None)).budget, 3072)
 
     def test_non_string_effort_is_unknown(self):
@@ -257,7 +271,10 @@ class TestLeadingNewline(unittest.TestCase):
         self.assertEqual(set(range(VOCAB)) - _masked(logits, 3), {THINK_END})
 
     def test_disabled_rule_leaves_the_plain_set(self):
-        _cfg(leading_newline_forbidden=(), reasoning_open_forbidden=(EOS, IM_END, TOOL_START))
+        _cfg(
+            leading_newline_forbidden=(),
+            reasoning_open_forbidden=(EOS, IM_END, TOOL_START),
+        )
         self.assertEqual(_masked(_apply(_req())), {EOS, IM_END, TOOL_START})
 
 
@@ -287,9 +304,13 @@ class TestContentMask(unittest.TestCase):
         """With EOS shut in fresh CONTENT a model that wanted to stop takes
         <|tool_call:start|> as the exit; a request without tools loses it."""
         fresh = _req([7, THINK_END], tools=False)
-        self.assertEqual(_masked(_apply(fresh)), set(fsm.CFG.content_fresh_forbidden_notools))
+        self.assertEqual(
+            _masked(_apply(fresh)), set(fsm.CFG.content_fresh_forbidden_notools)
+        )
         done = _req([7, THINK_END, 8], tools=False)
-        self.assertEqual(_masked(_apply(done)), set(fsm.CFG.content_done_forbidden_notools))
+        self.assertEqual(
+            _masked(_apply(done)), set(fsm.CFG.content_done_forbidden_notools)
+        )
         self.assertIn(TOOL_START, _masked(_apply(done)))
 
     def test_tools_present_or_unstated_keep_the_vendor_sets(self):
@@ -347,7 +368,9 @@ class TestPlanGate(unittest.TestCase):
     def test_zero_budget_does_not_pin_a_closed_block_eager(self):
         """A none/minimal request whose block is closed (pre-closed by the
         template, or forced) must not keep the batch off the folded path."""
-        pre_closed = _req([7, 8], prompt=(1, 2, 3, THINK_START, THINK_END), effort="none")
+        pre_closed = _req(
+            [7, 8], prompt=(1, 2, 3, THINK_START, THINK_END), effort="none"
+        )
         self.assertFalse(self._gate(pre_closed))
         forced_then_content = _req([THINK_END, 7], effort="minimal")
         self.assertFalse(self._gate(forced_then_content))
@@ -377,7 +400,9 @@ class TestInitFromEnv(unittest.TestCase):
                 json.dump(body, f)
         self.base_env = {"SOLAR_FSM": "1", "SOLAR_FSM_TOKENIZER_DIR": self.dir}
         self.clear = [
-            k for k in os.environ if k.startswith("SOLAR_FSM_") and k != "SOLAR_FSM_TOKENIZER_DIR"
+            k
+            for k in os.environ
+            if k.startswith("SOLAR_FSM_") and k != "SOLAR_FSM_TOKENIZER_DIR"
         ]
 
     def _init(self, **env):
@@ -385,7 +410,11 @@ class TestInitFromEnv(unittest.TestCase):
             for k in self.clear:
                 os.environ.pop(k, None)
             for k in list(os.environ):
-                if k.startswith("SOLAR_FSM_") and k not in env and k not in self.base_env:
+                if (
+                    k.startswith("SOLAR_FSM_")
+                    and k not in env
+                    and k not in self.base_env
+                ):
                     os.environ.pop(k)
             fsm.CFG.enabled = False
             fsm.init_from_env()
@@ -423,7 +452,8 @@ class TestInitFromEnv(unittest.TestCase):
             self.assertNotIn(EOS, getattr(c, name))
             self.assertNotIn(IM_END, getattr(c, name))
         self.assertEqual(
-            set(c.content_done_forbidden_notools), set(c.content_done_forbidden) | {TOOL_START}
+            set(c.content_done_forbidden_notools),
+            set(c.content_done_forbidden) | {TOOL_START},
         )
 
     def test_per_effort_override_and_hard_limit(self):
@@ -452,7 +482,9 @@ class TestInitFromEnv(unittest.TestCase):
     def test_bad_values_fail_loud_by_name(self):
         with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT"):
             self._init(SOLAR_FSM_HARD_LIMIT="abc")
-        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_HARD_LIMIT must be positive"):
+        with self.assertRaisesRegex(
+            RuntimeError, "SOLAR_FSM_HARD_LIMIT must be positive"
+        ):
             self._init(SOLAR_FSM_HARD_LIMIT="0")
         with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_BUDGET_LOW must be >= 0"):
             self._init(SOLAR_FSM_BUDGET_LOW="-1")

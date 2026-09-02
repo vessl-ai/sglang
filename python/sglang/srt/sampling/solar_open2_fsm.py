@@ -217,7 +217,9 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
                 f"SOLAR_FSM_LEADING_NEWLINE_IDS must be a comma list of ids, got {raw!r}"
             ) from exc
         if any(i < 0 for i in ids):
-            raise RuntimeError(f"SOLAR_FSM_LEADING_NEWLINE_IDS has a negative id: {raw!r}")
+            raise RuntimeError(
+                f"SOLAR_FSM_LEADING_NEWLINE_IDS has a negative id: {raw!r}"
+            )
         return tuple(sorted(ids))
     tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
     vocab = {}
@@ -277,8 +279,10 @@ def _budget_for(effort, max_new_tokens: Optional[int]) -> int:
     budget = CFG.effort_budgets.get(key) if key is not None else None
     if budget is None:
         _warn_unknown_effort(effort)
-        budget = 0 if CFG.default_effort in _NO_REASONING_EFFORTS else (
-            CFG.effort_budgets[CFG.default_effort]
+        budget = (
+            0
+            if CFG.default_effort in _NO_REASONING_EFFORTS
+            else (CFG.effort_budgets[CFG.default_effort])
         )
     return min(budget, CFG.hard_limit)
 
@@ -303,18 +307,28 @@ def _req_tools(req) -> bool:
     return True
 
 
-def _content_forbidden(fsm: "SolarReqFSM", has_content: bool) -> Tuple[int, ...]:
+def _content_forbidden(fsm: SolarReqFSM, has_content: bool) -> Tuple[int, ...]:
     """CONTENT forbid set for a request: the vendor's (tool call allowed), or
     the no-tools variant that also forbids ``<|tool_call:start|>``."""
     if has_content:
-        return CFG.content_done_forbidden if fsm.tools else CFG.content_done_forbidden_notools
-    return CFG.content_fresh_forbidden if fsm.tools else CFG.content_fresh_forbidden_notools
+        return (
+            CFG.content_done_forbidden
+            if fsm.tools
+            else CFG.content_done_forbidden_notools
+        )
+    return (
+        CFG.content_fresh_forbidden
+        if fsm.tools
+        else CFG.content_fresh_forbidden_notools
+    )
 
 
 def _reasoning_forbidden(state) -> Tuple[int, ...]:
     """REASONING forbid set for ``state`` (a ``SolarReqFSM`` or ``_SimState``):
     the leading-newline ids join it on the token right after ``<|think:start|>``."""
-    return CFG.reasoning_open_forbidden if state.at_think_open else CFG.reasoning_forbidden
+    return (
+        CFG.reasoning_open_forbidden if state.at_think_open else CFG.reasoning_forbidden
+    )
 
 
 def init_from_env() -> None:
@@ -360,7 +374,9 @@ def init_from_env() -> None:
         sorted(set(CFG.reasoning_forbidden) | set(CFG.leading_newline_forbidden))
     )
 
-    CFG.budget_policy = os.environ.get("SOLAR_FSM_BUDGET_POLICY", "effort").strip().lower()
+    CFG.budget_policy = (
+        os.environ.get("SOLAR_FSM_BUDGET_POLICY", "effort").strip().lower()
+    )
     if CFG.budget_policy not in ("effort", "legacy"):
         raise RuntimeError(
             "SOLAR_FSM_BUDGET_POLICY must be 'effort' or 'legacy', got "
@@ -368,7 +384,9 @@ def init_from_env() -> None:
         )
     CFG.hard_limit = _env_int("SOLAR_FSM_HARD_LIMIT", _HARD_LIMIT)
     if CFG.hard_limit <= 0:
-        raise RuntimeError(f"SOLAR_FSM_HARD_LIMIT must be positive, got {CFG.hard_limit}")
+        raise RuntimeError(
+            f"SOLAR_FSM_HARD_LIMIT must be positive, got {CFG.hard_limit}"
+        )
     budgets = {}
     for effort, default in _EFFORT_BUDGETS.items():
         name = f"SOLAR_FSM_BUDGET_{effort.upper()}"
@@ -470,7 +488,9 @@ class SolarReqFSM:
         # True while the next token is the first one after <|think:start|>
         # (the chat template ends the prompt with it when reasoning is on).
         self.at_think_open = bool(
-            self.in_reasoning and len(prompt_ids) > 0 and prompt_ids[-1] == CFG.think_start
+            self.in_reasoning
+            and len(prompt_ids) > 0
+            and prompt_ids[-1] == CFG.think_start
         )
         self.content_progress = False
         self.count = 0
@@ -772,7 +792,9 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
             # also loses <|tool_call:start|>: with EOS shut, a model that
             # wanted to stop takes it as the exit instead (KMMLU-Pro medium
             # rerun: 13 of 35 no-answer rows ended on "<|tool_call:start|>think").
-            mask_rows.setdefault(_content_forbidden(fsm, fsm.content_progress), []).append(i)
+            mask_rows.setdefault(
+                _content_forbidden(fsm, fsm.content_progress), []
+            ).append(i)
 
     for ids, rows_i in mask_rows.items():
         if not ids:

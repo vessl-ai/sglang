@@ -1085,7 +1085,9 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> None:
         effort = request.reasoning_effort
         ctk = request.chat_template_kwargs
-        requested = effort if effort is not None else (ctk or {}).get("reasoning_effort")
+        requested = (
+            effort if effort is not None else (ctk or {}).get("reasoning_effort")
+        )
         # The scheduler-side FSM sizes the reasoning budget from the effort the
         # request asked for (solar_open2_fsm: low 4K .. max 128K), so hand it
         # over before the fold below hides xhigh/max from the template.
