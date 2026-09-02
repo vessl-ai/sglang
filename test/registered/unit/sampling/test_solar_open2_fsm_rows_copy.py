@@ -82,9 +82,34 @@ def _forward_copy(info: SamplingBatchInfo) -> SamplingBatchInfo:
     return info.copy_for_forward()
 
 
+_CFG_FIELDS = (
+    "enabled",
+    "think_start",
+    "think_end",
+    "all_controls",
+    "reasoning_forbidden",
+    "content_mask",
+    "spec_always_eager",
+    "budget_abs",
+    "budget_ratio",
+)
+
+
 class TestSolarFsmRowsSurviveCopy(unittest.TestCase):
     def setUp(self):
+        # CFG and _WARNED are module-global; restoring them in tearDown keeps
+        # this file from leaving a live FSM (or a spent once-only warning)
+        # behind for the other sampler suites in the same process.
+        self._saved = {k: getattr(fsm.CFG, k) for k in _CFG_FIELDS}
+        self._saved_warned = dict(fsm._WARNED)
         _cfg()
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(fsm.CFG, k, v)
+        fsm._WARNED.clear()
+        fsm._WARNED.update(self._saved_warned)
+        fsm.CFG._mask_cache.clear()
 
     def test_rows_is_a_declared_field(self):
         names = {f.name for f in dataclasses.fields(SamplingBatchInfo)}
@@ -159,17 +184,80 @@ class TestSolarFsmRowsSurviveCopy(unittest.TestCase):
         fsm.merge_rows(info, other)
         self.assertEqual(info.solar_fsm_rows, ["a", "c", "d"])
 
-    def test_merge_keeps_rows_when_one_side_has_none(self):
+    def test_merge_with_one_side_missing_keeps_rows_and_is_loud_once(self):
+        """A batch that lost its rows must not erase the other side's rows on
+        merge -- and, with the FSM on, the mismatch is reported once."""
+        fsm._WARNED["merge"] = False
+        for missing_side in ("self", "other"):
+            with self.subTest(missing=missing_side):
+                info, other = _minimal_sampling_info(), _minimal_sampling_info()
+                (other if missing_side == "self" else info).solar_fsm_rows = ["a"]
+                if missing_side == "self":
+                    with self.assertLogs(fsm.logger, level="WARNING") as captured:
+                        fsm.merge_rows(info, other)
+                    self.assertIn("one side has no solar_fsm_rows", captured.output[0])
+                else:
+                    with self.assertNoLogs(fsm.logger, level="WARNING"):
+                        fsm.merge_rows(info, other)  # warned once already
+                self.assertEqual(info.solar_fsm_rows, ["a"])
+        # Both sides missing is not a merge problem: nothing to warn about.
+        info, other = _minimal_sampling_info(), _minimal_sampling_info()
+        fsm._WARNED["merge"] = False
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            fsm.merge_rows(info, other)
+        self.assertIsNone(info.solar_fsm_rows)
+
+    def test_empty_rows_under_a_nonempty_batch_is_loud_once(self):
+        """Rows that fell out of step with the batch (here: an empty list under
+        a one-row logits tensor) are reported, once, and the step is skipped
+        rather than masked against the wrong rows."""
         info = _minimal_sampling_info()
-        info.solar_fsm_rows = ["a"]
-        other = _minimal_sampling_info()
-        fsm.merge_rows(info, other)
-        self.assertEqual(info.solar_fsm_rows, ["a"])
-        info2 = _minimal_sampling_info()
-        other2 = _minimal_sampling_info()
-        other2.solar_fsm_rows = ["b"]
-        fsm.merge_rows(info2, other2)
-        self.assertEqual(info2.solar_fsm_rows, ["b"])
+        info.solar_fsm_rows = []
+        logits = torch.zeros(1, VOCAB)
+        fsm._WARNED["shape"] = False
+        with self.assertLogs(fsm.logger, level="WARNING") as captured:
+            fsm.apply(logits, info)
+        self.assertIn("out of step", captured.output[0])
+        self.assertTrue(torch.isfinite(logits).all())
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            fsm.apply(logits, info)
+        # A genuinely empty batch stays silent.
+        with self.assertNoLogs(fsm.logger, level="WARNING"):
+            fsm.apply(torch.zeros(0, VOCAB), info)
+
+    def _orchestrator_stub(self):
+        return SimpleNamespace(
+            filter=lambda keep_indices_device: None,
+            merge=lambda other: None,
+            is_required=False,
+        )
+
+    def test_filter_batch_keeps_rows_in_step(self):
+        """Through the real ``SamplingBatchInfo.filter_batch``, not just the
+        helper: the rows list is filtered with the same indices as the
+        per-row tensors."""
+        info = _minimal_sampling_info()
+        info.penalizer_orchestrator = self._orchestrator_stub()
+        for item in ("temperatures", "top_ps", "top_ks", "min_ps"):
+            setattr(info, item, torch.tensor([0.1, 0.2, 0.3]))
+        reqs = [_req([10]), _req([11]), _req([12])]
+        info.solar_fsm_rows = list(reqs)
+        info.filter_batch([0, 2], torch.tensor([0, 2], dtype=torch.long))
+        self.assertEqual(info.solar_fsm_rows, [reqs[0], reqs[2]])
+        self.assertEqual(len(info), 2)
+
+    def test_merge_batch_keeps_rows_in_step(self):
+        """Through the real ``SamplingBatchInfo.merge_batch``: self's rows
+        first, then other's, matching the tensor concatenation order."""
+        left, right = _minimal_sampling_info(), _minimal_sampling_info()
+        for info, temps in ((left, [0.1, 0.2]), (right, [0.3])):
+            info.penalizer_orchestrator = self._orchestrator_stub()
+            info.temperatures = torch.tensor(temps)
+        lreqs, rreqs = [_req([10]), _req([11])], [_req([12])]
+        left.solar_fsm_rows, right.solar_fsm_rows = list(lreqs), list(rreqs)
+        left.merge_batch(right)
+        self.assertEqual(left.solar_fsm_rows, lreqs + rreqs)
+        self.assertEqual(len(left), 3)
 
 
 if __name__ == "__main__":

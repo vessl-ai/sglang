@@ -375,7 +375,20 @@ def merge_rows(sampling_info, other) -> None:
     other_rows = getattr(other, "solar_fsm_rows", None)
     if rows is None and other_rows is None:
         return
-    # One side without rows would otherwise drop the other's rows silently.
+    if (rows is None) != (other_rows is None) and is_active():
+        # from_schedule_batch attaches rows to every batch while the FSM is on,
+        # so one side arriving without them means a construction site skipped
+        # attach_rows: the merged list would be shorter than the batch and
+        # apply() would then skip the whole step. Merge what is there, loudly.
+        if not _WARNED["merge"]:
+            logger.warning(
+                "[SOLAR-FSM] merge_batch: one side has no solar_fsm_rows "
+                "(self=%s other=%s); the merged rows will be short of the batch. "
+                "This warning is logged once.",
+                "missing" if rows is None else len(rows),
+                "missing" if other_rows is None else len(other_rows),
+            )
+            _WARNED["merge"] = True
     sampling_info.solar_fsm_rows = list(rows or []) + list(other_rows or [])
 
 
@@ -433,7 +446,7 @@ def advance_committed(result, batch) -> None:
     result.solar_fsm_advanced = True
 
 
-_WARNED = {"shape": False, "rows": False}
+_WARNED = {"shape": False, "rows": False, "merge": False}
 
 
 def apply(logits: torch.Tensor, sampling_info) -> None:
@@ -444,29 +457,37 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
     rows = getattr(sampling_info, "solar_fsm_rows", None)
     if rows is None:
         # Every SamplingBatchInfo on the sampler path comes from
-        # from_schedule_batch, which attaches the rows whenever the FSM is on.
-        # Reaching here means a copy or a new construction site lost them --
-        # the failure this module once had silently. Say so, once.
+        # from_schedule_batch, which attaches the rows whenever the FSM is on
+        # (the one other construction site, the EAGLE draft cuda-graph runner,
+        # picks draft tokens itself and never reaches the Sampler). Reaching
+        # here means a copy or a new construction site lost them -- the failure
+        # this module once had silently. Say so, once.
         if not _WARNED["rows"]:
             logger.warning(
                 "[SOLAR-FSM] sampling_info carries no solar_fsm_rows while the "
-                "FSM is active: think-block masks are NOT applied on this path. "
-                "This warning is logged once."
+                "FSM is active (logits rows=%d): think-block masks are NOT "
+                "applied on this path. This warning is logged once.",
+                logits.shape[0],
             )
             _WARNED["rows"] = True
         return
-    if not rows:
-        return
     if logits.shape[0] != len(rows):
-        # Speculative decoding and other multi-token-per-row paths land here.
+        # The sampler sees one logits row per request, and the verify step of
+        # speculative decoding does not come through here (it masks its own
+        # strided logits via plan_verify). A mismatch -- including an empty
+        # rows list under a non-empty batch -- means the rows fell out of step
+        # with the batch somewhere (a filter or merge site).
         if not _WARNED["shape"]:
             logger.warning(
-                "[SOLAR-FSM] skipping mask: logits rows=%d != batch rows=%d "
-                "(spec decode?). This warning is logged once.",
+                "[SOLAR-FSM] skipping mask: logits rows=%d != batch rows=%d; "
+                "the rows list is out of step with the batch. This warning is "
+                "logged once.",
                 logits.shape[0],
                 len(rows),
             )
             _WARNED["shape"] = True
+        return
+    if not rows:
         return
 
     force_rows: List[int] = []
