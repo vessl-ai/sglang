@@ -617,10 +617,6 @@ class TestInitFromEnv(_FsmCase):
         self._init(SOLAR_FSM_DEFAULT_EFFORT="none")
         self.assertEqual(fsm._budget_for(None, 4096), 0)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_all_fourteen_sentinels_are_controls_and_newline_added_token_is_leading(
         self,
     ):
@@ -1037,7 +1033,9 @@ class TestSpecPathToolStates(_FsmCase):
 
     def test_plan_gate_goes_eager_inside_a_tool_call(self):
         """With a committed FSM: a row in any TOOL_* state leaves the folded
-        path; content-with-progress stays on it."""
+        path (also after content, when content_progress is True);
+        content-with-progress stays on it; fresh CONTENT under a grammar
+        stays on it (the grammar owns CONTENT), without a grammar leaves."""
         for output, state in (
             ((THINK_END, TOOL_START), fsm.TOOL_CALL_BEGIN),
             ((THINK_END, TOOL_START, 7), fsm.TOOL_CALL_NAME),
@@ -1046,12 +1044,18 @@ class TestSpecPathToolStates(_FsmCase):
                 fsm.TOOL_ARG_VALUE_BEGIN,
             ),
             (self.CALL[:-1], fsm.TOOL_ARG_END),
+            # A second call after content: content_progress is True, so only
+            # the tool-state clause can send the row eager (review round 3).
+            (self.CALL + (11, TOOL_START), fsm.TOOL_CALL_BEGIN),
+            (self.CALL + (11, TOOL_START, 7), fsm.TOOL_CALL_NAME),
         ):
             with self.subTest(state=fsm._STATE_NAMES[state]):
                 req = _req(output, tools=True, rid=f"r{state}")
                 committed = fsm._req_fsm(req)
                 committed.advance(req.output_ids)
                 self.assertEqual(committed.state, state)
+                if output[: len(self.CALL)] == self.CALL:
+                    self.assertTrue(committed.content_progress)
                 self.assertTrue(fsm.plan_gate([req], stride=3))
         req = _req(self.CALL + (11,), tools=True, rid="done")
         committed = fsm._req_fsm(req)
@@ -1084,3 +1088,7 @@ class TestSpecPathToolStates(_FsmCase):
             plan.mask_rows[fsm.CFG.forbidden[(fsm.TOOL_ARG_NAME, False)]], [2]
         )
         self.assertEqual(plan.force_rows, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3605,6 +3605,113 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         )
         self.assertEqual(json.loads(arguments), {"location": "Paris"})
 
+    def _finish_choice(self, text, finish_reason, request=None):
+        """Streaming through _generate_chat_stream (the finish_reason chunk is
+        built there, not in _generate_stream_content): return the one choice
+        that carries finish_reason."""
+        request = (request or self.request).model_copy(update={"stream": True})
+
+        async def _gen():
+            yield {
+                "text": text,
+                "index": 0,
+                "meta_info": {
+                    "id": "chatcmpl-solar-finish",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 7,
+                    "cached_tokens": 0,
+                    "finish_reason": dict(finish_reason),
+                },
+            }
+
+        self.chat.tokenizer_manager.generate_request.return_value = _gen()
+        raw_request = Mock(spec=Request)
+        raw_request.headers = {}
+
+        async def run():
+            out = []
+            async for chunk in self.chat._generate_chat_stream(
+                Mock(), request, raw_request
+            ):
+                out.append(chunk)
+            return out
+
+        chunks = get_or_create_event_loop().run_until_complete(run())
+        finishing = []
+        for c in chunks:
+            if not c.startswith("data: ") or c == "data: [DONE]\n\n":
+                continue
+            for choice in json.loads(c[len("data: ") :]).get("choices") or []:
+                if choice.get("finish_reason"):
+                    finishing.append(choice)
+        self.assertEqual(len(finishing), 1, chunks)
+        return finishing[0]
+
+    def test_streaming_finish_chunk_hides_the_internal_stop(self):
+        """The finish_reason chunk: a glued call is reported as tool_calls with
+        no matched_stop; our stop matched without a call is "stop" with no
+        matched_stop; a client's own stop string is still reported (round 3
+        I4: both rewrites lived without a test that drove the chunk)."""
+        choice = self._finish_choice(self._TRIMMED_CALL_TEXT, self._STOP_MATCHED)
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertIsNone(choice.get("matched_stop"))
+
+        choice = self._finish_choice("Sure, here it is:", self._STOP_MATCHED)
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertIsNone(choice.get("matched_stop"))
+
+        required = self.request.model_copy(
+            update={"tool_choice": "required", "stop": [SOLAR_OPEN2_TOOL_CALL_END]}
+        )
+        choice = self._finish_choice("nothing", self._STOP_MATCHED, required)
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice.get("matched_stop"), SOLAR_OPEN2_TOOL_CALL_END)
+
+    def test_single_call_stop_predicate_excludes_named_tool_choice(self):
+        """required/named use maxItems=1 on the JSON-schema array, never the
+        stop string: the predicate rejects both even if a client put the
+        terminator in its own stop list."""
+        tools = self.chat._effective_tools(self.request)
+        self.assertTrue(
+            self.chat._solar_single_call_stop_matched(
+                self.request, tools, dict(self._STOP_MATCHED)
+            )
+        )
+        for choice in (
+            "required",
+            {"type": "function", "function": {"name": "get_weather"}},
+        ):
+            with self.subTest(tool_choice=choice):
+                # Validated, as a real request is (a named choice becomes a
+                # ToolChoice model, which the predicate tests for).
+                request = ChatCompletionRequest.model_validate(
+                    {
+                        **self.request.model_dump(exclude_none=True),
+                        "tool_choice": choice,
+                    }
+                )
+                self.assertFalse(
+                    self.chat._solar_single_call_stop_matched(
+                        request, tools, dict(self._STOP_MATCHED)
+                    )
+                )
+
+    def test_non_streaming_fence_opened_call_is_glued(self):
+        """The fence-opened shape the detector accepts is an opener for the
+        glue too (the streaming glue asks the detector; non-streaming asks
+        the same helper), so the trimmed terminator is restored."""
+        text = (
+            "```get_weather\n"
+            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>\n"
+        )
+        choice = self._build_choice(self.request, text, self._STOP_MATCHED)
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        self.assertEqual(
+            json.loads(choice.message.tool_calls[0].function.arguments),
+            {"location": "Paris"},
+        )
+
     def test_streaming_stop_matched_without_opener_does_not_glue(self):
         """The injected stop matched but the model never opened a call: there
         is nothing to close, so the terminator is not fed to the detector --

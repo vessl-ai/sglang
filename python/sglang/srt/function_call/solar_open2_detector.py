@@ -149,6 +149,12 @@ def _param_type(
     return None
 
 
+def has_call_opener(text: str) -> bool:
+    """Whether ``text`` contains a call opener (marker or fence form) -- the
+    serving layer's test for gluing a trimmed terminator back on."""
+    return TOOL_CALL_START in text or FENCE_CALL_OPEN.search(text) is not None
+
+
 class SolarOpen2Detector(BaseFormatDetector):
     """Non-streaming + buffered-streaming detector for the Solar Open2 format."""
 
@@ -164,8 +170,11 @@ class SolarOpen2Detector(BaseFormatDetector):
         self._pending_ws: str = ""
         self.bot_token = TOOL_CALL_START
         self.eot_token = TOOL_CALL_END
+        # The name group excludes a sentinel prefix: with the vendor's ``(.+?)``
+        # a call missing its newline followed by a well-formed one parses as
+        # one call named "<name><|tool_call:end|>..." (a fake call, no log).
         self.tool_call_pattern = re.compile(
-            rf"{re.escape(TOOL_CALL_START)}(.+?)\n"
+            rf"{re.escape(TOOL_CALL_START)}((?:(?!<\|)[^\n])+?)\n"
             rf"(.*?)"
             rf"{re.escape(TOOL_CALL_END)}",
             re.DOTALL,
@@ -184,6 +193,15 @@ class SolarOpen2Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         return TOOL_CALL_START in text or bool(self.fence_call_pattern.search(text))
+
+    def _call_starts_all(self, text: str) -> List[int]:
+        """Every call opener in ``text`` (marker or fence form), in order."""
+        starts = [m.start() for m in re.finditer(re.escape(TOOL_CALL_START), text)]
+        starts += [
+            m.start() + (1 if text[m.start()] == "\n" else 0)
+            for m in FENCE_CALL_OPEN.finditer(text)
+        ]
+        return sorted(starts)
 
     def _call_starts(self, text: str) -> List[int]:
         """Start offsets of call openers in ``text`` (marker or fence form)."""
@@ -280,6 +298,14 @@ class SolarOpen2Detector(BaseFormatDetector):
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
             )
+        if not streaming and calls:
+            openers = len(self._call_starts_all(text))
+            if openers > len(calls):
+                logger.warning(
+                    "Solar Open2: %d opener(s) in the output did not parse as a "
+                    "call and are not content",
+                    openers - len(calls),
+                )
         if streaming and text_out is not None and calls:
             trailing = text[consumed_until:]
             if self._call_starts(trailing):
@@ -323,9 +349,10 @@ class SolarOpen2Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         """Buffer until whole calls are closed, then emit them at once.
 
-        The wire format is not incrementally valid JSON, so per-token argument
-        streaming would emit unparsable fragments. Callers get complete
-        ToolCallItems one call at a time instead.
+        A kept delta from the vendor's streaming parser, which streams
+        string-typed argument values per token: this detector emits complete
+        ToolCallItems only (every call closed in the buffer at once), so a
+        client never assembles a partial call.
 
         Content is decided as the vendor's streaming parser decides it, and
         independently of where the chunks are cut: text before the first
@@ -415,7 +442,8 @@ class SolarOpen2Detector(BaseFormatDetector):
         (opened, never closed -- e.g. cut by max_tokens) are returned as
         content, so nothing is dropped silently -- the vendor's non-streaming
         parser keeps such output as content (its streaming parser has already
-        emitted it as deltas). After a call was emitted, only real trailing
+        emitted as deltas whatever it had parsed; a call cut inside its name
+        is emitted by neither). After a call was emitted, only real trailing
         text is content (see parse_streaming_increment)."""
         held, self._buffer = self._buffer, ""
         unparsed, self._unparsed = self._unparsed, ""
@@ -452,13 +480,12 @@ class SolarOpen2Detector(BaseFormatDetector):
         (a JSON array of calls, parsed by the JSON path), as the vendor's vLLM
         serving does (``ToolParser.adjust_request`` -> ``StructuredOutputsParams
         (json=...)``; ``SolarOpen2ToolParser`` keeps the default
-        ``supports_required_and_named``). The legacy structural tag built from
-        :meth:`structure_info` forces only the opening ``<|tool_call:start|>``
-        as a token; xgrammar matches the closing marker as a *string*, so the
-        model may spell ``<|tool_call:end|>`` out in text, and the Solar
+        ``supports_required_and_named``). Under the legacy structural tag
+        built from :meth:`structure_info` the model was observed to spell
+        ``<|tool_call:end|>`` out as text (a structural tag's begin/end/
+        trigger are all text; see ``_has_grammar`` in the FSM), and the Solar
         Open2 FSM (``srt/sampling/solar_open2_fsm.py``), which tracks the
-        tool-call envelope by sentinel id, would then never see the call
-        close. With JSON output no sentinel is emitted at all and the FSM
+        tool-call envelope by sentinel id, then never saw the call close. With JSON output no sentinel is emitted at all and the FSM
         stays in CONTENT, where the grammar owns the phase -- the vendor's
         exact rule."""
         return False

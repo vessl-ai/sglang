@@ -165,9 +165,10 @@ _LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")  # named in the fail-loud message only
 # effort to the scheduler-side FSM (serving_chat._normalize_solar_open2_reasoning_effort).
 EFFORT_PARAM = "solar_reasoning_effort"
 # custom_params key: whether the request offers tools (chat entrypoint). A
-# request without tools can never have a <|tool_call:start|> answered, so its
-# CONTENT states forbid the token; with EOS shut in fresh CONTENT the model
-# otherwise takes it as the exit ("<|tool_call:start|>think" then stop).
+# request without tools can never have a <|tool_call:start|> answered, so the
+# no-tools table forbids the token in every state (it matters in CONTENT: with
+# EOS shut in fresh CONTENT the model otherwise takes it as the exit --
+# "<|tool_call:start|>think" then stop).
 TOOLS_PARAM = "solar_tools_available"
 
 
@@ -577,7 +578,8 @@ def init_from_env() -> None:
             # Vendor: a negative per-effort budget falls back to the built-in
             # default with a warning rather than failing every request (a
             # non-integer value still fails loud in _env_int, unlike the
-            # vendor, which warns for every malformed value).
+            # vendor, which warns for every malformed value; a blank value
+            # takes the default silently here, with a warning there).
             logger.warning(
                 "[SOLAR-FSM] ignoring %s=%d (must be >= 0); using the built-in "
                 "%s budget %d.",
@@ -1071,7 +1073,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
             # until real content exists (otherwise the model leaves reasoning
             # and immediately stops with an empty answer: 6/13 GPQA errors in
             # R2-3rd had content_len == 0); inside a tool call only the
-            # envelope sentinel the sub-state expects is open. A request
+            # envelope sentinel(s) the sub-state expects are open. A request
             # without tools also loses <|tool_call:start|>: with EOS shut, a
             # model that wanted to stop takes it as the exit instead (KMMLU-Pro
             # medium rerun: 13 of 35 no-answer rows ended on
@@ -1257,11 +1259,13 @@ def plan_gate(reqs, stride: int) -> bool:
     -- too late for the folded epilogue, which accepts inside the cuda graph
     off its own buffers. Each is judged per row from committed state, so
     outside a tool call a generation spends only its boundary steps eager.
-    A committed-CONTENT row under a grammar folds as well (the grammar owns
-    CONTENT), so a drafted sentinel can put chain positions 1..stride-1 into
-    TOOL_* states the folded mask does not carry; the grammar rejects the
-    sentinel at accept, which bounds it (the general <=stride-1 gap is
-    INF-450).
+    A CONTENT row under a grammar -- fresh or not -- folds as well, exempt
+    from the content-mask clause below: the grammar owns CONTENT (the vendor's
+    rule), the folded mask writes nothing for it and plan_verify is not
+    consulted on a folded step, so a drafted sentinel can put chain positions
+    1..stride-1 into TOOL_* states that carry no mask. A JSON-schema grammar
+    (required/named) cannot emit a sentinel, which bounds it; an ebnf/regex
+    grammar could (the general <=stride-1 gap is INF-450).
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied
@@ -1303,8 +1307,9 @@ def plan_gate(reqs, stride: int) -> bool:
             and (fsm.state != CONTENT or not fsm.content_progress)
             and not (fsm.state == CONTENT and _has_grammar(req))
         ):
-            # Fresh CONTENT, and every step inside a tool call (its envelope
-            # set masks EOS/<|im:end|>, which the folded mask does not carry):
+            # Fresh CONTENT (unless a grammar owns it -- see the docstring),
+            # and every step inside a tool call (its envelope set masks
+            # EOS/<|im:end|>, which the folded mask does not carry):
             # the fresh-content set is plan_verify's alone. Once
             # the turn has content the folded path is kept -- its unmasked
             # CONTENT rows then only lack content_done_forbidden (stray control

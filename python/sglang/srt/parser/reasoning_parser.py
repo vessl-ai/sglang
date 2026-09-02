@@ -1940,9 +1940,10 @@ class ReasoningParser:
             force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
         # --- solar-open2 force_reasoning override (injected) ---
-        # The solar_open2 template pre-closes the think block for
-        # reasoning_effort none/low, so whether the stream starts inside
-        # reasoning depends on the request, not on the detector default.
+        # The solar_open2 template pre-closes the think block for every
+        # reasoning_effort other than medium/high (xhigh/max reach it only
+        # after serving_chat's fold to high), so whether the stream starts
+        # inside reasoning depends on the request, not on the detector default.
         if model_type.lower() == "solar_open2":
             force_reasoning = solar_open2_force_reasoning(request)
 
@@ -2052,7 +2053,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     (`` ```name `` followed by ``<|tool_arg:start|>`` — see
     ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
     Without the escape, the call would ride the think block to its end and
-    never reach the tool-call parser as a parseable block.
+    never reach the tool-call parser as a parseable block. The escape holds
+    in streaming, and in non-streaming only when the block never closes: a
+    call completed inside a block that closes later stays in reasoning here
+    (the vendor promotes such blocks after the content; phase 2, INF-451).
 
     The content region may open with *redundant* ``<|think:end|>`` sentinels.
     The FSM (``srt/sampling/solar_open2_fsm.py``) force-closes reasoning once
@@ -2076,7 +2080,9 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     output is returned as reasoning, with only complete embedded tool-call
     blocks promoted to content. Only a request with reasoning off puts this
     text on the content channel, and such a request never opens a think block
-    to leave unclosed.
+    to leave unclosed (the model may still open one itself, e.g. after a tool
+    result; a block cut there is reasoning here and content in the vendor's
+    parser -- an edge case).
     """
 
     def __init__(

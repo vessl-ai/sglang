@@ -1725,10 +1725,6 @@ class TestSolarOpen2NoEndTag(CustomTestCase):
         self.assertEqual(content, "Hello")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
     """Continuing an assistant turn resumes inside the think block.
 
@@ -1776,3 +1772,7 @@ class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
         ret = detector.detect_and_parse("still thinking")
         self.assertEqual(ret.reasoning_text, "still thinking")
         self.assertEqual(ret.normal_text, "")
+
+
+if __name__ == "__main__":
+    unittest.main()

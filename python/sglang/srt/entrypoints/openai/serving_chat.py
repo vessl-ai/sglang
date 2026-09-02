@@ -68,6 +68,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.solar_open2_detector import (
     TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
+    has_call_opener as _solar_has_call_opener,
     TOOL_CALL_START as SOLAR_OPEN2_TOOL_CALL_START,
 )
 
@@ -1119,8 +1120,9 @@ class OpenAIServingChat(OpenAIServingBase):
             custom[SOLAR_OPEN2_EFFORT_PARAM] = requested.strip().lower()
         # Whether a tool call can be answered at all -- the tool-call parser's
         # own condition (tools offered, tool_choice not "none", a parser
-        # configured). Otherwise the FSM forbids <|tool_call:start|> in
-        # CONTENT, where a model shut out of EOS takes it as the exit.
+        # configured). Otherwise the FSM forbids <|tool_call:start|> in every
+        # state (it matters in CONTENT, where a model shut out of EOS takes it
+        # as the exit).
         custom[SOLAR_OPEN2_TOOLS_PARAM] = self._tool_call_parsing_active(request)
         request.custom_params = custom
         # The chat template tests the effort with an exact, case-sensitive
@@ -1975,10 +1977,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The internal stop string is not part of the response,
                 # whether or not a call parses from the glued text.
                 finish_reason["matched"] = None
-                if SOLAR_OPEN2_TOOL_CALL_START in text:
+                if _solar_has_call_opener(text):
                     text += SOLAR_OPEN2_TOOL_CALL_END
-                # else: the terminator matched without an opener (malformed
-                # generation) -- nothing to glue.
+                # else: the terminator matched without an opener (marker or
+                # fence form; the same test the streaming glue applies) --
+                # nothing to glue.
 
             # Handle reasoning content
             reasoning_text = None

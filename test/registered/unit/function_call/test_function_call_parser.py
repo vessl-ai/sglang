@@ -5376,6 +5376,27 @@ class TestSolarOpen2Detector(unittest.TestCase):
                         tail.rstrip() if sep.strip() else "",
                     )
 
+    def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
+        """A call without the newline after its name followed by a well-formed
+        call: with the vendor's ``(.+?)`` name group the two parse as one
+        fake call named "<name><|tool_call:end|>..."; the name group here
+        stops at a sentinel, so the good call parses and the bad one is
+        reported (review round 3)."""
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            result = detector.detect_and_parse(bad + "\n" + good, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertEqual(result.normal_text, "")
+        self.assertTrue(any("did not parse" in m for m in logs.output))
+
     def test_stream_end_after_a_call_drops_a_cut_second_call(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
