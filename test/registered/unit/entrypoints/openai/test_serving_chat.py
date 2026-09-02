@@ -900,11 +900,11 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIsNone(result.stop)
 
     def test_solar_open2_parallel_tool_calls_false_injects_call_end_stop(self):
-        """The solar_open2 structural tag has no call-count knob (only
-        at_least_one) and auto has no constraint at all, so
-        parallel_tool_calls=False is enforced by stopping generation at the
-        per-call terminator instead -- but only when the request actually
-        asks for it. The stop injection does not depend on the constraint
+        """tool_choice=auto has no grammar, so parallel_tool_calls=False is
+        enforced by stopping generation at the per-call terminator -- but
+        only when the request actually asks for it. required/named get
+        maxItems=1 on the JSON-schema array instead and no stop string. The
+        stop injection does not depend on a constraint
         (get_structure_constraint is mocked to None here for the auto
         case)."""
         self.template_manager.chat_template_name = None
@@ -4174,6 +4174,15 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.chat._normalize_solar_open2_reasoning_effort(req)
         self.assertEqual(req.custom_params, {self.KEY: "max", self.TOOLS: False})
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+
+    def test_template_kwargs_effort_is_lower_cased_for_the_template(self):
+        """chat_template.jinja tests the effort with an exact, case-sensitive
+        ``in``; a differently cased value would render the closed think pair
+        while the FSM budget (lower-cased) followed the requested tier."""
+        req = self._req(chat_template_kwargs={"reasoning_effort": " Medium "})
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "medium")
 
     def test_existing_custom_params_are_kept_and_the_key_is_owned(self):
         req = self._req(

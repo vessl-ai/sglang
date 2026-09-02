@@ -1,9 +1,15 @@
 """Vendor-parity rules of the Solar-Open2 FSM.
 
 The vendor's reference is the UpstageAI vLLM logits processor (Solar Pro 4
-parser/LP patch set for vLLM 0.25.0, 2026-09-01). Three of its rules are
-checked here against ``solar_open2_fsm``:
+parser/LP patch set for vLLM 0.25.0, 2026-09-01). The rules checked here
+against ``solar_open2_fsm``:
 
+* the forbidden tables per state (all sentinels minus the state's allowed
+  set, EOS masked outside CONTENT, sentinels never counted as EOS);
+* the tool-call envelope walk -- transitions and auto-advance -- checked
+  differentially against a transcript of the vendor's ``_process_token``;
+* budget accounting (REASONING tokens only, reset at ``<|think:start|>``)
+  and the env semantics of the budget/hard-limit overrides;
 * the reasoning budget is a fixed table keyed by the request's reasoning
   effort (low 4K / medium 16K / high 32K / xhigh 64K / max 128K, default
   high, none/minimal close the block at once, nothing above the hard limit),

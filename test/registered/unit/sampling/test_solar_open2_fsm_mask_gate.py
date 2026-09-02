@@ -9,9 +9,10 @@ Two mechanisms cover it, and the invariant is that together they leave no gap:
 
 * ``plan_gate`` sends the step to the eager path, where ``plan_verify`` writes
   the mask. It fires only for what the eager path is *needed* for -- a forced
-  ``<|think:end|>`` at a spent budget, and the ``content_mask`` sets -- because
-  forcing eager on every thinking step would cost the folded in-graph accept
-  for most of a generation.
+  ``<|think:end|>`` at a spent budget, the ``content_mask`` sets (a fresh
+  CONTENT row and every step inside a tool call), and the leading-newline set
+  right after ``<|think:start|>`` -- because forcing eager on every thinking
+  step would cost the folded in-graph accept for most of a generation.
 * ``folded_mask_flags`` carries the reasoning mask into the graph instead, one
   flag per (request, chain position) row.
 
@@ -216,7 +217,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
         self.assertFalse(fsm.plan_gate([req], 8))
 
-    def test_content_mask_gates_only_a_fresh_content_row(self):
+    def test_content_mask_gates_a_fresh_content_row(self):
         """The content sets have no in-graph carrier, so a row whose turn has
         no content yet must go eager; once it has content the fold is kept
         (its rows then only lack the content_done set, a documented gap)."""

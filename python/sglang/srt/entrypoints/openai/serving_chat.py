@@ -1111,15 +1111,22 @@ class OpenAIServingChat(OpenAIServingBase):
         # CONTENT, where a model shut out of EOS takes it as the exit.
         custom[SOLAR_OPEN2_TOOLS_PARAM] = self._tool_call_parsing_active(request)
         request.custom_params = custom
-        if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
-            request.reasoning_effort = "high"
+        # The chat template tests the effort with an exact, case-sensitive
+        # ``in`` (a differently cased value renders the closed think pair), so
+        # the value handed to the template is lower-cased here -- one place --
+        # and solar_open2_force_reasoning mirrors that.
+        if isinstance(effort, str):
+            effort = effort.strip().lower()
+            request.reasoning_effort = (
+                "high" if effort in self._SOLAR_OPEN2_EFFORT_FOLD else effort
+            )
         if ctk:
             effort = ctk.get("reasoning_effort")
-            if (
-                isinstance(effort, str)
-                and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD
-            ):
-                ctk["reasoning_effort"] = "high"
+            if isinstance(effort, str) and effort.strip():
+                effort = effort.strip().lower()
+                ctk["reasoning_effort"] = (
+                    "high" if effort in self._SOLAR_OPEN2_EFFORT_FOLD else effort
+                )
             if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
                 # One source for the template: the request's (folded) effort.
                 # A server default in --default-chat-template-kwargs lands in

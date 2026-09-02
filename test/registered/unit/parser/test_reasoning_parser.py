@@ -1631,9 +1631,11 @@ class TestSolarOpen2NoEndTag(CustomTestCase):
 
     A stop string or the token budget can end generation inside the think
     block. The text stays on the reasoning channel and content is empty --
-    the contract Upstage states for this model (2026-09-01). The reference
-    parser (UpstageAI/vllm) returns the whole output as content instead,
-    which this class asserted until the behaviour was measured end to end:
+    the contract Upstage states for this model (2026-09-01). The vendor's
+    current parser (2026-09-01 patch set) does the same when the request's
+    effort opened the block; its older parser returned the whole output as
+    content, which this class asserted until the behaviour was measured end
+    to end:
     ``stop:["**"]`` came back as ``content="Thinking Process:\n\n1.  "``
     with ``finish_reason: "stop"``, so a caller reads a few tokens of
     thinking preamble as a complete short answer. Any stop string occurring
