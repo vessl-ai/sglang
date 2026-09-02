@@ -1095,10 +1095,11 @@ class OpenAIServingChat(OpenAIServingBase):
         custom.pop(SOLAR_OPEN2_EFFORT_PARAM, None)
         if isinstance(requested, str) and requested.strip():
             custom[SOLAR_OPEN2_EFFORT_PARAM] = requested.strip().lower()
-        # Whether a tool call can be answered at all: without tools the FSM
-        # forbids <|tool_call:start|> in CONTENT, where a model shut out of
-        # EOS otherwise takes it as the exit.
-        custom[SOLAR_OPEN2_TOOLS_PARAM] = bool(self._effective_tools(request))
+        # Whether a tool call can be answered at all -- the tool-call parser's
+        # own condition (tools offered, tool_choice not "none", a parser
+        # configured). Otherwise the FSM forbids <|tool_call:start|> in
+        # CONTENT, where a model shut out of EOS takes it as the exit.
+        custom[SOLAR_OPEN2_TOOLS_PARAM] = self._tool_call_parsing_active(request)
         request.custom_params = custom
         if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
             request.reasoning_effort = "high"

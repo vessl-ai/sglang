@@ -3930,6 +3930,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
         self.chat.reasoning_parser = "solar_open2"
+        self.chat.tool_call_parser = "solar_open2"
 
     def _req(self, **kwargs):
         return ChatCompletionRequest(
@@ -3977,6 +3978,16 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         req = self._req(reasoning_effort="medium", tools=[tool])
         self.chat._normalize_solar_open2_reasoning_effort(req)
         self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: True})
+        # tool_choice="none" switches the tool-call parser off, so a tool call
+        # could not be answered either.
+        req = self._req(reasoning_effort="medium", tools=[tool], tool_choice="none")
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
+        # No tool-call parser configured: nothing could consume the call.
+        self.chat.tool_call_parser = None
+        req = self._req(reasoning_effort="medium", tools=[tool])
+        self.chat._normalize_solar_open2_reasoning_effort(req)
+        self.assertEqual(req.custom_params, {self.KEY: "medium", self.TOOLS: False})
 
     def test_request_effort_wins_over_a_server_default_in_template_kwargs(self):
         # --default-chat-template-kwargs lands in ctk after the client's own

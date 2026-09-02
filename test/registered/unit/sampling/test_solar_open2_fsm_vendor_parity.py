@@ -366,6 +366,7 @@ class TestInitFromEnv(unittest.TestCase):
                     str(THINK_START): {"content": "<|think:start|>"},
                     str(THINK_END): {"content": "<|think:end|>"},
                     str(IM_END): {"content": "<|im:end|>"},
+                    str(TOOL_START): {"content": "<|tool_call:start|>"},
                 }
             },
             "generation_config.json": {"eos_token_id": [EOS]},
@@ -405,6 +406,25 @@ class TestInitFromEnv(unittest.TestCase):
             set(c.reasoning_open_forbidden), set(c.reasoning_forbidden) | {NL, NLNL}
         )
         self.assertIn(EOS, c.reasoning_forbidden)
+
+    def test_content_sets_are_built_from_the_vocab(self):
+        """The vendor sets allow a tool call; the no-tools variants forbid it.
+        EOS is shut only while the turn has no content."""
+        self._init()
+        c = fsm.CFG
+        self.assertNotIn(TOOL_START, c.content_fresh_forbidden)
+        self.assertNotIn(TOOL_START, c.content_done_forbidden)
+        self.assertIn(TOOL_START, c.content_fresh_forbidden_notools)
+        self.assertIn(TOOL_START, c.content_done_forbidden_notools)
+        for name in ("content_fresh_forbidden", "content_fresh_forbidden_notools"):
+            self.assertIn(EOS, getattr(c, name))
+            self.assertIn(IM_END, getattr(c, name))
+        for name in ("content_done_forbidden", "content_done_forbidden_notools"):
+            self.assertNotIn(EOS, getattr(c, name))
+            self.assertNotIn(IM_END, getattr(c, name))
+        self.assertEqual(
+            set(c.content_done_forbidden_notools), set(c.content_done_forbidden) | {TOOL_START}
+        )
 
     def test_per_effort_override_and_hard_limit(self):
         self._init(SOLAR_FSM_BUDGET_MEDIUM="777", SOLAR_FSM_HARD_LIMIT="50000")

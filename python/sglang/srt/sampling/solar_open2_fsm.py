@@ -985,8 +985,10 @@ def plan_gate(reqs, stride: int) -> bool:
             # Fresh CONTENT: the fresh-content set is plan_verify's alone. Once
             # the turn has content the folded path is kept -- its unmasked
             # CONTENT rows then only lack content_done_forbidden (stray control
-            # tokens), the same class of gap as a drafted <|think:start|>
-            # (folded_mask_flags). A think_end accepted in the run this state
+            # tokens; for a request without tools that includes
+            # <|tool_call:start|>, benign here because the exit it offers only
+            # matters while EOS is shut, i.e. in fresh CONTENT), the same class
+            # of gap as a drafted <|think:start|> (folded_mask_flags). A think_end accepted in the run this state
             # lags behind is covered by the folded mask's overmask for the EOS
             # / <|im:end|> half of the fresh-content rule (the rest of that
             # chain is still masked with the reasoning set: it also holds
