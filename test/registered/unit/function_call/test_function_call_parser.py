@@ -5291,6 +5291,53 @@ class TestSolarOpen2Detector(unittest.TestCase):
         result = detector.detect_and_parse(text, self.tools)
         self.assertEqual((result.normal_text, result.calls), (text, []))
 
+    def test_streaming_text_between_calls_is_not_content(self):
+        """Once a call has been emitted, text between or after calls is not
+        content -- the non-streaming rule -- however the chunks are cut
+        (review round 2: a separator newline became a content delta with
+        small chunks while prose vanished with large ones)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for sep in ("\n", "\n\n", "\nAlso:\n"):
+            with self.subTest(sep=repr(sep)):
+                text = call + sep + call
+                for size in (len(text), 5):
+                    parser = FunctionCallParser(self.tools, "solar_open2")
+                    texts, calls = [], []
+                    for i in range(0, len(text), size):
+                        t, c = parser.parse_stream_chunk(text[i : i + size])
+                        texts.append(t or "")
+                        calls.extend(c)
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual("".join(texts), "")
+                    # And whatever trails the last call is not content either.
+                    t, c = parser.parse_stream_chunk("\nDone." if sep.strip() else "\n")
+                    self.assertEqual((t or "", c), ("", []))
+                    fin = parser.detector.finish(self.tools)
+                    self.assertEqual((fin.normal_text, fin.calls), ("", []))
+
+    def test_stream_end_after_a_call_drops_a_cut_second_call(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        _, calls = parser.parse_stream_chunk(call + f"\n{TOOL_CALL_START}get_time\n")
+        self.assertEqual(len(calls), 1)
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            end_text, end_calls = parser.parse_stream_end()
+        self.assertEqual((end_text, end_calls), ("", []))
+
     def test_stream_end_releases_held_text(self):
         """Text held back for a marker that never arrives (a trailing code
         fence, an unfinished call cut by max_tokens) is released as content

@@ -1293,7 +1293,11 @@ def plan_gate(reqs, stride: int) -> bool:
                 # block -- a spent or zero budget must not keep a request that
                 # has left reasoning eager for the rest of its life.
                 return True
-        elif CFG.content_mask and (fsm.state != CONTENT or not fsm.content_progress):
+        elif (
+            CFG.content_mask
+            and (fsm.state != CONTENT or not fsm.content_progress)
+            and not (fsm.state == CONTENT and _has_grammar(req))
+        ):
             # Fresh CONTENT, and every step inside a tool call (its envelope
             # set masks EOS/<|im:end|>, which the folded mask does not carry):
             # the fresh-content set is plan_verify's alone. Once

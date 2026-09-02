@@ -1053,6 +1053,14 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertEqual(committed.state, fsm.CONTENT)
         self.assertTrue(committed.content_progress)
         self.assertFalse(fsm.plan_gate([req], stride=3))
+        # Fresh CONTENT under a grammar is the grammar's: no eager step.
+        req = _req((THINK_END,), tools=True, rid="grammar")
+        req.sampling_params.json_schema = "{}"
+        fsm._req_fsm(req).advance(req.output_ids)
+        self.assertFalse(fsm.plan_gate([req], stride=3))
+        req = _req((THINK_END,), tools=True, rid="nogrammar")
+        fsm._req_fsm(req).advance(req.output_ids)
+        self.assertTrue(fsm.plan_gate([req], stride=3))
 
     def test_plan_verify_walks_the_envelope_per_row(self):
         req = _req((THINK_END, TOOL_START, 7), tools=True)

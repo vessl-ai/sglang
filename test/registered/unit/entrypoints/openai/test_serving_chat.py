@@ -3423,6 +3423,47 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
         response = self.chat._build_chat_response(request, ret, created=123)
         return response.choices[0]
 
+    def _stream_pieces(self, request, pieces):
+        """Drive _generate_stream_content over several content chunks; the
+        last one carries the finish. Returns the tool-call deltas."""
+        parser_dict, has_tool_calls, deltas = {}, {}, []
+
+        async def run():
+            for n, piece in enumerate(pieces):
+                last = n == len(pieces) - 1
+                content = {
+                    "text": piece,
+                    "meta_info": {
+                        "id": "chatcmpl-solar-stream-test",
+                        "finish_reason": {"type": "stop"} if last else None,
+                    },
+                }
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=request,
+                    stream_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict=parser_dict,
+                    has_tool_calls=has_tool_calls,
+                    choice_logprobs=None,
+                    finish_reason_type="stop" if last else None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 5},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 10},
+                ):
+                    if not chunk.startswith("data: ") or chunk.startswith(
+                        "data: [DONE]"
+                    ):
+                        continue
+                    for choice in json.loads(chunk[len("data: ") :]).get("choices", []):
+                        for tc in (choice.get("delta") or {}).get("tool_calls") or []:
+                            deltas.append(tc)
+
+        get_or_create_event_loop().run_until_complete(run())
+        return deltas
+
     def _stream(self, request, text, finish_reason):
         """Streaming: drive _generate_stream_content over one content chunk.
         Returns (chunks, tool_call_deltas, has_tool_calls)."""
@@ -3561,6 +3602,51 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             d["function"].get("arguments") or "" for d in tool_call_deltas
         )
         self.assertEqual(json.loads(arguments), {"location": "Paris"})
+
+    def test_required_streaming_two_calls_split_over_the_last_delta(self):
+        """The last delta closes call a and carries the whole of call b: the
+        stream-end drain must release b's arguments too (review round 2:
+        one empty step emitted b's name with empty arguments)."""
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        pieces = [
+            '[{"name": "get_weather", "parameters": {"location": "Par',
+            'is"}}, {"name": "get_weather", "parameters": {"location": "Tokyo"}}]',
+        ]
+        deltas = self._stream_pieces(request, pieces)
+        by_index = {}
+        for d in deltas:
+            entry = by_index.setdefault(d["index"], {"name": None, "args": ""})
+            entry["name"] = entry["name"] or d["function"].get("name")
+            entry["args"] += d["function"].get("arguments") or ""
+        self.assertEqual(sorted(by_index), [0, 1])
+        self.assertEqual(json.loads(by_index[0]["args"]), {"location": "Paris"})
+        self.assertEqual(by_index[1]["name"], "get_weather")
+        self.assertEqual(json.loads(by_index[1]["args"]), {"location": "Tokyo"})
+
+    def test_required_streaming_two_calls_in_one_delta(self):
+        request = self.request.model_copy(
+            update={"tool_choice": "required", "parallel_tool_calls": True}
+        )
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Paris"}}, '
+            '{"name": "get_weather", "parameters": {"location": "Tokyo"}}] '
+        )
+        chunks, deltas, has_tool_calls = self._stream(request, text, {"type": "stop"})
+        by_index = {}
+        for d in deltas:
+            entry = by_index.setdefault(d["index"], "")
+            by_index[d["index"]] = entry + (d["function"].get("arguments") or "")
+        self.assertEqual(
+            {k: json.loads(v)["location"] for k, v in by_index.items()},
+            {0: "Paris", 1: "Tokyo"},
+        )
+        # the array's trailing whitespace is not a content delta
+        for chunk in chunks:
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                for choice in json.loads(chunk[6:]).get("choices", []):
+                    self.assertFalse((choice.get("delta") or {}).get("content"))
 
     def test_required_streaming_json_array_emits_completed_call(self):
         """The JSON array arrives token by token; the JsonArrayParser streams

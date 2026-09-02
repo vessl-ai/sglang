@@ -285,10 +285,23 @@ class SolarOpen2Detector(BaseFormatDetector):
                 emit, self._buffer = self._buffer[:-hold], self._buffer[-hold:]
             else:
                 emit, self._buffer = self._buffer, ""
+            if self.current_tool_id >= 0:
+                # Once a call has been emitted, only further calls are read
+                # from the rest of the output: text between or after calls is
+                # not content -- the non-streaming rule (content is what
+                # precedes the first call), applied here so the result does
+                # not depend on where the chunks were cut.
+                if emit.strip():
+                    logger.debug("Solar Open2: dropping text after a call: %r", emit)
+                emit = ""
             return StreamingParseResult(normal_text=emit, calls=[])
 
         head = self._buffer[: min(starts)]
         rest = self._buffer[min(starts) :]
+        if self.current_tool_id >= 0:
+            if head.strip():
+                logger.debug("Solar Open2: dropping text between calls: %r", head)
+            head = ""
         if TOOL_CALL_END not in rest:
             self._buffer = rest
             return StreamingParseResult(normal_text=head, calls=[])
@@ -310,13 +323,27 @@ class SolarOpen2Detector(BaseFormatDetector):
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """The stream is over: release what was held back waiting for a marker
-        that can no longer arrive. A partial opener / fence candidate is
-        ordinary text; an unfinished call (opened, never closed -- e.g. cut by
-        max_tokens) is returned as text as well, so nothing is dropped
-        silently (the vendor's non-streaming parser keeps such output as
-        content; its streaming parser has already emitted it as deltas)."""
+        that can no longer arrive. Before any call was emitted, a partial
+        opener / fence candidate is ordinary text and an unfinished call
+        (opened, never closed -- e.g. cut by max_tokens) is returned as text
+        as well, so nothing is dropped silently (the vendor's non-streaming
+        parser keeps such output as content; its streaming parser has already
+        emitted it as deltas). After a call was emitted, held text is not
+        content (see parse_streaming_increment)."""
         held, self._buffer = self._buffer, ""
         if not held:
+            return StreamingParseResult()
+        if self.current_tool_id >= 0:
+            # A call was already emitted; whatever follows -- an unfinished
+            # later call, or trailing text -- is not content, as on the
+            # non-streaming path (content is what precedes the first call).
+            if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
+                logger.warning(
+                    "Solar Open2: stream ended inside an unfinished tool call "
+                    "after %d completed call(s) (%d chars); dropping it",
+                    self.current_tool_id + 1,
+                    len(held),
+                )
             return StreamingParseResult()
         if TOOL_CALL_START in held or FENCE_CALL_OPEN.search(held):
             logger.warning(
