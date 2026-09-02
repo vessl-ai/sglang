@@ -8,21 +8,27 @@ model, not as an optional extra: it structurally closes the illegal exits from
 the REASONING block so the turn can only end through ``<|think:end|>``, and it
 force-emits ``<|think:end|>`` once the reasoning budget is spent.
 
-Scope of this port (agreed with the campaign owner):
-  * REASONING state: sentinel/EOS mask + ``_FORCE_THINK_END`` on budget.
-  * CONTENT / TOOL_CALL_* states: **not** masked here - the tool-call parser
-    (``srt/function_call/solar_open2_detector.py``) covers the tool envelope.
+Scope of this port:
+  * REASONING state: sentinel/EOS mask + ``_FORCE_THINK_END`` on budget, and
+    the vendor's leading-newline rule on the first token of the block.
+  * CONTENT state: only the turn-end rule (a block that has produced no
+    content yet may not end the turn, ``content_mask``); the tool envelope
+    stays with the tool-call parser (``srt/function_call/solar_open2_detector.py``).
 
-Two deliberate deviations from the fork, both campaign decisions:
-  1. **Reasoning budget is relative to the request's ``max_new_tokens``**
-     (default 75%), not the fork's absolute 128K. The absolute default can
-     never fire for our request sizes, which would make the port a no-op.
-     ``SOLAR_FSM_BUDGET_RATIO`` / ``SOLAR_FSM_BUDGET_ABS`` override it.
-  2. Token ids are resolved from the served tokenizer rather than hardcoded
-     (the fork's defaults are its own tokenizer's layout).
+Budget and ids follow the vendor's vLLM 0.25.0 logits processor (Solar Pro 4
+parser/LP patch set, 2026-09-01): a fixed budget per reasoning effort
+(``_EFFORT_BUDGETS``, default ``high``), ids resolved from the served
+tokenizer rather than hardcoded. The effort reaches the FSM through
+``custom_params[EFFORT_PARAM]``, set by the chat entrypoint; ``/generate``
+and ``/v1/completions`` carry no effort and get the default budget. The
+served chat template opens a think block only for ``medium``/``high``
+(``low``/``none``/``minimal`` pre-close it), so the ``low`` budget only
+applies to a block the model opens itself, e.g. after a tool result. The
+earlier port's ``min(SOLAR_FSM_BUDGET_ABS, max_new_tokens *
+SOLAR_FSM_BUDGET_RATIO)`` remains behind ``SOLAR_FSM_BUDGET_POLICY=legacy``.
 
-Enabled by ``SOLAR_FSM=1``; a resolution failure disables it loudly rather
-than masking with wrong ids.
+Enabled by ``SOLAR_FSM=1``; a resolution failure fails loud at first use
+rather than masking with wrong ids.
 """
 
 from __future__ import annotations
@@ -56,6 +62,34 @@ _SENTINEL_TOKENS = (
 
 _FORK_ABS_BUDGET = 128 * 1024
 
+# Vendor budget table (UpstageAI vllm solar_open2 logits processor, Pro 4
+# parser/LP patch set for vLLM 0.25.0, 2026-09-01: _REASONING_BUDGET_BY_EFFORT).
+# The budget is fixed per reasoning effort and does not depend on max_tokens;
+# "none"/"minimal" close a think block the moment it opens; nothing may exceed
+# the hard limit. The chat template defaults to "high" when the request names
+# no effort, and so does the table.
+_EFFORT_BUDGETS: Dict[str, int] = {
+    "low": 4 * 1024,
+    "medium": 16 * 1024,
+    "high": 32 * 1024,
+    "xhigh": 64 * 1024,
+    "max": 128 * 1024,
+}
+_NO_REASONING_EFFORTS = frozenset({"none", "minimal"})
+_DEFAULT_EFFORT = "high"
+_HARD_LIMIT = 128 * 1024
+# The token right after <|think:start|> may not be a bare newline (vendor
+# _DEFAULT_LEADING_NEWLINE_IDS: "\n", "\n\n"). Byte-level BPE spells them so.
+_LEADING_NEWLINE_TEXTS = ("Ċ", "ĊĊ")
+# custom_params key the chat entrypoint uses to hand the request's reasoning
+# effort to the scheduler-side FSM (serving_chat._normalize_solar_open2_reasoning_effort).
+EFFORT_PARAM = "solar_reasoning_effort"
+# custom_params key: whether the request offers tools (chat entrypoint). A
+# request without tools can never have a <|tool_call:start|> answered, so its
+# CONTENT states forbid the token; with EOS shut in fresh CONTENT the model
+# otherwise takes it as the exit ("<|tool_call:start|>think" then stop).
+TOOLS_PARAM = "solar_tools_available"
+
 
 class _Config:
     """Resolved once per process."""
@@ -75,15 +109,34 @@ class _Config:
     #                             the instant it leaves reasoning (empty answer)
     #   CONTENT (has content): allow tool_call_start + im_end, EOS free
     reasoning_forbidden: Tuple[int, ...] = ()
+    # reasoning_forbidden plus the leading-newline ids: the set for the one
+    # token that directly follows <|think:start|>.
+    reasoning_open_forbidden: Tuple[int, ...] = ()
+    leading_newline_forbidden: Tuple[int, ...] = ()
     content_fresh_forbidden: Tuple[int, ...] = ()
     content_done_forbidden: Tuple[int, ...] = ()
+    # The same two sets for a request that offers no tools: tool_call_start
+    # joins them.
+    content_fresh_forbidden_notools: Tuple[int, ...] = ()
+    content_done_forbidden_notools: Tuple[int, ...] = ()
+    # Reasoning budget. "effort" (default) is the vendor rule: a fixed budget per
+    # reasoning effort (effort_budgets, hard_limit). "legacy" keeps the earlier
+    # port's min(budget_abs, max_new_tokens * budget_ratio).
+    budget_policy: str = "effort"
+    effort_budgets: Dict[str, int] = dict(_EFFORT_BUDGETS)
+    default_effort: str = _DEFAULT_EFFORT
+    hard_limit: int = _HARD_LIMIT
     budget_ratio: float = 0.75
-    # R4 measured this as a REGRESSION (GPQA 74.0% -> 68.0%): forbidding EOS in
-    # fresh CONTENT forces a model that wanted to stop to emit something, which
-    # raised truncation (1->7) and unparsable answers (1->6). The fork's rule
-    # only makes sense together with the rest of its FSM; ported in isolation it
-    # hurts. Kept as an opt-in so the asset survives, default OFF.
-    content_mask: bool = False
+    # Vendor rule (_MASK_SPEC_CONTENT): a turn may not end before it has
+    # produced content, so the step right after <|think:end|> cannot sample
+    # EOS/<|im:end|>. R4 measured this OFF as the better setting (GPQA 74.0% ->
+    # 68.0% with it on), but on a port whose budget force never fired: the rows
+    # were lost in copy_for_forward (sampling_batch_info.py), so the mask only
+    # ever acted on requests the model had closed itself. With the force alive,
+    # leaving it off makes every budget-forced request finish with an empty
+    # answer (2026-09-01 KMMLU-Pro rerun: 26 of 49 forced rows). Default ON for
+    # parity; SOLAR_FSM_CONTENT_MASK=0 restores the earlier rule.
+    content_mask: bool = True
     # R5-8: masking the verify logits costs the folded in-graph accept, so by
     # default we only leave the folded path on steps where the reasoning budget
     # actually falls inside the draft chain. Set 1 to mask every verify step
@@ -127,6 +180,165 @@ def _eos_ids(tokenizer_dir: str) -> List[int]:
     return ids
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number, got {raw!r}") from exc
+
+
+def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
+    """Ids forbidden as the first token after ``<|think:start|>``.
+
+    Resolved from the tokenizer's vocab (``_LEADING_NEWLINE_TEXTS``);
+    ``SOLAR_FSM_LEADING_NEWLINE_IDS`` overrides with a comma list, and an
+    empty value switches the rule off. Like the think ids, a vocab that
+    cannot supply them fails loud rather than silently dropping the rule.
+    """
+    raw = os.environ.get("SOLAR_FSM_LEADING_NEWLINE_IDS")
+    if raw is not None:
+        try:
+            ids = {int(x) for x in raw.split(",") if x.strip()}
+        except ValueError as exc:
+            raise RuntimeError(
+                f"SOLAR_FSM_LEADING_NEWLINE_IDS must be a comma list of ids, got {raw!r}"
+            ) from exc
+        if any(i < 0 for i in ids):
+            raise RuntimeError(
+                f"SOLAR_FSM_LEADING_NEWLINE_IDS has a negative id: {raw!r}"
+            )
+        return tuple(sorted(ids))
+    tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
+    vocab = {}
+    if os.path.isfile(tk_path):
+        with open(tk_path, encoding="utf-8") as f:
+            model = json.load(f).get("model") or {}
+        vocab = model.get("vocab") if isinstance(model.get("vocab"), dict) else {}
+    ids = {int(vocab[t]) for t in _LEADING_NEWLINE_TEXTS if t in vocab}
+    if not ids:
+        raise RuntimeError(
+            f"SOLAR_FSM: leading-newline tokens {_LEADING_NEWLINE_TEXTS} not found "
+            f"in {tk_path} (model.vocab); set SOLAR_FSM_LEADING_NEWLINE_IDS to the "
+            "ids, or to an empty string to switch the rule off"
+        )
+    return tuple(sorted(ids))
+
+
+_EFFORT_LOG = {"last": 0.0, "num_suppressed": 0}
+_EFFORT_LOG_INTERVAL = 60.0
+
+
+def _warn_unknown_effort(effort) -> None:
+    """Rate-limited (one line per minute, with the suppressed count): a fleet
+    of clients sending a bad value should stay visible for the life of the
+    server, unlike the once-only wiring-defect warnings."""
+    now = time.monotonic()
+    if now - _EFFORT_LOG["last"] < _EFFORT_LOG_INTERVAL:
+        _EFFORT_LOG["num_suppressed"] += 1
+        return
+    suppressed = _EFFORT_LOG["num_suppressed"]
+    _EFFORT_LOG["last"] = now
+    _EFFORT_LOG["num_suppressed"] = 0
+    logger.warning(
+        "[SOLAR-FSM] unknown reasoning effort %r; using the default effort %r "
+        "budget. %d earlier occurrence(s) suppressed.",
+        effort,
+        CFG.default_effort,
+        suppressed,
+    )
+
+
+def _budget_for(effort, max_new_tokens: Optional[int]) -> int:
+    """Reasoning budget (tokens) for one request. ``effort`` is the value the
+    entrypoint attached (a string), or None for the default."""
+    if CFG.budget_policy == "legacy":
+        if max_new_tokens and max_new_tokens > 0:
+            return min(CFG.budget_abs, int(max_new_tokens * CFG.budget_ratio))
+        return CFG.budget_abs
+    if effort is None:
+        key = CFG.default_effort
+    elif isinstance(effort, str):
+        key = effort.strip().lower()
+    else:
+        key = None
+    if key in _NO_REASONING_EFFORTS:
+        return 0
+    budget = CFG.effort_budgets.get(key) if key is not None else None
+    if budget is None:
+        _warn_unknown_effort(effort)
+        budget = (
+            0
+            if CFG.default_effort in _NO_REASONING_EFFORTS
+            else (CFG.effort_budgets[CFG.default_effort])
+        )
+    return min(budget, CFG.hard_limit)
+
+
+def _req_effort(req):
+    """The reasoning effort the chat entrypoint attached to the request
+    (``EFFORT_PARAM`` in ``sampling_params.custom_params``), or None."""
+    params = getattr(getattr(req, "sampling_params", None), "custom_params", None)
+    if isinstance(params, dict):
+        return params.get(EFFORT_PARAM)
+    return None
+
+
+def _req_tools(req) -> bool:
+    """Whether the request offers tools (``TOOLS_PARAM``); True when the
+    entrypoint did not say (the vendor's sets, which allow a tool call)."""
+    params = getattr(getattr(req, "sampling_params", None), "custom_params", None)
+    if isinstance(params, dict) and TOOLS_PARAM in params:
+        value = params[TOOLS_PARAM]
+        if isinstance(value, bool):
+            return value
+        if not _WARNED["tools"]:
+            logger.warning(
+                "[SOLAR-FSM] custom_params[%r] is %r, not a bool; treating the "
+                "request as offering tools. This warning is logged once.",
+                TOOLS_PARAM,
+                value,
+            )
+            _WARNED["tools"] = True
+    return True
+
+
+def _content_forbidden(fsm: SolarReqFSM, has_content: bool) -> Tuple[int, ...]:
+    """CONTENT forbid set for a request: the vendor's (tool call allowed), or
+    the no-tools variant that also forbids ``<|tool_call:start|>``."""
+    if has_content:
+        return (
+            CFG.content_done_forbidden
+            if fsm.tools
+            else CFG.content_done_forbidden_notools
+        )
+    return (
+        CFG.content_fresh_forbidden
+        if fsm.tools
+        else CFG.content_fresh_forbidden_notools
+    )
+
+
+def _reasoning_forbidden(state) -> Tuple[int, ...]:
+    """REASONING forbid set for ``state`` (a ``SolarReqFSM`` or ``_SimState``):
+    the leading-newline ids join it on the token right after ``<|think:start|>``."""
+    return (
+        CFG.reasoning_open_forbidden if state.at_think_open else CFG.reasoning_forbidden
+    )
+
+
 def init_from_env() -> None:
     """Resolve ids + budget. Called lazily on first sampler pass."""
     if not os.environ.get("SOLAR_FSM", "0") == "1":
@@ -163,25 +375,97 @@ def init_from_env() -> None:
     CFG.reasoning_forbidden = build({CFG.think_end}, True)
     CFG.content_fresh_forbidden = build({CFG.tool_call_start}, True)
     CFG.content_done_forbidden = build({CFG.tool_call_start, CFG.im_end}, False)
+    CFG.content_fresh_forbidden_notools = build(set(), True)
+    CFG.content_done_forbidden_notools = build({CFG.im_end}, False)
+    CFG.leading_newline_forbidden = _leading_newline_ids(tok_dir)
+    CFG.reasoning_open_forbidden = tuple(
+        sorted(set(CFG.reasoning_forbidden) | set(CFG.leading_newline_forbidden))
+    )
 
-    CFG.budget_ratio = float(os.environ.get("SOLAR_FSM_BUDGET_RATIO", "0.75"))
-    CFG.content_mask = os.environ.get("SOLAR_FSM_CONTENT_MASK", "0") == "1"
+    CFG.budget_policy = (
+        os.environ.get("SOLAR_FSM_BUDGET_POLICY", "effort").strip().lower()
+    )
+    if CFG.budget_policy not in ("effort", "legacy"):
+        raise RuntimeError(
+            "SOLAR_FSM_BUDGET_POLICY must be 'effort' or 'legacy', got "
+            f"{CFG.budget_policy!r}"
+        )
+    CFG.hard_limit = _env_int("SOLAR_FSM_HARD_LIMIT", _HARD_LIMIT)
+    if CFG.hard_limit <= 0:
+        raise RuntimeError(
+            f"SOLAR_FSM_HARD_LIMIT must be positive, got {CFG.hard_limit}"
+        )
+    budgets = {}
+    for effort, default in _EFFORT_BUDGETS.items():
+        name = f"SOLAR_FSM_BUDGET_{effort.upper()}"
+        value = _env_int(name, default)
+        if value < 0:
+            raise RuntimeError(f"{name} must be >= 0, got {value}")
+        if value > CFG.hard_limit:
+            if name in os.environ:
+                logger.warning(
+                    "[SOLAR-FSM] %s=%d exceeds SOLAR_FSM_HARD_LIMIT=%d; clamped.",
+                    name,
+                    value,
+                    CFG.hard_limit,
+                )
+            value = CFG.hard_limit
+        budgets[effort] = value
+    CFG.effort_budgets = budgets
+    CFG.default_effort = (
+        os.environ.get("SOLAR_FSM_DEFAULT_EFFORT", _DEFAULT_EFFORT).strip().lower()
+    )
+    if (
+        CFG.default_effort not in CFG.effort_budgets
+        and CFG.default_effort not in _NO_REASONING_EFFORTS
+    ):
+        raise RuntimeError(
+            f"SOLAR_FSM_DEFAULT_EFFORT={CFG.default_effort!r} is not a known "
+            f"reasoning effort: {sorted(CFG.effort_budgets)} / "
+            f"{sorted(_NO_REASONING_EFFORTS)}"
+        )
+    CFG.budget_ratio = _env_float("SOLAR_FSM_BUDGET_RATIO", 0.75)
+    CFG.budget_abs = _env_int("SOLAR_FSM_BUDGET_ABS", _FORK_ABS_BUDGET)
+    legacy_vars = [
+        v for v in ("SOLAR_FSM_BUDGET_RATIO", "SOLAR_FSM_BUDGET_ABS") if v in os.environ
+    ]
+    if legacy_vars and CFG.budget_policy == "effort":
+        logger.warning(
+            "[SOLAR-FSM] %s set but SOLAR_FSM_BUDGET_POLICY is 'effort': the "
+            "reasoning budget follows the per-effort table and these values are "
+            "ignored. Set SOLAR_FSM_BUDGET_POLICY=legacy to keep "
+            "min(SOLAR_FSM_BUDGET_ABS, max_new_tokens * SOLAR_FSM_BUDGET_RATIO).",
+            ", ".join(legacy_vars),
+        )
+    CFG.content_mask = os.environ.get("SOLAR_FSM_CONTENT_MASK", "1") == "1"
     CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
-    CFG.budget_abs = int(os.environ.get("SOLAR_FSM_BUDGET_ABS", str(_FORK_ABS_BUDGET)))
     CFG.enabled = True
+    if CFG.budget_policy == "legacy":
+        budget_desc = "legacy min(%d, max_new_tokens*%.2f)" % (
+            CFG.budget_abs,
+            CFG.budget_ratio,
+        )
+    else:
+        budget_desc = "per effort %s default=%s hard_limit=%d" % (
+            CFG.effort_budgets,
+            CFG.default_effort,
+            CFG.hard_limit,
+        )
     logger.info(
         "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
-        "forbidden reasoning=%s content_fresh=%s content_done=%s | "
-        "content_mask=%s budget=min(%d, max_new_tokens*%.2f)",
+        "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
+        "content_done=%s (no tools: %s / %s) | content_mask=%s budget=%s",
         CFG.think_start,
         CFG.think_end,
         CFG.im_end,
         CFG.reasoning_forbidden,
+        CFG.reasoning_open_forbidden,
         CFG.content_fresh_forbidden,
         CFG.content_done_forbidden,
+        CFG.content_fresh_forbidden_notools,
+        CFG.content_done_forbidden_notools,
         CFG.content_mask,
-        CFG.budget_abs,
-        CFG.budget_ratio,
+        budget_desc,
     )
 
 
@@ -201,31 +485,46 @@ class SolarReqFSM:
 
     __slots__ = (
         "in_reasoning",
+        "at_think_open",
         "count",
         "consumed",
         "budget",
         "forced",
         "content_progress",
+        "tools",
     )
 
-    def __init__(self, prompt_ids: Sequence[int], max_new_tokens: Optional[int]):
+    def __init__(
+        self,
+        prompt_ids: Sequence[int],
+        max_new_tokens: Optional[int],
+        effort: Optional[str] = None,
+        tools: bool = True,
+    ):
         # Mirrors the fork's _initial_state: inside reasoning iff the last
         # think_start in the prompt is not followed by a think_end.
         self.in_reasoning = _starts_in_reasoning(prompt_ids)
+        # True while the next token is the first one after <|think:start|>
+        # (the chat template ends the prompt with it when reasoning is on).
+        self.at_think_open = bool(
+            self.in_reasoning
+            and len(prompt_ids) > 0
+            and prompt_ids[-1] == CFG.think_start
+        )
         self.content_progress = False
         self.count = 0
         self.consumed = 0
-        if max_new_tokens and max_new_tokens > 0:
-            self.budget = min(CFG.budget_abs, int(max_new_tokens * CFG.budget_ratio))
-        else:
-            self.budget = CFG.budget_abs
+        self.budget = _budget_for(effort, max_new_tokens)
+        self.tools = bool(tools)
         self.forced = False
 
     def _step(self, tok: int) -> None:
         """Per-token transition. Reused verbatim as ``_SimState.step``, which
         walks a throwaway copy of this state over a speculative chain, so the
-        two can never drift. Touches only ``in_reasoning`` / ``count`` /
-        ``content_progress`` -- the slots ``_SimState`` also carries."""
+        two can never drift. Touches only ``in_reasoning`` / ``at_think_open``
+        / ``count`` / ``content_progress`` -- the slots ``_SimState`` also
+        carries."""
+        self.at_think_open = tok == CFG.think_start
         if tok == CFG.think_start:
             self.in_reasoning = True
             self.content_progress = False
@@ -292,6 +591,8 @@ def _req_fsm(req) -> SolarReqFSM:
         fsm = SolarReqFSM(
             getattr(req, "origin_input_ids", ()) or (),
             getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
+            _req_effort(req),
+            _req_tools(req),
         )
         req._solar_fsm = fsm
         req._solar_fsm_retractions = req.retraction_count
@@ -373,8 +674,23 @@ def filter_rows(sampling_info, keep_indices: List[int]) -> None:
 def merge_rows(sampling_info, other) -> None:
     rows = getattr(sampling_info, "solar_fsm_rows", None)
     other_rows = getattr(other, "solar_fsm_rows", None)
-    if rows is not None and other_rows is not None:
-        sampling_info.solar_fsm_rows = rows + other_rows
+    if rows is None and other_rows is None:
+        return
+    if (rows is None) != (other_rows is None) and is_active():
+        # from_schedule_batch attaches rows to every batch while the FSM is on,
+        # so one side arriving without them means a construction site skipped
+        # attach_rows: the merged list would be shorter than the batch and
+        # apply() would then skip the whole step. Merge what is there, loudly.
+        if not _WARNED["merge"]:
+            logger.warning(
+                "[SOLAR-FSM] merge_batch: one side has no solar_fsm_rows "
+                "(self=%s other=%s); the merged rows will be short of the batch. "
+                "This warning is logged once.",
+                "missing" if rows is None else len(rows),
+                "missing" if other_rows is None else len(other_rows),
+            )
+            _WARNED["merge"] = True
+    sampling_info.solar_fsm_rows = list(rows or []) + list(other_rows or [])
 
 
 def advance_committed(result, batch) -> None:
@@ -431,7 +747,7 @@ def advance_committed(result, batch) -> None:
     result.solar_fsm_advanced = True
 
 
-_WARNED = {"shape": False}
+_WARNED = {"shape": False, "rows": False, "merge": False, "tools": False}
 
 
 def apply(logits: torch.Tensor, sampling_info) -> None:
@@ -440,18 +756,39 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
         return
 
     rows = getattr(sampling_info, "solar_fsm_rows", None)
-    if not rows:
+    if rows is None:
+        # Every SamplingBatchInfo on the sampler path comes from
+        # from_schedule_batch, which attaches the rows whenever the FSM is on
+        # (the one other construction site, the EAGLE draft cuda-graph runner,
+        # picks draft tokens itself and never reaches the Sampler). Reaching
+        # here means a copy or a new construction site lost them -- the failure
+        # this module once had silently. Say so, once.
+        if not _WARNED["rows"]:
+            logger.warning(
+                "[SOLAR-FSM] sampling_info carries no solar_fsm_rows while the "
+                "FSM is active (logits rows=%d): think-block masks are NOT "
+                "applied on this path. This warning is logged once.",
+                logits.shape[0],
+            )
+            _WARNED["rows"] = True
         return
     if logits.shape[0] != len(rows):
-        # Speculative decoding and other multi-token-per-row paths land here.
+        # The sampler sees one logits row per request, and the verify step of
+        # speculative decoding does not come through here (it masks its own
+        # strided logits via plan_verify). A mismatch -- including an empty
+        # rows list under a non-empty batch -- means the rows fell out of step
+        # with the batch somewhere (a filter or merge site).
         if not _WARNED["shape"]:
             logger.warning(
-                "[SOLAR-FSM] skipping mask: logits rows=%d != batch rows=%d "
-                "(spec decode?). This warning is logged once.",
+                "[SOLAR-FSM] skipping mask: logits rows=%d != batch rows=%d; "
+                "the rows list is out of step with the batch. This warning is "
+                "logged once.",
                 logits.shape[0],
                 len(rows),
             )
             _WARNED["shape"] = True
+        return
+    if not rows:
         return
 
     force_rows: List[int] = []
@@ -463,17 +800,20 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
             if fsm.budget_exhausted():
                 force_rows.append(i)
             else:
-                mask_rows.setdefault(CFG.reasoning_forbidden, []).append(i)
+                mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
         elif not CFG.content_mask:
             continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
-        elif fsm.content_progress:
-            mask_rows.setdefault(CFG.content_done_forbidden, []).append(i)
         else:
             # Fresh CONTENT: EOS/im_end forbidden until real content exists.
             # Without this the model leaves reasoning and immediately stops,
             # yielding finish=stop with an empty answer (observed: 6/13 GPQA
-            # errors in R2-3rd had content_len == 0).
-            mask_rows.setdefault(CFG.content_fresh_forbidden, []).append(i)
+            # errors in R2-3rd had content_len == 0). A request without tools
+            # also loses <|tool_call:start|>: with EOS shut, a model that
+            # wanted to stop takes it as the exit instead (KMMLU-Pro medium
+            # rerun: 13 of 35 no-answer rows ended on "<|tool_call:start|>think").
+            mask_rows.setdefault(
+                _content_forbidden(fsm, fsm.content_progress), []
+            ).append(i)
 
     for ids, rows_i in mask_rows.items():
         if not ids:
@@ -540,10 +880,11 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 class _SimState:
     """Throwaway FSM state used to walk a speculative chain."""
 
-    __slots__ = ("in_reasoning", "count", "content_progress")
+    __slots__ = ("in_reasoning", "at_think_open", "count", "content_progress")
 
     def __init__(self, fsm: SolarReqFSM):
         self.in_reasoning = fsm.in_reasoning
+        self.at_think_open = fsm.at_think_open
         self.count = fsm.count
         self.content_progress = fsm.content_progress
 
@@ -637,11 +978,14 @@ def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    Two things can only be done on the eager path, and this predicate names
+    Three things can only be done on the eager path, and this predicate names
     them: forcing ``<|think:end|>`` on a row whose reasoning budget is spent,
-    and the ``content_mask`` sets. Both are ``plan_verify``'s work, and
-    ``plan_verify`` runs after the grammar barrier -- too late for the folded
-    epilogue, which accepts inside the cuda graph off its own buffers.
+    the fresh-CONTENT set (``content_mask``) on the step after a think block
+    closes, and the leading-newline set on the step after one opens. All are
+    ``plan_verify``'s work, and ``plan_verify`` runs after the grammar barrier
+    -- too late for the folded epilogue, which accepts inside the cuda graph
+    off its own buffers. Each is judged per row from committed state, so a
+    generation spends only its boundary steps eager.
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied
@@ -660,10 +1004,6 @@ def plan_gate(reqs, stride: int) -> bool:
         return False
     if CFG.spec_always_eager:
         return True
-    if CFG.content_mask:
-        # The content sets are plan_verify's alone; nothing in the graph applies
-        # them. Off by default.
-        return True
     window = 2 * stride
     for req in reqs:
         fsm = getattr(req, "_solar_fsm", None)
@@ -672,9 +1012,31 @@ def plan_gate(reqs, stride: int) -> bool:
             # and _req_fsm will rebuild it after the barrier).
             return True
         fsm.advance(req.output_ids)
-        if fsm.budget <= window:
-            return True
-        if fsm.in_reasoning and fsm.count + window >= fsm.budget:
+        if fsm.in_reasoning:
+            if fsm.at_think_open:
+                # The leading-newline set is not the folded mask's set.
+                return True
+            if fsm.count + window >= fsm.budget:
+                # Also every step of a zero-budget (none/minimal) block: the
+                # force belongs to plan_verify. Judged only while inside the
+                # block -- a spent or zero budget must not keep a request that
+                # has left reasoning eager for the rest of its life.
+                return True
+        elif CFG.content_mask and not fsm.content_progress:
+            # Fresh CONTENT: the fresh-content set is plan_verify's alone. Once
+            # the turn has content the folded path is kept -- its unmasked
+            # CONTENT rows then only lack content_done_forbidden (stray control
+            # tokens; for a request without tools that includes
+            # <|tool_call:start|>, benign here because the exit it offers only
+            # matters while EOS is shut, i.e. in fresh CONTENT), the same
+            # class of gap as a drafted <|think:start|> (folded_mask_flags). A think_end
+            # accepted in the run this state
+            # lags behind is covered by the folded mask's overmask for the EOS
+            # / <|im:end|> half of the fresh-content rule (the rest of that
+            # chain is still masked with the reasoning set: it also holds
+            # <|tool_call:start|> back for up to stride-1 rows and lets a
+            # second <|think:end|> through); the same lag leaves a run-final
+            # generated <|think:start|> without the leading-newline set.
             return True
     return False
 
@@ -772,12 +1134,12 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                             rids[i],
                         )
                 else:
-                    mask_rows.setdefault(CFG.reasoning_forbidden, []).append(row)
+                    mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
             elif not CFG.content_mask:
                 continue  # R2-3rd behaviour: CONTENT unmasked (parser owns it)
-            elif sim.content_progress:
-                mask_rows.setdefault(CFG.content_done_forbidden, []).append(row)
             else:
-                mask_rows.setdefault(CFG.content_fresh_forbidden, []).append(row)
+                mask_rows.setdefault(
+                    _content_forbidden(fsm, sim.content_progress), []
+                ).append(row)
 
     return VerifyPlan(force_rows, mask_rows, stride, bs, rids)

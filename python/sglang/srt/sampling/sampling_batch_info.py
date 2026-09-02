@@ -61,6 +61,13 @@ class SamplingBatchInfo:
         None  # Used in the overlap mode for repetition penalty
     )
 
+    # Solar-Open2 FSM (sampling/solar_open2_fsm.py): per-row ``Req`` handles the
+    # sampler reads to build the think-block masks. A declared field so that
+    # ``copy_for_forward`` (``dataclasses.replace``) carries it to the forward-only
+    # copy the sampler receives; as an ad-hoc attribute it was dropped there and
+    # ``solar_open2_fsm.apply`` silently skipped every non-speculative step.
+    solar_fsm_rows: Optional[List[Any]] = None
+
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
     # Custom parameters
