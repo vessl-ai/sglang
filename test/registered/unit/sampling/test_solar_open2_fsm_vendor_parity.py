@@ -5,7 +5,8 @@ parser/LP patch set for vLLM 0.25.0, 2026-09-01). The rules checked here
 against ``solar_open2_fsm``:
 
 * the forbidden tables per state (all sentinels minus the state's allowed
-  set, EOS masked outside CONTENT, sentinels never counted as EOS);
+  set; EOS masked everywhere except CONTENT-with-progress and TOOL_CALL_END;
+  sentinels never counted as EOS);
 * the tool-call envelope walk -- transitions and auto-advance -- checked
   differentially against a transcript of the vendor's ``_process_token``;
 * budget accounting (REASONING tokens only, reset at ``<|think:start|>``)
@@ -1034,8 +1035,10 @@ class TestSpecPathToolStates(_FsmCase):
     def test_plan_gate_goes_eager_inside_a_tool_call(self):
         """With a committed FSM: a row in any TOOL_* state leaves the folded
         path (also after content, when content_progress is True);
-        content-with-progress stays on it; fresh CONTENT under a grammar
-        stays on it (the grammar owns CONTENT), without a grammar leaves."""
+        content-with-progress stays on it; fresh CONTENT under a grammar is
+        not sent eager by this predicate (the grammar owns CONTENT; the
+        worker forces eager for grammar batches anyway), without a grammar
+        it leaves."""
         for output, state in (
             ((THINK_END, TOOL_START), fsm.TOOL_CALL_BEGIN),
             ((THINK_END, TOOL_START, 7), fsm.TOOL_CALL_NAME),

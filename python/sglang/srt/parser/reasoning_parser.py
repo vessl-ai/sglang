@@ -2030,7 +2030,7 @@ def solar_open2_force_reasoning(request) -> bool:
         )
     if effort is None:
         return True
-    return str(effort).lower() in _SOLAR_OPEN2_THINK_OPEN_EFFORTS
+    return str(effort).strip().lower() in _SOLAR_OPEN2_THINK_OPEN_EFFORTS
 
 
 class SolarOpen2Detector(BaseReasoningFormatDetector):
@@ -2054,9 +2054,12 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
     Without the escape, the call would ride the think block to its end and
     never reach the tool-call parser as a parseable block. The escape holds
-    in streaming, and in non-streaming only when the block never closes: a
-    call completed inside a block that closes later stays in reasoning here
-    (the vendor promotes such blocks after the content; phase 2, INF-451).
+    in streaming when the opener arrives before ``<|think:end|>`` does (one
+    delta carrying both is split at the close first, and the call stays in
+    reasoning -- as in the vendor's streaming parser), and in non-streaming
+    only when the block never closes: a call completed inside a block that
+    closes later stays in reasoning here (the vendor promotes such blocks
+    after the content; phase 2, INF-451).
 
     The content region may open with *redundant* ``<|think:end|>`` sentinels.
     The FSM (``srt/sampling/solar_open2_fsm.py``) force-closes reasoning once
@@ -2169,7 +2172,8 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
                 # returned "Thinking Process:\n\n1.  " with ``finish_reason:
                 # "stop"``). Only a request with reasoning off puts this text
                 # on the content channel, and such a request never opens a
-                # think block to leave unclosed.
+                # think block to leave unclosed (unless the model opens one
+                # itself -- see the class docstring).
                 return StreamingParseResult(reasoning_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret

@@ -1259,13 +1259,16 @@ def plan_gate(reqs, stride: int) -> bool:
     -- too late for the folded epilogue, which accepts inside the cuda graph
     off its own buffers. Each is judged per row from committed state, so
     outside a tool call a generation spends only its boundary steps eager.
-    A CONTENT row under a grammar -- fresh or not -- folds as well, exempt
-    from the content-mask clause below: the grammar owns CONTENT (the vendor's
-    rule), the folded mask writes nothing for it and plan_verify is not
-    consulted on a folded step, so a drafted sentinel can put chain positions
-    1..stride-1 into TOOL_* states that carry no mask. A JSON-schema grammar
-    (required/named) cannot emit a sentinel, which bounds it; an ebnf/regex
-    grammar could (the general <=stride-1 gap is INF-450).
+    A CONTENT row under a grammar -- fresh or not -- is exempt from the
+    content-mask clause below: the grammar owns CONTENT (the vendor's rule).
+    A batch with a grammar never takes the fold (the worker forces eager
+    independently), so the exemption only stops this predicate from being
+    redundantly True; where the graph did replay, the folded mask writes
+    nothing for such a row and plan_verify is not consulted, so a drafted
+    sentinel could put chain positions 1..stride-1 into TOOL_* states that
+    carry no mask. A JSON-schema grammar (required/named) cannot emit a
+    sentinel, which bounds it; an ebnf/regex grammar could (the general
+    <=stride-1 gap is INF-450).
 
     The reasoning mask is **not** in that list. It is the common case and it
     would cost the folded path for most of a generation, so it is applied

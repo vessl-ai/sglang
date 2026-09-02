@@ -3712,6 +3712,99 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
             {"location": "Paris"},
         )
 
+    def test_streaming_fence_opened_call_is_glued(self):
+        """Streaming twin of the fence-opened glue: the detector holds the
+        fence-opened call, so the trimmed terminator is fed back and the
+        call is emitted."""
+        text = (
+            "```get_weather\n"
+            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>\n"
+        )
+        chunks, deltas, has_tool_calls = self._stream(
+            self.request, text, self._STOP_MATCHED
+        )
+        self.assertTrue(has_tool_calls.get(0))
+        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(deltas[0]["function"]["arguments"]), {"location": "Paris"}
+        )
+
+    def test_streaming_unparsable_glued_call_is_content_without_stop_leak(self):
+        """Streaming twin of the non-stream unparsable glue: the opener is
+        there, the glued terminator closes a call that does not parse, so
+        the whole output is content and no matched_stop is reported."""
+        text = (
+            "<|tool_call:start|>get_weather"
+            "<|tool_arg:start|>location<|tool_arg:value|>Paris<|tool_arg:end|>"
+        )
+        choice = self._finish_choice(text, self._STOP_MATCHED)
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertIsNone(choice.get("matched_stop"))
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            chunks, deltas, has_tool_calls = self._stream(
+                self.request, text, self._STOP_MATCHED
+            )
+        self.assertEqual(deltas, [])
+        content = ""
+        for chunk in chunks:
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                for c in json.loads(chunk[6:]).get("choices", []):
+                    content += (c.get("delta") or {}).get("content") or ""
+        self.assertEqual(content, text + SOLAR_OPEN2_TOOL_CALL_END)
+
+    def test_float_reasoning_effort_is_rejected_for_solar(self):
+        """The vendor's request model accepts the named tiers only; a float
+        would silently pre-close the think block here (review round 4)."""
+        request = self.request.model_copy(update={"reasoning_effort": 0.5})
+        error = self.chat._validate_request(request)
+        self.assertIsNotNone(error)
+        self.assertIn("reasoning_effort", error)
+        self.assertIsNone(self.chat._validate_request(self.request))
+
+    def test_required_streaming_whitespace_after_the_array_in_its_own_delta(self):
+        """Whitespace that follows the closing bracket in a later delta is not
+        a content delta (review round 4)."""
+        request = self.request.model_copy(update={"tool_choice": "required"})
+        pieces = [self._JSON_ARRAY_CALL_TEXT, "\n "]
+        parser_dict, has_tool_calls, texts = {}, {}, []
+        for i, piece in enumerate(pieces):
+            content = {
+                "text": piece,
+                "meta_info": {
+                    "id": "x",
+                    "finish_reason": {"type": "stop"} if i == len(pieces) - 1 else None,
+                },
+            }
+
+            async def run(content=content, finishing=(i == len(pieces) - 1)):
+                out = []
+                async for chunk in self.chat._generate_stream_content(
+                    content=content,
+                    index=0,
+                    request=request,
+                    stream_offsets={},
+                    reasoning_parser_dict={},
+                    parser_dict=parser_dict,
+                    has_tool_calls=has_tool_calls,
+                    choice_logprobs=None,
+                    finish_reason_type="stop" if finishing else None,
+                    continuous_usage_stats=False,
+                    prompt_tokens={0: 5},
+                    reasoning_tokens={0: 0},
+                    completion_tokens={0: 10},
+                ):
+                    out.append(chunk)
+                return out
+
+            for chunk in get_or_create_event_loop().run_until_complete(run()):
+                if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                    for c in json.loads(chunk[6:]).get("choices", []):
+                        texts.append((c.get("delta") or {}).get("content") or "")
+        self.assertTrue(has_tool_calls.get(0))
+        self.assertEqual("".join(texts), "")
+
     def test_streaming_stop_matched_without_opener_does_not_glue(self):
         """The injected stop matched but the model never opened a call: there
         is nothing to close, so the terminator is not fed to the detector --
@@ -4371,6 +4464,20 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.chat._normalize_solar_open2_reasoning_effort(req)
         self.assertEqual(req.custom_params, {self.KEY: "max", self.TOOLS: False})
         self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+
+    def test_cased_effort_from_template_kwargs_is_lower_cased_on_the_request(self):
+        """The message pipeline moves a chat_template_kwargs effort into the
+        request field before the Solar normaliser runs; a cased value must
+        reach the template lower-cased on both."""
+        req = self._req(chat_template_kwargs={"reasoning_effort": "High"})
+        self.template_manager.chat_template_name = None
+        # The move into the request field happens while server defaults are
+        # merged (--default-chat-template-kwargs); any default triggers it.
+        self.chat.default_chat_template_kwargs = {"thinking": True}
+        self.chat._process_messages(req, is_multimodal=False)
+        self.assertEqual(req.reasoning_effort, "high")
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+        self.assertEqual(req.custom_params[self.KEY], "high")
 
     def test_template_kwargs_effort_is_lower_cased_for_the_template(self):
         """chat_template.jinja tests the effort with an exact, case-sensitive

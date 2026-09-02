@@ -886,6 +886,17 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
+        if "solar_open2" in (self.reasoning_parser, self.tool_call_parser) and (
+            isinstance(request.reasoning_effort, float)
+        ):
+            # The vendor's request model accepts the named tiers only (a float
+            # is rejected with 422); here a float would silently pre-close the
+            # think block and skip the FSM budget.
+            return (
+                "reasoning_effort must be one of none, minimal, low, medium, "
+                "high, xhigh, max for this model."
+            )
+
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not effective_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
@@ -1974,8 +1985,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if self._solar_single_call_stop_matched(
                 request, effective_tools, finish_reason
             ):
-                # The internal stop string is not part of the response,
-                # whether or not a call parses from the glued text.
+                # The internal stop string is never reported as matched_stop,
+                # whether or not a call parses from the glued text (when
+                # nothing parses, the glued text is content, as the model
+                # did emit the terminator).
                 finish_reason["matched"] = None
                 if _solar_has_call_opener(text):
                     text += SOLAR_OPEN2_TOOL_CALL_END
@@ -2656,13 +2669,17 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
             normal_text, calls = result.normal_text, result.calls
+            if normal_text and not normal_text.strip():
+                # Under the array constraint the output is the array; the
+                # whitespace after its "]" is not content.
+                normal_text = ""
             if flush:
                 # The base JSON detector advances one call one step (its name,
                 # or its arguments) per increment. When the last delta carries
                 # the rest of the array -- a short required/named call under
                 # the grammar, or the close of one call plus the whole of the
                 # next -- there is no next increment, so drain with empty
-                # steps until a step yields nothing. The cap is a safety net
+                # steps until a step yields no call and no real text. The cap is a safety net
                 # only: two steps per call, and one tool may be called many
                 # times, so it is not sized by the tools list. Whitespace-only
                 # text the drain releases from the array's tail is not content.

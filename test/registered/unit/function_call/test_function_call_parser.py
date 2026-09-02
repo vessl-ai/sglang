@@ -5436,6 +5436,82 @@ class TestSolarOpen2Detector(unittest.TestCase):
         whole = SolarOpen2Detector().detect_and_parse("".join(pieces), self.tools)
         self.assertEqual((whole.normal_text, len(whole.calls)), ("", 1))
 
+    def test_unparsed_call_sharing_a_chunk_with_parsed_calls(self):
+        """An unparsable closed call between or after parsed calls: the prose
+        before it is content and nothing from its opener on is, whether the
+        calls share one chunk or arrive split (review round 4: one chunk
+        leaked the raw call as content between two parsed calls, and dropped
+        the prose before a trailing one)."""
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        cases = {
+            "good, bad, good": (good + "\n" + bad + "\n" + good, "", 2),
+            "good, prose, bad, prose, good": (
+                good + "\nAlso:\n" + bad + "\nMore\n" + good,
+                "\nAlso:\nMore",
+                2,
+            ),
+            "good, prose, bad": (good + "\nAlso:\n" + bad, "\nAlso:", 1),
+            "good, prose, unfinished": (
+                good + "\nmid\n" + f"{TOOL_CALL_START}get_time\n",
+                "\nmid",
+                1,
+            ),
+        }
+        for name, (text, want_text, want_calls) in cases.items():
+            for size in (len(text), 5, 1):
+                with self.subTest(case=name, size=size):
+                    with self.assertLogs(
+                        "sglang.srt.function_call.solar_open2_detector", "WARNING"
+                    ):
+                        got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual(
+                        (got_text, len(got_calls)), (want_text, want_calls)
+                    )
+                    self.assertNotIn(TOOL_CALL_START, got_text)
+
+    def test_newlines_before_the_name_parse_as_the_vendor_does(self):
+        """The vendor's lazy name group plus strip() accepts newlines between
+        the opener and the name (FSM-legal); the sentinel-stopping group must
+        keep accepting them (review round 4)."""
+        detector = SolarOpen2Detector()
+        for lead in ("\n", "\n\n"):
+            with self.subTest(lead=repr(lead)):
+                text = (
+                    f"{TOOL_CALL_START}{lead}get_weather\n"
+                    f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+                    f"{TOOL_CALL_END}"
+                )
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual([c.name for c in result.calls], ["get_weather"])
+                self.assertEqual(result.normal_text, "")
+                got_text, got_calls = self._stream_all(text, 5)
+                self.assertEqual((got_text, len(got_calls)), ("", 1))
+
+    def test_empty_name_makes_the_output_content_like_the_vendor(self):
+        """A call whose name is blank yields no call at all; the whole output
+        is content in non-streaming and at stream end (vendor rule)."""
+        text = (
+            f"{TOOL_CALL_START}   \n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual((result.normal_text, result.calls), (text, []))
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            got_text, got_calls = self._stream_all(text, len(text))
+        self.assertEqual((got_text, got_calls), (text, []))
+
     def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
         """A call without the newline after its name followed by a well-formed
         call: with the vendor's ``(.+?)`` name group the two parse as one
@@ -5710,6 +5786,230 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "not_a_tool")
         self.assertEqual(json.loads(result.calls[0].parameters), {"x": 1})
+
+
+class TestSolarOpen2VendorDifferential(unittest.TestCase):
+    """Our detector against the vendor's own vLLM tool parser (a verbatim
+    copy in ``solar_open2_vendor_reference.py``), shape by shape: non-stream
+    must agree exactly; streaming must agree on calls and on content (up to
+    whitespace, the one documented streaming delta); and ours must be
+    identical at whole / 5-char / 1-char chunking. Shapes where the vendor
+    itself misbehaves (its lazy name group swallows a following call after
+    a call that lacks its newline) or where its streaming parser emits a
+    partial call are compared only where a comparison is meaningful, and
+    say so. A new difference here is a detector bug unless it is added to
+    the documented deltas in CONTEXT/the detector docstring."""
+
+    TOOLS = [
+        Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "days": {"type": "integer"},
+                        "urgent": {"type": "boolean"},
+                    },
+                },
+            ),
+        ),
+        Tool(
+            type="function",
+            function=Function(
+                name="get_time",
+                parameters={
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                },
+            ),
+        ),
+    ]
+
+    @staticmethod
+    def _call(name="get_weather", **args):
+        body = "".join(
+            f"{TOOL_ARG_START}{k}{TOOL_ARG_VALUE}{v}{TOOL_ARG_END}\n"
+            for k, v in args.items()
+        )
+        return f"{TOOL_CALL_START}{name}\n{body}{TOOL_CALL_END}"
+
+    @classmethod
+    def shapes(cls):
+        good = cls._call(location="Paris")
+        good2 = cls._call("get_time", timezone="UTC")
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        unfinished = f"{TOOL_CALL_START}get_time\n"
+        # name -> (text, vendor_nonstream_comparable, vendor_stream_comparable)
+        return {
+            "call": (good, True, True),
+            "ws prefix": ("\n\n" + good, True, True),
+            "prose prefix": ("Sure.\n" + good, True, True),
+            "prose prefix no ws": ("Sure." + good, True, True),
+            "two calls": (good + "\n" + good2, True, True),
+            "two calls prose between": (good + "\nAlso:\n" + good2, True, True),
+            "trailing prose": (good + "\nDone.", True, True),
+            "trailing ws": (good + "\n\n", True, True),
+            "prose call prose": ("Let me check. " + good + " there", True, True),
+            "typed args": (
+                cls._call(location="Paris", days="3", urgent="true"),
+                True,
+                True,
+            ),
+            "null arg": (cls._call(location="null"), True, True),
+            # The vendor's non-streaming parser accepts newlines before the
+            # name (lazy group + strip); its streaming parser reads an empty
+            # name at the first newline and emits no call. Ours parses it in
+            # both modes.
+            "newline before name": (
+                f"{TOOL_CALL_START}\nget_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                False,
+            ),
+            "no call": ("Just text.", True, True),
+            "whitespace only": ("\n \n", True, True),
+            # The vendor's streaming parser waits for the name's newline and
+            # emits nothing for these; ours releases the output as content
+            # at stream end (the vendor's non-streaming rule).
+            "bad only": (bad, True, False),
+            "prose then bad": ("Hi " + bad, True, False),
+            "good then bad": (good + "\n" + bad, True, False),
+            "empty name": (
+                f"{TOOL_CALL_START}  \n{TOOL_ARG_START}a{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                False,
+            ),
+            # The vendor's lazy name group swallows the following call after a
+            # call missing its newline (a fake call): not comparable at all.
+            "bad then good": (bad + "\n" + good, False, False),
+            "good, prose, bad, prose, good": (
+                good + "\nAlso:\n" + bad + "\nMore\n" + good2,
+                False,
+                False,
+            ),
+            # The vendor streams the name of an unfinished call; ours emits
+            # complete calls only and keeps the text as content at the end.
+            "unfinished": (unfinished, True, False),
+            "good then unfinished": (good + "\n" + unfinished, True, False),
+        }
+
+    @classmethod
+    def _reference(cls):
+        if not hasattr(cls, "_ref"):
+            import importlib.util
+            import os
+
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "solar_open2_vendor_reference.py",
+            )
+            spec = importlib.util.spec_from_file_location(
+                "solar_open2_vendor_reference", path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            cls._ref = module
+        return cls._ref
+
+    def _vendor(self):
+        ref = self._reference()
+
+        tools = [
+            ref._Record(
+                type="function",
+                function=ref._Record(
+                    name=t.function.name, parameters=t.function.parameters
+                ),
+            )
+            for t in self.TOOLS
+        ]
+        return ref, ref.ChatCompletionRequest(tools=tools)
+
+    @staticmethod
+    def _args(raw):
+        try:
+            return json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return raw
+
+    def _vendor_nonstream(self, text):
+        ref, req = self._vendor()
+        r = ref.SolarOpen2ToolParser(tokenizer=None).extract_tool_calls(text, req)
+        return r.content or "", [
+            (t.function.name, self._args(t.function.arguments)) for t in r.tool_calls
+        ]
+
+    def _vendor_stream(self, text, size):
+        ref, req = self._vendor()
+        parser = ref.SolarOpen2ToolParser(tokenizer=None)
+        prev, content, calls = "", "", {}
+        for i in range(0, len(text), size):
+            delta = text[i : i + size]
+            cur = prev + delta
+            out = parser.extract_tool_calls_streaming(prev, cur, delta, [], [], [], req)
+            prev = cur
+            if out is None:
+                continue
+            content += out.content or ""
+            for tc in out.tool_calls or []:
+                entry = calls.setdefault(tc.index, ["", ""])
+                fn = getattr(tc, "function", None)
+                if getattr(fn, "name", None):
+                    entry[0] = fn.name
+                entry[1] += getattr(fn, "arguments", None) or ""
+        return content, [(n, self._args(a)) for _, (n, a) in sorted(calls.items())]
+
+    def _ours_nonstream(self, text):
+        r = SolarOpen2Detector().detect_and_parse(text, self.TOOLS)
+        return r.normal_text, [(c.name, self._args(c.parameters)) for c in r.calls]
+
+    def _ours_stream(self, text, size):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.TOOLS, "solar_open2")
+        texts, calls = [], []
+        for i in range(0, len(text), size):
+            t, c = parser.parse_stream_chunk(text[i : i + size])
+            texts.append(t or "")
+            calls.extend(c)
+        t, c = parser.parse_stream_end()
+        texts.append(t or "")
+        calls.extend(c)
+        return "".join(texts), [(x.name, self._args(x.parameters)) for x in calls]
+
+    @staticmethod
+    def _ws(s):
+        return " ".join(s.split())
+
+    def test_non_stream_matches_the_vendor(self):
+        for name, (text, comparable, _) in self.shapes().items():
+            if not comparable:
+                continue
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    self._ours_nonstream(text), self._vendor_nonstream(text)
+                )
+
+    def test_streaming_is_chunk_invariant_and_matches_the_vendor(self):
+        for name, (text, _, comparable) in self.shapes().items():
+            with self.subTest(shape=name):
+                whole = self._ours_stream(text, max(1, len(text)))
+                for size in (5, 1):
+                    self.assertEqual(self._ours_stream(text, size), whole, size)
+                if not comparable:
+                    continue
+                for size in (max(1, len(text)), 5, 1):
+                    v_content, v_calls = self._vendor_stream(text, size)
+                    self.assertEqual(whole[1], v_calls, size)
+                    self.assertEqual(self._ws(whole[0]), self._ws(v_content), size)
+
+    def test_streaming_calls_match_non_stream(self):
+        for name, (text, _, _) in self.shapes().items():
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    self._ours_stream(text, 5)[1], self._ours_nonstream(text)[1]
+                )
 
 
 if __name__ == "__main__":
