@@ -581,14 +581,20 @@ def _fsm_content_notools_forbidden_ids() -> List[int]:
     under-mask the moment ``configure_ids`` made the two tables differ by
     anything new.
 
-    Same placeholder contract as the siblings, and with the same property they
-    have and a difference-set buffer did not: whenever the FSM is active this
-    set is non-empty (``<|think:start|>`` is forbidden in CONTENT and its id is
-    required), so ``[0]`` is only ever paired with an all-False row buffer.
+    The placeholder goes back only with the FSM off, where the flags return
+    None and disarm every row. An active FSM with an empty set is the same
+    failure the sibling above refuses to boot on, for the same reason, so it
+    refuses here too.
     """
-    if not (_fsm.is_active() and _fsm.CFG.content_done_forbidden_notools):
+    if not _fsm.is_active():
         return [0]
-    return list(_fsm.CFG.content_done_forbidden_notools)
+    ids = _fsm.CFG.content_done_forbidden_notools
+    if not ids:
+        raise RuntimeError(
+            "SOLAR_FSM: the no-tools CONTENT forbidden set is empty; every "
+            "armed row would mask token id 0 and no sentinel"
+        )
+    return list(ids)
 
 
 class DsparkVerifyEpilogue:

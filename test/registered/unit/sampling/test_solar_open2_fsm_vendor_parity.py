@@ -437,6 +437,18 @@ class TestPlanGate(_FsmCase):
                 ):
                     self.assertEqual(flags, [False] * 4, "no in-graph mask")
 
+        # The counterpart, and the reason folded_mask_flags has no grammar term
+        # of its own: a grammar owns CONTENT, not the think block, so a
+        # REASONING row under one folds *and* is armed. Adding a grammar test
+        # there "for consistency" would delete the reasoning mask, and until
+        # this ran nothing said so.
+        reasoning = _req([7] * 10)
+        reasoning.sampling_params.json_schema = '{"type": "object"}'
+        # Primed, or _folded_flags short-circuits on the missing FSM and this
+        # passes for the absence rather than the property.
+        self.assertTrue(fsm._req_fsm(reasoning).in_reasoning)
+        self.assertEqual(fsm.folded_mask_flags([reasoning], 4), [True] * 4)
+
     def test_content_with_progress_keeps_the_folded_path(self):
         self.assertFalse(self._gate(_req([7, THINK_END, 8])))
 

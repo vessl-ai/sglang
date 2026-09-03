@@ -1300,8 +1300,8 @@ def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
 
     True where the request's **committed** state is CONTENT with content
     already produced and no grammar -- the non-grammar subset of the rows
-    :func:`plan_gate` declines to send eager, and therefore the rows whose forbidden set nothing
-    else applies. Without this the second bullet of
+    :func:`plan_gate` declines to send eager, and so the rows nothing else
+    applies a forbidden set to. Without this the second bullet of
     :func:`folded_mask_flags` is open: a drafted ``<|think:start|>`` (or any
     other sentinel CONTENT does not allow) is accepted unmasked on a
     content-with-progress row, which is how a control token reaches the client

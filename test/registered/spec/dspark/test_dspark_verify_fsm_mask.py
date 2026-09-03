@@ -320,16 +320,13 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 self.assertIsInstance(arg, ast.Call)
                 self.assertEqual(arg.func.attr, flags)
 
-    def test_the_folded_path_stays_greedy_on_both_legs(self):
-        """The folded epilogue accepts by argmax and nothing else, so a batch
-        that wants sampling must not be folded. Leg A is the worker refusing to
-        fold one; leg B is the epilogue having no other accept. Drop either and
-        a sampling request is silently served greedy.
+    def test_the_worker_refuses_to_fold_a_sampling_batch(self):
+        """Leg A of what keeps the folded path greedy. The epilogue accepts by
+        argmax alone, so a batch that wants sampling must not reach it.
 
-        Checked structurally: a grep survives a negation, and cannot see leg B
-        at all.
+        Structural because fold_eligible is an inline expression with no handle
+        to call, and because a grep survives a negation.
         """
-        # Leg A: fold_eligible admits only a greedy batch, and not under a `not`.
         worker = ast.parse(inspect.getsource(dspark_worker_v2))
         binds = [
             n
@@ -342,16 +339,14 @@ class TestEpilogueFsmMasks(CustomTestCase):
         ]
         self.assertEqual(len(binds), 1, "fold_eligible is bound once")
         self.assertIsInstance(binds[0], ast.Assign, "and not amended after")
-        # Required, not merely mentioned: a top-level operand of the `and`.
-        # `... or self.allow_sampled_fold` reads it and does not require it.
         conj = binds[0].value
         self.assertIsInstance(conj, ast.BoolOp)
         self.assertIsInstance(conj.op, ast.And)
         greedy = [v for v in conj.values if "is_all_greedy" in ast.dump(v)]
         self.assertEqual(len(greedy), 1, "one conjunct tests it")
         # `x is None or x.is_all_greedy` and nothing else: a third disjunct
-        # (`or self.allow_sampled_fold`) reads the flag without requiring it,
-        # and a negation or comparison inverts what it requires.
+        # reads the flag without requiring it, and a negation or comparison
+        # inverts what it requires.
         self.assertIsInstance(greedy[0], ast.BoolOp)
         self.assertIsInstance(greedy[0].op, ast.Or)
         self.assertEqual(len(greedy[0].values), 2, "no escape hatch disjunct")
@@ -361,14 +356,11 @@ class TestEpilogueFsmMasks(CustomTestCase):
             ):
                 self.fail("the greedy test is negated or compared, not required")
 
-        # Leg B: the in-graph accept is the greedy one, unconditionally. Scoped
-        # to the epilogue class -- the eager path in the same module has its own
-        # accept and is not folded.
-        epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
-
-        # Leg B: the in-graph accept is the greedy one, and reached by name.
-        # Scoped to the epilogue class -- the eager path in the same module has
-        # its own accept and is not folded.
+    def test_the_epilogue_has_no_accept_but_the_greedy_one(self):
+        """Leg B. Scoped to the class -- the eager path in the same module has
+        its own accept and is not folded. Reached by name, too: a computed
+        callee leaves nothing to read while the accept changes underneath.
+        """
         epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
         callees = [
             n.func.id
@@ -378,19 +370,11 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertEqual(
             [c for c in callees if c.startswith("accept_")],
             ["accept_greedy_triton"],
-            "the folded epilogue must accept by argmax and nothing else",
         )
-        # And reached by name: `getattr(mod, "accept_sampled_triton")(...)`
-        # leaves no Name callee to see, so the list above stays correct while
-        # the accept changes.
         self.assertNotIn("getattr", callees, "no dynamic dispatch in here")
         for n in ast.walk(epilogue):
             if isinstance(n, ast.Call):
-                self.assertIsInstance(
-                    n.func,
-                    (ast.Name, ast.Attribute),
-                    "a computed callee hides which accept runs",
-                )
+                self.assertIsInstance(n.func, (ast.Name, ast.Attribute))
 
     def test_a_fresh_id_snapshot_is_not_reported(self):
         """The negative control for all three divergence checks: a detector that
