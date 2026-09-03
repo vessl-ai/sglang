@@ -21,7 +21,6 @@ against ``solar_open2_fsm``:
 Pure CPU: small float logits tensors and duck-typed requests.
 """
 
-import inspect
 import json
 import os
 import tempfile
@@ -32,7 +31,6 @@ from unittest import mock
 import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
-from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1124,7 +1122,7 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertEqual(plan.force_rows, [])
 
     def test_the_documented_folded_gaps_stay_exactly_as_documented(self):
-        """plan_gate records three folded-path gaps as accepted. Nothing pinned
+        """plan_gate records two folded-path gaps as accepted. Nothing pinned
         them, so a refactor could widen or close one and no test would notice --
         and this repo pins accepted trade-offs so that changing one is
         deliberate. This lives here, not next to the flag functions, because
@@ -1134,9 +1132,7 @@ class TestSpecPathToolStates(_FsmCase):
         Not asserting the gaps are harmless -- each is a control token reaching
         the answer. Asserting their extent.
         """
-        _cfg()
-
-        # Gap 1: REASONING allows <|think:end|> (its only legal exit) while
+        # <|think:end|>: REASONING allows <|think:end|> (its only legal exit) while
         # fresh CONTENT forbids it, so the rows after a drafted <|think:end|>
         # are fresh CONTENT wearing the reasoning set, and a second one lands.
         self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
@@ -1151,15 +1147,8 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertIn(THINK_START, fsm.CFG.reasoning_forbidden)
         self.assertIn(THINK_START, fsm.CFG.content_done_forbidden)
         self.assertIn(THINK_START, fsm.CFG.content_done_forbidden_notools)
-        worker_src = inspect.getsource(dspark_worker_v2)
-        self.assertIn(
-            "is_all_greedy",
-            worker_src,
-            "fold_eligible must keep requiring a greedy batch, or a masked "
-            "sentinel could be sampled and the gap above becomes real",
-        )
 
-        # Gap 3: the tool states forbid the turn from ending, but the rows a
+        # <|tool_call:start|>: the tool states forbid the turn from ending, but the rows a
         # legally drafted <|tool_call:start|> puts there carry the CONTENT set,
         # which permits both.
         self.assertIn(EOS, fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])

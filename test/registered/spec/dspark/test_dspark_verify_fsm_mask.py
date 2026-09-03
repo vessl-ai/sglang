@@ -30,6 +30,14 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+_LOG = "sglang.srt.speculative.dspark_components.dspark_verify"
+# (staging setter, the flag function the worker must hand it)
+_MASKS = (
+    ("set_fsm_rows", "folded_mask_flags"),
+    ("set_fsm_content_rows", "folded_content_mask_flags"),
+    ("set_fsm_content_notools_rows", "folded_content_notools_mask_flags"),
+)
+
 THINK_START, THINK_END, EOS, TOOL_START = 100, 101, 2, 102
 TOOL_ARG_START, TOOL_ARG_VALUE, TOOL_ARG_END, TOOL_CALL_END = 103, 104, 105, 106
 TOOL_INTERNALS = (TOOL_ARG_START, TOOL_ARG_VALUE, TOOL_ARG_END, TOOL_CALL_END)
@@ -273,19 +281,9 @@ class TestEpilogueFsmMasks(CustomTestCase):
         buffer left behind by a late FSM resolution masks the wrong ids, and
         every armed content row then looks masked and is not."""
         fsm.CFG.content_done_forbidden = (THINK_START, 55)
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as logs:
+        with self.assertLogs(_LOG, level="ERROR") as logs:
             self.ep.set_fsm_content_rows([True] * self.stride)
         self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
-
-    def test_a_fresh_content_id_snapshot_is_not_reported(self):
-        """Without this, a detector that logs unconditionally passes the test
-        above."""
-        with self.assertNoLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ):
-            self.ep.set_fsm_content_rows([True] * self.stride)
 
     def test_a_disarming_call_does_not_burn_the_check(self):
         """The check fires once. If a None call spends it, the first step of a
@@ -293,22 +291,42 @@ class TestEpilogueFsmMasks(CustomTestCase):
         the common case, since flags are None whenever the FSM is inactive."""
         self.ep.set_fsm_content_rows(None)
         fsm.CFG.content_done_forbidden = (THINK_START, 55)
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as logs:
+        with self.assertLogs(_LOG, level="ERROR") as logs:
             self.ep.set_fsm_content_rows([True] * self.stride)
         self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
 
-    def test_a_fresh_reasoning_id_snapshot_is_not_reported(self):
-        """The negative control its two siblings have. Without it, pointing the
-        reasoning check at a sibling's ids (`want=_fsm_content_forbidden_ids`)
-        leaves every test green -- the only test that watches this setter's log
-        makes all three buffers stale on purpose, so a wrong `want` still
-        produces three lines."""
-        with self.assertNoLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ):
-            self.ep.set_fsm_rows([True] * self.stride)
+    def test_the_worker_arms_each_mask_from_its_own_flags(self):
+        """Source-shape guard for all three. A setter the worker never calls is
+        invisible to every behavioural test here, and handing one the wrong
+        flags is a live copy-paste mutant -- the content flags on the reasoning
+        setter puts EOS out of reach once the answer is done, which is the shape
+        this port exists to fix."""
+        calls = [
+            n
+            for n in ast.walk(ast.parse(inspect.getsource(dspark_worker_v2)))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        ]
+        for setter, flags in _MASKS:
+            with self.subTest(setter):
+                armed = [c for c in calls if c.func.attr == setter]
+                self.assertEqual(len(armed), 1, f"{setter} must be armed once")
+                arg = armed[0].args[0]
+                self.assertIsInstance(arg, ast.Call)
+                self.assertEqual(arg.func.attr, flags)
+
+    def test_fold_eligible_still_requires_a_greedy_batch(self):
+        """What keeps a masked sentinel out of the committed chain: a -inf logit
+        cannot be the argmax. Drop the requirement and every masked sentinel
+        becomes sampleable, which opens the gap plan_gate calls impossible."""
+        self.assertIn("is_all_greedy", inspect.getsource(dspark_worker_v2))
+
+    def test_a_fresh_id_snapshot_is_not_reported(self):
+        """The negative control for all three divergence checks: a detector that
+        logs unconditionally passes the staleness tests and cries wolf on every
+        engine."""
+        for setter, _ in _MASKS:
+            with self.subTest(setter), self.assertNoLogs(_LOG, level="ERROR"):
+                getattr(self.ep, setter)([True] * self.stride)
 
     def test_each_buffer_gets_its_own_check(self):
         """The one-shot check is keyed by a label string. Give two buffers the
@@ -321,40 +339,12 @@ class TestEpilogueFsmMasks(CustomTestCase):
         fsm.CFG.content_done_forbidden = (THINK_START, 56)
         fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START, 57)
         rows = [True] * self.stride
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as logs:
+        with self.assertLogs(_LOG, level="ERROR") as logs:
             self.ep.set_fsm_rows(rows)
             self.ep.set_fsm_content_rows(rows)
             self.ep.set_fsm_content_notools_rows(rows)
         self.assertEqual(len(self.ep._ids_checked), 3, self.ep._ids_checked)
         self.assertEqual(len(logs.output), 3, logs.output)
-
-    def test_the_worker_arms_the_content_mask_from_the_content_flags(self):
-        """Both halves are unit-tested; nothing else tests that the worker
-        connects them. Deleting the set_fsm_content_rows call leaves every
-        other test in the repo green and the mask armed on no row at all --
-        and handing it folded_mask_flags instead is a live copy-paste mutant.
-
-        Source-shape, deliberately: there is no GPU-free way to drive the
-        worker. A rename breaks this, which is the intended cost.
-        """
-        tree = ast.parse(inspect.getsource(dspark_worker_v2))
-        calls = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "set_fsm_content_rows"
-        ]
-        self.assertEqual(len(calls), 1, "the CONTENT mask must be armed once")
-        arg = calls[0].args[0]
-        self.assertIsInstance(arg, ast.Call)
-        self.assertEqual(
-            arg.func.attr,
-            "folded_content_mask_flags",
-            "the CONTENT setter must be given the CONTENT flags",
-        )
 
     def test_the_notools_buffer_holds_the_whole_no_tools_set(self):
         """Not a difference against the shared set, and not the [0] placeholder
@@ -418,58 +408,13 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertFalse(self.ep.fsm_row_buf.any())
         self.assertFalse(self.ep.fsm_content_row_buf.any())
 
-    def test_a_fresh_notools_id_snapshot_is_not_reported(self):
-        """The pair for the staleness test below: a detector that logs
-        unconditionally passes that one and would cry wolf on every engine."""
-        with self.assertNoLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ):
-            self.ep.set_fsm_content_notools_rows([True] * self.stride)
-
     def test_the_notools_staleness_check_sees_a_config_that_moved(self):
         """The realistic shape, matching the CONTENT sibling: the CFG changes
         after construction rather than the buffer being swapped by hand."""
         fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START, 42)
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as cm:
+        with self.assertLogs(_LOG, level="ERROR") as cm:
             self.ep.set_fsm_content_notools_rows([True] * self.stride)
         self.assertIn("no-tools", "\n".join(cm.output))
-
-    def test_the_worker_arms_the_reasoning_mask_from_the_reasoning_flags(self):
-        """The guard its two siblings have. Hand this setter the content flags
-        instead and every test here still passes, while content rows take the
-        reasoning set -- EOS forbidden after the answer is done, so generation
-        runs to max_new_tokens. That is the shape this port was written to
-        fix."""
-        tree = ast.parse(inspect.getsource(dspark_worker_v2))
-        calls = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "set_fsm_rows"
-        ]
-        self.assertEqual(len(calls), 1, "the reasoning mask must be armed once")
-        arg = calls[0].args[0]
-        self.assertIsInstance(arg, ast.Call)
-        self.assertEqual(arg.func.attr, "folded_mask_flags")
-
-    def test_the_worker_arms_the_notools_mask_with_the_notools_flags(self):
-        """Source-shape guard, like the CONTENT one: the call is invisible to
-        every behavioural test in this file if it is simply absent."""
-        tree = ast.parse(inspect.getsource(dspark_worker_v2))
-        calls = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "set_fsm_content_notools_rows"
-        ]
-        self.assertEqual(len(calls), 1, "the no-tools mask must be armed once")
-        arg = calls[0].args[0]
-        self.assertIsInstance(arg, ast.Call)
-        self.assertEqual(arg.func.attr, "folded_content_notools_mask_flags")
 
 
 if __name__ == "__main__":
