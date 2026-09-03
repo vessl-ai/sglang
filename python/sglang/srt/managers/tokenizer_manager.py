@@ -584,10 +584,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
-        # rid -> monotonic time _abort_orphaned_rid last sent an abort for
-        # it, so the abort goes out once per request rather than once per
-        # output message, and is retried if it did not take.
-        self._aborted_orphan_rids: Dict[str, float] = {}
+        # rid -> (monotonic time of the last _abort_orphaned_rid attempt,
+        # whether it actually went out), so an attempt is made once per
+        # request rather than once per output message, and retried if it did
+        # not take.
+        self._aborted_orphan_rids: Dict[str, Tuple[float, bool]] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -1997,16 +1998,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def _remember_orphan_abort(self, rid: str, now: float) -> None:
-        """Record an abort attempt, newest last, capped.
+    def _remember_orphan_abort(self, rid: str, now: float, *, sent: bool) -> None:
+        """Record an attempt, newest last, capped.
 
         Re-inserting moves the rid to the end, so insertion order is recency
         order and the oldest entry is the one nearest the end of its retry
         window -- evicting it costs at most one duplicate abort, which the
-        scheduler ignores.
+        scheduler ignores. ``sent`` distinguishes an abort that went out from
+        one this declined to send, so the log can say which.
         """
         self._aborted_orphan_rids.pop(rid, None)
-        self._aborted_orphan_rids[rid] = now
+        self._aborted_orphan_rids[rid] = (now, sent)
         while len(self._aborted_orphan_rids) > _MAX_TRACKED_ORPHAN_RIDS:
             self._aborted_orphan_rids.pop(next(iter(self._aborted_orphan_rids)))
 
@@ -2017,10 +2019,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         A stream that breaks (a worker-to-router SSE error, a client that goes
         away mid-generation) deletes the state here, but nothing tells the
         scheduler, so it runs the request to ``max_new_tokens`` with no
-        consumer. ``abort_request`` cannot be used: it returns early for
-        exactly this case (a rid with no state). Its empty-rid guard is
-        re-applied below; the prefix guard is new and ``abort_request`` still
-        lacks it.
+        consumer. ``abort_request`` is not usable: in single-tokenizer-worker
+        mode it returns early for exactly this case (a rid with no state), and
+        in either mode it lacks the prefix guard and the throttle below.
 
         The scheduler matches an abort by ``startswith``, so an empty rid
         would abort everything, and an orphaned ``X_1`` would finish a live
@@ -2031,19 +2032,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         matching -- ``abort_request`` has it too. An ``exact`` flag on
         ``AbortReq`` is what would close both.
 
-        Output keeps arriving until the scheduler acts, so an attempt is
-        remembered and not repeated for ``_ORPHAN_ABORT_RETRY_S``.
+        Output keeps arriving until the scheduler acts, so every outcome --
+        sent, declined, failed -- is recorded and not revisited for
+        ``_ORPHAN_ABORT_RETRY_S``. That throttle is what keeps the O(live
+        requests) collision scan off the per-message path, at the price of a
+        blocked orphan waiting out one more window after its collision clears.
         """
-        if not rid:
-            logger.error(
-                "Received orphaned output with an empty rid; not aborting "
-                "(an empty rid matches every request on the scheduler)."
-            )
+        now = time.monotonic()
+        last = self._aborted_orphan_rids.get(rid)
+        if last is not None and now - last[0] < _ORPHAN_ABORT_RETRY_S:
             return
 
-        now = time.monotonic()
-        sent_at = self._aborted_orphan_rids.get(rid)
-        if sent_at is not None and now - sent_at < _ORPHAN_ABORT_RETRY_S:
+        if not rid:
+            # Not just an internal bug: a caller may send rid="", which the
+            # request normalizers leave alone (they only replace None).
+            self._remember_orphan_abort(rid, now, sent=False)
+            logger.error(
+                "Received orphaned output with an empty rid; not aborting "
+                "(an empty rid matches every request on the scheduler). "
+                f"Suppressed for {_ORPHAN_ABORT_RETRY_S}s."
+            )
             return
 
         # Only reachable with no state for `rid`, so any live rid matching
@@ -2052,8 +2060,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             (live for live in self.rid_to_state if live.startswith(rid)), None
         )
         if collision is not None:
-            self._remember_orphan_abort(rid, now)
-            logger.warning(
+            self._remember_orphan_abort(rid, now, sent=False)
+            # Worse than the case below -- this leak is not being cured --
+            # so it is not logged one level quieter than the cure.
+            logger.error(
                 f"Orphaned {rid=} left running: live {collision=} has it as a "
                 f"prefix and the scheduler matches aborts by startswith, so "
                 f"aborting it would finish {collision} too. It generates with "
@@ -2064,25 +2074,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         logger.error(
             f"Received output for {rid=} but the state was deleted in "
             f"TokenizerManager; aborting it on the scheduler"
-            f"{' again' if sent_at is not None else ''}."
+            f"{' again' if last is not None and last[1] else ''}."
         )
-        # Recorded before the send: these failures are permanent (closed
-        # socket, unencodable object), so retrying per output message would
-        # flood the loop with tracebacks instead of retrying on the window.
-        self._remember_orphan_abort(rid, now)
+        sent = False
         try:
             self._dispatch_to_scheduler(
                 AbortReq(rid=rid, abort_message="orphaned output, no consumer")
             )
+            sent = True
         except Exception:
             # handle_loop has no handler and print_exception_wrapper kills the
-            # process tree, so a failed abort must not propagate.
+            # process tree, so a failed abort must not propagate. Recorded
+            # anyway below: these sends fail permanently (closed socket,
+            # unencodable object), and retrying per output message would flood
+            # the loop every stream shares with tracebacks.
             logger.exception(
                 f"Failed to abort orphaned {rid=}; retrying in "
                 f"{_ORPHAN_ABORT_RETRY_S}s."
             )
-            return
-        if self.enable_metrics:
+        self._remember_orphan_abort(rid, now, sent=sent)
+        if sent and self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
