@@ -1358,9 +1358,12 @@ def plan_gate(reqs, stride: int) -> bool:
     ``2 * stride`` because the state read here can lag by one accepted run.
 
     Three kinds of row reach the folded path. The third is deliberate and
-    unmasked: fresh CONTENT under a grammar is exempt here (the grammar owns
-    CONTENT), so no flag function arms it and ``plan_verify`` does not run for
-    it either. What keeps that from mattering lives in the worker:
+    unmasked: **CONTENT under a grammar**, which the grammar owns. Both of its
+    halves get here down different clauses -- a fresh row through the grammar
+    exemption below, one with content already produced through the
+    ``content_progress`` test, which does not look at the grammar at all -- and
+    neither is armed, because all three flag functions require
+    ``not _has_grammar``. What keeps that from mattering lives in the worker:
     ``fold_eligible`` requires ``not batch.has_grammar``. That is a
     *different* predicate -- ``req.grammar`` rather than the sampling params
     ``_has_grammar`` reads -- so the two must not be allowed to drift apart.

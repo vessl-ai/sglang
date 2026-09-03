@@ -544,9 +544,23 @@ def _fsm_content_forbidden_ids() -> List[int]:
         if tid is not None
     }
     ids = [i for i in _fsm.CFG.content_done_forbidden if i not in tool_internals]
-    # An empty index buffer would change the captured shape; fall back to the
-    # placeholder, which is only ever paired with an all-False row buffer.
-    return ids or [0]
+    if ids:
+        return ids
+    # Unreachable through configure_ids: CONTENT allows only
+    # <|tool_call:start|> and <|im:end|>, so the think ids -- both required --
+    # are always in this set and the subtraction cannot empty it. Reaching here
+    # means the tables were built some other way, and unlike the placeholder
+    # above it does NOT pair with an all-False row buffer: the flags never
+    # consult this set, so armed rows would mask token id 0 while every
+    # sentinel stayed open. Say so; an empty buffer would change the captured
+    # shape, so the placeholder still goes back.
+    logger.error(
+        "[SOLAR-FSM] the CONTENT forbidden set is nothing but tool internals "
+        "(%s), which this buffer subtracts; armed rows will mask token id 0 "
+        "and no sentinel",
+        list(_fsm.CFG.content_done_forbidden),
+    )
+    return [0]
 
 
 def _fsm_content_notools_forbidden_ids() -> List[int]:

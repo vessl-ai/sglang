@@ -409,25 +409,30 @@ class TestPlanGate(_FsmCase):
     def test_fresh_content_goes_eager(self):
         self.assertTrue(self._gate(_req([7, THINK_END])))
 
-    def test_fresh_content_under_a_grammar_folds_and_nothing_masks_it(self):
+    def test_content_under_a_grammar_folds_and_nothing_masks_it(self):
         """The third kind of row that reaches the folded path, and the only one
-        with no mask at all. `_content_needs_eager` exempts a CONTENT row under
-        a grammar -- the grammar owns CONTENT -- so plan_gate lets the step
-        fold, and none of the three flag functions arm it either.
+        with no mask at all. The grammar owns CONTENT, so plan_gate lets the
+        step fold and none of the three flag functions arm it either.
 
         The drift guard is in the worker -- see plan_gate's third-row paragraph.
         Pinned here so that drift is a test failure, not a control token in
         someone's answer.
         """
-        req = _req([7, THINK_END])
-        req.sampling_params.json_schema = '{"type": "object"}'
-        self.assertFalse(self._gate(req), "a grammar row is not sent eager")
-        for flags in (
-            fsm.folded_mask_flags([req], 4),
-            fsm.folded_content_mask_flags([req], 4),
-            fsm.folded_content_notools_mask_flags([req], 4),
-        ):
-            self.assertEqual(flags, [False] * 4, "no in-graph mask arms it")
+        # Both halves: a fresh row reaches this through the grammar exemption,
+        # one with content already produced through the content_progress test,
+        # which does not look at the grammar at all. Different clauses, same
+        # unmasked row -- pinning only the fresh one leaves half the class open.
+        for label, out in (("fresh", [7, THINK_END]), ("progress", [7, THINK_END, 8])):
+            with self.subTest(label):
+                req = _req(out)
+                req.sampling_params.json_schema = '{"type": "object"}'
+                self.assertFalse(self._gate(req), "a grammar row is not eager")
+                for flags in (
+                    fsm.folded_mask_flags([req], 4),
+                    fsm.folded_content_mask_flags([req], 4),
+                    fsm.folded_content_notools_mask_flags([req], 4),
+                ):
+                    self.assertEqual(flags, [False] * 4, "no in-graph mask")
 
     def test_content_with_progress_keeps_the_folded_path(self):
         self.assertFalse(self._gate(_req([7, THINK_END, 8])))

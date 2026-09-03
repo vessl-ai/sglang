@@ -321,38 +321,49 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 self.assertEqual(arg.func.attr, flags)
 
     def test_the_folded_path_stays_greedy_on_both_legs(self):
-        """What keeps a masked sentinel out of the committed chain: a -inf logit
-        cannot be the argmax. plan_gate documents two gaps as the only ones that
-        exist because of it, so if either leg goes the ledger becomes a lie.
+        """The folded epilogue accepts by argmax and nothing else, so a batch
+        that wants sampling must not be folded. Leg A is the worker refusing to
+        fold one; leg B is the epilogue having no other accept. Drop either and
+        a sampling request is silently served greedy.
 
         Checked structurally: a grep survives a negation, and cannot see leg B
         at all.
         """
         # Leg A: fold_eligible admits only a greedy batch, and not under a `not`.
         worker = ast.parse(inspect.getsource(dspark_worker_v2))
-        greedy_reads = [
-            n
+        fold = [
+            n.value
             for n in ast.walk(worker)
-            if isinstance(n, ast.Attribute) and n.attr == "is_all_greedy"
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "fold_eligible" for t in n.targets
+            )
         ]
-        self.assertEqual(len(greedy_reads), 1, "fold_eligible reads it once")
-        for n in ast.walk(worker):
-            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+        self.assertEqual(len(fold), 1, "one fold_eligible assignment")
+        # Scoped to that expression, so a read left behind in a log line or a
+        # clause moved out of the conjunction both fail.
+        conj = ast.dump(fold[0])
+        self.assertIn("is_all_greedy", conj, "fold_eligible must test it")
+        for n in ast.walk(fold[0]):
+            if isinstance(n, (ast.UnaryOp, ast.Compare)):
                 self.assertNotIn(
                     "is_all_greedy",
                     ast.dump(n),
-                    "the greedy test is negated -- only sampling batches fold",
+                    "the greedy test is negated or compared, not required",
                 )
         # Leg B: the in-graph accept is the greedy one, unconditionally. Scoped
         # to the epilogue class -- the eager path in the same module has its own
         # accept and is not folded.
         epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
+
+        def callee(node):
+            f = node.func
+            return f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
+
         accepts = [
-            n.func.id
+            callee(n)
             for n in ast.walk(epilogue)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Name)
-            and n.func.id.startswith("accept_")
+            if isinstance(n, ast.Call) and callee(n).startswith("accept_")
         ]
         self.assertEqual(
             accepts,
@@ -372,30 +383,18 @@ class TestEpilogueFsmMasks(CustomTestCase):
             with self.subTest(setter), self.assertNoLogs(_LOG, level="ERROR"):
                 getattr(ep, setter)([True] * self.stride)
 
-    def test_the_content_placeholder_is_not_reachable_while_rows_are_armed(self):
-        """`return ids or [0]` sits after the FSM-active check, so unlike the
-        FSM-off branch above it the placeholder can be live while the flags
-        still arm rows -- which masks token id 0 instead of the sentinels. It
-        is reachable when CONTENT forbids only the tool internals, since those
-        are exactly what this buffer subtracts.
-
-        Asserting the shape rather than the current tables: whenever the buffer
-        falls back to the placeholder, no row may be armed for it.
-        """
+    def test_a_content_set_of_only_tool_internals_is_reported(self):
+        """The placeholder here is not the safe one. `return ids or [0]` sits
+        after the FSM-active check, and the flags never consult this set, so a
+        CONTENT set the subtraction empties leaves rows armed against token id 0
+        with every sentinel open. configure_ids cannot build that -- CONTENT
+        allows only the opener and <|im:end|>, so the required think ids are
+        always in the set -- which is why this says so loudly instead of
+        pretending the rows are unarmed."""
         fsm.CFG.content_done_forbidden = TOOL_INTERNALS
-        ids = _fsm_content_forbidden_ids()
-        self.assertEqual(ids, [0], "fixture must reach the placeholder branch")
-        req = SimpleNamespace(
-            output_ids=[7, THINK_END, 7],
-            sampling_params=SimpleNamespace(json_schema=None, regex=None, ebnf=None),
-            retraction_count=0,
-        )
-        flags = fsm.folded_content_mask_flags([req], self.stride)
-        self.assertFalse(
-            flags and any(flags),
-            "the placeholder is armed on a real row -- token id 0 is masked "
-            "and the sentinels are not",
-        )
+        with self.assertLogs(_LOG, level="ERROR") as logs:
+            self.assertEqual(_fsm_content_forbidden_ids(), [0])
+        self.assertIn("token id 0", "\n".join(logs.output))
 
     def test_each_buffer_gets_its_own_check(self):
         """The one-shot check is keyed by a label string. Give two buffers the
