@@ -919,9 +919,16 @@ _CONFLICT_LOG = {"last": -_LOG_INTERVAL, "num_suppressed": 0}
 
 
 def _log_force_conflict(rows, *, stride: int, rids) -> None:
-    """Report rows where the FSM wanted to force <|think:end|> but the grammar
-    had already forbidden it -- the two are reading different committed state,
-    and forcing would leave the row fully masked. Rate-limited like
+    """Report rows where the FSM wanted to force <|think:end|> but something
+    had already forbidden it, so forcing would leave the row fully masked.
+
+    Two sources, and the message names both because they are not
+    distinguishable here: a grammar reading different committed state, and the
+    in-graph CONTENT mask, which forbids ``<|think:end|>`` on a row committed
+    in CONTENT-with-progress. The second reaches this only for a zero-budget
+    request (effort ``none``/``minimal``) whose chain drafts a
+    ``<|think:start|>``: ``plan_verify`` then wants the budget force on a row
+    the content mask has already shut. Rate-limited like
     ``_warn_unknown_effort``."""
     num_suppressed = _rate_limited(_CONFLICT_LOG, count=len(rows))
     if num_suppressed is None:
@@ -931,9 +938,10 @@ def _log_force_conflict(rows, *, stride: int, rids) -> None:
     else:
         named = []
     logger.warning(
-        "[SOLAR-FSM] grammar already forbids <|think:end|> (id=%s) on %d row(s) "
-        "%s (reqs %s); skipping the budget force there so the row keeps the "
-        "grammar's allowed set. %d earlier occurrence(s) suppressed.",
+        "[SOLAR-FSM] <|think:end|> (id=%s) is already forbidden by the grammar "
+        "or by the in-graph CONTENT mask on %d row(s) %s (reqs %s); skipping "
+        "the budget force there so the row keeps the set it already has. "
+        "%d earlier occurrence(s) suppressed.",
         CFG.think_end,
         len(rows),
         rows,

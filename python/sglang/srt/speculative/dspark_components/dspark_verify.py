@@ -672,6 +672,18 @@ class DsparkVerifyEpilogue:
                     self.fsm_forbid_buf.tolist(),
                     list(forbidden_ids or ()),
                 )
+            # The CONTENT buffer is snapshotted in the same breath and can go
+            # stale the same way, and its rows are armed by the setter below,
+            # which takes no ids of its own -- so it is checked here.
+            want_content = list(_fsm.CFG.content_done_forbidden or ())
+            if want_content != self.fsm_content_forbid_buf.tolist():
+                logger.error(
+                    "[SOLAR-FSM] in-graph CONTENT mask holds %s but the FSM now "
+                    "forbids %s; captured before the FSM resolved, so armed "
+                    "content rows are masking the wrong ids",
+                    self.fsm_content_forbid_buf.tolist(),
+                    want_content,
+                )
         n = min(len(flags), self.fsm_row_buf.shape[0])
         self.fsm_row_buf[:n].copy_(
             torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True

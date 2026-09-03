@@ -34,6 +34,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 THINK_START, THINK_END, EOS = 100, 101, 2
+TOOL_START = 102
 
 
 def _cfg(**over):
@@ -46,6 +47,22 @@ def _cfg(**over):
     fsm.CFG.reasoning_open_forbidden = (EOS,)
     fsm.CFG.content_done_forbidden = (THINK_START,)
     fsm.CFG.content_fresh_forbidden = (THINK_START, EOS)
+    fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START)
+    fsm.CFG.content_fresh_forbidden_notools = (THINK_START, TOOL_START, EOS)
+    # plan_verify resolves CONTENT through _forbidden_for, which reads these;
+    # without them a pairing test measures whatever the process left behind.
+    fsm.CFG.forbidden = {
+        (fsm.REASONING, False): (EOS,),
+        (fsm.REASONING, True): (EOS,),
+        (fsm.CONTENT, False): fsm.CFG.content_fresh_forbidden,
+        (fsm.CONTENT, True): fsm.CFG.content_done_forbidden,
+    }
+    fsm.CFG.forbidden_notools = {
+        (fsm.REASONING, False): (EOS,),
+        (fsm.REASONING, True): (EOS,),
+        (fsm.CONTENT, False): fsm.CFG.content_fresh_forbidden_notools,
+        (fsm.CONTENT, True): fsm.CFG.content_done_forbidden_notools,
+    }
     fsm.CFG.spec_always_eager = False
     # Budgets here are pinned by hand: one effort, 3072 tokens.
     fsm.CFG.effort_budgets = {"high": 3072}
@@ -98,6 +115,10 @@ class TestSolarFsmMaskGate(CustomTestCase):
                 "reasoning_open_forbidden",
                 "content_done_forbidden",
                 "content_fresh_forbidden",
+                "content_done_forbidden_notools",
+                "content_fresh_forbidden_notools",
+                "forbidden",
+                "forbidden_notools",
             )
         }
         _cfg()
@@ -132,6 +153,21 @@ class TestSolarFsmMaskGate(CustomTestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
         self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
 
+    def test_a_row_that_left_content_is_not_flagged(self):
+        """The two sets kept apart, actually measured. content_progress is
+        sticky, so a row that produced content and then re-entered REASONING
+        still carries it -- only the state check keeps that row off the CONTENT
+        mask. The fixture above never had content_progress, so it cannot see
+        that check at all."""
+        _cfg()
+        req = _req([7, THINK_END, 7, THINK_START])
+        f = fsm._req_fsm(req)
+        f.advance(req.output_ids)
+        self.assertTrue(f.in_reasoning, "fixture must have re-entered REASONING")
+        self.assertTrue(f.content_progress, "fixture must carry content_progress")
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
+
     def test_content_under_a_grammar_is_not_flagged(self):
         """Structured outputs own CONTENT; masking it here would fight them."""
         _cfg()
@@ -139,16 +175,30 @@ class TestSolarFsmMaskGate(CustomTestCase):
         req.sampling_params.json_schema = '{"type": "object"}'
         self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
 
-    def test_no_content_row_is_left_unmasked(self):
-        """The pairing, for CONTENT: for every content-with-progress row
-        plan_verify would mask, either the gate fired or the flag is set."""
+    def test_content_flags_equal_the_rows_plan_verify_would_mask(self):
+        """The pairing, for CONTENT -- equality, not implication: an all-True
+        implementation satisfies implication and would write the content set
+        over reasoning and padding rows too."""
+        import torch
+
         _cfg()
-        for out in ([7, THINK_END, 7], [7, THINK_END, 7, 7], [7, THINK_END] + [7] * 9):
-            with self.subTest(out=out):
+        stride = 4
+        for label, out in (
+            ("content with progress", [7, THINK_END, 7]),
+            ("fresh content", [7, THINK_END]),
+            ("reasoning", [7] * 44),
+        ):
+            with self.subTest(label):
                 req = _req(out)
-                gated = fsm.plan_gate([req], 8)
-                flags = fsm.folded_content_mask_flags([req], 8)
-                self.assertTrue(gated or all(flags))
+                gated = fsm.plan_gate([req], stride)
+                flags = fsm.folded_content_mask_flags([req], stride) or []
+                plan = fsm.plan_verify([req], torch.tensor([[7] * stride]), stride)
+                masked = set(plan.mask_rows.get(fsm.CFG.content_done_forbidden, []))
+                flagged = {r for r, on in enumerate(flags) if on}
+                for row in masked:
+                    self.assertTrue(gated or row in flagged, f"{label}: row {row}")
+                if not gated:
+                    self.assertEqual(flagged, masked, label)
 
     def test_reasoning_row_far_from_the_budget_is_flagged(self):
         """The defect's own case. 44 tokens into a 3072-token budget is nowhere
@@ -256,6 +306,7 @@ class TestSolarFsmMaskGate(CustomTestCase):
         req.retraction_count = 1
         self.assertTrue(fsm.plan_gate([req], 8))
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
 
     def test_content_row_is_not_flagged(self):
         _cfg()
@@ -264,9 +315,10 @@ class TestSolarFsmMaskGate(CustomTestCase):
         self.assertFalse(fsm.plan_gate([req], 8))
 
     def test_fresh_content_row_gates(self):
-        """The content sets have no in-graph carrier, so a row whose turn has
-        no content yet must go eager; once it has content the fold is kept
-        (its rows then only lack the content_done set, a documented gap)."""
+        """Fresh CONTENT takes the stricter set (EOS and <|im:end|> shut),
+        which only plan_verify writes, so the row must go eager; once it has
+        content the fold is kept and folded_content_mask_flags arms it with
+        the content_done set instead."""
         _cfg()
         self.assertTrue(fsm.plan_gate([_req([7, THINK_END])], 8))
         self.assertFalse(fsm.plan_gate([_req([7, THINK_END, 7])], 8))
@@ -299,6 +351,7 @@ class TestSolarFsmMaskGate(CustomTestCase):
         try:
             self.assertFalse(fsm.plan_gate([req], 8))
             self.assertIsNone(fsm.folded_mask_flags([req], 8))
+            self.assertIsNone(fsm.folded_content_mask_flags([req], 8))
         finally:
             if prev is None:
                 os.environ.pop("SOLAR_FSM", None)
