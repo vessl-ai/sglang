@@ -1,8 +1,12 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
 import json
+import os
+import re
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.parser import reasoning_parser as reasoning_parser_module
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
@@ -1905,3 +1909,61 @@ class TestSolarOpen2OpenerInsideReasoning(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSolarOpen2EffortSetMatchesTheTemplate(CustomTestCase):
+    """`solar_open2_force_reasoning` decides whether the reasoning detector
+    starts inside the think block, and it must agree with the chat template's
+    own branch: the template opens `<|think:start|>` for some efforts and
+    pre-closes it for the rest.
+
+    Nothing tied the two together. If they disagree for an effort the template
+    opens, the detector starts in content and the whole think block -- the
+    literal `<|think:end|>` with it, since that token is not special -- is
+    served to the client as the answer. The checkpoint's template is checked in
+    at test/srt/fixtures/solar_open2_chat_template.jinja and, until this ran,
+    was referenced by nothing at all.
+    """
+
+    # .../test/registered/unit/parser/<this file> -> .../test/srt/fixtures/
+    TEMPLATE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        *([os.pardir] * 3),
+        "srt",
+        "fixtures",
+        "solar_open2_chat_template.jinja",
+    )
+
+    def test_the_generation_prompt_branch_lists_the_same_efforts(self):
+        with open(self.TEMPLATE) as f:
+            template = f.read()
+        # The one branch that decides whether the prompt ends with an open
+        # think block, rather than a pre-closed pair.
+        match = re.search(
+            r"\{%-\s*if\s+reasoning_effort\s+in\s*\[([^\]]*)\]\s*-%\}\s*"
+            r'\{\{-\s*"<\|im:start\|>assistant<\|im:content\|><\|think:start\|>"\s*\}\}',
+            template,
+        )
+        self.assertIsNotNone(
+            match, "the template's think-open branch moved; this test is blind"
+        )
+        efforts = tuple(re.findall(r'"([^"]+)"', match.group(1)))
+        self.assertEqual(
+            efforts,
+            reasoning_parser_module._SOLAR_OPEN2_THINK_OPEN_EFFORTS,
+            "the parser and the template disagree about which efforts open a "
+            "think block; the ones only the template opens leak their whole "
+            "reasoning into content",
+        )
+
+    def test_every_effort_the_template_opens_forces_reasoning(self):
+        """The same property through the function, not the constant."""
+        for effort in reasoning_parser_module._SOLAR_OPEN2_THINK_OPEN_EFFORTS:
+            with self.subTest(effort):
+                self.assertTrue(
+                    reasoning_parser_module.solar_open2_force_reasoning(
+                        SimpleNamespace(
+                            reasoning_effort=effort, chat_template_kwargs=None
+                        )
+                    )
+                )
