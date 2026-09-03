@@ -1308,12 +1308,13 @@ def plan_gate(reqs, stride: int) -> bool:
     only its boundary steps eager. The masks themselves are applied inside the
     graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
     for content-with-progress), and the budget window is ``2 * stride``
-    because the state read here can lag by one accepted run. Known folded-path
-    gaps, each <= stride-1 chain rows and closed by the next step's committed
-    state: a drafted sentinel under a grammar, and on a content-with-progress
-    row the no-tools variant of the CONTENT set -- the in-graph buffer carries
-    the tools-available one. Host-only and sync-free: it never touches the
-    draft tokens.
+    because the state read here can lag by one accepted run. One folded-path
+    gap is bounded at <= stride-1 chain rows and closed by the next step's
+    committed state: a drafted sentinel under a grammar. One is not bounded --
+    a request that offers no tools keeps ``<|tool_call:start|>`` open on every
+    content-with-progress row for the life of the request, because the in-graph
+    buffer carries the tools-available set and one static buffer cannot hold
+    both. Host-only and sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False

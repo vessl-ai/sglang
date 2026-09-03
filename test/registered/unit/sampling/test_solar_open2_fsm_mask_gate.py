@@ -72,7 +72,7 @@ def _cfg(**over):
         setattr(fsm.CFG, k, v)
 
 
-def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
+def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True, tools=None):
     """A request whose FSM state is already built, which is what plan_gate
     judges. Without priming it takes the "no committed state yet" branch and
     gates unconditionally, so an unprimed fixture cannot measure the predicate
@@ -86,6 +86,8 @@ def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
         output_ids=list(output_ids),
         sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
     )
+    if tools is not None:
+        req.sampling_params.custom_params = {fsm.TOOLS_PARAM: tools}
     if primed:
         fsm._req_fsm(req).advance(req.output_ids)
     return req
@@ -175,6 +177,55 @@ class TestSolarFsmMaskGate(CustomTestCase):
         req.sampling_params.json_schema = '{"type": "object"}'
         self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
 
+    def test_a_drafted_think_start_on_a_content_row_is_masked(self):
+        """The defect itself. plan_verify enters REASONING at that chain
+        position while folded_mask_flags stays False there, so the row is
+        covered only because the CONTENT set forbids <|think:start|>."""
+        import torch
+
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7])
+        self.assertFalse(fsm.plan_gate([req], stride))
+        self.assertEqual(fsm.folded_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_START, 7, 7]]), stride)
+        self.assertIn(
+            0,
+            plan.mask_rows.get(fsm.CFG.content_done_forbidden, []),
+            "row 0 is the position that would emit the sentinel",
+        )
+
+    def test_content_flags_match_plan_verify_row_for_row_in_a_mixed_batch(self):
+        """Both sides index row = i*stride + w. A single-request fixture cannot
+        tell request-major from chain-major."""
+        import torch
+
+        _cfg()
+        stride = 4
+        reqs = [_req([7] * 44), _req([7, THINK_END, 7])]
+        self.assertFalse(fsm.plan_gate(reqs, stride))
+        flags = fsm.folded_content_mask_flags(reqs, stride)
+        plan = fsm.plan_verify(reqs, torch.tensor([[7] * stride] * 2), stride)
+        self.assertEqual(
+            {r for r, on in enumerate(flags) if on},
+            set(plan.mask_rows.get(fsm.CFG.content_done_forbidden, [])),
+        )
+        # The line that actually pins the order.
+        self.assertEqual(flags, [False] * stride + [True] * stride)
+
+    def test_a_no_tools_request_is_still_flagged_and_keeps_its_gap(self):
+        """Characterising the accepted trade, not endorsing it: one static
+        buffer carries the tools-available set, so a no-tools request is armed
+        with it and <|tool_call:start|> stays open on its content rows. If this
+        ever changes, the docstrings that describe the gap are stale."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        self.assertNotIn(TOOL_START, fsm.CFG.content_done_forbidden)
+        self.assertIn(TOOL_START, fsm.CFG.content_done_forbidden_notools)
+
     def test_content_flags_equal_the_rows_plan_verify_would_mask(self):
         """The pairing, for CONTENT -- equality, not implication: an all-True
         implementation satisfies implication and would write the content set
@@ -199,6 +250,9 @@ class TestSolarFsmMaskGate(CustomTestCase):
                     self.assertTrue(gated or row in flagged, f"{label}: row {row}")
                 if not gated:
                     self.assertEqual(flagged, masked, label)
+                else:
+                    # Gated rows are plan_verify's; the flags must stay off.
+                    self.assertEqual(flagged, set(), label)
 
     def test_reasoning_row_far_from_the_budget_is_flagged(self):
         """The defect's own case. 44 tokens into a 3072-token budget is nowhere

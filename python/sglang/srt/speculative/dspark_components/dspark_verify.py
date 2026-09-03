@@ -510,18 +510,43 @@ def _fsm_forbidden_ids() -> List[int]:
 
 
 def _fsm_content_forbidden_ids() -> List[int]:
-    """The content-with-progress forbidden set, resolved at construction.
+    """The sentinels a content row may not emit, minus the tool-call internals.
 
-    Same placeholder contract as :func:`_fsm_forbidden_ids`. Only the
-    tools-available variant is carried: the set differs for a request that
-    offers no tools (``<|tool_call:start|>`` joins it), and one static buffer
-    cannot hold both. That difference only matters in fresh CONTENT, which
-    ``plan_gate`` already sends eager, so what is left open here is a tool-call
-    opener on a row that has already produced content and can end normally.
+    Same placeholder contract as :func:`_fsm_forbidden_ids`. Two subtractions
+    from ``CFG.content_done_forbidden``, both because this buffer is armed per
+    request off committed state and then applied to every chain row:
+
+    * the tool-call internals (``<|tool_arg:start|>``, ``<|tool_arg:value|>``,
+      ``<|tool_arg:end|>``, ``<|tool_call:end|>``). A chain may legally open a
+      tool call -- ``<|tool_call:start|>`` is allowed in CONTENT -- and the
+      rows after it are in tool states, which need exactly those sentinels.
+      Masking them there would not reject the row, it would commit a different
+      token and hand back a malformed call. Committed tool states go eager
+      (``_content_needs_eager``), so the eager plan covers them properly.
+    * nothing else: what remains (``<|think:start|>``, ``<|think:end|>``,
+      ``<|im:start|>``, ``<|im:content|>``, ``<|tool_response:*|>``) is illegal
+      in CONTENT and in every state one chain can reach from it.
+
+    Only the tools-available variant is carried: the set differs for a request
+    that offers no tools (``<|tool_call:start|>`` joins it) and one static
+    buffer cannot hold both. See ``plan_gate`` for what that leaves open.
     """
-    if _fsm.is_active() and _fsm.CFG.content_done_forbidden:
-        return list(_fsm.CFG.content_done_forbidden)
-    return [0]
+    if not (_fsm.is_active() and _fsm.CFG.content_done_forbidden):
+        return [0]
+    tool_internals = {
+        tid
+        for tid in (
+            _fsm.CFG.tool_arg_start,
+            _fsm.CFG.tool_arg_value,
+            _fsm.CFG.tool_arg_end,
+            _fsm.CFG.tool_call_end,
+        )
+        if tid is not None
+    }
+    ids = [i for i in _fsm.CFG.content_done_forbidden if i not in tool_internals]
+    # An empty index buffer would change the captured shape; fall back to the
+    # placeholder, which is only ever paired with an all-False row buffer.
+    return ids or [0]
 
 
 class DsparkVerifyEpilogue:
@@ -598,6 +623,7 @@ class DsparkVerifyEpilogue:
             _fsm_content_forbidden_ids(), dtype=torch.long, device=device
         )
         self._fsm_ids_checked = False
+        self._fsm_content_ids_checked = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -634,6 +660,22 @@ class DsparkVerifyEpilogue:
         on the folded path: ``solar_open2_fsm.folded_content_mask_flags``.
         None disarms it for this step.
         """
+        if not self._fsm_content_ids_checked:
+            # Snapshotted at construction while the flags are decided per step,
+            # so the two describe different worlds if the FSM resolved after
+            # this object was built. Unchecked, every armed content row masks
+            # the placeholder id instead of the sentinels -- a row that looks
+            # masked and is not, with nothing in the logs.
+            self._fsm_content_ids_checked = True
+            want = _fsm_content_forbidden_ids()
+            if want != self.fsm_content_forbid_buf.tolist():
+                logger.error(
+                    "[SOLAR-FSM] in-graph CONTENT mask holds %s but the FSM now "
+                    "forbids %s; captured before the FSM resolved, so armed "
+                    "content rows are masking the wrong ids",
+                    self.fsm_content_forbid_buf.tolist(),
+                    want,
+                )
         if not flags:
             self.fsm_content_row_buf.zero_()
             return
@@ -671,18 +713,6 @@ class DsparkVerifyEpilogue:
                     "masking the wrong ids",
                     self.fsm_forbid_buf.tolist(),
                     list(forbidden_ids or ()),
-                )
-            # The CONTENT buffer is snapshotted in the same breath and can go
-            # stale the same way, and its rows are armed by the setter below,
-            # which takes no ids of its own -- so it is checked here.
-            want_content = list(_fsm.CFG.content_done_forbidden or ())
-            if want_content != self.fsm_content_forbid_buf.tolist():
-                logger.error(
-                    "[SOLAR-FSM] in-graph CONTENT mask holds %s but the FSM now "
-                    "forbids %s; captured before the FSM resolved, so armed "
-                    "content rows are masking the wrong ids",
-                    self.fsm_content_forbid_buf.tolist(),
-                    want_content,
                 )
         n = min(len(flags), self.fsm_row_buf.shape[0])
         self.fsm_row_buf[:n].copy_(

@@ -11,12 +11,16 @@ Pure CPU: the epilogue's constructor touches only torch and a tp_sync whose
 only use here is ``world_size``.
 """
 
+import ast
+import inspect
+import os
 import unittest
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
+from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
@@ -100,6 +104,9 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertEqual(
             self.ep.fsm_forbid_buf.tolist(), list(fsm.CFG.reasoning_forbidden)
         )
+        # int32 indexes fine today and may not tomorrow; the row buffer's dtype
+        # is asserted for the same reason.
+        self.assertEqual(self.ep.fsm_content_forbid_buf.dtype, torch.long)
 
     def test_the_two_row_buffers_are_separate_and_full_size(self):
         """One buffer for two masks would alias them; a short one would leave
@@ -201,6 +208,87 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.ep._apply_fsm_mask(bs=self.max_bs)
         self.assertTrue(torch.isinf(logits[:, EOS]).all())
         self.assertTrue(torch.isinf(logits[:, THINK_START]).all())
+
+    def test_the_placeholder_is_used_while_the_fsm_is_off(self):
+        """The [0] fallback is what keeps the captured shape static on a
+        deployment that does not run this model; it is only ever paired with
+        an all-False row buffer, so it writes nothing.
+
+        is_active() re-resolves from SOLAR_FSM, so clearing CFG.enabled alone
+        measures nothing on a host that sets it -- which is every engine pod.
+        """
+        prev = os.environ.get("SOLAR_FSM")
+        os.environ["SOLAR_FSM"] = "0"
+        fsm.CFG.enabled = False
+        try:
+            ep = DsparkVerifyEpilogue(
+                max_bs=self.max_bs,
+                verify_num_draft_tokens=self.stride,
+                device="cpu",
+                tp_sync=DsparkTpSync(SimpleNamespace(world_size=1)),
+            )
+            self.assertEqual(ep.fsm_content_forbid_buf.tolist(), [0])
+        finally:
+            if prev is None:
+                os.environ.pop("SOLAR_FSM", None)
+            else:
+                os.environ["SOLAR_FSM"] = prev
+            _cfg()
+
+    def test_a_stale_content_id_snapshot_is_reported(self):
+        """__init__ snapshots the ids while the flags are decided per step. A
+        buffer left behind by a late FSM resolution masks the wrong ids, and
+        every armed content row then looks masked and is not."""
+        fsm.CFG.content_done_forbidden = (THINK_START, 55)
+        with self.assertLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ) as logs:
+            self.ep.set_fsm_content_rows([True] * self.stride)
+        self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
+
+    def test_a_fresh_content_id_snapshot_is_not_reported(self):
+        """Without this, a detector that logs unconditionally passes the test
+        above."""
+        with self.assertNoLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ):
+            self.ep.set_fsm_content_rows([True] * self.stride)
+
+    def test_the_content_check_does_not_need_the_reasoning_setter(self):
+        """It guards the rows this setter arms, so it must not be reachable
+        only through the sibling that arms the other buffer."""
+        fsm.CFG.content_done_forbidden = (THINK_START, 55)
+        with self.assertLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ) as logs:
+            self.ep.set_fsm_content_rows(None)
+        self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
+
+    def test_the_worker_arms_the_content_mask_from_the_content_flags(self):
+        """Both halves are unit-tested; nothing else tests that the worker
+        connects them. Deleting the set_fsm_content_rows call leaves every
+        other test in the repo green and the mask armed on no row at all --
+        and handing it folded_mask_flags instead is a live copy-paste mutant.
+
+        Source-shape, deliberately: there is no GPU-free way to drive the
+        worker. A rename breaks this, which is the intended cost.
+        """
+        tree = ast.parse(inspect.getsource(dspark_worker_v2))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_fsm_content_rows"
+        ]
+        self.assertEqual(len(calls), 1, "the CONTENT mask must be armed once")
+        arg = calls[0].args[0]
+        self.assertIsInstance(arg, ast.Call)
+        self.assertEqual(
+            arg.func.attr,
+            "folded_content_mask_flags",
+            "the CONTENT setter must be given the CONTENT flags",
+        )
 
 
 if __name__ == "__main__":
