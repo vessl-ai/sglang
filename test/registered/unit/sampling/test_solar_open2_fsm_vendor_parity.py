@@ -1121,6 +1121,52 @@ class TestSpecPathToolStates(_FsmCase):
         )
         self.assertEqual(plan.force_rows, [])
 
+    def test_the_documented_folded_gaps_stay_exactly_as_documented(self):
+        """plan_gate records three folded-path gaps as accepted. Nothing pinned
+        them, so a refactor could widen or close one and no test would notice --
+        and this repo pins accepted trade-offs so that changing one is
+        deliberate. This lives here, not next to the flag functions, because
+        only this suite builds its tables with ``configure_ids``: a pin read off
+        a hand-written fixture re-checks the fixture, not the spec.
+
+        Not asserting the gaps are harmless -- each is a control token reaching
+        the answer. Asserting their extent.
+        """
+        _cfg()
+
+        # Gap 1: REASONING allows <|think:end|> (its only legal exit) while
+        # fresh CONTENT forbids it, so the rows after a drafted <|think:end|>
+        # are fresh CONTENT wearing the reasoning set, and a second one lands.
+        self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
+        self.assertIn(THINK_END, fsm.CFG.content_fresh_forbidden)
+
+        # Gap 2: a drafted <|think:start|> makes plan_verify treat that row and
+        # every row after it as REASONING; the folded flags are per request and
+        # stay False for all of them.
+        req = _req((THINK_END, 7), tools=True)
+        fsm._req_fsm(req).advance(req.output_ids)
+        self.assertEqual(fsm.folded_mask_flags([req], 4), [False] * 4)
+        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_START, 7, 7]]), 4)
+        self.assertEqual(
+            {
+                r
+                for forbidden, rows in plan.mask_rows.items()
+                if forbidden == fsm.CFG.reasoning_forbidden
+                for r in rows
+            },
+            {2, 3},
+            "the row that emits the opener is still judged CONTENT; REASONING "
+            "starts at the row after it, and the folded flags cover neither",
+        )
+
+        # Gap 3: the tool states forbid the turn from ending, but the rows a
+        # legally drafted <|tool_call:start|> puts there carry the CONTENT set,
+        # which permits both.
+        self.assertIn(EOS, fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])
+        self.assertIn(IM_END, fsm.CFG.forbidden[(fsm.TOOL_CALL_NAME, False)])
+        self.assertNotIn(EOS, fsm.CFG.content_done_forbidden)
+        self.assertNotIn(IM_END, fsm.CFG.content_done_forbidden)
+
 
 if __name__ == "__main__":
     unittest.main()

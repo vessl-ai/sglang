@@ -299,6 +299,17 @@ class TestEpilogueFsmMasks(CustomTestCase):
             self.ep.set_fsm_content_rows([True] * self.stride)
         self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
 
+    def test_a_fresh_reasoning_id_snapshot_is_not_reported(self):
+        """The negative control its two siblings have. Without it, pointing the
+        reasoning check at a sibling's ids (`want=_fsm_content_forbidden_ids`)
+        leaves every test green -- the only test that watches this setter's log
+        makes all three buffers stale on purpose, so a wrong `want` still
+        produces three lines."""
+        with self.assertNoLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ):
+            self.ep.set_fsm_rows([True] * self.stride)
+
     def test_each_buffer_gets_its_own_check(self):
         """The one-shot check is keyed by a label string. Give two buffers the
         same label and the first staging call spends the shot for both, so the
