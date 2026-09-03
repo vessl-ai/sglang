@@ -202,7 +202,17 @@ class TestNonSpecApplyForceGuard(SolarOpen2FsmVerifyTestBase):
         original_row0 = logits[0].clone()
 
         sampling_info = types.SimpleNamespace(solar_fsm_rows=[req0, req1])
-        with self.assertLogs(solar_open2_fsm.logger, level="WARNING"):
+        with self.assertLogs(solar_open2_fsm.logger, level="INFO") as logs:
+            solar_open2_fsm.apply(logits, sampling_info)
+        # One warning for the row left to the grammar, one info for the forced
+        # row; a second pass on the same request does not log the force again.
+        self.assertEqual(
+            [l.split(":")[0] for l in logs.output], ["WARNING", "INFO"], logs.output
+        )
+        self.assertIn("r1", logs.output[1])
+        self.assertFalse(fsm0.forced)
+        self.assertTrue(fsm1.forced)
+        with self.assertNoLogs(solar_open2_fsm.logger, level="INFO"):
             solar_open2_fsm.apply(logits, sampling_info)
 
         # Row 0: forced skipped, logits unchanged, still has finite entries.

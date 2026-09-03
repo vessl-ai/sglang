@@ -14,7 +14,7 @@ runs ``<|tool_arg:start|>`` ``<|tool_arg:value|>`` ``<|tool_arg:end|>``,
 * CONTENT: a turn that has produced no content token yet may not end (EOS and
   ``<|im:end|>`` masked); after the first content token only stray sentinels
   are masked. A request that offers no tools also loses ``<|tool_call:start|>``
-  (with EOS shut, a model that wants to stop would take it as the exit).
+  (``TOOLS_PARAM``).
 * Tool-call states (``TOOL_CALL_BEGIN`` .. ``TOOL_CALL_END``): only the
   envelope sentinel(s) the sub-state expects are open, so a call cannot be
   cut short by a turn end or a stray sentinel (after ``<|tool_call:end|>``
@@ -84,8 +84,8 @@ _TOKEN_TEXT_BY_FIELD = {
 }
 _SENTINEL_TOKENS = tuple(_TOKEN_TEXT_BY_FIELD.values())
 
-# FSM states, as small ints (they live in
-# __slots__ and are compared on every decode step).
+# FSM states, as small ints (they live in __slots__ and are compared on every
+# decode step).
 REASONING = 0
 CONTENT = 1
 TOOL_CALL_BEGIN = 2
@@ -110,9 +110,9 @@ _STATE_NAMES = (
 )
 _TOOL_STATES = frozenset(range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1))
 
-# Per-state mask specification: (allowed sentinel
-# fields, eos_masked). Bare EOS is forbidden wherever ending the turn is
-# template-illegal -- everywhere except CONTENT-with-progress and
+# Per-state mask specification: (allowed sentinel fields, eos_masked). Bare
+# EOS is forbidden wherever ending the turn is template-illegal -- everywhere
+# except CONTENT-with-progress and
 # TOOL_CALL_END. CONTENT is keyed by the content-progress flag instead.
 _MASK_SPEC_BY_STATE = {
     REASONING: (("think_end",), True),
@@ -131,8 +131,8 @@ _MASK_SPEC_CONTENT = {
     # Fresh CONTENT (no content yet): turn end (im_end + bare EOS) forbidden.
     False: (("tool_call_start",), True),
 }
-# Sentinel -> next state, and the
-# states a non-transition token advances by itself.
+# Sentinel -> next state, and the states a non-transition token advances by
+# itself.
 _TRANSITIONS = (
     ("think_start", REASONING),
     ("think_end", CONTENT),
@@ -170,9 +170,9 @@ _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
 EFFORT_PARAM = "solar_reasoning_effort"
 # custom_params key: whether the request offers tools (chat entrypoint). A
 # request without tools can never have a <|tool_call:start|> answered, so the
-# no-tools table forbids the token in every state (it matters in CONTENT: with
-# EOS shut in fresh CONTENT the model otherwise takes it as the exit --
-# "<|tool_call:start|>think" then stop).
+# no-tools table forbids the token in every state. It matters in fresh
+# CONTENT: with EOS shut there, the model otherwise takes the token as the
+# exit ("<|tool_call:start|>think", then stop).
 TOOLS_PARAM = "solar_tools_available"
 
 
@@ -492,9 +492,9 @@ def configure_ids(
     ``ids`` maps the field names of ``_TOKEN_TEXT_BY_FIELD`` to token ids,
     ``None`` for a sentinel the tokenizer does not carry. Per (state,
     content_progress) the forbidden set holds the control sentinels the state
-    does not allow, plus the bare EOS ids wherever ending
-    the turn is template-illegal. The unit tests configure the module through
-    this as well, so a test and the server can never disagree on how a set is
+    does not allow, plus the bare EOS ids wherever ending the turn is
+    template-illegal. The unit tests configure the module through this as
+    well, so a test and the server can never disagree on how a set is
     derived from the spec.
     """
     for field in _TOKEN_TEXT_BY_FIELD:
@@ -601,7 +601,8 @@ def _configure_budget_from_env() -> None:
     CFG.hard_limit = _env_int("SOLAR_REASONING_BUDGET_HARD_LIMIT", _HARD_LIMIT)
     if CFG.hard_limit < 0:
         raise RuntimeError(
-            f"SOLAR_REASONING_BUDGET_HARD_LIMIT must be >= 0 (0 disables), got {CFG.hard_limit}"
+            "SOLAR_REASONING_BUDGET_HARD_LIMIT must be >= 0 (0 disables), got "
+            f"{CFG.hard_limit}"
         )
     if CFG.hard_limit == 0:
         CFG.hard_limit = _NO_HARD_LIMIT
@@ -625,7 +626,8 @@ def _configure_budget_from_env() -> None:
         if value > CFG.hard_limit:
             if name in os.environ:
                 logger.warning(
-                    "[SOLAR-FSM] %s=%d exceeds SOLAR_REASONING_BUDGET_HARD_LIMIT=%d; clamped.",
+                    "[SOLAR-FSM] %s=%d exceeds SOLAR_REASONING_BUDGET_HARD_LIMIT=%d; "
+                    "clamped.",
                     name,
                     value,
                     CFG.hard_limit,
@@ -648,8 +650,8 @@ def _configure_budget_from_env() -> None:
         and CFG.default_effort not in CFG.no_reasoning_efforts
     ):
         raise RuntimeError(
-            f"SOLAR_REASONING_BUDGET_DEFAULT_EFFORT={CFG.default_effort!r} is not a known "
-            f"reasoning effort: {sorted(CFG.effort_budgets)} / "
+            f"SOLAR_REASONING_BUDGET_DEFAULT_EFFORT={CFG.default_effort!r} is not "
+            f"a known reasoning effort: {sorted(CFG.effort_budgets)} / "
             f"{sorted(CFG.no_reasoning_efforts)}"
         )
 
@@ -665,9 +667,9 @@ def is_active() -> bool:
 
 
 class SolarReqFSM:
-    """Per-request walk of the ten-state envelope machine. Lives on
-    the Req, so a row permutation
-    can never hand one request another request's state."""
+    """Per-request walk of the ten-state envelope machine. Lives on the Req,
+    so a row permutation can never hand one request another request's
+    state."""
 
     __slots__ = (
         "state",
@@ -687,8 +689,8 @@ class SolarReqFSM:
         effort: Optional[str] = None,
         tools: bool = True,
     ):
-        # Initial state: inside reasoning iff the last
-        # think_start in the prompt is not followed by a think_end.
+        # Initial state: inside reasoning iff the last think_start in the
+        # prompt is not followed by a think_end.
         self.state = REASONING if _starts_in_reasoning(prompt_ids) else CONTENT
         # True while the next token is the first one after <|think:start|>
         # (the chat template ends the prompt with it when reasoning is on).
@@ -697,8 +699,8 @@ class SolarReqFSM:
             and len(prompt_ids) > 0
             and prompt_ids[-1] == CFG.think_start
         )
-        # Completed-call seed: a tool call the
-        # prompt's *current* assistant turn already completed counts as content.
+        # Completed-call seed: a tool call the prompt's *current* assistant
+        # turn already completed counts as content.
         self.content_progress = _prompt_completed_tool_call(prompt_ids)
         self.count = 0
         self.consumed = 0
@@ -939,8 +941,8 @@ def _log_force_conflict(rows, stride: int, rids) -> None:
 
 
 # --------------------------------------------------------------------------
-# Hooks called from the sampler, the batch-info copy, the batch result
-# processor, the scheduler, and the DSpark verify worker and verify graph.
+# Hooks called from the sampler, the batch-info build/filter/merge, the batch
+# result processor, the scheduler, and the DSpark verify worker and graph.
 # --------------------------------------------------------------------------
 def attach_rows(sampling_info, batch) -> None:
     if not os.environ.get("SOLAR_FSM", "0") == "1":
@@ -1089,9 +1091,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
             # Fresh CONTENT forbids EOS/im_end until real content exists
             # (otherwise the model leaves reasoning and stops at once with an
             # empty answer); inside a tool call only the envelope sentinel(s)
-            # the sub-state expects are open; a request without tools also
-            # loses <|tool_call:start|> (with EOS shut, a model that wants to
-            # stop takes it as the exit instead).
+            # the sub-state expects are open; no tools -> see TOOLS_PARAM.
             mask_rows.setdefault(
                 _forbidden_for(fsm.state, fsm.content_progress, fsm.tools), []
             ).append(i)

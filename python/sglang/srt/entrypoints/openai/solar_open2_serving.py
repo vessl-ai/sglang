@@ -75,6 +75,9 @@ def validate_request(request: ChatCompletionRequest) -> Optional[str]:
     return None
 
 
+_WARNED_EFFORTS: set = set()
+
+
 def _template_effort(value: Any) -> Optional[str]:
     """The effort handed to the chat template: lower-cased, xhigh/max folded to
     high. Anything that is not a tier -- only a server default can get here
@@ -85,11 +88,15 @@ def _template_effort(value: Any) -> Optional[str]:
         return "high"
     if tier in EFFORT_TIERS:
         return tier
-    logger.warning(
-        "solar_open2: ignoring reasoning_effort %r from the server defaults "
-        "(not a tier); using the template default",
-        value,
-    )
+    if repr(value) not in _WARNED_EFFORTS:
+        # Once per distinct value: a bad server default would otherwise log
+        # at request rate.
+        _WARNED_EFFORTS.add(repr(value))
+        logger.warning(
+            "solar_open2: ignoring reasoning_effort %r (not a tier); using the "
+            "template default",
+            value,
+        )
     return None
 
 
@@ -97,9 +104,9 @@ def normalize_reasoning_effort(
     request: ChatCompletionRequest, tools_available: bool
 ) -> None:
     """Rule 2. ``tools_available``: whether a tool call can be answered at all
-    (tools offered, tool_choice not "none", a parser configured) -- otherwise
-    the FSM forbids ``<|tool_call:start|>`` in every state (it matters in
-    CONTENT, where a model shut out of EOS takes it as the exit)."""
+    (tools offered, tool_choice not "none", a parser configured); the FSM
+    forbids ``<|tool_call:start|>`` everywhere when it cannot (see
+    ``solar_open2_fsm.TOOLS_PARAM``)."""
     ctk = request.chat_template_kwargs
     requested = (
         request.reasoning_effort
@@ -118,15 +125,19 @@ def normalize_reasoning_effort(
     raw = request.reasoning_effort
     if raw is not None:
         request.reasoning_effort = _template_effort(raw)
-    if ctk and ctk.get("reasoning_effort") is not None:
+    if ctk and "reasoning_effort" in ctk:
         # Only a server default (--default-chat-template-kwargs) can still be
         # here: the client's copy was moved into the request field before
         # this, and so was the default when that field was empty -- then the
-        # fold above already judged it. The template reads one source, the
-        # request's folded effort, when there is one.
+        # fold above already judged it. The template reads ctk last, so it
+        # gets one source: the request's folded effort when there is one
+        # (a present ``None`` would fail the template's test and close the
+        # think block while the parser starts in reasoning).
         default = ctk["reasoning_effort"]
         folded = (
-            request.reasoning_effort if default == raw else _template_effort(default)
+            request.reasoning_effort
+            if default in (raw, None)
+            else _template_effort(default)
         )
         effort = request.reasoning_effort or folded
         if effort is None:

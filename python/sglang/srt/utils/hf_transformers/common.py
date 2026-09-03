@@ -640,7 +640,6 @@ try:
             "already used" not in str(_solar_err).lower()
         ):
             raise
-    logger.info("[SOLAR-PATCH] registered SolarOpen2Config (model_type=solar_open2)")
 except Exception as _solar_err:  # fail loudly: a silent skip means a wrong model
     logger.error("[SOLAR-PATCH] SolarOpen2Config registration FAILED: %s", _solar_err)
     raise

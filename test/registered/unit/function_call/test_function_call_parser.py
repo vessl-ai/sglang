@@ -5529,6 +5529,29 @@ class TestSolarOpen2Detector(unittest.TestCase):
         result = SolarOpen2Detector().detect_and_parse(text, tools)
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Paris"})
 
+    def test_non_dict_parameters_or_properties_leave_values_as_strings(self):
+        # A schema that is not a JSON Schema object still yields the call; the
+        # reference falls back to "string" the same way.
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for params in (None, "x", {"type": "object", "properties": "x"}):
+            with self.subTest(params=params):
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(name="get_weather", parameters=params),
+                    )
+                ]
+                result = SolarOpen2Detector().detect_and_parse(text, tools)
+                self.assertEqual(json.loads(result.calls[0].parameters), {"days": "3"})
+                streamed = SolarOpen2Detector().parse_streaming_increment(text, tools)
+                self.assertEqual(
+                    json.loads(streamed.calls[0].parameters), {"days": "3"}
+                )
+
     def test_blank_name_call_next_to_parsed_calls(self):
         """A blank-name call is an unparsed segment in streaming: the calls
         around it are emitted (dropped after a call, held before one), at
@@ -5884,8 +5907,9 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
     agree exactly; streaming must agree on calls and, unless a shape says
     ``"calls"``, on content up to whitespace (the documented streaming
     deltas: rstripped whitespace before an opener, held unparsed output);
-    and ours must be identical at whole / 5-char / 1-char chunking. Shapes where the vendor
-    itself misbehaves (its lazy name group swallows a following call after
+    and ours must be identical at whole / 5-char / 1-char chunking. Shapes
+    where the vendor itself misbehaves (its lazy name group swallows a
+    following call after
     a call that lacks its newline) or where its streaming parser emits a
     partial call are compared only where a comparison is meaningful, and
     say so. A new difference here is a detector bug unless it is added to
@@ -5970,7 +5994,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             "no call": ("Just text.", True, True),
             # The vendor's streaming parser never flushes a trailing whitespace
             # run (no end-of-stream hook); ours releases it as non-streaming
-            # does. Calls-only in streaming.
+            # does. Streaming compared on calls only (none either way).
             "whitespace only": ("\n \n", True, "calls"),
             # The vendor's streaming parser waits for the name's newline and
             # emits nothing from the opener on (prose before it streams); ours

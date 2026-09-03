@@ -2124,9 +2124,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         return self._scrub_content_head(super().parse_streaming_increment(new_text))
 
     def finish(self) -> StreamingParseResult:
-        # A stream that ends inside the think block needs nothing added: its
-        # reasoning deltas are already out on the reasoning channel and content
-        # stays empty (the same rule detect_and_parse applies). Whatever is
+        # A stream that ends inside the think block adds no content: the base
+        # class hands the block back as reasoning (streamed already, or flushed
+        # here with stream_reasoning off), the same rule detect_and_parse
+        # applies. Whatever is
         # still held after the last scrub is a sentinel fragment at the head of
         # the content region, and a fragment of a control sentinel is never an
         # answer.

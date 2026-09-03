@@ -553,7 +553,7 @@ class DsparkVerifyEpilogue:
         )
         self.strided_logits: Optional[torch.Tensor] = None
         self.strided_hidden: Optional[torch.Tensor] = None
-        # --- solar-open2 FSM in-graph reasoning mask (injected) ---
+        # --- solar-open2 FSM in-graph reasoning mask ---
         # The reasoning mask is the common case and would cost the folded path
         # for most of a generation if it forced the eager one, so it lands
         # inside the graph instead.
@@ -719,7 +719,7 @@ class DsparkVerifyEpilogue:
         self.strided_hidden = self._ensure_out(self.strided_hidden, compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
-        # --- solar-open2 FSM in-graph reasoning mask (injected) ---
+        # --- solar-open2 FSM in-graph reasoning mask ---
         # After the scatter fills strided_logits and before the accept reads it.
         self._apply_fsm_mask(bs)
         commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)

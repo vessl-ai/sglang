@@ -13,6 +13,8 @@ whose name is not among the request's tools is still emitted, with a warning:
 the client owns name validation. A body without argument markers that parses
 as a JSON object is accepted as the arguments; any other non-empty body is
 kept as ``{"__raw": body}``.
+An explicit ``"type": null`` in a parameter schema is no type at all (the
+value stays a string); a non-dict ``parameters``/``properties`` likewise.
 
 ``tool_choice="required"`` and a named choice are not parsed here: they are
 constrained to a JSON array of calls by the JSON-schema grammar
@@ -186,7 +188,6 @@ class _StreamContent:
             at = held.find(TOOL_CALL_START)
             if at != -1:
                 self._dropped("unfinished tool call at stream end", len(held) - at)
-                self.pending_ws = pending
                 return self.text(held[:at], before_opener=True)
             if partial_opener:
                 logger.warning(
@@ -397,9 +398,8 @@ def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Option
         if tool.function.name != func_name:
             continue
         params = tool.function.parameters
-        if not isinstance(params, dict):
-            return None
-        prop = (params.get("properties") or {}).get(param_name)
+        props = params.get("properties") if isinstance(params, dict) else None
+        prop = props.get(param_name) if isinstance(props, dict) else None
         if not isinstance(prop, dict):
             return None
         t = prop.get("type")

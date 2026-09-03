@@ -3789,6 +3789,7 @@ class TestSolarOpen2ParallelToolCallsSingleCall(unittest.TestCase):
                         "chat_template_kwargs": {"reasoning_effort": bad},
                     }
                 )
+                solar_serving._WARNED_EFFORTS.clear()
                 with self.assertLogs(
                     "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
                 ):
@@ -4553,6 +4554,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         # A blank value only reaches here from --default-chat-template-kwargs
         # (validate_request rejects it from a client).
         req = self._req(chat_template_kwargs={"reasoning_effort": "  "})
+        solar_serving._WARNED_EFFORTS.clear()
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ):
@@ -4560,12 +4562,27 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.assertEqual(req.custom_params, {self.TOOLS: False})
         self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
 
+    def test_present_none_effort_key_never_reaches_the_template(self):
+        # The template reads chat_template_kwargs last and its test fails on
+        # None: a present None key next to a client effort takes the folded
+        # field, and with no effort at all it is removed.
+        req = self._req(
+            reasoning_effort="xhigh", chat_template_kwargs={"reasoning_effort": None}
+        )
+        self._normalize(req)
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "high")
+        self.assertEqual(req.custom_params[self.KEY], "xhigh")
+        req = self._req(chat_template_kwargs={"reasoning_effort": None})
+        self._normalize(req)
+        self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+        self.assertNotIn(self.KEY, req.custom_params)
+
     def test_bad_server_default_is_reported_once(self):
         # The pipeline copies the server default into the field when the
-        # field is empty (the field is typed, so the copy is an assignment):
-        # the same value is judged once.
+        # field is empty: the same value is judged once.
         req = self._req(chat_template_kwargs={"reasoning_effort": "foo"})
         req.reasoning_effort = "foo"
+        solar_serving._WARNED_EFFORTS.clear()
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ) as logs:
@@ -4578,6 +4595,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         req = self._req(
             reasoning_effort="low", chat_template_kwargs={"reasoning_effort": "foo"}
         )
+        solar_serving._WARNED_EFFORTS.clear()
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ) as logs:
