@@ -693,6 +693,10 @@ class DsparkVerifyEpilogue:
     def _check_forbid_ids(self, *, buf, want, label: str) -> None:
         """Warn once if a forbid buffer and the FSM describe different worlds.
 
+        ``want`` is a thunk so the set it builds costs nothing after the one
+        check it exists for; ``label`` keys that check and names the buffer in
+        the log, and must be unique per buffer or one of them is never checked.
+
         The ids are snapshotted at construction and the flags are decided per
         step, so an FSM that resolved after this object was built leaves the
         buffer masking the wrong ids -- a row that looks masked and is not,
@@ -703,14 +707,15 @@ class DsparkVerifyEpilogue:
             return
         self._ids_checked.add(label)
         have = buf.tolist()
-        if list(want) != have:
+        wanted = list(want())
+        if wanted != have:
             logger.error(
                 "[SOLAR-FSM] in-graph %s mask holds %s but the FSM now forbids "
                 "%s; captured before the FSM resolved, so armed rows are "
                 "masking the wrong ids",
                 label,
                 have,
-                list(want),
+                wanted,
             )
 
     @staticmethod
@@ -736,7 +741,7 @@ class DsparkVerifyEpilogue:
             return
         self._check_forbid_ids(
             buf=self.fsm_content_forbid_buf,
-            want=_fsm_content_forbidden_ids(),
+            want=_fsm_content_forbidden_ids,
             label="CONTENT",
         )
         self._stage_rows(buf=self.fsm_content_row_buf, flags=flags)
@@ -754,7 +759,7 @@ class DsparkVerifyEpilogue:
             return
         self._check_forbid_ids(
             buf=self.fsm_content_notools_forbid_buf,
-            want=_fsm_content_notools_forbidden_ids(),
+            want=_fsm_content_notools_forbidden_ids,
             label="no-tools CONTENT",
         )
         self._stage_rows(buf=self.fsm_content_notools_row_buf, flags=flags)
@@ -773,7 +778,9 @@ class DsparkVerifyEpilogue:
             self.fsm_row_buf.zero_()
             return
         self._check_forbid_ids(
-            buf=self.fsm_forbid_buf, want=list(forbidden_ids or ()), label="reasoning"
+            buf=self.fsm_forbid_buf,
+            want=lambda: list(forbidden_ids or ()),
+            label="reasoning",
         )
         self._stage_rows(buf=self.fsm_row_buf, flags=flags)
 

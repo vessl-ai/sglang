@@ -268,6 +268,23 @@ class TestSolarFsmMaskGate(CustomTestCase):
             fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
         )
 
+    def test_a_committed_state_behind_the_output_is_advanced_first(self):
+        """plan_gate returns True at the first request needing eager, so the
+        rest of the batch is never advanced there -- but staging runs on every
+        step regardless. Without the advance in _folded_flags those requests
+        are armed off a state one step stale: here the FSM still says REASONING
+        while the output has left it, so the reasoning mask would be armed on a
+        content row and the content mask on none."""
+        _cfg()
+        stride = 4
+        req = _req([7] * 4)
+        f = fsm._req_fsm(req)
+        f.advance(req.output_ids)
+        self.assertTrue(f.in_reasoning, "fixture must start inside the block")
+        req.output_ids = [7] * 4 + [THINK_END, 7]
+        self.assertEqual(fsm.folded_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+
     def test_no_tools_flags_are_a_subset_of_the_content_flags(self):
         """The layering contract: the extra id is applied on top of the shared
         set, never instead of it, so a no-tools row must be armed for both. A

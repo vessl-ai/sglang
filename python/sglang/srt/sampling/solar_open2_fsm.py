@@ -1356,12 +1356,19 @@ def plan_gate(reqs, stride: int) -> bool:
     for content-with-progress, and ``folded_content_notools_mask_flags``
     layered over those of its rows that offer no tools), and the budget window
     is ``2 * stride`` because the state read here can lag by one accepted run.
-    Every folded-path gap that remains comes from that same lag, so each is
-    bounded at <= stride-1 chain rows and closed by the next step's committed
-    state: a drafted sentinel under a grammar, a drafted ``<|think:start|>``
-    (see ``folded_mask_flags``), and the tool states a chain opens for itself
-    with a drafted ``<|tool_call:start|>`` (see ``_fsm_content_forbidden_ids``,
-    which drops the tool internals on purpose). Host-only and
+    A grammar never reaches here at all -- ``fold_eligible`` requires
+    ``not batch.has_grammar`` -- so the grammar rows below are about the
+    request's own constraint, not a folded step.
+
+    Two folded-path gaps remain, both from applying one per-request forbidden
+    set to every chain row. Lag-derived and bounded at <= stride-1 rows: a
+    drafted ``<|think:start|>`` (see ``folded_mask_flags``). Not lag-derived
+    and therefore recurring on every folded step of such a request: the rows
+    after a legally drafted ``<|tool_call:start|>`` are in tool states, which
+    forbid bare EOS and ``<|im:end|>``, but carry the CONTENT set, which allows
+    both -- and ``_fsm_content_forbidden_ids`` drops the tool internals from
+    chain row 0 too, where no draft has moved the state. Closing either needs
+    a per-position buffer, not another per-request one. Host-only and
     sync-free: it never touches the draft tokens.
     """
     if not is_active():

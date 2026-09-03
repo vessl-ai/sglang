@@ -30,7 +30,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-THINK_START, THINK_END, EOS, TOOL_START, TOOL_ARG_VALUE = 100, 101, 2, 102, 103
+THINK_START, THINK_END, EOS, TOOL_START = 100, 101, 2, 102
+TOOL_ARG_START, TOOL_ARG_VALUE, TOOL_ARG_END, TOOL_CALL_END = 103, 104, 105, 106
+TOOL_INTERNALS = (TOOL_ARG_START, TOOL_ARG_VALUE, TOOL_ARG_END, TOOL_CALL_END)
 VOCAB = 128
 
 _CFG_FIELDS = (
@@ -47,7 +49,10 @@ _CFG_FIELDS = (
     "content_done_forbidden_notools",
     "content_fresh_forbidden_notools",
     "tool_call_start",
+    "tool_arg_start",
     "tool_arg_value",
+    "tool_arg_end",
+    "tool_call_end",
     "spec_always_eager",
     "effort_budgets",
     "default_effort",
@@ -67,14 +72,28 @@ def _cfg():
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.reasoning_open_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
-    fsm.CFG.content_done_forbidden = (THINK_START, TOOL_ARG_VALUE)
-    fsm.CFG.content_fresh_forbidden = (THINK_START, EOS)
+    fsm.CFG.content_done_forbidden = (THINK_START, THINK_END, *TOOL_INTERNALS)
+    fsm.CFG.content_fresh_forbidden = (THINK_START, THINK_END, *TOOL_INTERNALS, EOS)
     # The no-tools tables differ from the above by the opener alone, which is
     # what lets the third buffer hold one id.
     fsm.CFG.tool_call_start = TOOL_START
+    fsm.CFG.tool_arg_start = TOOL_ARG_START
     fsm.CFG.tool_arg_value = TOOL_ARG_VALUE
-    fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START, TOOL_ARG_VALUE)
-    fsm.CFG.content_fresh_forbidden_notools = (THINK_START, TOOL_START, EOS)
+    fsm.CFG.tool_arg_end = TOOL_ARG_END
+    fsm.CFG.tool_call_end = TOOL_CALL_END
+    fsm.CFG.content_done_forbidden_notools = (
+        THINK_START,
+        THINK_END,
+        TOOL_START,
+        *TOOL_INTERNALS,
+    )
+    fsm.CFG.content_fresh_forbidden_notools = (
+        THINK_START,
+        THINK_END,
+        TOOL_START,
+        *TOOL_INTERNALS,
+        EOS,
+    )
     fsm.CFG.spec_always_eager = False
     fsm.CFG.effort_budgets = {"high": 3072}
     fsm.CFG.default_effort = "high"
@@ -111,7 +130,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         left in place masks token id 0, which looks masked and is not."""
         self.assertEqual(
             self.ep.fsm_content_forbid_buf.tolist(),
-            [i for i in fsm.CFG.content_done_forbidden if i != TOOL_ARG_VALUE],
+            [i for i in fsm.CFG.content_done_forbidden if i not in TOOL_INTERNALS],
         )
         self.assertEqual(
             self.ep.fsm_forbid_buf.tolist(), list(fsm.CFG.reasoning_forbidden)
@@ -278,6 +297,26 @@ class TestEpilogueFsmMasks(CustomTestCase):
             self.ep.set_fsm_content_rows([True] * self.stride)
         self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
 
+    def test_each_buffer_gets_its_own_check(self):
+        """The one-shot check is keyed by a label string. Give two buffers the
+        same label and the first staging call spends the shot for both, so the
+        second is never checked for the life of the process -- silently, which
+        is the exact failure the check exists to prevent. Every other test here
+        builds a fresh epilogue and stages one buffer, so none of them can see
+        it."""
+        fsm.CFG.reasoning_forbidden = (EOS, 55)
+        fsm.CFG.content_done_forbidden = (THINK_START, 56)
+        fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START, 57)
+        rows = [True] * self.stride
+        with self.assertLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ) as logs:
+            self.ep.set_fsm_rows(rows, fsm.CFG.reasoning_forbidden)
+            self.ep.set_fsm_content_rows(rows)
+            self.ep.set_fsm_content_notools_rows(rows)
+        self.assertEqual(len(self.ep._ids_checked), 3, self.ep._ids_checked)
+        self.assertEqual(len(logs.output), 3, logs.output)
+
     def test_the_worker_arms_the_content_mask_from_the_content_flags(self):
         """Both halves are unit-tested; nothing else tests that the worker
         connects them. Deleting the set_fsm_content_rows call leaves every
@@ -337,10 +376,12 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertTrue(torch.isneginf(logits[0, TOOL_START]))
         # And the tool-call internals, which the shared buffer drops for the
         # sake of a chain that may legally open a call. A no-tools chain cannot.
-        self.assertTrue(torch.isneginf(logits[0, TOOL_ARG_VALUE]))
+        for tid in TOOL_INTERNALS:
+            self.assertTrue(torch.isneginf(logits[0, tid]), tid)
         # The tools-available row keeps both open: it may be inside a real call.
         self.assertFalse(torch.isneginf(logits[self.stride, TOOL_START]))
-        self.assertFalse(torch.isneginf(logits[self.stride, TOOL_ARG_VALUE]))
+        for tid in TOOL_INTERNALS:
+            self.assertFalse(torch.isneginf(logits[self.stride, tid]), tid)
 
     def test_the_notools_setter_stages_exactly_the_flags(self):
         flags = [True, False, True, False, False, False, False, True]
