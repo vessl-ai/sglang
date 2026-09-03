@@ -1362,8 +1362,11 @@ def plan_gate(reqs, stride: int) -> bool:
     halves get here down different clauses -- a fresh row through the grammar
     exemption below, one with content already produced through the
     ``content_progress`` test, which does not look at the grammar at all -- and
-    neither is armed, because all three flag functions require
-    ``not _has_grammar``. What keeps that from mattering lives in the worker:
+    neither is armed, because the two CONTENT flag functions require
+    ``not _has_grammar`` and ``folded_mask_flags`` needs REASONING. That last
+    one has no grammar term at all, deliberately: a REASONING row under a
+    grammar does fold, and is armed, which is correct -- the grammar owns
+    CONTENT, not the think block. What keeps that from mattering lives in the worker:
     ``fold_eligible`` requires ``not batch.has_grammar``. That is a
     *different* predicate -- ``req.grammar`` rather than the sampling params
     ``_has_grammar`` reads -- so the two must not be allowed to drift apart.

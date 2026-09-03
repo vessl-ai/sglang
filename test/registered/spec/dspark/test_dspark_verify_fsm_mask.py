@@ -331,45 +331,66 @@ class TestEpilogueFsmMasks(CustomTestCase):
         """
         # Leg A: fold_eligible admits only a greedy batch, and not under a `not`.
         worker = ast.parse(inspect.getsource(dspark_worker_v2))
-        fold = [
-            n.value
+        binds = [
+            n
             for n in ast.walk(worker)
-            if isinstance(n, ast.Assign)
+            if isinstance(n, (ast.Assign, ast.AugAssign, ast.NamedExpr))
             and any(
-                isinstance(t, ast.Name) and t.id == "fold_eligible" for t in n.targets
+                isinstance(t, ast.Name) and t.id == "fold_eligible"
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
             )
         ]
-        self.assertEqual(len(fold), 1, "one fold_eligible assignment")
-        # Scoped to that expression, so a read left behind in a log line or a
-        # clause moved out of the conjunction both fail.
-        conj = ast.dump(fold[0])
-        self.assertIn("is_all_greedy", conj, "fold_eligible must test it")
-        for n in ast.walk(fold[0]):
-            if isinstance(n, (ast.UnaryOp, ast.Compare)):
-                self.assertNotIn(
-                    "is_all_greedy",
-                    ast.dump(n),
-                    "the greedy test is negated or compared, not required",
-                )
+        self.assertEqual(len(binds), 1, "fold_eligible is bound once")
+        self.assertIsInstance(binds[0], ast.Assign, "and not amended after")
+        # Required, not merely mentioned: a top-level operand of the `and`.
+        # `... or self.allow_sampled_fold` reads it and does not require it.
+        conj = binds[0].value
+        self.assertIsInstance(conj, ast.BoolOp)
+        self.assertIsInstance(conj.op, ast.And)
+        greedy = [v for v in conj.values if "is_all_greedy" in ast.dump(v)]
+        self.assertEqual(len(greedy), 1, "one conjunct tests it")
+        # `x is None or x.is_all_greedy` and nothing else: a third disjunct
+        # (`or self.allow_sampled_fold`) reads the flag without requiring it,
+        # and a negation or comparison inverts what it requires.
+        self.assertIsInstance(greedy[0], ast.BoolOp)
+        self.assertIsInstance(greedy[0].op, ast.Or)
+        self.assertEqual(len(greedy[0].values), 2, "no escape hatch disjunct")
+        for n in ast.walk(greedy[0]):
+            if isinstance(n, ast.UnaryOp) or (
+                isinstance(n, ast.Compare) and "is_all_greedy" in ast.dump(n)
+            ):
+                self.fail("the greedy test is negated or compared, not required")
+
         # Leg B: the in-graph accept is the greedy one, unconditionally. Scoped
         # to the epilogue class -- the eager path in the same module has its own
         # accept and is not folded.
         epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
 
-        def callee(node):
-            f = node.func
-            return f.id if isinstance(f, ast.Name) else getattr(f, "attr", "")
-
-        accepts = [
-            callee(n)
+        # Leg B: the in-graph accept is the greedy one, and reached by name.
+        # Scoped to the epilogue class -- the eager path in the same module has
+        # its own accept and is not folded.
+        epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
+        callees = [
+            n.func.id
             for n in ast.walk(epilogue)
-            if isinstance(n, ast.Call) and callee(n).startswith("accept_")
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
         ]
         self.assertEqual(
-            accepts,
+            [c for c in callees if c.startswith("accept_")],
             ["accept_greedy_triton"],
             "the folded epilogue must accept by argmax and nothing else",
         )
+        # And reached by name: `getattr(mod, "accept_sampled_triton")(...)`
+        # leaves no Name callee to see, so the list above stays correct while
+        # the accept changes.
+        self.assertNotIn("getattr", callees, "no dynamic dispatch in here")
+        for n in ast.walk(epilogue):
+            if isinstance(n, ast.Call):
+                self.assertIsInstance(
+                    n.func,
+                    (ast.Name, ast.Attribute),
+                    "a computed callee hides which accept runs",
+                )
 
     def test_a_fresh_id_snapshot_is_not_reported(self):
         """The negative control for all three divergence checks: a detector that
@@ -383,18 +404,17 @@ class TestEpilogueFsmMasks(CustomTestCase):
             with self.subTest(setter), self.assertNoLogs(_LOG, level="ERROR"):
                 getattr(ep, setter)([True] * self.stride)
 
-    def test_a_content_set_of_only_tool_internals_is_reported(self):
-        """The placeholder here is not the safe one. `return ids or [0]` sits
-        after the FSM-active check, and the flags never consult this set, so a
-        CONTENT set the subtraction empties leaves rows armed against token id 0
-        with every sentinel open. configure_ids cannot build that -- CONTENT
-        allows only the opener and <|im:end|>, so the required think ids are
-        always in the set -- which is why this says so loudly instead of
-        pretending the rows are unarmed."""
+    def test_a_content_set_of_only_tool_internals_refuses_to_boot(self):
+        """The placeholder here is not the safe one. The flags never consult
+        this set, so a CONTENT set the subtraction empties leaves rows armed
+        against token id 0 with every sentinel open -- for the life of the
+        process, since the buffer is captured into the verify graph. The
+        sibling helper keeps a misconfiguration raising for the same reason;
+        this must too, or the only symptom is wrong output nobody can trace."""
         fsm.CFG.content_done_forbidden = TOOL_INTERNALS
-        with self.assertLogs(_LOG, level="ERROR") as logs:
-            self.assertEqual(_fsm_content_forbidden_ids(), [0])
-        self.assertIn("token id 0", "\n".join(logs.output))
+        with self.assertRaises(RuntimeError) as caught:
+            _fsm_content_forbidden_ids()
+        self.assertIn("token id 0", str(caught.exception))
 
     def test_each_buffer_gets_its_own_check(self):
         """The one-shot check is keyed by a label string. Give two buffers the

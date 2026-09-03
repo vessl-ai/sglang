@@ -546,21 +546,22 @@ def _fsm_content_forbidden_ids() -> List[int]:
     ids = [i for i in _fsm.CFG.content_done_forbidden if i not in tool_internals]
     if ids:
         return ids
-    # Unreachable through configure_ids: CONTENT allows only
-    # <|tool_call:start|> and <|im:end|>, so the think ids -- both required --
-    # are always in this set and the subtraction cannot empty it. Reaching here
-    # means the tables were built some other way, and unlike the placeholder
-    # above it does NOT pair with an all-False row buffer: the flags never
-    # consult this set, so armed rows would mask token id 0 while every
-    # sentinel stayed open. Say so; an empty buffer would change the captured
-    # shape, so the placeholder still goes back.
-    logger.error(
-        "[SOLAR-FSM] the CONTENT forbidden set is nothing but tool internals "
-        "(%s), which this buffer subtracts; armed rows will mask token id 0 "
-        "and no sentinel",
-        list(_fsm.CFG.content_done_forbidden),
+    # The sibling above keeps a misconfiguration raising for exactly this
+    # reason, and this is the same failure with a worse tail: the buffer is
+    # captured into the verify graph, so a process that starts here serves
+    # armed rows masking token id 0 -- and no sentinel -- for its whole life.
+    # The flags never consult this set, so nothing downstream can notice.
+    # A boot that fails is visible and revertible; this is neither.
+    #
+    # The tokenizer path cannot produce it: CONTENT allows only
+    # <|tool_call:start|> and <|im:end|>, so the required think ids stay in the
+    # set and the tool-internals subtraction cannot empty it. ``configure_ids``
+    # itself takes an arbitrary id map, which can.
+    raise RuntimeError(
+        "SOLAR_FSM: the CONTENT forbidden set is nothing but the tool "
+        f"internals this buffer subtracts ({list(_fsm.CFG.content_done_forbidden)}); "
+        "every armed row would mask token id 0 and no sentinel"
     )
-    return [0]
 
 
 def _fsm_content_notools_forbidden_ids() -> List[int]:
