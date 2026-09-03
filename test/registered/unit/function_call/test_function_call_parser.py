@@ -5958,7 +5958,7 @@ class TestSolarOpen2Detector(unittest.TestCase):
 
 class TestSolarOpen2VendorDifferential(unittest.TestCase):
     """Our detector against the reference tool parser (a verbatim copy in
-    ``solar_open2_vendor_reference.py``), shape by shape: non-stream must
+    ``test/srt/fixtures/solar_open2_vendor_reference.py``), shape by shape: non-stream must
     agree exactly; streaming must agree on calls and, unless a shape says
     ``"calls"``, on content up to whitespace (the documented streaming
     deltas: rstripped whitespace before an opener, held unparsed output);
@@ -6159,7 +6159,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
 
             path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                "solar_open2_vendor_reference.py",
+                "..", "..", "..", "srt", "fixtures", "solar_open2_vendor_reference.py",
             )
             spec = importlib.util.spec_from_file_location(
                 "solar_open2_vendor_reference", path

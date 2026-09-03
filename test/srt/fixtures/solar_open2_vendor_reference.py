@@ -5,7 +5,8 @@
 ``vllm/tool_parsers/solar_open2_tool_parser.py``), kept verbatim apart from
 the vLLM imports (replaced by the minimal stand-ins below so the parser runs
 inside this test tree without vLLM), the two ``timeout=`` keyword arguments of
-its regex ``finditer`` calls, and the line wrapping of one regex literal. It is
+its regex ``finditer`` calls, the line wrapping of one regex literal, and the
+unused imports the repo lint removes. It is
 the ground truth the SGLang detector is compared against in
 ``test_function_call_parser.py``
 (``TestSolarOpen2VendorDifferential``). Do not "fix" it: a difference from
@@ -16,8 +17,7 @@ import json
 import re as _re
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 def init_logger(name):
