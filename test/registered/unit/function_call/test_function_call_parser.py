@@ -6159,7 +6159,12 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
 
             path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                "..", "..", "..", "srt", "fixtures", "solar_open2_vendor_reference.py",
+                "..",
+                "..",
+                "..",
+                "srt",
+                "fixtures",
+                "solar_open2_vendor_reference.py",
             )
             spec = importlib.util.spec_from_file_location(
                 "solar_open2_vendor_reference", path
