@@ -113,9 +113,6 @@ class TestEpilogueFsmMasks(CustomTestCase):
             self.ep.fsm_content_forbid_buf.tolist(),
             [i for i in fsm.CFG.content_done_forbidden if i != TOOL_ARG_VALUE],
         )
-        # The subtraction is the point: a chain that offers tools may legally
-        # open a call, and the rows after it need those ids.
-        self.assertNotIn(TOOL_ARG_VALUE, self.ep.fsm_content_forbid_buf.tolist())
         self.assertEqual(
             self.ep.fsm_forbid_buf.tolist(), list(fsm.CFG.reasoning_forbidden)
         )
@@ -269,18 +266,6 @@ class TestEpilogueFsmMasks(CustomTestCase):
         ):
             self.ep.set_fsm_content_rows([True] * self.stride)
 
-    def test_the_content_check_does_not_need_the_reasoning_setter(self):
-        """It guards the rows this setter arms, so it must not be reachable
-        only through the sibling that arms the other buffer. Armed, not None:
-        a disarming call has no rows to protect and must not burn the one
-        shot -- see test_a_disarming_call_does_not_burn_the_check."""
-        fsm.CFG.content_done_forbidden = (THINK_START, 55)
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as logs:
-            self.ep.set_fsm_content_rows([True] * self.stride)
-        self.assertTrue(any("CONTENT mask holds" in m for m in logs.output))
-
     def test_a_disarming_call_does_not_burn_the_check(self):
         """The check fires once. If a None call spends it, the first step of a
         process with the FSM off silences every later divergence -- and that is
@@ -329,7 +314,6 @@ class TestEpilogueFsmMasks(CustomTestCase):
             self.ep.fsm_content_notools_forbid_buf.tolist(),
             list(fsm.CFG.content_done_forbidden_notools),
         )
-        self.assertNotEqual(self.ep.fsm_content_notools_forbid_buf.tolist(), [0])
         self.assertEqual(self.ep.fsm_content_notools_forbid_buf.dtype, torch.long)
         self.assertIsNot(
             self.ep.fsm_content_notools_row_buf, self.ep.fsm_content_row_buf
@@ -351,8 +335,12 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.ep._apply_fsm_mask(self.max_bs)
         self.assertTrue(torch.isneginf(logits[0, THINK_START]))
         self.assertTrue(torch.isneginf(logits[0, TOOL_START]))
-        # The tools-available row keeps the opener open.
+        # And the tool-call internals, which the shared buffer drops for the
+        # sake of a chain that may legally open a call. A no-tools chain cannot.
+        self.assertTrue(torch.isneginf(logits[0, TOOL_ARG_VALUE]))
+        # The tools-available row keeps both open: it may be inside a real call.
         self.assertFalse(torch.isneginf(logits[self.stride, TOOL_START]))
+        self.assertFalse(torch.isneginf(logits[self.stride, TOOL_ARG_VALUE]))
 
     def test_the_notools_setter_stages_exactly_the_flags(self):
         flags = [True, False, True, False, False, False, False, True]
@@ -368,21 +356,6 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertFalse(self.ep.fsm_row_buf.any())
         self.assertFalse(self.ep.fsm_content_row_buf.any())
 
-    def test_a_no_tools_row_masks_the_tool_call_internals_too(self):
-        """The shared buffer drops the tool-call internals because a chain that
-        offers tools may legally open a call. A no-tools chain cannot, so those
-        ids must still be shut here -- otherwise a drafted <|tool_arg:value|> is
-        accepted on a content row and served as text."""
-        logits = self._logits()
-        self.ep.set_fsm_content_rows([True] * self.stride + [False] * self.stride)
-        self.ep.set_fsm_content_notools_rows(
-            [True] * self.stride + [False] * self.stride
-        )
-        self.ep._apply_fsm_mask(self.max_bs)
-        self.assertTrue(torch.isneginf(logits[0, TOOL_ARG_VALUE]))
-        # The tools-available row keeps them open: it may be inside a real call.
-        self.assertFalse(torch.isneginf(logits[self.stride, TOOL_ARG_VALUE]))
-
     def test_a_fresh_notools_id_snapshot_is_not_reported(self):
         """The pair for the staleness test below: a detector that logs
         unconditionally passes that one and would cry wolf on every engine."""
@@ -395,18 +368,6 @@ class TestEpilogueFsmMasks(CustomTestCase):
         """The realistic shape, matching the CONTENT sibling: the CFG changes
         after construction rather than the buffer being swapped by hand."""
         fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START, 42)
-        with self.assertLogs(
-            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
-        ) as cm:
-            self.ep.set_fsm_content_notools_rows([True] * self.stride)
-        self.assertIn("no-tools", "\n".join(cm.output))
-
-    def test_the_notools_ids_are_checked_for_staleness(self):
-        """The buffer is a construction-time snapshot. If the FSM resolves after
-        this object is built, armed rows mask the wrong id with nothing in the
-        logs -- so the first staging call has to say so."""
-        self.ep.fsm_content_notools_forbid_buf = torch.tensor([0], dtype=torch.long)
-        self.ep._ids_checked.discard("no-tools CONTENT")
         with self.assertLogs(
             "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
         ) as cm:

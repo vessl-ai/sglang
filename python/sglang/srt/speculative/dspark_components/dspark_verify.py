@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Set
+from typing import List, Optional
 
 import msgspec
 import torch
@@ -512,8 +512,8 @@ def _fsm_forbidden_ids() -> List[int]:
 def _fsm_content_forbidden_ids() -> List[int]:
     """The sentinels a content row may not emit, minus the tool-call internals.
 
-    Same placeholder contract as :func:`_fsm_forbidden_ids`. Two subtractions
-    from ``CFG.content_done_forbidden``, both because this buffer is armed per
+    Same placeholder contract as :func:`_fsm_forbidden_ids`. One subtraction
+    from ``CFG.content_done_forbidden``, because this buffer is armed per
     request off committed state and then applied to every chain row:
 
     * the tool-call internals (``<|tool_arg:start|>``, ``<|tool_arg:value|>``,
@@ -523,7 +523,7 @@ def _fsm_content_forbidden_ids() -> List[int]:
       Masking them there would not reject the row, it would commit a different
       token and hand back a malformed call. Committed tool states go eager
       (``_content_needs_eager``), so the eager plan covers them properly.
-    * nothing else: what remains (``<|think:start|>``, ``<|think:end|>``,
+    Nothing else is dropped: what remains (``<|think:start|>``, ``<|think:end|>``,
       ``<|im:start|>``, ``<|im:content|>``, ``<|tool_response:*|>``) is illegal
       in CONTENT and in every state one chain can reach from it.
 
@@ -560,14 +560,12 @@ def _fsm_content_notools_forbidden_ids() -> List[int]:
       open a tool call and the rows after it need them. No tools makes
       ``<|tool_call:start|>`` illegal in every state, so no such chain exists
       and there is no legal call for masking them to break.
-    * ``<|tool_call:start|>`` itself is absent there because the shared buffer
-      carries the tools-available table.
+    * ``<|tool_call:start|>`` itself, which the shared buffer never carries.
 
-    Overlapping the two masks is idempotent -- writing ``-inf`` twice over an
-    id costs a second write and changes nothing -- so carrying the full set
-    here needs no coordination with what the shared buffer holds, which is the
-    point: a difference-set buffer would silently under-mask the moment
-    ``configure_ids`` made the two tables differ by anything new.
+    Carrying the full set needs no coordination with what the shared buffer
+    holds, which is the point: a difference-set buffer would silently
+    under-mask the moment ``configure_ids`` made the two tables differ by
+    anything new.
 
     Same placeholder contract as the siblings, and with the same property they
     have and a difference-set buffer did not: whenever the FSM is active this
@@ -652,8 +650,8 @@ class DsparkVerifyEpilogue:
         self.fsm_content_forbid_buf = torch.tensor(
             _fsm_content_forbidden_ids(), dtype=torch.long, device=device
         )
-        # The no-tools difference, layered on top of the CONTENT half for the
-        # subset of those rows whose request offers no tools.
+        # The no-tools set, layered over the CONTENT half for the subset of
+        # those rows whose request offers no tools.
         self.fsm_content_notools_row_buf = torch.zeros(
             (self.max_bs * self.stride,), dtype=torch.bool, device=device
         )
@@ -662,7 +660,7 @@ class DsparkVerifyEpilogue:
         )
         # Which forbid buffers have had their ids checked against the FSM.
         # One check each, on the buffer's first armed staging call.
-        self._ids_checked: Set[str] = set()
+        self._ids_checked: set[str] = set()
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -808,7 +806,7 @@ class DsparkVerifyEpilogue:
             self.fsm_content_forbid_buf,
         )
         # Not disjoint from the call above -- deliberately a subset of it. The
-        # no-tools rows take the shared content set and this one id on top.
+        # no-tools rows carry the shared content set and the whole no-tools set.
         _fsm.apply_folded_mask(
             self.strided_logits[:n],
             self.fsm_content_notools_row_buf[:n],

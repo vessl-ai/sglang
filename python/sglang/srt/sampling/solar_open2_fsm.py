@@ -169,9 +169,11 @@ _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
 EFFORT_PARAM = "solar_reasoning_effort"
 # custom_params key: whether the request offers tools (chat entrypoint). A
 # request without tools can never have a <|tool_call:start|> answered, so the
-# no-tools table forbids the token in every state. It matters in fresh
+# no-tools table forbids the token in every state. It matters most in fresh
 # CONTENT: with EOS shut there, the model otherwise takes the token as the
-# exit ("<|tool_call:start|>think", then stop).
+# exit ("<|tool_call:start|>think", then stop). It is not confined to that --
+# the opener is illegal on every content row of such a request, which is why
+# the folded path masks it there too.
 TOOLS_PARAM = "solar_tools_available"
 
 
@@ -1255,7 +1257,7 @@ def _content_needs_eager(fsm, *, req) -> bool:
     return not fsm.content_progress and not _has_grammar(req)
 
 
-def _folded_flags(reqs, stride: int, pred) -> Optional[List[bool]]:
+def _folded_flags(reqs, *, stride: int, pred) -> Optional[List[bool]]:
     """The shape every in-graph flag list has: ``stride`` copies of one
     per-request predicate, read off **committed** state.
 
@@ -1297,8 +1299,8 @@ def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     """Per-(request, chain position) flags for the in-graph CONTENT mask.
 
     True where the request's **committed** state is CONTENT with content
-    already produced and no grammar -- exactly the rows :func:`plan_gate`
-    declines to send eager, and therefore the rows whose forbidden set nothing
+    already produced and no grammar -- the non-grammar subset of the rows
+    :func:`plan_gate` declines to send eager, and therefore the rows whose forbidden set nothing
     else applies. Without this the second bullet of
     :func:`folded_mask_flags` is open: a drafted ``<|think:start|>`` (or any
     other sentinel CONTENT does not allow) is accepted unmasked on a
@@ -1318,7 +1320,7 @@ def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
-    return _folded_flags(reqs, stride, _content_with_progress)
+    return _folded_flags(reqs, stride=stride, pred=_content_with_progress)
 
 
 def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
@@ -1337,8 +1339,8 @@ def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]
     """
     return _folded_flags(
         reqs,
-        stride,
-        lambda fsm, req: _content_with_progress(fsm, req) and not fsm.tools,
+        stride=stride,
+        pred=lambda fsm, req: _content_with_progress(fsm, req) and not fsm.tools,
     )
 
 
@@ -1356,8 +1358,10 @@ def plan_gate(reqs, stride: int) -> bool:
     is ``2 * stride`` because the state read here can lag by one accepted run.
     Every folded-path gap that remains comes from that same lag, so each is
     bounded at <= stride-1 chain rows and closed by the next step's committed
-    state -- a drafted sentinel under a grammar, plus the two named in
-    ``folded_mask_flags`` and in ``_fsm_content_forbidden_ids``. Host-only and
+    state: a drafted sentinel under a grammar, a drafted ``<|think:start|>``
+    (see ``folded_mask_flags``), and the tool states a chain opens for itself
+    with a drafted ``<|tool_call:start|>`` (see ``_fsm_content_forbidden_ids``,
+    which drops the tool internals on purpose). Host-only and
     sync-free: it never touches the draft tokens.
     """
     if not is_active():
@@ -1411,7 +1415,7 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
-    return _folded_flags(reqs, stride, _in_reasoning_with_budget)
+    return _folded_flags(reqs, stride=stride, pred=_in_reasoning_with_budget)
 
 
 def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
