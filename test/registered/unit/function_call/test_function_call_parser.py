@@ -6016,7 +6016,34 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 },
             ),
         ),
+        # A coding agent's tool: code-shaped values, and the schema shapes
+        # without a plain ``type`` (_param_type: first non-null entry of a
+        # list, None -> string).
+        Tool(
+            type="function",
+            function=Function(
+                name="write_file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "lines": {"type": "array"},
+                        "meta": {"type": "object"},
+                        "n": {"type": "integer"},
+                        "mode": {"enum": ["r", "w"]},
+                        "opt": {"type": ["string", "null"]},
+                        "any": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                        "nullable_int": {"type": ["null", "integer"]},
+                    },
+                },
+            ),
+        ),
     ]
+
+    # A code-shaped string value: newlines, indentation, braces, quotes and a
+    # backslash-escaped quote.
+    CODE = 'def f(x):\n    return {"a": [1, 2], "b": "q\\"uote"}\n'
 
     @staticmethod
     def _call(name="get_weather", **args):
@@ -6149,7 +6176,112 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             # complete calls only and keeps the text as content at the end.
             "unfinished": (unfinished, True, False),
             "good then unfinished": (good + "\n" + unfinished, True, False),
+            # Code-shaped argument values (a coding agent's write_file); the
+            # exact parsed values are pinned in test_code_shaped_values_parse
+            # _exactly, the parity and chunk invariance here.
+            "code value": (
+                cls._call("write_file", path="a.py", content=cls.CODE),
+                True,
+                True,
+            ),
+            "unicode value": (
+                cls._call("write_file", content="한국어 ✓ 🚀"),
+                True,
+                True,
+            ),
+            "long value": (cls._call("write_file", content="x" * 20000), True, True),
+            "empty value": (cls._call("write_file", content=""), True, True),
+            "int with spaces": (cls._call("write_file", n="  3  "), True, True),
+            # dict last-wins on both sides.
+            "dup arg names": (
+                f"{TOOL_CALL_START}write_file\n"
+                f"{TOOL_ARG_START}n{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n"
+                f"{TOOL_ARG_START}n{TOOL_ARG_VALUE}2{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                True,
+            ),
+            # An argument without its value sentinel is not skipped: the lazy
+            # argument regex (ours and the vendor's) runs the name on to the
+            # next value sentinel, so the good argument lands under a garbage
+            # name that holds the sentinels between.
+            "arg missing value sentinel": (
+                f"{TOOL_CALL_START}write_file\n"
+                f"{TOOL_ARG_START}path{TOOL_ARG_END}\n"
+                f"{TOOL_ARG_START}content{TOOL_ARG_VALUE}x{TOOL_ARG_END}\n"
+                f"{TOOL_CALL_END}",
+                True,
+                True,
+            ),
+            "no-arg call": (f"{TOOL_CALL_START}ping\n{TOOL_CALL_END}", True, True),
+            "nested object": (
+                cls._call("write_file", meta='{"k": {"j": [1, {"z": "}"}]}}'),
+                True,
+                True,
+            ),
+            "array of objects": (
+                cls._call("write_file", lines='[{"n": 1}, {"n": 2}]'),
+                True,
+                True,
+            ),
+            # A value that is a prefix of a sentinel: the streaming holdback
+            # must not swallow it.
+            "sentinel prefix value": (
+                cls._call("write_file", content="see <|tool_arg"),
+                True,
+                True,
+            ),
+            # Schemas without a plain ``type``: the value stays a string
+            # (enum-only, anyOf-only), a type list takes its first non-null
+            # entry.
+            "enum only": (cls._call("write_file", mode="w"), True, True),
+            "string or null": (cls._call("write_file", opt="x"), True, True),
+            "anyOf only": (cls._call("write_file", any="3"), True, True),
+            "null then integer": (
+                cls._call("write_file", nullable_int="3"),
+                True,
+                True,
+            ),
         }
+
+    def test_code_shaped_values_parse_exactly(self):
+        """The exact arguments of the code-shaped shapes above
+        (SolarOpen2Detector.detect_and_parse -> _parse_arguments / _coerce /
+        _param_type; streaming agrees by
+        test_streaming_calls_match_non_stream). The JSON is written with
+        ensure_ascii=False (_item), so the unicode value round-trips
+        verbatim."""
+        expected = {
+            "code value": {"path": "a.py", "content": self.CODE},
+            "unicode value": {"content": "한국어 ✓ 🚀"},
+            "long value": {"content": "x" * 20000},
+            "empty value": {"content": ""},
+            "int with spaces": {"n": 3},
+            "dup arg names": {"n": 2},
+            "arg missing value sentinel": {
+                f"path{TOOL_ARG_END}\n{TOOL_ARG_START}content": "x",
+            },
+            "no-arg call": {},
+            "nested object": {"meta": {"k": {"j": [1, {"z": "}"}]}}},
+            "array of objects": {"lines": [{"n": 1}, {"n": 2}]},
+            "sentinel prefix value": {"content": "see <|tool_arg"},
+            "enum only": {"mode": "w"},
+            "string or null": {"opt": "x"},
+            "anyOf only": {"any": "3"},
+            "null then integer": {"nullable_int": 3},
+        }
+        shapes = self.shapes()
+        for name, arguments in expected.items():
+            with self.subTest(shape=name):
+                result = SolarOpen2Detector().detect_and_parse(
+                    shapes[name][0], self.TOOLS
+                )
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(json.loads(result.calls[0].parameters), arguments)
+        raw = SolarOpen2Detector().detect_and_parse(
+            shapes["unicode value"][0], self.TOOLS
+        )
+        self.assertIn("한국어 ✓ 🚀", raw.calls[0].parameters)
 
     @classmethod
     def _reference(cls):

@@ -1853,5 +1853,55 @@ class TestSolarOpen2ForceReasoning(CustomTestCase):
                 self.assertEqual(content, "")
 
 
+class TestSolarOpen2OpenerInsideReasoning(CustomTestCase):
+    """INF-451: the model spells the tool-call opener inside its reasoning
+    (quoting the format) and closes the block properly afterwards.
+
+    Non-streaming splits at ``<|think:end|>`` first
+    (BaseReasoningFormatDetector._detect_and_parse_impl), so the opener stays
+    reasoning. Streaming decides per chunk (_parse_streaming_increment_impl):
+    a chunk holding the closer splits there too, but a chunk holding the opener
+    and not yet the closer ends reasoning at the opener (the tool escape), after
+    which the closer reaches the client as content (the tool detector holds an
+    opener that never parses and releases it at stream end). Pinned as the
+    documented divergence; how often the model does this is live-only.
+    """
+
+    OPENER = "<|tool_call:start|>"
+    END = "<|think:end|>"
+    TEXT = f"about {OPENER} format{END}Answer"
+    WHOLE_BLOCK = (f"about {OPENER} format", "Answer")
+    EARLY_CUT = ("about ", f"{OPENER} format{END}Answer")
+
+    def _feed(self, chunk_size):
+        detector = SolarOpen2Detector()
+        reasoning = normal = ""
+        for i in range(0, len(self.TEXT), chunk_size):
+            ret = detector.parse_streaming_increment(self.TEXT[i : i + chunk_size])
+            reasoning += ret.reasoning_text
+            normal += ret.normal_text
+        ret = detector.finish()
+        return reasoning + ret.reasoning_text, normal + ret.normal_text
+
+    def test_non_stream_keeps_the_opener_in_reasoning(self):
+        ret = SolarOpen2Detector().detect_and_parse(self.TEXT)
+        self.assertEqual((ret.reasoning_text, ret.normal_text), self.WHOLE_BLOCK)
+        self.assertEqual(
+            ReasoningParser("solar_open2").parse_non_stream(self.TEXT),
+            self.WHOLE_BLOCK,
+        )
+
+    def test_streaming_is_chunk_dependent(self):
+        """A chunk that carries both sentinels (or the whole closer before the
+        opener completes) splits at the closer; smaller chunks complete the
+        opener first and escape there."""
+        for chunk_size in (1, 2, 3, 5, 7, 11):
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(self._feed(chunk_size), self.EARLY_CUT)
+        for chunk_size in (23, 1000):
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(self._feed(chunk_size), self.WHOLE_BLOCK)
+
+
 if __name__ == "__main__":
     unittest.main()
