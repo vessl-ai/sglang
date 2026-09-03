@@ -24,6 +24,7 @@ from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
+    _fsm_content_forbidden_ids,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -113,16 +114,20 @@ def _cfg():
 class TestEpilogueFsmMasks(CustomTestCase):
     max_bs, stride = 2, 4
 
-    def setUp(self):
-        self._saved = {k: getattr(fsm.CFG, k) for k in _CFG_FIELDS}
-        _cfg()
-        # After _cfg(): both forbid buffers are snapshotted in __init__.
-        self.ep = DsparkVerifyEpilogue(
+    def _epilogue(self):
+        """A fresh epilogue, which snapshots the forbid buffers off the CFG
+        _cfg() has already set."""
+        return DsparkVerifyEpilogue(
             max_bs=self.max_bs,
             verify_num_draft_tokens=self.stride,
             device="cpu",
             tp_sync=DsparkTpSync(SimpleNamespace(world_size=1)),
         )
+
+    def setUp(self):
+        self._saved = {k: getattr(fsm.CFG, k) for k in _CFG_FIELDS}
+        _cfg()
+        self.ep = self._epilogue()
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -301,6 +306,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         flags is a live copy-paste mutant -- the content flags on the reasoning
         setter puts EOS out of reach once the answer is done, which is the shape
         this port exists to fix."""
+        self.assertEqual(len(_MASKS), 3, "a mask lost its guards with its row")
         calls = [
             n
             for n in ast.walk(ast.parse(inspect.getsource(dspark_worker_v2)))
@@ -314,19 +320,91 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 self.assertIsInstance(arg, ast.Call)
                 self.assertEqual(arg.func.attr, flags)
 
-    def test_fold_eligible_still_requires_a_greedy_batch(self):
+    def test_the_folded_path_stays_greedy_on_both_legs(self):
         """What keeps a masked sentinel out of the committed chain: a -inf logit
-        cannot be the argmax. Drop the requirement and every masked sentinel
-        becomes sampleable, which opens the gap plan_gate calls impossible."""
-        self.assertIn("is_all_greedy", inspect.getsource(dspark_worker_v2))
+        cannot be the argmax. plan_gate documents two gaps as the only ones that
+        exist because of it, so if either leg goes the ledger becomes a lie.
+
+        Both legs are checked structurally rather than by grepping the source,
+        which a negation, a comment mentioning the name, or a moved clause all
+        survive -- and which cannot see the second leg at all.
+        """
+        # Leg A: fold_eligible admits only a greedy batch, and not under a `not`.
+        worker = ast.parse(inspect.getsource(dspark_worker_v2))
+        greedy_reads = [
+            n
+            for n in ast.walk(worker)
+            if isinstance(n, ast.Attribute) and n.attr == "is_all_greedy"
+        ]
+        self.assertEqual(len(greedy_reads), 1, "fold_eligible reads it once")
+        negated = {
+            id(operand)
+            for n in ast.walk(worker)
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not)
+            for operand in ast.walk(n.operand)
+        }
+        self.assertNotIn(
+            id(greedy_reads[0]),
+            negated,
+            "the greedy test is negated -- only sampling batches would fold",
+        )
+        # Leg B: the in-graph accept is the greedy one, unconditionally. Scoped
+        # to the epilogue class -- the eager path in the same module has its own
+        # accept and is not folded.
+        cls = next(
+            n
+            for n in ast.walk(ast.parse(inspect.getsource(DsparkVerifyEpilogue)))
+            if isinstance(n, ast.ClassDef)
+        )
+        accepts = [
+            n.func.id
+            for n in ast.walk(cls)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id.startswith("accept_")
+        ]
+        self.assertEqual(
+            accepts,
+            ["accept_greedy_triton"],
+            "the folded epilogue must accept by argmax and nothing else",
+        )
 
     def test_a_fresh_id_snapshot_is_not_reported(self):
         """The negative control for all three divergence checks: a detector that
         logs unconditionally passes the staleness tests and cries wolf on every
         engine."""
         for setter, _ in _MASKS:
+            # A fresh epilogue each, as the three separate tests had: sharing one
+            # makes subtests 2 and 3 pass vacuously under a mutation that
+            # collapses the per-label one-shot into a per-process one.
+            ep = self._epilogue()
             with self.subTest(setter), self.assertNoLogs(_LOG, level="ERROR"):
-                getattr(self.ep, setter)([True] * self.stride)
+                getattr(ep, setter)([True] * self.stride)
+
+    def test_the_content_placeholder_is_not_reachable_while_rows_are_armed(self):
+        """`return ids or [0]` sits after the FSM-active check, so unlike the
+        FSM-off branch above it the placeholder can be live while the flags
+        still arm rows -- which masks token id 0 instead of the sentinels. It
+        is reachable when CONTENT forbids only the tool internals, since those
+        are exactly what this buffer subtracts.
+
+        Asserting the shape rather than the current tables: whenever the buffer
+        falls back to the placeholder, no row may be armed for it.
+        """
+        fsm.CFG.content_done_forbidden = TOOL_INTERNALS
+        ids = _fsm_content_forbidden_ids()
+        self.assertEqual(ids, [0], "fixture must reach the placeholder branch")
+        req = SimpleNamespace(
+            output_ids=[7, THINK_END, 7],
+            sampling_params=SimpleNamespace(json_schema=None, regex=None, ebnf=None),
+            retraction_count=0,
+        )
+        flags = fsm.folded_content_mask_flags([req], self.stride)
+        self.assertFalse(
+            flags and any(flags),
+            "the placeholder is armed on a real row -- token id 0 is masked "
+            "and the sentinels are not",
+        )
 
     def test_each_buffer_gets_its_own_check(self):
         """The one-shot check is keyed by a label string. Give two buffers the
