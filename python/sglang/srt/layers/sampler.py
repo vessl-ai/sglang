@@ -16,6 +16,7 @@ from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -93,8 +94,6 @@ class Sampler(nn.Module):
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
         # --- solar-open2 FSM ---
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         _solar_fsm.apply(logits, sampling_info)
         sanitize_nan_logits(logits, "sampler: next_token_logits")
         return logits

@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -687,8 +688,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         # --- solar-open2 FSM fold gate ---
         # Decided before the target launch: the folded epilogue accepts inside
         # the cuda graph, where the FSM mask below would never land.
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         _solar_fsm_gate = _solar_fsm.plan_gate(batch.reqs, verify_ids_2d.shape[1])
         # The reasoning mask does not force the eager path -- it is staged here
         # and applied inside the verify graph, so a thinking batch keeps the
@@ -699,9 +698,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         # must agree, and is_active() resolves lazily, so a second call could
         # answer differently and leave the mask block without a chain.
         _solar_fsm_on = _solar_fsm.is_active()
-        _solar_fsm_epilogue = self._verify_executor.verify_epilogue
-        if _solar_fsm_epilogue is not None:
-            _solar_fsm_epilogue.set_fsm_rows(
+        epilogue = self._verify_executor.verify_epilogue
+        if epilogue is not None:
+            epilogue.set_fsm_rows(
                 _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1]),
                 _solar_fsm.CFG.reasoning_forbidden,
             )
@@ -726,7 +725,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # The Solar FSM forces it for the same reason, so the two gates are
         # independent and both have to hold for the folded path to be taken.
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
             and proposal.folded
             # The epilogue's in-graph accept is greedy (accept_greedy_triton);
             # sampling batches must take the eager accept path even when the
@@ -789,9 +788,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # replay that graph never executes it, and this is the only carrier
         # left. Both are known here because the target verify has returned.
         _solar_fsm_in_graph = (
-            self._verify_executor.verify_epilogue is not None
-            and run_compact
-            and can_run_cuda_graph
+            epilogue is not None and run_compact and can_run_cuda_graph
         )
         # `_solar_fsm_on` is the same read the chain was staged on, so a step
         # that reaches here always has one. Guarding on `grammar_tree` instead
@@ -816,7 +813,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_lens=getattr(layout, "verify_lens", None),
                 )
 
-        epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,

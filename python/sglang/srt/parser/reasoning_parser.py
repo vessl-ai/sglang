@@ -2021,8 +2021,6 @@ def solar_open2_force_reasoning(request) -> bool:
     "high"). The template's test is exact and case-sensitive; the serving
     layer lower-cases the value before the template, and this lower-cases
     too so a raw request object gives the same answer."""
-    if request is None:
-        return True
     effort = getattr(request, "reasoning_effort", None)
     if effort is None:
         effort = (getattr(request, "chat_template_kwargs", None) or {}).get(

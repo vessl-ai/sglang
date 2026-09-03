@@ -13,6 +13,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarRow,
 )
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -224,8 +225,6 @@ class SamplingBatchInfo:
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         # --- solar-open2 FSM ---
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         _solar_fsm.attach_rows(ret, batch)
         return ret
 
@@ -334,8 +333,6 @@ class SamplingBatchInfo:
             ]
 
         # --- solar-open2 FSM ---
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         _solar_fsm.filter_rows(self, keep_indices)
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -402,8 +399,6 @@ class SamplingBatchInfo:
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
         # --- solar-open2 FSM ---
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         _solar_fsm.merge_rows(self, other)
 
         # Merge the custom logit processors and custom params lists

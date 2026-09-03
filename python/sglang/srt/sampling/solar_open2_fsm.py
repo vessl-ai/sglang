@@ -58,6 +58,7 @@ import os
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import msgspec
 import torch
 
 logger = logging.getLogger(__name__)
@@ -108,7 +109,6 @@ _STATE_NAMES = (
     "TOOL_ARG_END",
     "TOOL_CALL_END",
 )
-_TOOL_STATES = frozenset(range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1))
 
 # Per-state mask specification: (allowed sentinel fields, eos_masked). Bare
 # EOS is forbidden wherever ending the turn is template-illegal -- everywhere
@@ -391,21 +391,29 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     return tuple(sorted(ids))
 
 
+_LOG_INTERVAL = 60.0
 _EFFORT_LOG = {"last": 0.0, "num_suppressed": 0}
-_EFFORT_LOG_INTERVAL = 60.0
+
+
+def _rate_limited(state: Dict[str, float], count: int = 1) -> Optional[int]:
+    """One report per ``_LOG_INTERVAL``: the number suppressed since the last
+    report, or None while suppressing (``count`` more suppressed)."""
+    now = time.monotonic()
+    if now - state["last"] < _LOG_INTERVAL:
+        state["num_suppressed"] += count
+        return None
+    suppressed = int(state["num_suppressed"])
+    state["last"], state["num_suppressed"] = now, 0
+    return suppressed
 
 
 def _warn_unknown_effort(effort) -> None:
     """Rate-limited (one line per minute, with the suppressed count): a fleet
     of clients sending a bad value should stay visible for the life of the
     server, unlike the once-only wiring-defect warnings."""
-    now = time.monotonic()
-    if now - _EFFORT_LOG["last"] < _EFFORT_LOG_INTERVAL:
-        _EFFORT_LOG["num_suppressed"] += 1
+    suppressed = _rate_limited(_EFFORT_LOG)
+    if suppressed is None:
         return
-    suppressed = _EFFORT_LOG["num_suppressed"]
-    _EFFORT_LOG["last"] = now
-    _EFFORT_LOG["num_suppressed"] = 0
     logger.warning(
         "[SOLAR-FSM] unknown reasoning effort %r; using the default effort %r "
         "budget. %d earlier occurrence(s) suppressed.",
@@ -541,10 +549,7 @@ def configure_ids(
 
 
 def init_from_env() -> None:
-    """Resolve ids + budget. Called lazily by the first ``is_active`` caller."""
-    if not os.environ.get("SOLAR_FSM", "0") == "1":
-        CFG.enabled = False
-        return
+    """Resolve ids + budget. Called by ``is_active`` once SOLAR_FSM=1 is seen."""
     tok_dir = os.environ.get("SOLAR_FSM_TOKENIZER_DIR", "")
     if not tok_dir or not os.path.isdir(tok_dir):
         raise RuntimeError(
@@ -570,7 +575,10 @@ def init_from_env() -> None:
         CFG.content_done_forbidden,
         CFG.content_fresh_forbidden_notools,
         CFG.content_done_forbidden_notools,
-        {_STATE_NAMES[st]: CFG.forbidden[(st, False)] for st in sorted(_TOOL_STATES)},
+        {
+            _STATE_NAMES[st]: CFG.forbidden[(st, False)]
+            for st in range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1)
+        },
         CFG.effort_budgets,
         CFG.default_effort,
         "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
@@ -910,20 +918,15 @@ def _mask_and_force(
 
 
 _CONFLICT_LOG = {"last": 0.0, "num_suppressed": 0}
-_CONFLICT_LOG_INTERVAL = 60.0
 
 
 def _log_force_conflict(rows, *, stride: int, rids) -> None:
     """Report rows where the FSM wanted to force <|think:end|> but the grammar
     had already forbidden it -- the two are reading different committed state,
     and forcing would leave the row fully masked."""
-    now = time.monotonic()
-    num_suppressed = _CONFLICT_LOG["num_suppressed"]
-    if now - _CONFLICT_LOG["last"] < _CONFLICT_LOG_INTERVAL:
-        _CONFLICT_LOG["num_suppressed"] = num_suppressed + len(rows)
+    num_suppressed = _rate_limited(_CONFLICT_LOG, len(rows))
+    if num_suppressed is None:
         return
-    _CONFLICT_LOG["last"] = now
-    _CONFLICT_LOG["num_suppressed"] = 0
     if rids is not None and stride > 0:
         named = [rids[r // stride] for r in rows if r // stride < len(rids)]
     else:
@@ -1165,17 +1168,14 @@ class _SimState:
         return self.in_reasoning and self.count >= budget
 
 
-class VerifyPlan:
+class VerifyPlan(msgspec.Struct, kw_only=True):
     """Per-(request, chain position) masks for one target-verify step."""
 
-    __slots__ = ("force_rows", "mask_rows", "stride", "bs", "rids")
-
-    def __init__(self, *, force_rows, mask_rows, stride, bs, rids):
-        self.force_rows = force_rows
-        self.mask_rows = mask_rows
-        self.stride = stride
-        self.bs = bs
-        self.rids = rids
+    force_rows: List[int]
+    mask_rows: Dict[Tuple[int, ...], List[int]]
+    stride: int
+    bs: int
+    rids: Optional[List[str]]
 
     def apply(self, logits: torch.Tensor, verify_lens=None) -> None:
         expect_rows = self.bs * self.stride

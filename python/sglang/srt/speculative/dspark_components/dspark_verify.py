@@ -30,6 +30,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.sampling import solar_open2_fsm as _fsm
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -493,16 +494,12 @@ logger = logging.getLogger(__name__)
 def _fsm_forbidden_ids() -> List[int]:
     """The reasoning forbidden set, resolved once at epilogue construction.
 
-    Returns a one-element placeholder when the FSM is off (or not importable),
+    Returns a one-element placeholder when the FSM is off,
     so the mask kernels still have a static index to write through and the
     captured graph is the same shape either way. That placeholder is only ever
     paired with an all-False row buffer -- ``folded_mask_flags`` returns None
     while the FSM is inactive, which disarms every row -- so it writes nothing.
     """
-    try:
-        from sglang.srt.sampling import solar_open2_fsm as _fsm
-    except ImportError:  # the epilogue must not depend on the FSM being present
-        return [0]
     # A misconfigured SOLAR_FSM_TOKENIZER_DIR raises out of is_active() on
     # purpose, and it must keep raising here: swallowing it would leave the
     # placeholder in place for the process's life and mask token id 0 instead
@@ -661,10 +658,8 @@ class DsparkVerifyEpilogue:
         """
         if self.strided_logits is None:
             return
-        from sglang.srt.sampling.solar_open2_fsm import apply_folded_mask
-
         n = bs * self.stride
-        apply_folded_mask(
+        _fsm.apply_folded_mask(
             self.strided_logits[:n], self.fsm_row_buf[:n], self.fsm_forbid_buf
         )
 

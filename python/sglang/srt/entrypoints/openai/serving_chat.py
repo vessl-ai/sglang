@@ -763,12 +763,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle tool calls
         if self._tool_call_parsing_active(request):
             finishing = finish_reason_type is not None and finish_reason_type != "abort"
-            glue_terminator = finish_reason_type is not None and (
-                self._solar_single_call_stop_matched(
-                    request,
-                    effective_tools=self._effective_tools(request),
-                    finish_reason=content["meta_info"].get("finish_reason"),
-                )
+            glue_terminator = self._solar_single_call_stop_matched(
+                request,
+                effective_tools=self._effective_tools(request),
+                finish_reason=content["meta_info"].get("finish_reason"),
             )
             async for chunk in self._process_tool_call_stream(
                 index,
