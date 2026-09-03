@@ -356,6 +356,29 @@ class TestEpilogueFsmMasks(CustomTestCase):
             ):
                 self.fail("the greedy test is negated or compared, not required")
 
+    def test_the_folded_accept_is_gated_on_fold_eligible(self):
+        """Leg A decides whether a batch may fold; this is where that decision
+        is used. Both legs pass with `fold_eligible and` deleted from here --
+        the flag would still be computed correctly and the epilogue would still
+        hold only the greedy accept, while every sampling batch took it."""
+        worker = ast.parse(inspect.getsource(dspark_worker_v2))
+        gates = [
+            n.value
+            for n in ast.walk(worker)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "folded_accept" for t in n.targets
+            )
+        ]
+        self.assertEqual(len(gates), 1, "folded_accept is assigned once")
+        self.assertIsInstance(gates[0], ast.BoolOp)
+        self.assertIsInstance(gates[0].op, ast.And)
+        self.assertIn(
+            "fold_eligible",
+            [v.id for v in gates[0].values if isinstance(v, ast.Name)],
+            "the folded accept must require fold_eligible",
+        )
+
     def test_the_epilogue_has_no_accept_but_the_greedy_one(self):
         """Leg B. Scoped to the class -- the eager path in the same module has
         its own accept and is not folded. Reached by name, too: a computed
@@ -363,9 +386,9 @@ class TestEpilogueFsmMasks(CustomTestCase):
         """
         epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
         callees = [
-            n.func.id
+            (n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", ""))
             for n in ast.walk(epilogue)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            if isinstance(n, ast.Call)
         ]
         self.assertEqual(
             [c for c in callees if c.startswith("accept_")],

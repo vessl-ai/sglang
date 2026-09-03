@@ -1174,6 +1174,18 @@ class TestSpecPathToolStates(_FsmCase):
         built, so the tie lives here.
         """
         _cfg()
+        fields = {
+            f
+            for state, (fl, _) in fsm._MASK_SPEC_BY_STATE.items()
+            if state != fsm.REASONING
+            for f in fl
+        }
+        # Without this, a sentinel the fixture does not map drops out of
+        # `allowed` and the check below holds for the wrong reason --
+        # while the real server resolves that id and the shared buffer eats it.
+        self.assertLessEqual(
+            fields, set(IDS), "fixture must map every sentinel a tool state allows"
+        )
         allowed = {
             IDS.get(f)
             for state, (fields, _) in fsm._MASK_SPEC_BY_STATE.items()
