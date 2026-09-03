@@ -136,9 +136,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.crash_dump_folder = ""
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
-    tm.rid_to_state = {}
-    tm._aborted_orphan_rids = {}
-    tm._orphan_evict_warn_at = 0.0
+    tm.init_running_status()
     tm.tokenizer_ipc_name = None
     tm.enable_metrics = False
     tm.enable_trace = False
@@ -423,7 +421,7 @@ class TestOrphanedOutputAborts(CustomTestCase):
         tm = _make_tokenizer_manager(self)
         self._capture_dispatch(tm)
         tm.rid_to_state["X_10"] = _make_req_state("X_10")
-        with self.assertLogs(tokenizer_manager.logger, level="WARNING") as logs:
+        with self.assertLogs(tokenizer_manager.logger, level="ERROR") as logs:
             asyncio.run(tm._handle_batch_output(_make_batch_str_output("X_1")))
 
         self.assertEqual(self._sent_aborts(tm), [])
@@ -464,6 +462,8 @@ class TestOrphanedOutputAborts(CustomTestCase):
                 asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
 
         self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+        # Only the failure line: no "aborted it" claim for a send that failed.
+        self.assertEqual(len(logs.output), 1)
         self.assertIn(rid, tm._aborted_orphan_rids)
         # Recorded as not sent, so the next attempt does not claim "again".
         self.assertFalse(tm._aborted_orphan_rids[rid][1])
@@ -605,6 +605,41 @@ class TestOrphanedOutputAborts(CustomTestCase):
         tm._dispatch_to_scheduler = Mock(side_effect=RuntimeError("zmq down"))
         tm._abort_orphaned_rid("orphan_uncounted")
         self.assertEqual(observe.call_count, 1)
+
+    def test_a_retried_abort_is_not_counted_twice(self):
+        """already_counted reads the previous attempt's flag, so it has to be
+        taken before the map is overwritten -- after it, it would equal `sent`
+        and the metric would never fire at all."""
+        tm = _make_tokenizer_manager(self)
+        tm.enable_metrics = True
+        tm.metrics_collector = MagicMock(spec=TokenizerMetricsCollector)
+        tm.metrics_collector.labels = {}
+        tm._dispatch_to_scheduler = Mock()
+        rid = "orphan_counted_once"
+        tm._abort_orphaned_rid(rid)
+        with patch.object(tokenizer_manager, "_ORPHAN_ABORT_RETRY_S", 0.0):
+            tm._abort_orphaned_rid(rid)
+
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 2)
+        observe = tm.metrics_collector.observe_one_aborted_request
+        observe.assert_called_once_with(tm.metrics_collector.labels)
+
+    def test_evicting_an_in_window_entry_is_reported_once_per_window(self):
+        """Eviction inside the window un-throttles that rid; the degradation
+        says so, and says it once."""
+        tm = _make_tokenizer_manager(self)
+        now = time.monotonic()
+        tm._aborted_orphan_rids = {
+            f"old_{i}": (now, True) for i in range(_MAX_TRACKED_ORPHAN_RIDS)
+        }
+        with self.assertLogs(tokenizer_manager.logger, level="ERROR") as logs:
+            tm._remember_orphan_abort("newcomer", now, sent=True)
+            tm._remember_orphan_abort("newcomer2", now, sent=True)
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("throttle full", logs.output[0])
+        # Reports how many were evicted in-window, not just one sample victim.
+        self.assertIn("1 entries evicted", logs.output[0])
 
     def test_orphan_abort_is_stamped_for_the_owning_worker(self):
         """Multi-tokenizer mode routes by the stamp, so it must survive."""

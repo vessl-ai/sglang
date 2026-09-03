@@ -590,7 +590,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # request rather than once per output message, and retried if it did
         # not take.
         self._aborted_orphan_rids: Dict[str, Tuple[float, bool]] = {}
-        self._orphan_evict_warn_at = 0.0
+        self._orphan_evict_warn_at = float("-inf")
+        self._orphan_evicted_in_window = 0
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2014,21 +2015,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while len(self._aborted_orphan_rids) > _MAX_TRACKED_ORPHAN_RIDS:
             victim = next(iter(self._aborted_orphan_rids))
             victim_at, _ = self._aborted_orphan_rids.pop(victim)
-            if (
-                now - victim_at < _ORPHAN_ABORT_RETRY_S
-                and now - self._orphan_evict_warn_at >= _ORPHAN_ABORT_RETRY_S
-            ):
+            if now - victim_at >= _ORPHAN_ABORT_RETRY_S:
+                continue
+            self._orphan_evicted_in_window += 1
+            if now - self._orphan_evict_warn_at >= _ORPHAN_ABORT_RETRY_S:
                 # Evicting an entry past its window is free. Evicting one still
                 # inside it un-throttles that rid -- its abort, its log and the
                 # collision scan go back to once per output message -- so the
                 # degradation says so rather than looking like more orphans.
-                self._orphan_evict_warn_at = now
                 logger.error(
                     f"Orphan abort throttle full at {_MAX_TRACKED_ORPHAN_RIDS} "
-                    f"rids; evicted {victim=} {now - victim_at:.1f}s into its "
-                    f"{_ORPHAN_ABORT_RETRY_S}s window. Throttling is degraded: "
-                    "orphan aborts and their logs may repeat per output message."
+                    f"rids; {self._orphan_evicted_in_window} entries evicted "
+                    f"inside their {_ORPHAN_ABORT_RETRY_S}s window since the "
+                    f"last report (latest {victim=}, {now - victim_at:.1f}s in). "
+                    "Throttling is degraded: orphan aborts and their logs may "
+                    "repeat per output message."
                 )
+                self._orphan_evict_warn_at = now
+                self._orphan_evicted_in_window = 0
 
     def _abort_orphaned_rid(self, rid: str) -> None:
         """Abort a request the scheduler is still generating for but this
@@ -2094,11 +2098,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
 
+        # Built outside the try: a signature change is a programming error,
+        # not a transport failure, and should fail at the call site.
+        abort = AbortReq(rid=rid, abort_message="orphaned output, no consumer")
         sent = False
         try:
-            self._dispatch_to_scheduler(
-                AbortReq(rid=rid, abort_message="orphaned output, no consumer")
-            )
+            self._dispatch_to_scheduler(abort)
             sent = True
             # Logged only once the abort is really on its way: the failure
             # branch below is the only line the other path should produce.
