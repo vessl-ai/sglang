@@ -34,7 +34,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
 import numpy as np
@@ -171,8 +171,11 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
-# Cap on remembered orphan rids (see _abort_orphaned_rid).
+# Cap on remembered orphan rids, and how long one is remembered before the
+# abort is sent again (see _abort_orphaned_rid). The abort is fire-and-forget,
+# so a lost one has to be retried or the request generates on forever.
 _MAX_TRACKED_ORPHAN_RIDS = 4096
+_ORPHAN_ABORT_RETRY_S = 30.0
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -582,9 +585,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
-        # rids already aborted by _abort_orphaned_rid, so the abort goes out
-        # once per request rather than once per output message.
-        self._aborted_orphan_rids: Set[str] = set()
+        # rid -> monotonic time _abort_orphaned_rid last sent an abort for
+        # it, so the abort goes out once per request rather than once per
+        # output message, and is retried if it did not take.
+        self._aborted_orphan_rids: Dict[str, float] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2003,20 +2007,69 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         scheduler, so it runs the request to ``max_new_tokens`` with no
         consumer -- measured at ~250 tok/s for 17 minutes on one such request.
         ``abort_request`` cannot be used: it returns early for exactly this
-        case (a rid with no state), so the AbortReq goes out directly.
+        case (a rid with no state), so the AbortReq goes out directly -- which
+        also means the two guards it applies are re-applied here.
 
-        Output for an aborted rid keeps arriving until the scheduler acts on
-        the abort, so the rid is remembered and the abort sent once. The set
-        is cleared wholesale when it grows past its cap: a re-abort costs one
-        message and the alternative is unbounded growth.
+        The scheduler matches an abort by ``startswith``, so an empty rid would
+        abort everything, and an orphaned ``X_1`` would finish a live ``X_10``
+        (a batch expands a caller's rid into ``<rid>_0 .. <rid>_N``). Output
+        routes back to the worker that submitted it, so any colliding sibling
+        is in this worker's own map.
+
+        Output keeps arriving until the scheduler acts, so a sent abort is
+        remembered and not repeated for ``_ORPHAN_ABORT_RETRY_S``; past that
+        it goes again, because nothing here can observe whether it landed.
         """
-        if rid in self._aborted_orphan_rids:
+        if not rid:
+            logger.error(
+                "Received orphaned output with an empty rid; not aborting "
+                "(an empty rid matches every request on the scheduler)."
+            )
+            return
+        if any(live_rid.startswith(rid) for live_rid in self.rid_to_state):
+            return
+
+        now = time.monotonic()
+        sent_at = self._aborted_orphan_rids.get(rid)
+        if sent_at is not None and now - sent_at < _ORPHAN_ABORT_RETRY_S:
+            return
+        logger.error(
+            f"Received output for {rid=} but the state was deleted in "
+            f"TokenizerManager; aborting it on the scheduler"
+            f"{' again' if sent_at is not None else ''}."
+        )
+        try:
+            self._dispatch_to_scheduler(
+                AbortReq(rid=rid, abort_message="orphaned output, no consumer")
+            )
+        except Exception:
+            # handle_loop has no handler and print_exception_wrapper kills the
+            # process tree, so a failed abort must not propagate. Leaving the
+            # rid unrecorded retries it on the next output message.
+            logger.exception(f"Failed to abort orphaned {rid=}.")
             return
         if len(self._aborted_orphan_rids) >= _MAX_TRACKED_ORPHAN_RIDS:
-            self._aborted_orphan_rids.clear()
-        self._aborted_orphan_rids.add(rid)
-        logger.warning(f"Aborting orphaned {rid=} on the scheduler.")
-        self._dispatch_to_scheduler(AbortReq(rid=rid))
+            # Expired entries suppress nothing, so drop those first. A burst
+            # wider than the cap inside one retry window leaves nothing to
+            # expire, so fall back to the newest half -- dropping an entry
+            # costs one duplicate abort, which the scheduler ignores.
+            kept = {
+                r: t
+                for r, t in self._aborted_orphan_rids.items()
+                if now - t < _ORPHAN_ABORT_RETRY_S
+            }
+            if len(kept) >= _MAX_TRACKED_ORPHAN_RIDS:
+                kept = dict(
+                    sorted(kept.items(), key=lambda item: item[1], reverse=True)[
+                        : _MAX_TRACKED_ORPHAN_RIDS // 2
+                    ]
+                )
+            self._aborted_orphan_rids = kept
+        self._aborted_orphan_rids[rid] = now
+        if self.enable_metrics:
+            self.metrics_collector.observe_one_aborted_request(
+                self.metrics_collector.labels
+            )
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
@@ -2262,9 +2315,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
                 self._abort_orphaned_rid(rid)
                 continue
 
@@ -3438,6 +3488,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            # Live again: forget the abort sent for its previous incarnation,
+            # or a second orphaning of the same rid would be suppressed.
+            self._aborted_orphan_rids.pop(rid, None)
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
