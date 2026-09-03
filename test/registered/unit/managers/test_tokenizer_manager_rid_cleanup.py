@@ -13,8 +13,9 @@ Covers:
 """
 
 import asyncio
+import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -28,6 +29,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     BatchStrOutput,
     GenerateReqInput,
 )
+from sglang.srt.managers import tokenizer_manager  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     _MAX_TRACKED_ORPHAN_RIDS,
     _ORPHAN_ABORT_RETRY_S,
@@ -172,8 +174,8 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
-def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
-    """Create a minimal BatchStrOutput for a single request.
+def _make_batch_str_output(rid, finished_reason=None) -> BatchStrOutput:
+    """Create a minimal BatchStrOutput. ``rid`` is one rid or a list.
 
     Uses struct field introspection so that new or renamed fields in
     BatchStrOutput don't break this test.  Only the fields that matter for
@@ -181,6 +183,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     all others receive type-appropriate defaults based on naming patterns.
     Fields with class-level defaults are left alone automatically.
     """
+    rids = [rid] if isinstance(rid, str) else list(rid)
+    n = len(rids)
     if finished_reason is _NOT_FINISHED:
         fr = None
     elif finished_reason is None:
@@ -191,19 +195,19 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     kwargs = {}
     for f in msgspec.structs.fields(BatchStrOutput):
         if f.name == "rids":
-            kwargs[f.name] = [rid]
+            kwargs[f.name] = rids
         elif f.name == "finished_reasons":
-            kwargs[f.name] = [fr]
+            kwargs[f.name] = [fr] * n
         elif f.name == "output_strs":
-            kwargs[f.name] = ["hello"]
+            kwargs[f.name] = ["hello"] * n
         elif f.name in _PER_REQUEST_INT_FIELDS:
-            kwargs[f.name] = [0]
+            kwargs[f.name] = [0] * n
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
-            kwargs[f.name] = [0.0]
+            kwargs[f.name] = [0.0] * n
         elif f.name in _PER_REQUEST_NESTED_LIST_FIELDS:
-            kwargs[f.name] = [[]]
+            kwargs[f.name] = [[]] * n
         elif f.name in _PER_REQUEST_OPTIONAL_FIELDS:
-            kwargs[f.name] = [None]
+            kwargs[f.name] = [None] * n
         # Fields with class defaults — skip, let the default be used
         elif (
             f.default is not msgspec.NODEFAULT
@@ -215,7 +219,7 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
         # List[List[...]] and is unlikely to crash on [i] indexing for
         # List[int] either (the inner [] just means "no data").
         else:
-            kwargs[f.name] = [[]]
+            kwargs[f.name] = [[]] * n
 
     return BatchStrOutput(**kwargs)
 
@@ -336,6 +340,8 @@ class TestOrphanedOutputAborts(CustomTestCase):
         ]
 
     def _capture_dispatch(self, tm):
+        # Deliberately bypasses stamp_http_worker_ipc;
+        # test_orphan_abort_is_stamped_for_the_owning_worker covers that.
         tm._dispatch_to_scheduler = Mock()
 
     def test_orphaned_output_aborts_on_the_scheduler(self):
@@ -349,16 +355,6 @@ class TestOrphanedOutputAborts(CustomTestCase):
         self.assertEqual(len(aborts), 1)
         self.assertEqual(aborts[0].rid, rid)
         self.assertFalse(aborts[0].abort_all)
-
-    def test_still_generating_orphan_is_aborted(self):
-        """The bug is the orphan that is still generating, not a finished one."""
-        tm = _make_tokenizer_manager(self)
-        self._capture_dispatch(tm)
-        rid = "orphan_streaming"
-        batch = _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
-        asyncio.run(tm._handle_batch_output(batch))
-
-        self.assertEqual([a.rid for a in self._sent_aborts(tm)], [rid])
 
     def test_abort_is_sent_once_per_rid(self):
         """Output keeps arriving until the scheduler acts on the abort."""
@@ -376,10 +372,10 @@ class TestOrphanedOutputAborts(CustomTestCase):
         self._capture_dispatch(tm)
         rid = "orphan_retry_rid"
         asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
-        tm._aborted_orphan_rids[rid] -= _ORPHAN_ABORT_RETRY_S + 1
-        asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+        with patch.object(tokenizer_manager, "_ORPHAN_ABORT_RETRY_S", 0.0):
+            asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
 
-        self.assertEqual(len(self._sent_aborts(tm)), 2)
+        self.assertEqual([a.rid for a in self._sent_aborts(tm)], [rid, rid])
 
     def test_resubmitted_rid_is_aborted_again_when_orphaned_again(self):
         """A rid that came back to life is no longer a known orphan."""
@@ -404,29 +400,49 @@ class TestOrphanedOutputAborts(CustomTestCase):
         """The scheduler matches by startswith: an empty rid matches all."""
         tm = _make_tokenizer_manager(self)
         self._capture_dispatch(tm)
+        # Load-bearing: every live rid startswith(""), so a non-empty
+        # rid_to_state would let the prefix guard absorb this case and the
+        # empty-rid guard would go untested.
+        self.assertEqual(tm.rid_to_state, {})
         asyncio.run(tm._handle_batch_output(_make_batch_str_output("")))
 
         self.assertEqual(self._sent_aborts(tm), [])
 
-    def test_live_sibling_prefix_is_not_aborted(self):
+    def test_live_sibling_prefix_is_not_aborted_and_says_so(self):
         """A batch expands one rid into <rid>_0..<rid>_N; aborting an orphaned
-        X_1 would prefix-match a live X_10 on the scheduler."""
+        X_1 would prefix-match a live X_10 on the scheduler. That leaves a
+        real leak running, so it must not be silent."""
         tm = _make_tokenizer_manager(self)
         self._capture_dispatch(tm)
         tm.rid_to_state["X_10"] = _make_req_state("X_10")
-        asyncio.run(tm._handle_batch_output(_make_batch_str_output("X_1")))
+        with self.assertLogs(tokenizer_manager.logger, level="WARNING") as logs:
+            asyncio.run(tm._handle_batch_output(_make_batch_str_output("X_1")))
 
         self.assertEqual(self._sent_aborts(tm), [])
+        self.assertTrue(any("X_10" in line for line in logs.output))
 
-    def test_dispatch_failure_does_not_propagate(self):
-        """handle_loop has no handler; print_exception_wrapper kills the tree."""
+    def test_orphaned_longer_rid_is_aborted_despite_a_live_prefix(self):
+        """The guard is one-directional on purpose: the scheduler matches the
+        rid we send by startswith, so aborting X_10 cannot reach a live X_1."""
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        tm.rid_to_state["X_1"] = _make_req_state("X_1")
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output("X_10")))
+
+        self.assertEqual([a.rid for a in self._sent_aborts(tm)], ["X_10"])
+        self.assertIn("X_1", tm.rid_to_state)
+
+    def test_dispatch_failure_does_not_propagate_and_is_throttled(self):
+        """handle_loop has no handler; print_exception_wrapper kills the tree.
+        These sends fail permanently, so the retry waits for the window."""
         tm = _make_tokenizer_manager(self)
         tm._dispatch_to_scheduler = Mock(side_effect=RuntimeError("zmq down"))
         rid = "orphan_dispatch_boom"
-        asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+        for _ in range(3):
+            asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
 
-        # Not recorded, so the next output message retries it.
-        self.assertNotIn(rid, tm._aborted_orphan_rids)
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+        self.assertIn(rid, tm._aborted_orphan_rids)
 
     def test_health_check_rid_is_not_aborted(self):
         """The /health_generate race pops its own rid; that is not an orphan."""
@@ -449,6 +465,27 @@ class TestOrphanedOutputAborts(CustomTestCase):
 
         self.assertEqual(self._sent_aborts(tm), [])
 
+    def test_live_siblings_in_the_batch_still_get_their_output(self):
+        """The orphan branch continues the loop -- an orphan sits next to live
+        siblings and must not cost the ones after it their output."""
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        before, after = "sibling_a", "sibling_c"
+        states = {r: _make_req_state(r) for r in (before, after)}
+        tm.rid_to_state.update(states)
+
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_output([before, "sibling_orphan_b", after])
+            )
+        )
+
+        self.assertEqual([a.rid for a in self._sent_aborts(tm)], ["sibling_orphan_b"])
+        for rid, state in states.items():
+            self.assertTrue(state.finished, f"{rid} was never marked finished")
+            self.assertEqual(state.out_list[-1]["meta_info"]["id"], rid)
+            self.assertNotIn(rid, tm.rid_to_state)
+
     def test_cap_holds_and_every_orphan_is_still_aborted(self):
         tm = _make_tokenizer_manager(self)
         self._capture_dispatch(tm)
@@ -457,16 +494,34 @@ class TestOrphanedOutputAborts(CustomTestCase):
             asyncio.run(tm._handle_batch_output(_make_batch_str_output(f"orphan_{i}")))
 
         self.assertEqual(len(self._sent_aborts(tm)), n)
-        self.assertLessEqual(len(tm._aborted_orphan_rids), _MAX_TRACKED_ORPHAN_RIDS)
+        # Bounded, and not pruned to nothing: a prune that empties the map
+        # turns every later output message back into a duplicate abort.
+        self.assertEqual(len(tm._aborted_orphan_rids), _MAX_TRACKED_ORPHAN_RIDS)
+
+    def test_eviction_drops_the_oldest_attempt_first(self):
+        """Re-inserting moves a rid to the end, so the oldest entry is the one
+        nearest the end of its retry window."""
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        now = time.monotonic()
+        tm._aborted_orphan_rids = {
+            f"old_{i}": now for i in range(_MAX_TRACKED_ORPHAN_RIDS)
+        }
+        tm._remember_orphan_abort("newcomer", now)
+
+        self.assertEqual(len(tm._aborted_orphan_rids), _MAX_TRACKED_ORPHAN_RIDS)
+        self.assertNotIn("old_0", tm._aborted_orphan_rids)
+        self.assertIn("newcomer", tm._aborted_orphan_rids)
 
     def test_orphan_abort_is_stamped_for_the_owning_worker(self):
         """Multi-tokenizer mode routes by the stamp, so it must survive."""
         tm = _make_tokenizer_manager(self)
         tm.tokenizer_ipc_name = "ipc:///tmp/worker-7"
-        tm.send_to_scheduler = MagicMock()
-        tm._abort_orphaned_rid("orphan_mw")
+        with patch.object(tokenizer_manager, "sock_send") as sock_send:
+            tm._abort_orphaned_rid("orphan_mw")
 
-        sent = tm.send_to_scheduler.method_calls[0].args[0]
+        sent = sock_send.call_args.args[1]
+        self.assertIsInstance(sent, AbortReq)
         self.assertEqual(sent.rid, "orphan_mw")
         self.assertEqual(sent.http_worker_ipc, "ipc:///tmp/worker-7")
 

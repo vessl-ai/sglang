@@ -171,9 +171,8 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
-# Cap on remembered orphan rids, and how long one is remembered before the
-# abort is sent again (see _abort_orphaned_rid). The abort is fire-and-forget,
-# so a lost one has to be retried or the request generates on forever.
+# Bound on remembered orphan rids; evicting one costs a duplicate abort. The
+# abort is fire-and-forget, so a lost one is retried once the window passes.
 _MAX_TRACKED_ORPHAN_RIDS = 4096
 _ORPHAN_ABORT_RETRY_S = 30.0
 
@@ -1998,6 +1997,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
+    def _remember_orphan_abort(self, rid: str, now: float) -> None:
+        """Record an abort attempt, newest last, capped.
+
+        Re-inserting moves the rid to the end, so insertion order is recency
+        order and the oldest entry is the one nearest the end of its retry
+        window -- evicting it costs at most one duplicate abort, which the
+        scheduler ignores.
+        """
+        self._aborted_orphan_rids.pop(rid, None)
+        self._aborted_orphan_rids[rid] = now
+        while len(self._aborted_orphan_rids) > _MAX_TRACKED_ORPHAN_RIDS:
+            self._aborted_orphan_rids.pop(next(iter(self._aborted_orphan_rids)))
+
     def _abort_orphaned_rid(self, rid: str) -> None:
         """Abort a request the scheduler is still generating for but this
         manager has no state for.
@@ -2005,20 +2017,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         A stream that breaks (a worker-to-router SSE error, a client that goes
         away mid-generation) deletes the state here, but nothing tells the
         scheduler, so it runs the request to ``max_new_tokens`` with no
-        consumer -- measured at ~250 tok/s for 17 minutes on one such request.
-        ``abort_request`` cannot be used: it returns early for exactly this
-        case (a rid with no state), so the AbortReq goes out directly -- which
-        also means the two guards it applies are re-applied here.
+        consumer. ``abort_request`` cannot be used: it returns early for
+        exactly this case (a rid with no state). Its empty-rid guard is
+        re-applied below; the prefix guard is new and ``abort_request`` still
+        lacks it.
 
-        The scheduler matches an abort by ``startswith``, so an empty rid would
-        abort everything, and an orphaned ``X_1`` would finish a live ``X_10``
-        (a batch expands a caller's rid into ``<rid>_0 .. <rid>_N``). Output
-        routes back to the worker that submitted it, so any colliding sibling
-        is in this worker's own map.
+        The scheduler matches an abort by ``startswith``, so an empty rid
+        would abort everything, and an orphaned ``X_1`` would finish a live
+        ``X_10`` (a batch expands a caller's rid into ``<rid>_0 .. <rid>_N``).
+        Batch siblings all live in the worker that received the request, so
+        that collision is visible here; a collision between *caller-supplied*
+        rids on two different workers is not, and is inherent to ``startswith``
+        matching -- ``abort_request`` has it too. An ``exact`` flag on
+        ``AbortReq`` is what would close both.
 
-        Output keeps arriving until the scheduler acts, so a sent abort is
-        remembered and not repeated for ``_ORPHAN_ABORT_RETRY_S``; past that
-        it goes again, because nothing here can observe whether it landed.
+        Output keeps arriving until the scheduler acts, so an attempt is
+        remembered and not repeated for ``_ORPHAN_ABORT_RETRY_S``.
         """
         if not rid:
             logger.error(
@@ -2026,46 +2040,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "(an empty rid matches every request on the scheduler)."
             )
             return
-        if any(live_rid.startswith(rid) for live_rid in self.rid_to_state):
-            return
 
         now = time.monotonic()
         sent_at = self._aborted_orphan_rids.get(rid)
         if sent_at is not None and now - sent_at < _ORPHAN_ABORT_RETRY_S:
             return
+
+        # Only reachable with no state for `rid`, so any live rid matching
+        # here extends it: a real orphan this cannot kill without collateral.
+        collision = next(
+            (live for live in self.rid_to_state if live.startswith(rid)), None
+        )
+        if collision is not None:
+            self._remember_orphan_abort(rid, now)
+            logger.warning(
+                f"Orphaned {rid=} left running: live {collision=} has it as a "
+                f"prefix and the scheduler matches aborts by startswith, so "
+                f"aborting it would finish {collision} too. It generates with "
+                f"no consumer until {collision} ends."
+            )
+            return
+
         logger.error(
             f"Received output for {rid=} but the state was deleted in "
             f"TokenizerManager; aborting it on the scheduler"
             f"{' again' if sent_at is not None else ''}."
         )
+        # Recorded before the send: these failures are permanent (closed
+        # socket, unencodable object), so retrying per output message would
+        # flood the loop with tracebacks instead of retrying on the window.
+        self._remember_orphan_abort(rid, now)
         try:
             self._dispatch_to_scheduler(
                 AbortReq(rid=rid, abort_message="orphaned output, no consumer")
             )
         except Exception:
             # handle_loop has no handler and print_exception_wrapper kills the
-            # process tree, so a failed abort must not propagate. Leaving the
-            # rid unrecorded retries it on the next output message.
-            logger.exception(f"Failed to abort orphaned {rid=}.")
+            # process tree, so a failed abort must not propagate.
+            logger.exception(
+                f"Failed to abort orphaned {rid=}; retrying in "
+                f"{_ORPHAN_ABORT_RETRY_S}s."
+            )
             return
-        if len(self._aborted_orphan_rids) >= _MAX_TRACKED_ORPHAN_RIDS:
-            # Expired entries suppress nothing, so drop those first. A burst
-            # wider than the cap inside one retry window leaves nothing to
-            # expire, so fall back to the newest half -- dropping an entry
-            # costs one duplicate abort, which the scheduler ignores.
-            kept = {
-                r: t
-                for r, t in self._aborted_orphan_rids.items()
-                if now - t < _ORPHAN_ABORT_RETRY_S
-            }
-            if len(kept) >= _MAX_TRACKED_ORPHAN_RIDS:
-                kept = dict(
-                    sorted(kept.items(), key=lambda item: item[1], reverse=True)[
-                        : _MAX_TRACKED_ORPHAN_RIDS // 2
-                    ]
-                )
-            self._aborted_orphan_rids = kept
-        self._aborted_orphan_rids[rid] = now
         if self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
