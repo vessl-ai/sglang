@@ -1347,40 +1347,43 @@ def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-        The folded epilogue accepts inside the cuda graph off its own buffers and
-        ``plan_verify`` runs after the grammar barrier, so what only plan_verify
-        can do -- named by the two row predicates above -- must be decided here,
-        per row, from committed state. Outside a tool call a generation spends
-        only its boundary steps eager. The masks themselves are applied inside the
-        graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
-        for content-with-progress, and ``folded_content_notools_mask_flags``
-        layered over those of its rows that offer no tools), and the budget window
-        is ``2 * stride`` because the state read here can lag by one accepted run.
-    Three folded-path gaps remain, all from applying one per-request
-        forbidden set to every chain row of a step:
+            The folded epilogue accepts inside the cuda graph off its own buffers and
+            ``plan_verify`` runs after the grammar barrier, so what only plan_verify
+            can do -- named by the two row predicates above -- must be decided here,
+            per row, from committed state. Outside a tool call a generation spends
+            only its boundary steps eager. The masks themselves are applied inside the
+            graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
+            for content-with-progress, and ``folded_content_notools_mask_flags``
+            layered over those of its rows that offer no tools), and the budget window
+            is ``2 * stride`` because the state read here can lag by one accepted run.
+    Two folded-path gaps remain. Both need a sentinel the mask leaves open,
+        because the folded accept is greedy (``accept_greedy_triton``, and
+        ``fold_eligible`` requires ``is_all_greedy``): a ``-inf`` logit is never
+        the argmax, so a masked sentinel is never committed and the states it
+        would open are unreachable inside the chain.
 
-        * A drafted ``<|think:end|>`` leaves the rows after it in fresh CONTENT,
-          which forbids that token, while they still carry the reasoning set,
-          which allows it. A second ``<|think:end|>`` is accepted into the answer.
-        * A drafted ``<|think:start|>`` undermasks the rows after it against the
-          reasoning set (see ``folded_mask_flags``).
-        * The rows after a legally drafted ``<|tool_call:start|>`` are in tool
-          states, which forbid bare EOS and ``<|im:end|>``, but carry the CONTENT
-          set, which allows both -- so a drafted EOS ends the turn mid call. This
-          one has a companion that is *not* lag-derived:
+        * ``<|think:end|>`` is REASONING's only allowed exit, so it is deliberately
+          not in the reasoning set. A chain from committed REASONING can commit it,
+          and the rows after it are fresh CONTENT -- which forbids it -- still
+          wearing the reasoning set, which allows it, so a second one lands in the
+          answer. Bounded at <= stride-1 rows and closed by the next step's
+          committed state.
+        * ``<|tool_call:start|>`` is in CONTENT's allowed set, so it commits too,
+          and the rows after it are in tool states, which forbid bare EOS and
+          ``<|im:end|>`` while the CONTENT set they carry allows both -- a drafted
+          EOS ends the turn mid call. Its companion is not lag-derived:
           ``_fsm_content_forbidden_ids`` drops the tool internals from chain row 0
-          too, where no draft has moved the state, so it recurs every folded step.
+          as well, where no draft has moved the state, so on every folded step of
+          every tools request they can be committed straight into the answer.
 
-        The first three are bounded at <= stride-1 rows and close themselves on the
-        next step's committed state. Making the last one eager would close both
-        tool-state holes -- ``_content_needs_eager`` returning True for any request
-        that offers tools does it in one clause -- at the cost of the folded accept
-        for all tool traffic. That is a throughput trade, not an impossibility, and
-        it is left untaken deliberately: nothing here masks per chain position, so
-        the alternative is a per-position buffer.
+        Making ``_content_needs_eager`` return True for any request that offers
+        tools closes both tool-state holes in one clause, since the eager
+        ``plan_verify`` masks per chain position. What that costs is the folded
+        accept for all tool traffic -- a throughput trade, not an impossibility,
+        left untaken deliberately.
 
         Host-only and
-        sync-free: it never touches the draft tokens.
+            sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False
@@ -1428,8 +1431,9 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       that position; these flags stay False. The row is not unmasked, though:
       it is a content-with-progress row, so :func:`folded_content_mask_flags`
       arms it with the CONTENT set, which forbids ``<|think:start|>`` in the
-      first place. What is left is undermasking of the following rows against
-      the *reasoning* set, bounded the same way as above.
+      first place -- and the folded accept is greedy, so a masked token is
+      never the argmax and never commits. Nothing follows it into REASONING,
+      so there is no residue here.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """

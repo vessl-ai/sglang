@@ -21,6 +21,7 @@ against ``solar_open2_fsm``:
 Pure CPU: small float logits tensors and duck-typed requests.
 """
 
+import inspect
 import json
 import os
 import tempfile
@@ -31,6 +32,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
+from sglang.srt.speculative.dspark_components import dspark_worker_v2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1140,23 +1142,21 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
         self.assertIn(THINK_END, fsm.CFG.content_fresh_forbidden)
 
-        # Gap 2: a drafted <|think:start|> makes plan_verify treat that row and
-        # every row after it as REASONING; the folded flags are per request and
-        # stay False for all of them.
-        req = _req((THINK_END, 7), tools=True)
-        fsm._req_fsm(req).advance(req.output_ids)
-        self.assertEqual(fsm.folded_mask_flags([req], 4), [False] * 4)
-        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_START, 7, 7]]), 4)
-        self.assertEqual(
-            {
-                r
-                for forbidden, rows in plan.mask_rows.items()
-                if forbidden == fsm.CFG.reasoning_forbidden
-                for r in rows
-            },
-            {2, 3},
-            "the row that emits the opener is still judged CONTENT; REASONING "
-            "starts at the row after it, and the folded flags cover neither",
+        # Not a gap, and the reason is worth pinning: <|think:start|> is
+        # masked on every row that can reach the folded path, and the folded
+        # accept is greedy, so a -inf logit is never the argmax and the token
+        # never commits. If either half changes -- the sentinel leaving a
+        # forbidden set, or the accept becoming non-greedy -- a real gap opens
+        # here, and this fails.
+        self.assertIn(THINK_START, fsm.CFG.reasoning_forbidden)
+        self.assertIn(THINK_START, fsm.CFG.content_done_forbidden)
+        self.assertIn(THINK_START, fsm.CFG.content_done_forbidden_notools)
+        worker_src = inspect.getsource(dspark_worker_v2)
+        self.assertIn(
+            "is_all_greedy",
+            worker_src,
+            "fold_eligible must keep requiring a greedy batch, or a masked "
+            "sentinel could be sampled and the gap above becomes real",
         )
 
         # Gap 3: the tool states forbid the turn from ending, but the rows a
