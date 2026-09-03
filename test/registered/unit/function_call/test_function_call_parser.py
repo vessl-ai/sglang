@@ -5508,26 +5508,59 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertEqual((got_text, len(got_calls)), ("\nSee 5", 1))
         self.assertTrue(any("partial opener" in m for m in logs.output))
 
-    def test_non_string_schema_type_does_not_raise(self):
+    def test_non_string_schema_type_keeps_the_string(self):
+        # A type that is not a string (5, None) is no type: the value stays a
+        # string. (The reference nulls a value under ``"type": null``; kept
+        # delta.)
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for schema_type in (5, None):
+            with self.subTest(type=schema_type):
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name="get_weather",
+                            parameters={
+                                "type": "object",
+                                "properties": {"location": {"type": schema_type}},
+                            },
+                        ),
+                    )
+                ]
+                result = SolarOpen2Detector().detect_and_parse(text, tools)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"location": "Paris"}
+                )
+
+    def test_duplicate_tool_names_take_the_first_declaring_schema(self):
+        # Reference parity: a same-named tool without a usable schema is
+        # skipped in favour of the next one.
         tools = [
+            Tool(
+                type="function", function=Function(name="get_weather", parameters="x")
+            ),
             Tool(
                 type="function",
                 function=Function(
                     name="get_weather",
                     parameters={
                         "type": "object",
-                        "properties": {"location": {"type": 5}},
+                        "properties": {"days": {"type": "integer"}},
                     },
                 ),
-            )
+            ),
         ]
         text = (
             f"{TOOL_CALL_START}get_weather\n"
-            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
             f"{TOOL_CALL_END}"
         )
         result = SolarOpen2Detector().detect_and_parse(text, tools)
-        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Paris"})
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
 
     def test_non_dict_parameters_or_properties_leave_values_as_strings(self):
         # A schema that is not a JSON Schema object still yields the call; the
@@ -5909,8 +5942,8 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
     deltas: rstripped whitespace before an opener, held unparsed output);
     and ours must be identical at whole / 5-char / 1-char chunking. Shapes
     where the vendor itself misbehaves (its lazy name group swallows a
-    following call after
-    a call that lacks its newline) or where its streaming parser emits a
+    following call after a call that lacks its newline) or where its
+    streaming parser emits a
     partial call are compared only where a comparison is meaningful, and
     say so. A new difference here is a detector bug unless it is added to
     the documented deltas in CONTEXT/the detector docstring."""
@@ -5949,6 +5982,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 },
             ),
         ),
+        Tool(type="function", function=Function(name="ping", parameters=None)),
     ]
 
     @staticmethod
@@ -6009,6 +6043,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 True,
             ),
             "null any case": (cls._call(location=" NULL "), True, True),
+            "no schema": (cls._call("ping", x="1"), True, True),
             "integral number": (cls._call(location="Paris", temp="3"), True, True),
             "alias args": (
                 cls._call(

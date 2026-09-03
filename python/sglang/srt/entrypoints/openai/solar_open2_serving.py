@@ -25,7 +25,7 @@ and the glue-before-flush order of rule 4 sit at the call sites.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, get_args
+from typing import Any, Dict, List, Optional, Set, get_args
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -75,7 +75,7 @@ def validate_request(request: ChatCompletionRequest) -> Optional[str]:
     return None
 
 
-_WARNED_EFFORTS: set = set()
+_WARNED_EFFORTS: Set[str] = set()
 
 
 def _template_effort(value: Any) -> Optional[str]:
@@ -122,23 +122,17 @@ def normalize_reasoning_effort(
     custom[TOOLS_PARAM] = tools_available
     request.custom_params = custom
 
-    raw = request.reasoning_effort
-    if raw is not None:
-        request.reasoning_effort = _template_effort(raw)
+    if request.reasoning_effort is not None:
+        request.reasoning_effort = _template_effort(request.reasoning_effort)
     if ctk and "reasoning_effort" in ctk:
         # Only a server default (--default-chat-template-kwargs) can still be
         # here: the client's copy was moved into the request field before
-        # this, and so was the default when that field was empty -- then the
-        # fold above already judged it. The template reads ctk last, so it
-        # gets one source: the request's folded effort when there is one
-        # (a present ``None`` would fail the template's test and close the
-        # think block while the parser starts in reasoning).
+        # this. The template reads ctk last, so it gets one source: the
+        # request's folded effort when there is one (a present ``None`` would
+        # fail the template's test and close the think block while the parser
+        # starts in reasoning).
         default = ctk["reasoning_effort"]
-        folded = (
-            request.reasoning_effort
-            if default in (raw, None)
-            else _template_effort(default)
-        )
+        folded = None if default is None else _template_effort(default)
         effort = request.reasoning_effort or folded
         if effort is None:
             ctk.pop("reasoning_effort")

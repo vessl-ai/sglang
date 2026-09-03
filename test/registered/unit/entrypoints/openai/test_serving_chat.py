@@ -4488,6 +4488,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         )
 
     def setUp(self):
+        solar_serving._WARNED_EFFORTS.clear()
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
@@ -4554,7 +4555,6 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         # A blank value only reaches here from --default-chat-template-kwargs
         # (validate_request rejects it from a client).
         req = self._req(chat_template_kwargs={"reasoning_effort": "  "})
-        solar_serving._WARNED_EFFORTS.clear()
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ):
@@ -4582,7 +4582,6 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         # field is empty: the same value is judged once.
         req = self._req(chat_template_kwargs={"reasoning_effort": "foo"})
         req.reasoning_effort = "foo"
-        solar_serving._WARNED_EFFORTS.clear()
         with self.assertLogs(
             "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
         ) as logs:
@@ -4590,6 +4589,12 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.assertEqual(len(logs.output), 1)
         self.assertIsNone(req.reasoning_effort)
         self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+        # The same bad value on a later request is not reported again.
+        req = self._req(chat_template_kwargs={"reasoning_effort": "foo"})
+        req.reasoning_effort = "foo"
+        with self.assertNoLogs("sglang.srt.entrypoints.openai.solar_open2_serving"):
+            self._normalize(req)
+        self.assertIsNone(req.reasoning_effort)
         # Next to a client effort the bad default is still reported, and the
         # client's value reaches the template.
         req = self._req(

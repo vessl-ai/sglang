@@ -1821,6 +1821,16 @@ class TestSolarOpen2ForceReasoning(CustomTestCase):
                         (reasoning, normal), (text, "") if expected else ("", text)
                     )
 
+    def test_non_streaming_keeps_a_sentinel_fragment_as_content(self):
+        """Non-streaming follows the vendor: a fragment of <|think:end|> at the
+        head of the content region stays content (streaming drops it)."""
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        ret = SolarOpen2Detector(force_reasoning=True).detect_and_parse(
+            "thinking<|think:end|><|thi"
+        )
+        self.assertEqual((ret.reasoning_text, ret.normal_text), ("thinking", "<|thi"))
+
     def test_split_partial_sentinel_at_eos_is_dropped_too(self):
         """A sentinel fragment after <|think:end|> is dropped at stream end
         whether it arrived in the same delta or a later one."""

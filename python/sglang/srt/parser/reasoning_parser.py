@@ -2050,8 +2050,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
     * the content region may open with a run of redundant ``<|think:end|>``
       sentinels (the FSM forces one at a spent budget and the model often emits
       its own right after; a drafted one on the speculative path leaves the
-      rest of the chain unmasked). The run is consumed, streaming included,
-      where a fragment that could still be a sentinel is held back;
+      following rows under the REASONING set, which still allows another).
+      The run is consumed, streaming included, where a fragment that could
+      still be a sentinel is held back and dropped if the stream ends inside
+      it; non-streaming keeps such a fragment as content (vendor rule);
     * a stream that ends with the think block still open answered nothing:
       the text stays reasoning and content is empty. Only a request with
       reasoning off would put such text on the content channel, and that
@@ -2113,10 +2115,6 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         ret = super().detect_and_parse(text)
-        if ret.reasoning_text and not ret.normal_text:
-            if self.think_end_token not in text:
-                # The block never closed: nothing was answered.
-                return StreamingParseResult(reasoning_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 
@@ -2127,10 +2125,9 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         # A stream that ends inside the think block adds no content: the base
         # class hands the block back as reasoning (streamed already, or flushed
         # here with stream_reasoning off), the same rule detect_and_parse
-        # applies. Whatever is
-        # still held after the last scrub is a sentinel fragment at the head of
-        # the content region, and a fragment of a control sentinel is never an
-        # answer.
+        # applies. Whatever is still held after the last scrub is a sentinel
+        # fragment at the head of the content region, and a fragment of a
+        # control sentinel is never an answer.
         ret = self._scrub_content_head(super().finish())
         if self._content_head_hold:
             logger.warning(

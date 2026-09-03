@@ -182,13 +182,13 @@ class _StreamContent:
         """Content in what the detector still holds at the end of the stream.
         ``partial_opener``: length of a trailing partial ``<|tool_call:start|>``,
         cut only after a call (before one it is content, as in non-streaming)."""
-        pending, self.pending_ws = self.pending_ws, ""
         unparsed, self.unparsed = self.unparsed, ""
         if self.after_call:
             at = held.find(TOOL_CALL_START)
             if at != -1:
                 self._dropped("unfinished tool call at stream end", len(held) - at)
                 return self.text(held[:at], before_opener=True)
+            pending, self.pending_ws = self.pending_ws, ""
             if partial_opener:
                 logger.warning(
                     "Solar Open2: stream ended on a partial opener after %d "
@@ -198,6 +198,7 @@ class _StreamContent:
                 )
                 held = held[:-partial_opener]
             return (pending + held).rstrip()
+        pending, self.pending_ws = self.pending_ws, ""
         if TOOL_CALL_START in held:
             logger.warning(
                 "Solar Open2: stream ended inside an unfinished tool call "
@@ -393,7 +394,9 @@ def _parse_arguments(name: str, *, body: str, tools: List[Tool]) -> Dict[str, An
 
 
 def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Optional[str]:
-    """JSON-schema ``type`` of a parameter from the request's tools, or None."""
+    """JSON-schema ``type`` of a parameter from the request's tools, or None:
+    the first tool of that name whose schema declares the parameter
+    (``Tool.type`` is always "function")."""
     for tool in tools:
         if tool.function.name != func_name:
             continue
@@ -401,7 +404,7 @@ def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Option
         props = params.get("properties") if isinstance(params, dict) else None
         prop = props.get(param_name) if isinstance(props, dict) else None
         if not isinstance(prop, dict):
-            return None
+            continue
         t = prop.get("type")
         if isinstance(t, list):
             t = next((x for x in t if x != "null"), None)
@@ -414,7 +417,8 @@ def _coerce(value: str, *, arg_type: Optional[str]) -> Any:
     that does not convert is returned as the string, with a warning, so broken
     output still reaches the client as something inspectable; an unknown type
     is the string as well, without one. ``null`` (any case) is None whatever
-    the type; a ``number`` with no fractional part is an int."""
+    the type, and a ``null``/``none``-typed parameter is None whatever the
+    value; a ``number`` with no fractional part is an int."""
     if value.strip().lower() == "null":
         return None
     pt = (arg_type or "string").strip().lower()

@@ -112,8 +112,8 @@ _TOOL_STATES = frozenset(range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1))
 
 # Per-state mask specification: (allowed sentinel fields, eos_masked). Bare
 # EOS is forbidden wherever ending the turn is template-illegal -- everywhere
-# except CONTENT-with-progress and
-# TOOL_CALL_END. CONTENT is keyed by the content-progress flag instead.
+# except CONTENT-with-progress and TOOL_CALL_END. CONTENT is keyed by the
+# content-progress flag instead.
 _MASK_SPEC_BY_STATE = {
     REASONING: (("think_end",), True),
     TOOL_CALL_BEGIN: ((), True),
@@ -161,9 +161,8 @@ _NO_REASONING_EFFORTS = frozenset({"none", "minimal"})
 _DEFAULT_EFFORT = "high"
 _HARD_LIMIT = 128 * 1024
 _NO_HARD_LIMIT = 1 << 62  # SOLAR_REASONING_BUDGET_HARD_LIMIT=0: no ceiling
-# The token right after <|think:start|> may not be a newline run: every vocab
-# token whose text is only byte-level "\n" ("Ċ", "ĊĊ", ...) plus a verbatim
-# "\n" / "\n\n" (ids 4294 / 4372 in the shipped tokenizer).
+# Leading-newline rule after <|think:start|>: ids resolved by
+# _leading_newline_ids.
 _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
 # custom_params key the chat entrypoint uses to hand the request's reasoning
 # effort to the scheduler-side FSM (solar_open2_serving.normalize_reasoning_effort).
@@ -542,7 +541,7 @@ def configure_ids(
 
 
 def init_from_env() -> None:
-    """Resolve ids + budget. Called lazily on first sampler pass."""
+    """Resolve ids + budget. Called lazily by the first ``is_active`` caller."""
     if not os.environ.get("SOLAR_FSM", "0") == "1":
         CFG.enabled = False
         return
@@ -881,6 +880,7 @@ def _mask_tensor(ids: Tuple[int, ...], device: torch.device) -> torch.Tensor:
 
 def _mask_and_force(
     logits: torch.Tensor,
+    *,
     mask_rows: Dict[Tuple[int, ...], List[int]],
     force_rows: List[int],
 ) -> Tuple[List[int], List[int]]:
@@ -913,7 +913,7 @@ _CONFLICT_LOG = {"last": 0.0, "num_suppressed": 0}
 _CONFLICT_LOG_INTERVAL = 60.0
 
 
-def _log_force_conflict(rows, stride: int, rids) -> None:
+def _log_force_conflict(rows, *, stride: int, rids) -> None:
     """Report rows where the FSM wanted to force <|think:end|> but the grammar
     had already forbidden it -- the two are reading different committed state,
     and forcing would leave the row fully masked."""
@@ -1096,9 +1096,11 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 _forbidden_for(fsm.state, fsm.content_progress, fsm.tools), []
             ).append(i)
 
-    forced, blocked = _mask_and_force(logits, mask_rows, force_rows)
+    forced, blocked = _mask_and_force(
+        logits, mask_rows=mask_rows, force_rows=force_rows
+    )
     if blocked:
-        _log_force_conflict(blocked, 1, [r.rid for r in rows])
+        _log_force_conflict(blocked, stride=1, rids=[r.rid for r in rows])
     for i in forced:
         fsm = rows[i]._solar_fsm
         if not fsm.forced:
@@ -1168,7 +1170,7 @@ class VerifyPlan:
 
     __slots__ = ("force_rows", "mask_rows", "stride", "bs", "rids")
 
-    def __init__(self, force_rows, mask_rows, stride, bs, rids):
+    def __init__(self, *, force_rows, mask_rows, stride, bs, rids):
         self.force_rows = force_rows
         self.mask_rows = mask_rows
         self.stride = stride
@@ -1194,11 +1196,11 @@ class VerifyPlan:
         keep = lambda rs: [r for r in rs if valid is None or r in valid]
         _, blocked = _mask_and_force(
             logits,
-            {ids: keep(rows_i) for ids, rows_i in self.mask_rows.items()},
-            keep(self.force_rows),
+            mask_rows={ids: keep(rows_i) for ids, rows_i in self.mask_rows.items()},
+            force_rows=keep(self.force_rows),
         )
         if blocked:
-            _log_force_conflict(blocked, self.stride, self.rids)
+            _log_force_conflict(blocked, stride=self.stride, rids=self.rids)
 
 
 def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
@@ -1381,4 +1383,6 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                     _forbidden_for(sim.state, sim.content_progress, fsm.tools), []
                 ).append(row)
 
-    return VerifyPlan(force_rows, mask_rows, stride, bs, rids)
+    return VerifyPlan(
+        force_rows=force_rows, mask_rows=mask_rows, stride=stride, bs=bs, rids=rids
+    )
