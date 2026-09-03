@@ -415,11 +415,9 @@ class TestPlanGate(_FsmCase):
         a grammar -- the grammar owns CONTENT -- so plan_gate lets the step
         fold, and none of the three flag functions arm it either.
 
-        What keeps that from mattering is in the worker: fold_eligible requires
-        `not batch.has_grammar`. That reads `req.grammar` while this reads the
-        sampling params, so the two can drift apart, and the day they do this
-        row folds unmasked. Pinned here so the drift is a test failure rather
-        than a control token in someone's answer.
+        The drift guard is in the worker -- see plan_gate's third-row paragraph.
+        Pinned here so that drift is a test failure, not a control token in
+        someone's answer.
         """
         req = _req([7, THINK_END])
         req.sampling_params.json_schema = '{"type": "object"}'

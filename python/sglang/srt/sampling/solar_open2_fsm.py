@@ -1357,17 +1357,16 @@ def plan_gate(reqs, stride: int) -> bool:
     those of its rows that offer no tools), and the budget window is
     ``2 * stride`` because the state read here can lag by one accepted run.
 
-    Three kinds of row reach the folded path, not two. The third is deliberate
-    and unmasked: fresh CONTENT under a grammar is exempt here (the grammar owns
+    Three kinds of row reach the folded path. The third is deliberate and
+    unmasked: fresh CONTENT under a grammar is exempt here (the grammar owns
     CONTENT), so no flag function arms it and ``plan_verify`` does not run for
-    it either. Nothing masks it, and what keeps that from mattering lives in the
-    worker: ``fold_eligible`` requires ``not batch.has_grammar``. That is a
+    it either. What keeps that from mattering lives in the worker:
+    ``fold_eligible`` requires ``not batch.has_grammar``. That is a
     *different* predicate -- ``req.grammar`` rather than the sampling params
     ``_has_grammar`` reads -- so the two must not be allowed to drift apart.
 
     On the other two, a gap needs a sentinel the forbidden set leaves open. A
-    masked one cannot be committed by any accept, greedy or sampling: ``-inf``
-    is probability zero, not merely a losing argmax.
+    masked one is ``-inf``, which no accept can commit.
 
     * ``<|think:end|>`` is REASONING's only allowed exit, so it is deliberately
       not in the reasoning set. A chain from committed REASONING can commit it,

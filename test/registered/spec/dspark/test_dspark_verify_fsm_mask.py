@@ -325,9 +325,8 @@ class TestEpilogueFsmMasks(CustomTestCase):
         cannot be the argmax. plan_gate documents two gaps as the only ones that
         exist because of it, so if either leg goes the ledger becomes a lie.
 
-        Both legs are checked structurally rather than by grepping the source,
-        which a negation, a comment mentioning the name, or a moved clause all
-        survive -- and which cannot see the second leg at all.
+        Checked structurally: a grep survives a negation, and cannot see leg B
+        at all.
         """
         # Leg A: fold_eligible admits only a greedy batch, and not under a `not`.
         worker = ast.parse(inspect.getsource(dspark_worker_v2))
@@ -337,28 +336,20 @@ class TestEpilogueFsmMasks(CustomTestCase):
             if isinstance(n, ast.Attribute) and n.attr == "is_all_greedy"
         ]
         self.assertEqual(len(greedy_reads), 1, "fold_eligible reads it once")
-        negated = {
-            id(operand)
-            for n in ast.walk(worker)
-            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not)
-            for operand in ast.walk(n.operand)
-        }
-        self.assertNotIn(
-            id(greedy_reads[0]),
-            negated,
-            "the greedy test is negated -- only sampling batches would fold",
-        )
+        for n in ast.walk(worker):
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+                self.assertNotIn(
+                    "is_all_greedy",
+                    ast.dump(n),
+                    "the greedy test is negated -- only sampling batches fold",
+                )
         # Leg B: the in-graph accept is the greedy one, unconditionally. Scoped
         # to the epilogue class -- the eager path in the same module has its own
         # accept and is not folded.
-        cls = next(
-            n
-            for n in ast.walk(ast.parse(inspect.getsource(DsparkVerifyEpilogue)))
-            if isinstance(n, ast.ClassDef)
-        )
+        epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
         accepts = [
             n.func.id
-            for n in ast.walk(cls)
+            for n in ast.walk(epilogue)
             if isinstance(n, ast.Call)
             and isinstance(n.func, ast.Name)
             and n.func.id.startswith("accept_")
