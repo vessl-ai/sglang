@@ -116,7 +116,7 @@ class SolarOpen2FsmVerifyTestBase(CustomTestCase):
         cfg.hard_limit = 1000
         cfg.spec_always_eager = False
         cfg._mask_cache.clear()
-        solar_open2_fsm._CONFLICT_LOG["last"] = 0.0
+        solar_open2_fsm._CONFLICT_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
         solar_open2_fsm._CONFLICT_LOG["num_suppressed"] = 0
 
     def tearDown(self):

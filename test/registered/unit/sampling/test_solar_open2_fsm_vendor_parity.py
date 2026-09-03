@@ -72,7 +72,7 @@ def _cfg(**overrides):
     c._mask_cache.clear()
     for name, value in overrides.items():
         setattr(c, name, value)
-    fsm._EFFORT_LOG["last"] = 0.0
+    fsm._EFFORT_LOG["last"] = -fsm._LOG_INTERVAL
     fsm._EFFORT_LOG["num_suppressed"] = 0
 
 
@@ -214,7 +214,7 @@ class TestEffortBudget(_FsmCase):
             fsm._req_fsm(_req(effort="ultra", rid="r1"))
         self.assertEqual(fsm._EFFORT_LOG["num_suppressed"], 1)
         # After the interval: logged again, with the suppressed count.
-        fsm._EFFORT_LOG["last"] = 0.0
+        fsm._EFFORT_LOG["last"] = -fsm._LOG_INTERVAL
         with self.assertLogs(fsm.logger, level="WARNING") as captured:
             fsm._req_fsm(_req(effort="ultra", rid="r2"))
         self.assertIn("1 earlier occurrence(s) suppressed", captured.output[0])
