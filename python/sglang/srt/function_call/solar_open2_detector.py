@@ -375,7 +375,8 @@ def _parse_arguments(name: str, *, body: str, tools: List[Tool]) -> Dict[str, An
     if TOOL_ARG_START in body:
         return {
             m.group(1).strip(): _coerce(
-                m.group(2), arg_type=_param_type(name, m.group(1).strip(), tools=tools)
+                m.group(2),
+                arg_type=_param_type(name, param_name=m.group(1).strip(), tools=tools),
             )
             for m in _ARG.finditer(body)
         }

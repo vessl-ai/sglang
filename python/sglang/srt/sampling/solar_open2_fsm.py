@@ -56,7 +56,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -390,17 +390,17 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
 
 
 _LOG_INTERVAL = 60.0
-_EFFORT_LOG = {"last": 0.0, "num_suppressed": 0}
+_EFFORT_LOG = {"last": -_LOG_INTERVAL, "num_suppressed": 0}
 
 
-def _rate_limited(state: Dict[str, float], count: int = 1) -> Optional[int]:
+def _rate_limited(state: Dict[str, Any], *, count: int = 1) -> Optional[int]:
     """One report per ``_LOG_INTERVAL``: the number suppressed since the last
     report, or None while suppressing (``count`` more suppressed)."""
     now = time.monotonic()
     if now - state["last"] < _LOG_INTERVAL:
         state["num_suppressed"] += count
         return None
-    suppressed = int(state["num_suppressed"])
+    suppressed = state["num_suppressed"]
     state["last"], state["num_suppressed"] = now, 0
     return suppressed
 
@@ -915,14 +915,15 @@ def _mask_and_force(
     return forced, blocked
 
 
-_CONFLICT_LOG = {"last": 0.0, "num_suppressed": 0}
+_CONFLICT_LOG = {"last": -_LOG_INTERVAL, "num_suppressed": 0}
 
 
 def _log_force_conflict(rows, *, stride: int, rids) -> None:
     """Report rows where the FSM wanted to force <|think:end|> but the grammar
     had already forbidden it -- the two are reading different committed state,
-    and forcing would leave the row fully masked."""
-    num_suppressed = _rate_limited(_CONFLICT_LOG, len(rows))
+    and forcing would leave the row fully masked. Rate-limited like
+    ``_warn_unknown_effort``."""
+    num_suppressed = _rate_limited(_CONFLICT_LOG, count=len(rows))
     if num_suppressed is None:
         return
     if rids is not None and stride > 0:

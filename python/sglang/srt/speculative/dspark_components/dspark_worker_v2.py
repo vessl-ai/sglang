@@ -792,8 +792,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # `_solar_fsm_on` is the same read the chain was staged on, so a step
         # that reaches here always has one. Guarding on `grammar_tree` instead
-        # would turn a wiring mistake into a silently unmasked step, which is
-        # the row would be left unmasked.
+        # would turn a wiring mistake into a silently unmasked step.
         if _solar_fsm_on and (_solar_fsm_gate or not _solar_fsm_in_graph):
             if not batch.has_grammar and grammar_barrier is not None:
                 # The grammar path runs the barrier inside build_grammar_vocab_mask;

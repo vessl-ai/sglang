@@ -494,10 +494,10 @@ logger = logging.getLogger(__name__)
 def _fsm_forbidden_ids() -> List[int]:
     """The reasoning forbidden set, resolved once at epilogue construction.
 
-    Returns a one-element placeholder when the FSM is off,
-    so the mask kernels still have a static index to write through and the
-    captured graph is the same shape either way. That placeholder is only ever
-    paired with an all-False row buffer -- ``folded_mask_flags`` returns None
+    Returns a one-element placeholder when the FSM is off, so the mask kernels
+    still have a static index to write through and the captured graph is the
+    same shape either way. That placeholder is only ever paired with an
+    all-False row buffer -- ``folded_mask_flags`` returns None
     while the FSM is inactive, which disarms every row -- so it writes nothing.
     """
     # A misconfigured SOLAR_FSM_TOKENIZER_DIR raises out of is_active() on

@@ -2018,9 +2018,10 @@ _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
 def solar_open2_force_reasoning(request) -> bool:
     """Mirror chat_template.jinja: thinking is opened in the generation prompt
     only when reasoning_effort is medium/high (unset -> template default
-    "high"). The template's test is exact and case-sensitive; the serving
-    layer lower-cases the value before the template, and this lower-cases
-    too so a raw request object gives the same answer."""
+    "high"). The template's test is exact and case-sensitive; this
+    case-folds as the serving layer does before the template. xhigh/max are
+    folded to high by the serving layer before this runs, so a raw request
+    carrying them answers False here."""
     effort = getattr(request, "reasoning_effort", None)
     if effort is None:
         effort = (getattr(request, "chat_template_kwargs", None) or {}).get(
