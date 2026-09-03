@@ -31,6 +31,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    _fsm_content_forbidden_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1146,6 +1149,33 @@ class TestSpecPathToolStates(_FsmCase):
         )
         self.assertEqual(plan.force_rows, [])
 
+    def test_the_shared_buffer_never_masks_what_a_tool_state_needs(self):
+        """`_fsm_content_forbidden_ids` subtracts four ids by name. What makes
+        that list right is a property of _MASK_SPEC_BY_STATE: the sentinels the
+        tool states reachable from CONTENT allow must survive the subtraction,
+        because a chain may legally open a call and the rows after it are in
+        those states. Nothing tied the two together -- the dspark suite asserts
+        the subtraction against a hand-written copy of the same four ids, over
+        a fixture with no tool tables in it at all, so adding an allowed
+        sentinel to a TOOL_* row leaves both suites green while the shared
+        buffer masks it. This is the only suite with tables configure_ids
+        built, so the tie lives here.
+        """
+        _cfg()
+        allowed = {
+            IDS.get(f)
+            for state, (fields, _) in fsm._MASK_SPEC_BY_STATE.items()
+            if state != fsm.REASONING
+            for f in fields
+        } - {None}
+        kept = set(_fsm_content_forbidden_ids())
+        self.assertTrue(allowed, "fixture must reach the tool states")
+        self.assertFalse(
+            kept & allowed,
+            "the shared CONTENT buffer masks a sentinel a tool state needs; "
+            "a chain that opens a call would commit some other token there",
+        )
+
     def test_the_documented_folded_gaps_stay_exactly_as_documented(self):
         """plan_gate records two folded-path gaps as accepted. Nothing pinned
         them, so a refactor could widen or close one and no test would notice --
@@ -1163,8 +1193,8 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
         self.assertIn(THINK_END, fsm.CFG.content_fresh_forbidden)
 
-        # Not a gap, and the reason is worth pinning: <|think:start|> is
-        # masked on every row that can reach the folded path, and the folded
+        # Not a gap, and the reason is worth pinning: <|think:start|> is in
+        # every forbidden set the folded path arms a row against, and the folded
         # accept is greedy, so a -inf logit is never the argmax and the token
         # never commits. If either half changes -- the sentinel leaving a
         # forbidden set, or the accept becoming non-greedy -- a real gap opens
