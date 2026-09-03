@@ -317,7 +317,7 @@ class FunctionCallParser:
             return None
 
 
-# --- solar-open2 tool parser (injected) ---
+# --- solar-open2 tool parser ---
 try:
     from sglang.srt.function_call.solar_open2_detector import (
         SolarOpen2Detector as _SolarOpen2Detector,

@@ -4560,6 +4560,32 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
         self.assertEqual(req.custom_params, {self.TOOLS: False})
         self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
 
+    def test_bad_server_default_is_reported_once(self):
+        # The pipeline copies the server default into the field when the
+        # field is empty (the field is typed, so the copy is an assignment):
+        # the same value is judged once.
+        req = self._req(chat_template_kwargs={"reasoning_effort": "foo"})
+        req.reasoning_effort = "foo"
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
+        ) as logs:
+            self._normalize(req)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIsNone(req.reasoning_effort)
+        self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
+        # Next to a client effort the bad default is still reported, and the
+        # client's value reaches the template.
+        req = self._req(
+            reasoning_effort="low", chat_template_kwargs={"reasoning_effort": "foo"}
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.solar_open2_serving", "WARNING"
+        ) as logs:
+            self._normalize(req)
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(req.chat_template_kwargs["reasoning_effort"], "low")
+        self.assertEqual(req.custom_params[self.KEY], "low")
+
     def test_tools_are_reported_to_the_fsm(self):
         tool = {
             "type": "function",

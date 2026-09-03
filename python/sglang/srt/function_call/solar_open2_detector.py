@@ -94,13 +94,12 @@ class _StreamContent:
 
     ``pending_ws``: a whitespace run waiting for real text (content) or an
     opener (not); at the end of the stream it is content unless a call was
-    emitted. ``emitted``: real text has been sent, so
-    whitespace trailing it before the first call is content. ``unparsed``:
-    everything from an opener that did not parse onward, prose included, held
-    until a call parses (dropped) or the stream ends (content). ``calls``:
-    calls emitted so far
-    -- after the first, prose is content but whitespace and unparsed calls
-    are not."""
+    emitted. ``emitted``: real text has been sent, so whitespace trailing it
+    before the first call is content. ``unparsed``: everything from an opener
+    that did not parse onward, prose included, held until a call parses
+    (dropped) or the stream ends (content). ``calls``: calls emitted so far --
+    after the first, prose is content but whitespace and unparsed calls are
+    not."""
 
     def __init__(self) -> None:
         self.pending_ws = ""

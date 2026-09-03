@@ -224,7 +224,7 @@ class SamplingBatchInfo:
             sampling_mask_max_top_k=sampling_mask_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
-        # --- solar-open2 FSM (injected) ---
+        # --- solar-open2 FSM ---
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
         _solar_fsm.attach_rows(ret, batch)
@@ -334,7 +334,7 @@ class SamplingBatchInfo:
                 self.return_sampling_masks[i] for i in keep_indices
             ]
 
-        # --- solar-open2 FSM (injected) ---
+        # --- solar-open2 FSM ---
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
         _solar_fsm.filter_rows(self, keep_indices)
@@ -402,7 +402,7 @@ class SamplingBatchInfo:
 
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
-        # --- solar-open2 FSM (injected) ---
+        # --- solar-open2 FSM ---
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
         _solar_fsm.merge_rows(self, other)

@@ -663,7 +663,7 @@ class SchedulerBatchResultProcessor:
         # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
 
-        # --- solar-open2 FSM commit advance (injected) ---
+        # --- solar-open2 FSM commit advance ---
         from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
         _solar_fsm.advance_committed(result, batch)

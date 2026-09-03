@@ -1877,7 +1877,7 @@ class Scheduler(
 
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
-            # --- solar-open2 FSM commit advance (injected) ---
+            # --- solar-open2 FSM commit advance ---
             _solar_fsm.advance_committed(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")

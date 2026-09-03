@@ -628,7 +628,7 @@ def attach_additional_stop_token_ids(tokenizer):
     tokenizer.additional_stop_token_ids = stop_ids or None
 
 
-# --- solar-open2 port (injected) ---
+# --- solar-open2 port ---
 try:
     from sglang.srt.configs.solar_open2 import SolarOpen2Config as _SolarOpen2Config
 

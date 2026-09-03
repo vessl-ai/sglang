@@ -115,21 +115,24 @@ def normalize_reasoning_effort(
     custom[TOOLS_PARAM] = tools_available
     request.custom_params = custom
 
-    if request.reasoning_effort is not None:
-        request.reasoning_effort = _template_effort(request.reasoning_effort)
-    if ctk:
-        if ctk.get("reasoning_effort") is not None:
-            effort = _template_effort(ctk["reasoning_effort"])
-            if effort is None:
-                ctk.pop("reasoning_effort")
-            else:
-                ctk["reasoning_effort"] = effort
-        if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
-            # One source for the template: the request's (folded) effort. A
-            # server default (--default-chat-template-kwargs) lands in ctk
-            # after the client's value was moved to the request field, and the
-            # template reads ctk last.
-            ctk["reasoning_effort"] = request.reasoning_effort
+    raw = request.reasoning_effort
+    if raw is not None:
+        request.reasoning_effort = _template_effort(raw)
+    if ctk and ctk.get("reasoning_effort") is not None:
+        # Only a server default (--default-chat-template-kwargs) can still be
+        # here: the client's copy was moved into the request field before
+        # this, and so was the default when that field was empty -- then the
+        # fold above already judged it. The template reads one source, the
+        # request's folded effort, when there is one.
+        default = ctk["reasoning_effort"]
+        folded = (
+            request.reasoning_effort if default == raw else _template_effort(default)
+        )
+        effort = request.reasoning_effort or folded
+        if effort is None:
+            ctk.pop("reasoning_effort")
+        else:
+            ctk["reasoning_effort"] = effort
 
 
 def injects_single_call_stop(

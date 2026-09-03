@@ -359,8 +359,9 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     (``tokenizer_config.json`` / ``tokenizer.json``) whose text is a pure
     newline run, plus a verbatim newline token;
     ``SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS`` (JSON list of ints) overrides,
-    ``[]`` switches the rule off, and a blank value is the same as unset. Like the think ids, a vocab that cannot
-    supply them fails loud rather than silently dropping the rule.
+    ``[]`` switches the rule off, and a blank value is the same as unset. Like
+    the think ids, a vocab that cannot supply them fails loud rather than
+    silently dropping the rule.
     """
     override = _env_id_list("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
     if override is not None:
@@ -1113,7 +1114,7 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
 # --------------------------------------------------------------------------
 # Speculative verify path (DSpark).
 #
-# `apply()` above is injected into layers/sampler.py, which the DSpark verify
+# `apply()` above is called from layers/sampler.py, which the DSpark verify
 # path never reaches, so these helpers mask the *verify* logits instead.
 #
 # Row layout is NOT the 1-row-1-token convention of ordinary decode. The verify
