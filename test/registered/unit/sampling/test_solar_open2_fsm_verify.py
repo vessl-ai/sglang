@@ -214,6 +214,19 @@ class TestNonSpecApplyForceGuard(SolarOpen2FsmVerifyTestBase):
         self.assertTrue(fsm1.forced)
         with self.assertNoLogs(solar_open2_fsm.logger, level="INFO"):
             solar_open2_fsm.apply(logits, sampling_info)
+        # The conflict warning is rate-limited per row: with both rows now
+        # closed by the grammar, one suppressed pass counts two, and the next
+        # report carries that count.
+        logits[1, THINK_END] = float("-inf")
+        with self.assertNoLogs(solar_open2_fsm.logger, level="INFO"):
+            solar_open2_fsm.apply(logits, sampling_info)
+        self.assertEqual(solar_open2_fsm._CONFLICT_LOG["num_suppressed"], 3)
+        solar_open2_fsm._CONFLICT_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
+        with self.assertLogs(solar_open2_fsm.logger, level="WARNING") as logs:
+            solar_open2_fsm.apply(logits, sampling_info)
+        self.assertIn("3 earlier occurrence(s) suppressed", logs.output[0])
+        self.assertEqual(solar_open2_fsm._CONFLICT_LOG["num_suppressed"], 0)
+        logits[1, THINK_END] = 0.0
 
         # Row 0: forced skipped, logits unchanged, still has finite entries.
         self.assertTrue(torch.equal(logits[0], original_row0))

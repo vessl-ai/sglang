@@ -5966,8 +5966,8 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
     where the vendor itself misbehaves (its lazy name group swallows a
     following call after a call that lacks its newline) or where its
     streaming parser emits a partial call are compared only where a
-    comparison is meaningful, and
-    say so. A new difference here is a detector bug unless it is added to
+    comparison is meaningful, and say so. A new difference here is a
+    detector bug unless it is added to
     the documented deltas in CONTEXT/the detector docstring."""
 
     TOOLS = [
@@ -6005,6 +6005,17 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             ),
         ),
         Tool(type="function", function=Function(name="ping", parameters=None)),
+        # Not a function tool: its schema must not type the arguments.
+        Tool(
+            type="custom",
+            function=Function(
+                name="get_time",
+                parameters={
+                    "type": "object",
+                    "properties": {"timezone": {"type": "integer"}},
+                },
+            ),
+        ),
     ]
 
     @staticmethod
@@ -6066,6 +6077,11 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
             ),
             "null any case": (cls._call(location=" NULL "), True, True),
             "no schema": (cls._call("ping", x="1"), True, True),
+            "custom-typed tool ignored": (
+                cls._call("get_time", timezone="3"),
+                True,
+                True,
+            ),
             "integral number": (cls._call(location="Paris", temp="3"), True, True),
             "alias args": (
                 cls._call(
@@ -6158,7 +6174,7 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
 
         tools = [
             ref._Record(
-                type="function",
+                type=t.type,
                 function=ref._Record(
                     name=t.function.name, parameters=t.function.parameters
                 ),

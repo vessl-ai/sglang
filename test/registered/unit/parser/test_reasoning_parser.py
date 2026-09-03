@@ -1798,6 +1798,9 @@ class TestSolarOpen2ForceReasoning(CustomTestCase):
             solar_open2_force_reasoning,
         )
 
+        # No request object at all (scheduler-side parsers): the template
+        # default, i.e. the block opens.
+        self.assertTrue(solar_open2_force_reasoning(None))
         for effort, expected in self.CASES:
             for route in ("field", "chat_template_kwargs"):
                 with self.subTest(effort=effort, route=route):
