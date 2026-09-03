@@ -57,7 +57,7 @@ def _req(
 def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     """Build a SolarReqFSM with explicit state, bypassing the prompt walk."""
     fsm = solar_open2_fsm.SolarReqFSM.__new__(solar_open2_fsm.SolarReqFSM)
-    fsm.in_reasoning = in_reasoning
+    fsm.state = solar_open2_fsm.REASONING if in_reasoning else solar_open2_fsm.CONTENT
     fsm.count = count
     fsm.consumed = consumed
     fsm.budget = budget

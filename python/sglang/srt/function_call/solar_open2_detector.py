@@ -34,11 +34,13 @@ Content rules (what is *not* a call):
   the end of the stream.
 
 Streaming emits complete calls only, and its result does not depend on where
-the chunks are cut: whitespace before the next opener is rstripped; everything
-from an opener that did not parse (a blank name included) onward, prose
-included, is dropped once a call has been emitted, and before that it is held
-to the end of the stream -- content if no call ever parses. ``_StreamContent``
-owns those rules; ``_parse_calls`` is pure.
+the chunks are cut: whitespace before the next opener is rstripped. Before any
+call is emitted, everything from an opener that did not parse (a blank name
+included) onward, prose included, is held to the end of the stream -- content
+if no call ever parses, dropped once one does. After a call, a closed unparsed
+call is dropped from its opener to its terminator and an unfinished one from
+its opener on; the prose around them is content. ``_StreamContent`` owns those
+rules; ``_parse_calls`` is pure.
 """
 
 from __future__ import annotations
@@ -148,10 +150,10 @@ class _StreamContent:
             out.append(self.text(segment[:at], before_opener=True))
             end = segment.find(TOOL_CALL_END, at)
             if end == -1:
-                self._dropped("unfinished tool call", len(segment) - at)
+                self._dropped("unfinished tool call", size=len(segment) - at)
                 return "".join(out)
             end += len(TOOL_CALL_END)
-            self._dropped("closed tool call that did not parse", end - at)
+            self._dropped("closed tool call that did not parse", size=end - at)
             segment = segment[end:]
 
     def unparsed_call(self, complete: str) -> str:
@@ -182,11 +184,10 @@ class _StreamContent:
         """Content in what the detector still holds at the end of the stream.
         ``partial_opener``: length of a trailing partial ``<|tool_call:start|>``,
         cut only after a call (before one it is content, as in non-streaming)."""
-        unparsed, self.unparsed = self.unparsed, ""
-        if self.after_call:
+        if self.after_call:  # after a call ``unparsed`` is always empty
             at = held.find(TOOL_CALL_START)
             if at != -1:
-                self._dropped("unfinished tool call at stream end", len(held) - at)
+                self._dropped("unfinished tool call at stream end", size=len(held) - at)
                 return self.text(held[:at], before_opener=True)
             pending, self.pending_ws = self.pending_ws, ""
             if partial_opener:
@@ -199,6 +200,7 @@ class _StreamContent:
                 held = held[:-partial_opener]
             return (pending + held).rstrip()
         pending, self.pending_ws = self.pending_ws, ""
+        unparsed, self.unparsed = self.unparsed, ""
         if TOOL_CALL_START in held:
             logger.warning(
                 "Solar Open2: stream ended inside an unfinished tool call "
@@ -207,7 +209,7 @@ class _StreamContent:
             )
         return pending + unparsed + held
 
-    def _dropped(self, what: str, size: int) -> None:
+    def _dropped(self, what: str, *, size: int) -> None:
         logger.warning(
             "Solar Open2: %s after %d completed call(s) (%d chars); dropping it",
             what,
@@ -395,10 +397,10 @@ def _parse_arguments(name: str, *, body: str, tools: List[Tool]) -> Dict[str, An
 
 def _param_type(func_name: str, param_name: str, *, tools: List[Tool]) -> Optional[str]:
     """JSON-schema ``type`` of a parameter from the request's tools, or None:
-    the first tool of that name whose schema declares the parameter
-    (``Tool.type`` is always "function")."""
+    the first ``function`` tool of that name whose schema declares the
+    parameter (any other ``Tool.type`` is skipped, as the reference does)."""
     for tool in tools:
-        if tool.function.name != func_name:
+        if tool.type != "function" or tool.function.name != func_name:
             continue
         params = tool.function.parameters
         props = params.get("properties") if isinstance(params, dict) else None

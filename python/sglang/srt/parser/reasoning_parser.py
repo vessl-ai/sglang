@@ -2046,9 +2046,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
       there (the base class's ``tool_start_token`` escape), so the call reaches
       the tool-call parser;
     * the content region may open with a run of redundant ``<|think:end|>``
-      sentinels (the FSM forces one at a spent budget and the model often emits
-      its own right after; a drafted one on the speculative path leaves the
-      following rows under the REASONING set, which still allows another).
+      sentinels (the FSM forces one at a spent budget; a drafted one on the
+      speculative path leaves the following rows under the REASONING set,
+      which still allows another, and a model that closes the block itself
+      may repeat the sentinel).
       The run is consumed, streaming included, where a fragment that could
       still be a sentinel is held back and dropped if the stream ends inside
       it; non-streaming keeps such a fragment as content (vendor rule);

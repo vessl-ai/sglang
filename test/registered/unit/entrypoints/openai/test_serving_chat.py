@@ -4579,7 +4579,7 @@ class TestSolarOpen2ReasoningEffortCapture(unittest.TestCase):
 
     def test_bad_server_default_is_reported_once(self):
         # The pipeline copies the server default into the field when the
-        # field is empty: the same value is judged once.
+        # field is empty; the value is reported once (``_WARNED_EFFORTS``).
         req = self._req(chat_template_kwargs={"reasoning_effort": "foo"})
         req.reasoning_effort = "foo"
         with self.assertLogs(

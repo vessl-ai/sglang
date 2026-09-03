@@ -18,9 +18,9 @@ runs ``<|tool_arg:start|>`` ``<|tool_arg:value|>`` ``<|tool_arg:end|>``,
 * Tool-call states (``TOOL_CALL_BEGIN`` .. ``TOOL_CALL_END``): only the
   envelope sentinel(s) the sub-state expects are open, so a call cannot be
   cut short by a turn end or a stray sentinel (after ``<|tool_call:end|>``
-  the turn may end). When the request carries a
-  grammar (json_schema / regex / ebnf / structural_tag) the grammar owns the
-  CONTENT phase and this mask stays out of it.
+  the turn may end). When the request carries a grammar (json_schema / regex
+  / ebnf / structural_tag) the grammar owns the CONTENT phase and this mask
+  stays out of it.
 
 The states, their allowed-sentinel tables, the transitions and the budget table
 (``_MASK_SPEC_BY_STATE``, ``_MASK_SPEC_CONTENT``, ``_TRANSITIONS``,
@@ -341,7 +341,7 @@ def _env_id_list(name: str) -> Optional[set]:
     return set(data)
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, *, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
@@ -371,8 +371,6 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
         with open(tk_path, encoding="utf-8") as f:
             model = json.load(f).get("model") or {}
         vocab = model.get("vocab") if isinstance(model.get("vocab"), dict) else {}
-    # Every vocab token whose text is a pure newline run
-    # (byte-level "Ċ" repeated), plus a verbatim "\n" / "\n\n".
     table = dict(vocab)
     table.update(_added_token_ids(tokenizer_dir))
     ids = {
@@ -473,7 +471,9 @@ def _req_tools(req) -> bool:
     return True
 
 
-def _forbidden_for(state: int, content_progress: bool, tools: bool) -> Tuple[int, ...]:
+def _forbidden_for(
+    state: int, *, content_progress: bool, tools: bool
+) -> Tuple[int, ...]:
     """The forbidden set for a non-REASONING step: the
     (state, content_progress) entry of the forbidden table, or of the
     no-tools variant when the request offers no tools."""
@@ -518,7 +518,7 @@ def configure_ids(
     CFG.transitions = transitions
     eos_set = set(eos) - sentinels
 
-    def build(allowed_fields, mask_eos, block_tool_call_start):
+    def build(allowed_fields, *, mask_eos, block_tool_call_start):
         allowed = {ids.get(f) for f in allowed_fields} - {None}
         f = sentinels - allowed
         if block_tool_call_start and CFG.tool_call_start is not None:
@@ -531,10 +531,12 @@ def configure_ids(
         table: Dict[Tuple[int, bool], Tuple[int, ...]] = {}
         for state, (allowed, mask_eos) in _MASK_SPEC_BY_STATE.items():
             table[(state, False)] = table[(state, True)] = build(
-                allowed, mask_eos, block
+                allowed, mask_eos=mask_eos, block_tool_call_start=block
             )
         for progress, (allowed, mask_eos) in _MASK_SPEC_CONTENT.items():
-            table[(CONTENT, progress)] = build(allowed, mask_eos, block)
+            table[(CONTENT, progress)] = build(
+                allowed, mask_eos=mask_eos, block_tool_call_start=block
+            )
         setattr(CFG, attr, table)
     CFG.reasoning_forbidden = CFG.forbidden[(REASONING, False)]
     CFG.content_fresh_forbidden = CFG.forbidden[(CONTENT, False)]
@@ -605,7 +607,7 @@ def _configure_budget_from_env() -> None:
     effort from ``SOLAR_REASONING_BUDGET_*``."""
     # A hard limit of 0 disables the server-wide ceiling; a negative value is a
     # configuration error.
-    CFG.hard_limit = _env_int("SOLAR_REASONING_BUDGET_HARD_LIMIT", _HARD_LIMIT)
+    CFG.hard_limit = _env_int("SOLAR_REASONING_BUDGET_HARD_LIMIT", default=_HARD_LIMIT)
     if CFG.hard_limit < 0:
         raise RuntimeError(
             "SOLAR_REASONING_BUDGET_HARD_LIMIT must be >= 0 (0 disables), got "
@@ -616,7 +618,7 @@ def _configure_budget_from_env() -> None:
     budgets = {}
     for effort, default in _EFFORT_BUDGETS.items():
         name = f"SOLAR_REASONING_BUDGET_{effort.upper()}"
-        value = _env_int(name, default)
+        value = _env_int(name, default=default)
         if value < 0:
             # A negative per-effort budget falls back to the built-in default
             # with a warning rather than failing every request; a non-integer
@@ -756,10 +758,6 @@ class SolarReqFSM:
     def in_reasoning(self) -> bool:
         return self.state == REASONING
 
-    @in_reasoning.setter
-    def in_reasoning(self, value: bool) -> None:
-        self.state = REASONING if value else CONTENT
-
     def advance(self, output_ids: Sequence[int]) -> None:
         """Catch up to ``req.output_ids``. A no-op when ``commit()`` has already
         fed this run: ``consumed`` counts tokens and ``req.output_ids`` only ever
@@ -845,7 +843,7 @@ def _req_fsm(req) -> SolarReqFSM:
     return fsm
 
 
-def _rindex(values: Sequence[int], needle: int) -> Optional[int]:
+def _rindex(values: Sequence[int], *, needle: int) -> Optional[int]:
     for i in range(len(values) - 1, -1, -1):
         if values[i] == needle:
             return i
@@ -855,10 +853,10 @@ def _rindex(values: Sequence[int], needle: int) -> Optional[int]:
 def _starts_in_reasoning(prompt_ids: Sequence[int]) -> bool:
     if CFG.think_start is None or CFG.think_end is None:
         return False
-    last_start = _rindex(prompt_ids, CFG.think_start)
+    last_start = _rindex(prompt_ids, needle=CFG.think_start)
     if last_start is None:
         return False
-    last_end = _rindex(prompt_ids, CFG.think_end)
+    last_end = _rindex(prompt_ids, needle=CFG.think_end)
     return last_end is None or last_start > last_end
 
 
@@ -870,14 +868,14 @@ def _prompt_completed_tool_call(prompt_ids: Sequence[int]) -> bool:
     conservatively stays False."""
     if CFG.tool_call_end is None or CFG.im_start is None:
         return False
-    last_call_end = _rindex(prompt_ids, CFG.tool_call_end)
+    last_call_end = _rindex(prompt_ids, needle=CFG.tool_call_end)
     if last_call_end is None:
         return False
-    last_im_start = _rindex(prompt_ids, CFG.im_start)
+    last_im_start = _rindex(prompt_ids, needle=CFG.im_start)
     return last_im_start is not None and last_im_start < last_call_end
 
 
-def _mask_tensor(ids: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+def _mask_tensor(ids: Tuple[int, ...], *, device: torch.device) -> torch.Tensor:
     key = (ids, str(device))
     t = CFG._mask_cache.get(key)
     if t is None:
@@ -900,7 +898,7 @@ def _mask_and_force(
     for ids, rows_i in mask_rows.items():
         if not ids or not rows_i:
             continue
-        idx = _mask_tensor(ids, logits.device)
+        idx = _mask_tensor(ids, device=logits.device)
         rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
         logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
     if not force_rows:
@@ -1096,7 +1094,10 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
             # empty answer); inside a tool call only the envelope sentinel(s)
             # the sub-state expects are open; no tools -> see TOOLS_PARAM.
             mask_rows.setdefault(
-                _forbidden_for(fsm.state, fsm.content_progress, fsm.tools), []
+                _forbidden_for(
+                    fsm.state, content_progress=fsm.content_progress, tools=fsm.tools
+                ),
+                [],
             ).append(i)
 
     forced, blocked = _mask_and_force(
@@ -1225,7 +1226,7 @@ def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
     logits[:, forbid_ids] = logits[:, forbid_ids].masked_fill(rows, NEG_INF)
 
 
-def _reasoning_needs_eager(fsm, window: int) -> bool:
+def _reasoning_needs_eager(fsm, *, window: int) -> bool:
     """Inside the think block: the leading-newline set on the step after
     ``<|think:start|>`` and the forced ``<|think:end|>`` at a spent budget
     (also every step of a zero-budget none/minimal block) are plan_verify's
@@ -1235,7 +1236,7 @@ def _reasoning_needs_eager(fsm, window: int) -> bool:
     return fsm.at_think_open or fsm.count + window >= fsm.budget
 
 
-def _content_needs_eager(fsm, req) -> bool:
+def _content_needs_eager(fsm, *, req) -> bool:
     """Outside the think block: fresh CONTENT (no content token yet) and every
     step inside a tool call take their EOS/``<|im:end|>``-shutting sets from
     plan_verify; the folded mask does not carry them. A CONTENT row under a
@@ -1274,9 +1275,9 @@ def plan_gate(reqs, stride: int) -> bool:
             return True
         fsm.advance(req.output_ids)
         if fsm.in_reasoning:
-            if _reasoning_needs_eager(fsm, window):
+            if _reasoning_needs_eager(fsm, window=window):
                 return True
-        elif _content_needs_eager(fsm, req):
+        elif _content_needs_eager(fsm, req=req):
             return True
     return False
 
@@ -1380,7 +1381,12 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                 continue  # structured outputs own the CONTENT phase
             else:
                 mask_rows.setdefault(
-                    _forbidden_for(sim.state, sim.content_progress, fsm.tools), []
+                    _forbidden_for(
+                        sim.state,
+                        content_progress=sim.content_progress,
+                        tools=fsm.tools,
+                    ),
+                    [],
                 ).append(row)
 
     return VerifyPlan(

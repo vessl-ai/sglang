@@ -503,7 +503,7 @@ def _fsm_forbidden_ids() -> List[int]:
     # A misconfigured SOLAR_FSM_TOKENIZER_DIR raises out of is_active() on
     # purpose, and it must keep raising here: swallowing it would leave the
     # placeholder in place for the process's life and mask token id 0 instead
-    # of the EOS ids, which is the customer-visible defect wearing a disguise.
+    # of the EOS ids, which is an unmasked row that looks masked.
     if _fsm.is_active() and _fsm.CFG.reasoning_forbidden:
         return list(_fsm.CFG.reasoning_forbidden)
     return [0]
@@ -622,8 +622,8 @@ class DsparkVerifyEpilogue:
             # The forbidden ids were snapshotted at construction and the flags
             # are decided per step, so the two can describe different worlds if
             # the FSM resolved after this object was built. Left unchecked that
-            # masks token id 0 instead of the EOS ids -- the customer-visible
-            # defect wearing a disguise, with nothing in the logs.
+            # masks token id 0 instead of the EOS ids -- an unmasked row that looks
+            # masked, with nothing in the logs.
             self._fsm_ids_checked = True
             if list(forbidden_ids or ()) != self.fsm_forbid_buf.tolist():
                 logger.error(

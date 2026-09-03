@@ -691,7 +691,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         _solar_fsm_gate = _solar_fsm.plan_gate(batch.reqs, verify_ids_2d.shape[1])
         # The reasoning mask does not force the eager path -- it is staged here
         # and applied inside the verify graph, so a thinking batch keeps the
-        # folded accept. The gate above stays what it was: the escape for what
+        # folded accept. The gate above is only the escape for what
         # only plan_verify can do (`_reasoning_needs_eager` /
         # `_content_needs_eager`).
         # Read once: the staging condition below and the mask block further down
@@ -793,7 +793,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # `_solar_fsm_on` is the same read the chain was staged on, so a step
         # that reaches here always has one. Guarding on `grammar_tree` instead
         # would turn a wiring mistake into a silently unmasked step, which is
-        # the defect this whole change exists to close.
+        # the row would be left unmasked.
         if _solar_fsm_on and (_solar_fsm_gate or not _solar_fsm_in_graph):
             if not batch.has_grammar and grammar_barrier is not None:
                 # The grammar path runs the barrier inside build_grammar_vocab_mask;

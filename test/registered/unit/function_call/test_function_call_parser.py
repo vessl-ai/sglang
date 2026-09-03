@@ -5536,6 +5536,28 @@ class TestSolarOpen2Detector(unittest.TestCase):
                     json.loads(result.calls[0].parameters), {"location": "Paris"}
                 )
 
+    def test_non_function_tools_are_skipped_for_the_schema(self):
+        # Reference parity: only ``type == "function"`` tools declare schemas.
+        tools = [
+            Tool(
+                type="custom",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"days": {"type": "integer"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": "3"})
+
     def test_duplicate_tool_names_take_the_first_declaring_schema(self):
         # Reference parity: a same-named tool without a usable schema is
         # skipped in favour of the next one.
@@ -5943,8 +5965,8 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
     and ours must be identical at whole / 5-char / 1-char chunking. Shapes
     where the vendor itself misbehaves (its lazy name group swallows a
     following call after a call that lacks its newline) or where its
-    streaming parser emits a
-    partial call are compared only where a comparison is meaningful, and
+    streaming parser emits a partial call are compared only where a
+    comparison is meaningful, and
     say so. A new difference here is a detector bug unless it is added to
     the documented deltas in CONTEXT/the detector docstring."""
 

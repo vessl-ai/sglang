@@ -854,7 +854,9 @@ class TestToolCallEnvelope(_FsmCase):
         self.assertTrue(sim.content_progress)
         self.assertEqual(state.state, fsm.CONTENT)  # the committed state is untouched
         self.assertEqual(
-            fsm._forbidden_for(sim.state, sim.content_progress, True),
+            fsm._forbidden_for(
+                sim.state, content_progress=sim.content_progress, tools=True
+            ),
             fsm.CFG.forbidden[(fsm.TOOL_CALL_END, False)],
         )
 
@@ -885,14 +887,16 @@ class _VendorTranscript:
 
     def __init__(self, prompt):
         ts, te = IDS["think_start"], IDS["think_end"]
-        last_start, last_end = fsm._rindex(prompt, ts), fsm._rindex(prompt, te)
+        last_start, last_end = fsm._rindex(prompt, needle=ts), fsm._rindex(
+            prompt, needle=te
+        )
         self.state = (
             fsm.CONTENT
             if last_start is None or (last_end is not None and last_start < last_end)
             else fsm.REASONING
         )
-        last_call_end = fsm._rindex(prompt, IDS["tool_call_end"])
-        last_im_start = fsm._rindex(prompt, IDS["im_start"])
+        last_call_end = fsm._rindex(prompt, needle=IDS["tool_call_end"])
+        last_im_start = fsm._rindex(prompt, needle=IDS["im_start"])
         self.content_progress = (
             last_call_end is not None
             and last_im_start is not None
@@ -1003,7 +1007,9 @@ class TestDifferentialAgainstVendorTranscript(_FsmCase):
                 got = (
                     fsm.CFG.reasoning_forbidden
                     if ours.state == fsm.REASONING
-                    else fsm._forbidden_for(ours.state, ours.content_progress, True)
+                    else fsm._forbidden_for(
+                        ours.state, content_progress=ours.content_progress, tools=True
+                    )
                 )
                 self.assertEqual(got, ref.mask(), (prompt, seq))
         self.assertGreater(steps, 2000)
