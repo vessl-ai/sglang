@@ -1357,8 +1357,17 @@ def plan_gate(reqs, stride: int) -> bool:
     those of its rows that offer no tools), and the budget window is
     ``2 * stride`` because the state read here can lag by one accepted run.
 
-    Two folded-path gaps remain. Both need a sentinel the mask leaves open,
-    because the folded accept is greedy (see ``folded_mask_flags``).
+    Three kinds of row reach the folded path, not two. The third is deliberate
+    and unmasked: fresh CONTENT under a grammar is exempt here (the grammar owns
+    CONTENT), so no flag function arms it and ``plan_verify`` does not run for
+    it either. Nothing masks it, and what keeps that from mattering lives in the
+    worker: ``fold_eligible`` requires ``not batch.has_grammar``. That is a
+    *different* predicate -- ``req.grammar`` rather than the sampling params
+    ``_has_grammar`` reads -- so the two must not be allowed to drift apart.
+
+    On the other two, a gap needs a sentinel the forbidden set leaves open. A
+    masked one cannot be committed by any accept, greedy or sampling: ``-inf``
+    is probability zero, not merely a losing argmax.
 
     * ``<|think:end|>`` is REASONING's only allowed exit, so it is deliberately
       not in the reasoning set. A chain from committed REASONING can commit it,
@@ -1422,9 +1431,9 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       that position; these flags stay False. The row is not unmasked, though:
       it is a content-with-progress row, so :func:`folded_content_mask_flags`
       arms it with the CONTENT set, which forbids ``<|think:start|>`` in the
-      first place -- and the folded accept is greedy, so a masked token is
-      never the argmax and never commits. Nothing follows it into REASONING,
-      so there is no residue here.
+      first place, and a masked token cannot be committed by any accept --
+      ``-inf`` is probability zero. Nothing follows it into REASONING, so
+      there is no residue here.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """

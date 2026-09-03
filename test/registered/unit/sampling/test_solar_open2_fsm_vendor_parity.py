@@ -409,6 +409,28 @@ class TestPlanGate(_FsmCase):
     def test_fresh_content_goes_eager(self):
         self.assertTrue(self._gate(_req([7, THINK_END])))
 
+    def test_fresh_content_under_a_grammar_folds_and_nothing_masks_it(self):
+        """The third kind of row that reaches the folded path, and the only one
+        with no mask at all. `_content_needs_eager` exempts a CONTENT row under
+        a grammar -- the grammar owns CONTENT -- so plan_gate lets the step
+        fold, and none of the three flag functions arm it either.
+
+        What keeps that from mattering is in the worker: fold_eligible requires
+        `not batch.has_grammar`. That reads `req.grammar` while this reads the
+        sampling params, so the two can drift apart, and the day they do this
+        row folds unmasked. Pinned here so the drift is a test failure rather
+        than a control token in someone's answer.
+        """
+        req = _req([7, THINK_END])
+        req.sampling_params.json_schema = '{"type": "object"}'
+        self.assertFalse(self._gate(req), "a grammar row is not sent eager")
+        for flags in (
+            fsm.folded_mask_flags([req], 4),
+            fsm.folded_content_mask_flags([req], 4),
+            fsm.folded_content_notools_mask_flags([req], 4),
+        ):
+            self.assertEqual(flags, [False] * 4, "no in-graph mask arms it")
+
     def test_content_with_progress_keeps_the_folded_path(self):
         self.assertFalse(self._gate(_req([7, THINK_END, 8])))
 
