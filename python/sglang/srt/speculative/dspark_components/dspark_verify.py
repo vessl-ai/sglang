@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import msgspec
 import torch
@@ -527,9 +527,9 @@ def _fsm_content_forbidden_ids() -> List[int]:
       ``<|im:start|>``, ``<|im:content|>``, ``<|tool_response:*|>``) is illegal
       in CONTENT and in every state one chain can reach from it.
 
-    Only the tools-available variant is carried here; the no-tools set adds
-    ``<|tool_call:start|>`` and nothing else, which
-    :func:`_fsm_content_notools_forbidden_ids` supplies as its own buffer.
+    Only the tools-available variant is carried here. A request that offers
+    no tools is masked by :func:`_fsm_content_notools_forbidden_ids` on top of
+    this, which carries its whole set rather than a difference against it.
     """
     if not (_fsm.is_active() and _fsm.CFG.content_done_forbidden):
         return [0]
@@ -550,17 +550,33 @@ def _fsm_content_forbidden_ids() -> List[int]:
 
 
 def _fsm_content_notools_forbidden_ids() -> List[int]:
-    """``<|tool_call:start|>`` alone: the whole difference between the no-tools
-    CONTENT set and the tools-available one that
-    :func:`_fsm_content_forbidden_ids` carries.
+    """The whole CONTENT forbidden set for a request that offers no tools.
 
-    Same placeholder contract as the others -- ``[0]`` keeps a buffer of the
-    captured shape in place when the FSM is off or the id is missing, and the
-    row buffer that selects it is all-False in that case anyway.
+    Not the difference against :func:`_fsm_content_forbidden_ids` -- the whole
+    set, applied on top of it, because the two subtractions that shape the
+    shared buffer both lose their justification here:
+
+    * the tool-call internals are dropped there because a chain may legally
+      open a tool call and the rows after it need them. No tools makes
+      ``<|tool_call:start|>`` illegal in every state, so no such chain exists
+      and there is no legal call for masking them to break.
+    * ``<|tool_call:start|>`` itself is absent there because the shared buffer
+      carries the tools-available table.
+
+    Overlapping the two masks is idempotent -- writing ``-inf`` twice over an
+    id costs a second write and changes nothing -- so carrying the full set
+    here needs no coordination with what the shared buffer holds, which is the
+    point: a difference-set buffer would silently under-mask the moment
+    ``configure_ids`` made the two tables differ by anything new.
+
+    Same placeholder contract as the siblings, and with the same property they
+    have and a difference-set buffer did not: whenever the FSM is active this
+    set is non-empty (``<|think:start|>`` is forbidden in CONTENT and its id is
+    required), so ``[0]`` is only ever paired with an all-False row buffer.
     """
-    if not (_fsm.is_active() and _fsm.CFG.tool_call_start is not None):
+    if not (_fsm.is_active() and _fsm.CFG.content_done_forbidden_notools):
         return [0]
-    return [_fsm.CFG.tool_call_start]
+    return list(_fsm.CFG.content_done_forbidden_notools)
 
 
 class DsparkVerifyEpilogue:
@@ -644,9 +660,9 @@ class DsparkVerifyEpilogue:
         self.fsm_content_notools_forbid_buf = torch.tensor(
             _fsm_content_notools_forbidden_ids(), dtype=torch.long, device=device
         )
-        self._fsm_ids_checked = False
-        self._fsm_content_ids_checked = False
-        self._fsm_content_notools_ids_checked = False
+        # Which forbid buffers have had their ids checked against the FSM.
+        # One check each, on the buffer's first armed staging call.
+        self._ids_checked: Set[str] = set()
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -676,6 +692,40 @@ class DsparkVerifyEpilogue:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
 
+    def _check_forbid_ids(self, *, buf, want, label: str) -> None:
+        """Warn once if a forbid buffer and the FSM describe different worlds.
+
+        The ids are snapshotted at construction and the flags are decided per
+        step, so an FSM that resolved after this object was built leaves the
+        buffer masking the wrong ids -- a row that looks masked and is not,
+        with nothing in the logs. Checked on the first *armed* staging call, so
+        an off step does not burn the one shot.
+        """
+        if label in self._ids_checked:
+            return
+        self._ids_checked.add(label)
+        have = buf.tolist()
+        if list(want) != have:
+            logger.error(
+                "[SOLAR-FSM] in-graph %s mask holds %s but the FSM now forbids "
+                "%s; captured before the FSM resolved, so armed rows are "
+                "masking the wrong ids",
+                label,
+                have,
+                list(want),
+            )
+
+    @staticmethod
+    def _stage_rows(*, buf, flags) -> None:
+        """Copy ``flags`` into a row buffer, zeroing whatever it does not fill.
+
+        Flags past the buffer are dropped: the buffer is sized for ``max_bs``,
+        so a longer list would mean a batch the graph was never captured for.
+        """
+        n = min(len(flags), buf.shape[0])
+        buf[:n].copy_(torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True)
+        buf[n:].zero_()
+
     def set_fsm_content_rows(self, flags) -> None:
         """Stage the in-graph CONTENT mask for the step about to launch.
 
@@ -683,62 +733,33 @@ class DsparkVerifyEpilogue:
         on the folded path: ``solar_open2_fsm.folded_content_mask_flags``.
         None disarms it for this step.
         """
-        if not self._fsm_content_ids_checked:
-            # Snapshotted at construction while the flags are decided per step,
-            # so the two describe different worlds if the FSM resolved after
-            # this object was built. Unchecked, every armed content row masks
-            # the placeholder id instead of the sentinels -- a row that looks
-            # masked and is not, with nothing in the logs.
-            self._fsm_content_ids_checked = True
-            want = _fsm_content_forbidden_ids()
-            if want != self.fsm_content_forbid_buf.tolist():
-                logger.error(
-                    "[SOLAR-FSM] in-graph CONTENT mask holds %s but the FSM now "
-                    "forbids %s; captured before the FSM resolved, so armed "
-                    "content rows are masking the wrong ids",
-                    self.fsm_content_forbid_buf.tolist(),
-                    want,
-                )
         if not flags:
             self.fsm_content_row_buf.zero_()
             return
-        n = min(len(flags), self.fsm_content_row_buf.shape[0])
-        self.fsm_content_row_buf[:n].copy_(
-            torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
+        self._check_forbid_ids(
+            buf=self.fsm_content_forbid_buf,
+            want=_fsm_content_forbidden_ids(),
+            label="CONTENT",
         )
-        if n < self.fsm_content_row_buf.shape[0]:
-            self.fsm_content_row_buf[n:].zero_()
+        self._stage_rows(buf=self.fsm_content_row_buf, flags=flags)
 
     def set_fsm_content_notools_rows(self, flags) -> None:
         """Stage the no-tools half of the CONTENT mask for the step about to
         launch: ``solar_open2_fsm.folded_content_notools_mask_flags``.
 
-        Arms ``<|tool_call:start|>`` on top of the shared content set, for the
-        rows whose request offers no tools. None disarms it for this step.
+        Arms the whole no-tools CONTENT set over the rows whose request offers
+        no tools, on top of the shared content mask those rows already carry.
+        None disarms it for this step.
         """
-        if not self._fsm_content_notools_ids_checked:
-            # Same staleness trap as set_fsm_content_rows: the buffer is a
-            # construction-time snapshot, so an FSM that resolved later leaves
-            # armed rows masking the placeholder id and nothing in the logs.
-            self._fsm_content_notools_ids_checked = True
-            want = _fsm_content_notools_forbidden_ids()
-            if want != self.fsm_content_notools_forbid_buf.tolist():
-                logger.error(
-                    "[SOLAR-FSM] in-graph no-tools CONTENT mask holds %s but the "
-                    "FSM now forbids %s; captured before the FSM resolved, so "
-                    "armed no-tools rows are masking the wrong ids",
-                    self.fsm_content_notools_forbid_buf.tolist(),
-                    want,
-                )
         if not flags:
             self.fsm_content_notools_row_buf.zero_()
             return
-        n = min(len(flags), self.fsm_content_notools_row_buf.shape[0])
-        self.fsm_content_notools_row_buf[:n].copy_(
-            torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
+        self._check_forbid_ids(
+            buf=self.fsm_content_notools_forbid_buf,
+            want=_fsm_content_notools_forbidden_ids(),
+            label="no-tools CONTENT",
         )
-        if n < self.fsm_content_notools_row_buf.shape[0]:
-            self.fsm_content_notools_row_buf[n:].zero_()
+        self._stage_rows(buf=self.fsm_content_notools_row_buf, flags=flags)
 
     def set_fsm_rows(self, flags, forbidden_ids=None) -> None:
         """Stage the in-graph reasoning mask for the step about to launch.
@@ -753,27 +774,10 @@ class DsparkVerifyEpilogue:
         if not flags:
             self.fsm_row_buf.zero_()
             return
-        if not self._fsm_ids_checked:
-            # The forbidden ids were snapshotted at construction and the flags
-            # are decided per step, so the two can describe different worlds if
-            # the FSM resolved after this object was built. Left unchecked that
-            # masks token id 0 instead of the EOS ids -- an unmasked row that looks
-            # masked, with nothing in the logs.
-            self._fsm_ids_checked = True
-            if list(forbidden_ids or ()) != self.fsm_forbid_buf.tolist():
-                logger.error(
-                    "[SOLAR-FSM] in-graph mask holds %s but the FSM now forbids "
-                    "%s; the mask was captured before the FSM resolved and is "
-                    "masking the wrong ids",
-                    self.fsm_forbid_buf.tolist(),
-                    list(forbidden_ids or ()),
-                )
-        n = min(len(flags), self.fsm_row_buf.shape[0])
-        self.fsm_row_buf[:n].copy_(
-            torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
+        self._check_forbid_ids(
+            buf=self.fsm_forbid_buf, want=list(forbidden_ids or ()), label="reasoning"
         )
-        if n < self.fsm_row_buf.shape[0]:
-            self.fsm_row_buf[n:].zero_()
+        self._stage_rows(buf=self.fsm_row_buf, flags=flags)
 
     def _apply_fsm_mask(self, bs: int) -> None:
         """Write -inf over the forbidden ids of every armed row.

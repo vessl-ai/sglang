@@ -1255,6 +1255,44 @@ def _content_needs_eager(fsm, *, req) -> bool:
     return not fsm.content_progress and not _has_grammar(req)
 
 
+def _folded_flags(reqs, stride: int, pred) -> Optional[List[bool]]:
+    """The shape every in-graph flag list has: ``stride`` copies of one
+    per-request predicate, read off **committed** state.
+
+    Committed state only is what keeps this sync-free -- the draft chain lives
+    on device and reading it before the target launch is the sync this whole
+    path exists to avoid. A request with no committed state, or one whose state
+    predates a retraction, is left False here because :func:`plan_gate` has
+    already sent that step to the eager path, where ``plan_verify`` rebuilds it
+    after the barrier.
+    """
+    if not is_active() or not reqs or stride <= 0:
+        return None
+    flags: List[bool] = []
+    for req in reqs:
+        fsm = getattr(req, "_solar_fsm", None)
+        if fsm is None or _fsm_stale(req):
+            flags.extend([False] * stride)
+            continue
+        fsm.advance(req.output_ids)
+        flags.extend([bool(pred(fsm, req))] * stride)
+    return flags
+
+
+def _in_reasoning_with_budget(fsm, req) -> bool:
+    """_SimState.exhausted's own predicate, read off the committed FSM."""
+    return fsm.in_reasoning and fsm.count < fsm.budget
+
+
+def _content_with_progress(fsm, req) -> bool:
+    """The rows :func:`plan_gate` declines to send eager -- CONTENT, content
+    already produced, no grammar. Shared so that the no-tools predicate below
+    is a conjunction of it rather than a copy of it: the caller layers the two
+    masks and needs the second set of rows to be a subset of the first, and
+    that is only guaranteed if neither can be edited without the other."""
+    return fsm.state == CONTENT and fsm.content_progress and not _has_grammar(req)
+
+
 def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     """Per-(request, chain position) flags for the in-graph CONTENT mask.
 
@@ -1280,60 +1318,28 @@ def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
-    if not is_active() or not reqs or stride <= 0:
-        return None
-    flags: List[bool] = []
-    for req in reqs:
-        fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None or _fsm_stale(req):
-            # plan_gate sent this step eager; plan_verify will judge it with
-            # fresh state after the barrier.
-            flags.extend([False] * stride)
-            continue
-        fsm.advance(req.output_ids)
-        on = bool(
-            fsm.state == CONTENT and fsm.content_progress and not _has_grammar(req)
-        )
-        flags.extend([on] * stride)
-    return flags
+    return _folded_flags(reqs, stride, _content_with_progress)
 
 
 def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     """The subset of :func:`folded_content_mask_flags` that offers no tools.
 
-    The no-tools CONTENT set is the tools-available one plus
-    ``<|tool_call:start|>`` -- ``configure_ids`` builds both tables from the
-    same spec and that token is the whole difference. So rather than a second
-    copy of the large set, these rows carry the difference alone: the caller
-    arms them against ``<|tool_call:start|>`` on top of the shared content
-    mask, which is already applied to them.
+    A conjunction of that function's predicate, not a copy of it: the caller
+    applies this mask on top of the shared one, so these rows must be a subset
+    of those. Sharing ``_content_with_progress`` makes that structural instead
+    of something a test has to keep watching.
 
-    Without this the opener stays open on every content-with-progress row of a
-    request that offers no tools, for the life of the request -- the one
-    unbounded folded-path gap ``plan_gate`` used to document. Masking it here
-    is unconditional because no tools makes it illegal in every state, so
-    unlike the shared set this one needs no subtraction for the tool states a
-    chain could otherwise reach.
+    Without it the whole no-tools CONTENT set is missing from the folded path
+    -- ``<|tool_call:start|>``, and the tool-call internals the shared buffer
+    subtracts for the sake of requests that may legally open a call.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
-    if not is_active() or not reqs or stride <= 0:
-        return None
-    flags: List[bool] = []
-    for req in reqs:
-        fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None or _fsm_stale(req):
-            flags.extend([False] * stride)
-            continue
-        fsm.advance(req.output_ids)
-        on = bool(
-            fsm.state == CONTENT
-            and fsm.content_progress
-            and not _has_grammar(req)
-            and not fsm.tools
-        )
-        flags.extend([on] * stride)
-    return flags
+    return _folded_flags(
+        reqs,
+        stride,
+        lambda fsm, req: _content_with_progress(fsm, req) and not fsm.tools,
+    )
 
 
 def plan_gate(reqs, stride: int) -> bool:
@@ -1345,11 +1351,14 @@ def plan_gate(reqs, stride: int) -> bool:
     per row, from committed state. Outside a tool call a generation spends
     only its boundary steps eager. The masks themselves are applied inside the
     graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
-    for content-with-progress), and the budget window is ``2 * stride``
-    because the state read here can lag by one accepted run. The folded-path
-    gap that remains is bounded at <= stride-1 chain rows and closed by the
-    next step's committed state: a drafted sentinel under a grammar. Host-only
-    and sync-free: it never touches the draft tokens.
+    for content-with-progress, and ``folded_content_notools_mask_flags``
+    layered over those of its rows that offer no tools), and the budget window
+    is ``2 * stride`` because the state read here can lag by one accepted run.
+    Every folded-path gap that remains comes from that same lag, so each is
+    bounded at <= stride-1 chain rows and closed by the next step's committed
+    state -- a drafted sentinel under a grammar, plus the two named in
+    ``folded_mask_flags`` and in ``_fsm_content_forbidden_ids``. Host-only and
+    sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False
@@ -1402,22 +1411,7 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """
-    if not is_active() or not reqs or stride <= 0:
-        return None
-    flags: List[bool] = []
-    for req in reqs:
-        fsm = getattr(req, "_solar_fsm", None)
-        if fsm is None or _fsm_stale(req):
-            # plan_gate sent this step eager; plan_verify will judge it with
-            # fresh state after the barrier.
-            flags.extend([False] * stride)
-            continue
-        fsm.advance(req.output_ids)
-        # _SimState.exhausted's own predicate, read off the committed FSM:
-        # in REASONING with the budget not yet spent.
-        on = bool(fsm.in_reasoning and fsm.count < fsm.budget)
-        flags.extend([on] * stride)
-    return flags
+    return _folded_flags(reqs, stride, _in_reasoning_with_budget)
 
 
 def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:

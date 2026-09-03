@@ -226,8 +226,6 @@ class TestSolarFsmMaskGate(CustomTestCase):
         self.assertEqual(
             fsm.folded_content_notools_mask_flags([req], stride), [True] * stride
         )
-        self.assertNotIn(TOOL_START, fsm.CFG.content_done_forbidden)
-        self.assertIn(TOOL_START, fsm.CFG.content_done_forbidden_notools)
 
     def test_a_request_with_tools_is_not_armed_against_the_opener(self):
         """The other half of the pair, or the flags could be all-True: opening a
@@ -241,20 +239,33 @@ class TestSolarFsmMaskGate(CustomTestCase):
             fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
         )
 
-    def test_the_no_tools_difference_is_exactly_the_opener(self):
-        """What lets the extra buffer hold one id instead of a second copy of
-        the set. If configure_ids ever makes the two tables differ by more, this
-        fails and the one-id buffer is wrong."""
+    def test_a_no_tools_row_under_a_grammar_is_flagged_for_neither(self):
+        """Mutation guard: drop `not _has_grammar` from the no-tools predicate
+        and this row goes shared=False / no-tools=True -- armed for the no-tools
+        set with the shared mask absent, which is the layering violation the
+        two masks exist to avoid. Every other no-tools fixture omits a grammar,
+        so nothing else can see it."""
         _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        req.sampling_params.json_schema = '{"type": "object"}'
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [False] * stride)
         self.assertEqual(
-            set(fsm.CFG.content_done_forbidden_notools)
-            - set(fsm.CFG.content_done_forbidden),
-            {TOOL_START},
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
         )
+
+    def test_a_stale_no_tools_row_is_flagged_for_neither(self):
+        """The same guard for `_fsm_stale`: a retracted request's committed
+        state describes a prefix that no longer exists, and plan_gate has
+        already sent the step eager."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        req.retraction_count = 1
+        self.assertTrue(fsm._fsm_stale(req), "fixture must be stale")
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [False] * stride)
         self.assertEqual(
-            set(fsm.CFG.content_done_forbidden)
-            - set(fsm.CFG.content_done_forbidden_notools),
-            set(),
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
         )
 
     def test_no_tools_flags_are_a_subset_of_the_content_flags(self):
