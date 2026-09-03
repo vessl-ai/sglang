@@ -4375,8 +4375,8 @@ class TestSolarOpen2ToolCallScenarios(_SolarOpen2ServingCase):
         self.assertIsNone(choice.matched_stop)
 
         pieces = [
-            "Sure.\n<|tool_call:start|>get_wea",
-            "ther\n<|tool_arg:start|>location<|tool_arg:value|>Par",
+            "Sure.\n<|tool_call:start|>get_weat",
+            "her\n<|tool_arg:start|>location<|tool_arg:value|>Par",
             "is<|tool_arg:end|>",
         ]
         self.assertEqual("".join(pieces), text)
@@ -4514,8 +4514,8 @@ class TestSolarOpen2ReasoningWithToolCalls(_SolarOpen2ServingCase):
         one tool-call delta carries the full arguments; the finish chunk is
         "tool_calls" without matched_stop."""
         pieces = [
-            "I need the wea",
-            "ther.<|think:e",
+            "I need the weat",
+            "her.<|think:e",
             "nd|>Let me check.\n<|tool_call:st",
             "art|>get_weather\n<|tool_arg:start|>location<|tool_arg:value|>Par",
             "is<|tool_arg:end|>\n<|tool_call:end|>",
