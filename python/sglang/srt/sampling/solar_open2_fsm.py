@@ -1298,6 +1298,44 @@ def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     return flags
 
 
+def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
+    """The subset of :func:`folded_content_mask_flags` that offers no tools.
+
+    The no-tools CONTENT set is the tools-available one plus
+    ``<|tool_call:start|>`` -- ``configure_ids`` builds both tables from the
+    same spec and that token is the whole difference. So rather than a second
+    copy of the large set, these rows carry the difference alone: the caller
+    arms them against ``<|tool_call:start|>`` on top of the shared content
+    mask, which is already applied to them.
+
+    Without this the opener stays open on every content-with-progress row of a
+    request that offers no tools, for the life of the request -- the one
+    unbounded folded-path gap ``plan_gate`` used to document. Masking it here
+    is unconditional because no tools makes it illegal in every state, so
+    unlike the shared set this one needs no subtraction for the tool states a
+    chain could otherwise reach.
+
+    Returns None when the FSM is inactive, so the caller keeps stock behaviour.
+    """
+    if not is_active() or not reqs or stride <= 0:
+        return None
+    flags: List[bool] = []
+    for req in reqs:
+        fsm = getattr(req, "_solar_fsm", None)
+        if fsm is None or _fsm_stale(req):
+            flags.extend([False] * stride)
+            continue
+        fsm.advance(req.output_ids)
+        on = bool(
+            fsm.state == CONTENT
+            and fsm.content_progress
+            and not _has_grammar(req)
+            and not fsm.tools
+        )
+        flags.extend([on] * stride)
+    return flags
+
+
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
@@ -1308,13 +1346,10 @@ def plan_gate(reqs, stride: int) -> bool:
     only its boundary steps eager. The masks themselves are applied inside the
     graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
     for content-with-progress), and the budget window is ``2 * stride``
-    because the state read here can lag by one accepted run. One folded-path
-    gap is bounded at <= stride-1 chain rows and closed by the next step's
-    committed state: a drafted sentinel under a grammar. One is not bounded --
-    a request that offers no tools keeps ``<|tool_call:start|>`` open on every
-    content-with-progress row for the life of the request, because the in-graph
-    buffer carries the tools-available set and one static buffer cannot hold
-    both. Host-only and sync-free: it never touches the draft tokens.
+    because the state read here can lag by one accepted run. The folded-path
+    gap that remains is bounded at <= stride-1 chain rows and closed by the
+    next step's committed state: a drafted sentinel under a grammar. Host-only
+    and sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False

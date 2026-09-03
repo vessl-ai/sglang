@@ -527,9 +527,9 @@ def _fsm_content_forbidden_ids() -> List[int]:
       ``<|im:start|>``, ``<|im:content|>``, ``<|tool_response:*|>``) is illegal
       in CONTENT and in every state one chain can reach from it.
 
-    Only the tools-available variant is carried: the set differs for a request
-    that offers no tools (``<|tool_call:start|>`` joins it) and one static
-    buffer cannot hold both. See ``plan_gate`` for what that leaves open.
+    Only the tools-available variant is carried here; the no-tools set adds
+    ``<|tool_call:start|>`` and nothing else, which
+    :func:`_fsm_content_notools_forbidden_ids` supplies as its own buffer.
     """
     if not (_fsm.is_active() and _fsm.CFG.content_done_forbidden):
         return [0]
@@ -547,6 +547,20 @@ def _fsm_content_forbidden_ids() -> List[int]:
     # An empty index buffer would change the captured shape; fall back to the
     # placeholder, which is only ever paired with an all-False row buffer.
     return ids or [0]
+
+
+def _fsm_content_notools_forbidden_ids() -> List[int]:
+    """``<|tool_call:start|>`` alone: the whole difference between the no-tools
+    CONTENT set and the tools-available one that
+    :func:`_fsm_content_forbidden_ids` carries.
+
+    Same placeholder contract as the others -- ``[0]`` keeps a buffer of the
+    captured shape in place when the FSM is off or the id is missing, and the
+    row buffer that selects it is all-False in that case anyway.
+    """
+    if not (_fsm.is_active() and _fsm.CFG.tool_call_start is not None):
+        return [0]
+    return [_fsm.CFG.tool_call_start]
 
 
 class DsparkVerifyEpilogue:
@@ -622,8 +636,17 @@ class DsparkVerifyEpilogue:
         self.fsm_content_forbid_buf = torch.tensor(
             _fsm_content_forbidden_ids(), dtype=torch.long, device=device
         )
+        # The no-tools difference, layered on top of the CONTENT half for the
+        # subset of those rows whose request offers no tools.
+        self.fsm_content_notools_row_buf = torch.zeros(
+            (self.max_bs * self.stride,), dtype=torch.bool, device=device
+        )
+        self.fsm_content_notools_forbid_buf = torch.tensor(
+            _fsm_content_notools_forbidden_ids(), dtype=torch.long, device=device
+        )
         self._fsm_ids_checked = False
         self._fsm_content_ids_checked = False
+        self._fsm_content_notools_ids_checked = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
@@ -685,6 +708,37 @@ class DsparkVerifyEpilogue:
         )
         if n < self.fsm_content_row_buf.shape[0]:
             self.fsm_content_row_buf[n:].zero_()
+
+    def set_fsm_content_notools_rows(self, flags) -> None:
+        """Stage the no-tools half of the CONTENT mask for the step about to
+        launch: ``solar_open2_fsm.folded_content_notools_mask_flags``.
+
+        Arms ``<|tool_call:start|>`` on top of the shared content set, for the
+        rows whose request offers no tools. None disarms it for this step.
+        """
+        if not self._fsm_content_notools_ids_checked:
+            # Same staleness trap as set_fsm_content_rows: the buffer is a
+            # construction-time snapshot, so an FSM that resolved later leaves
+            # armed rows masking the placeholder id and nothing in the logs.
+            self._fsm_content_notools_ids_checked = True
+            want = _fsm_content_notools_forbidden_ids()
+            if want != self.fsm_content_notools_forbid_buf.tolist():
+                logger.error(
+                    "[SOLAR-FSM] in-graph no-tools CONTENT mask holds %s but the "
+                    "FSM now forbids %s; captured before the FSM resolved, so "
+                    "armed no-tools rows are masking the wrong ids",
+                    self.fsm_content_notools_forbid_buf.tolist(),
+                    want,
+                )
+        if not flags:
+            self.fsm_content_notools_row_buf.zero_()
+            return
+        n = min(len(flags), self.fsm_content_notools_row_buf.shape[0])
+        self.fsm_content_notools_row_buf[:n].copy_(
+            torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
+        )
+        if n < self.fsm_content_notools_row_buf.shape[0]:
+            self.fsm_content_notools_row_buf[n:].zero_()
 
     def set_fsm_rows(self, flags, forbidden_ids=None) -> None:
         """Stage the in-graph reasoning mask for the step about to launch.
@@ -748,6 +802,13 @@ class DsparkVerifyEpilogue:
             self.strided_logits[:n],
             self.fsm_content_row_buf[:n],
             self.fsm_content_forbid_buf,
+        )
+        # Not disjoint from the call above -- deliberately a subset of it. The
+        # no-tools rows take the shared content set and this one id on top.
+        _fsm.apply_folded_mask(
+            self.strided_logits[:n],
+            self.fsm_content_notools_row_buf[:n],
+            self.fsm_content_notools_forbid_buf,
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:

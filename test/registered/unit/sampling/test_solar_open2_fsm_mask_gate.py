@@ -214,17 +214,67 @@ class TestSolarFsmMaskGate(CustomTestCase):
         # The line that actually pins the order.
         self.assertEqual(flags, [False] * stride + [True] * stride)
 
-    def test_a_no_tools_request_is_still_flagged_and_keeps_its_gap(self):
-        """Characterising the accepted trade, not endorsing it: one static
-        buffer carries the tools-available set, so a no-tools request is armed
-        with it and <|tool_call:start|> stays open on its content rows. If this
-        ever changes, the docstrings that describe the gap are stale."""
+    def test_a_no_tools_request_is_armed_against_the_opener_too(self):
+        """The gap that used to live here: the shared content buffer carries the
+        tools-available set, which leaves <|tool_call:start|> open. A no-tools
+        row is now flagged for both -- the shared set and, on top of it, the one
+        id that is the whole difference between the two tables."""
         _cfg()
         stride = 4
         req = _req([7, THINK_END, 7], tools=False)
         self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [True] * stride
+        )
         self.assertNotIn(TOOL_START, fsm.CFG.content_done_forbidden)
         self.assertIn(TOOL_START, fsm.CFG.content_done_forbidden_notools)
+
+    def test_a_request_with_tools_is_not_armed_against_the_opener(self):
+        """The other half of the pair, or the flags could be all-True: opening a
+        tool call is legal for a request that offers tools, and masking the
+        opener there would commit some other token instead."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=True)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
+        )
+
+    def test_the_no_tools_difference_is_exactly_the_opener(self):
+        """What lets the extra buffer hold one id instead of a second copy of
+        the set. If configure_ids ever makes the two tables differ by more, this
+        fails and the one-id buffer is wrong."""
+        _cfg()
+        self.assertEqual(
+            set(fsm.CFG.content_done_forbidden_notools)
+            - set(fsm.CFG.content_done_forbidden),
+            {TOOL_START},
+        )
+        self.assertEqual(
+            set(fsm.CFG.content_done_forbidden)
+            - set(fsm.CFG.content_done_forbidden_notools),
+            set(),
+        )
+
+    def test_no_tools_flags_are_a_subset_of_the_content_flags(self):
+        """The layering contract: the extra id is applied on top of the shared
+        set, never instead of it, so a no-tools row must be armed for both. A
+        row armed only for the opener would lose the rest of the set."""
+        _cfg()
+        stride = 4
+        reqs = [
+            _req([7, THINK_END, 7], tools=False),
+            _req([7, THINK_END, 7], tools=True),
+            _req([7] * 44, tools=False),
+            _req([7, THINK_END], tools=False),
+        ]
+        shared = fsm.folded_content_mask_flags(reqs, stride)
+        notools = fsm.folded_content_notools_mask_flags(reqs, stride)
+        self.assertEqual(len(shared), len(notools))
+        for i, (a, b) in enumerate(zip(shared, notools)):
+            self.assertFalse(b and not a, f"row {i} armed for the opener alone")
+        self.assertEqual(notools, [True] * stride + [False] * stride * 3)
 
     def test_content_flags_equal_the_rows_plan_verify_would_mask(self):
         """The pairing, for CONTENT -- equality, not implication: an all-True

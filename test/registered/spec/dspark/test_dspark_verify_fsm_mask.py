@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-THINK_START, THINK_END, EOS = 100, 101, 2
+THINK_START, THINK_END, EOS, TOOL_START = 100, 101, 2, 102
 VOCAB = 128
 
 _CFG_FIELDS = (
@@ -44,6 +44,9 @@ _CFG_FIELDS = (
     "leading_newline_forbidden",
     "content_done_forbidden",
     "content_fresh_forbidden",
+    "content_done_forbidden_notools",
+    "content_fresh_forbidden_notools",
+    "tool_call_start",
     "spec_always_eager",
     "effort_budgets",
     "default_effort",
@@ -54,7 +57,7 @@ _CFG_FIELDS = (
 def _cfg():
     fsm.CFG.enabled = True
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
-    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
+    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END, TOOL_START})
     fsm.CFG.transitions = {THINK_START: fsm.REASONING, THINK_END: fsm.CONTENT}
     # Disjoint on purpose: it is the only way this suite can tell the two masks
     # apart by looking at the logits.
@@ -63,6 +66,11 @@ def _cfg():
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.content_done_forbidden = (THINK_START,)
     fsm.CFG.content_fresh_forbidden = (THINK_START, EOS)
+    # The no-tools tables differ from the above by the opener alone, which is
+    # what lets the third buffer hold one id.
+    fsm.CFG.tool_call_start = TOOL_START
+    fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START)
+    fsm.CFG.content_fresh_forbidden_notools = (THINK_START, TOOL_START, EOS)
     fsm.CFG.spec_always_eager = False
     fsm.CFG.effort_budgets = {"high": 3072}
     fsm.CFG.default_effort = "high"
@@ -289,6 +297,86 @@ class TestEpilogueFsmMasks(CustomTestCase):
             "folded_content_mask_flags",
             "the CONTENT setter must be given the CONTENT flags",
         )
+
+    def test_the_notools_buffer_holds_the_opener_alone(self):
+        """One id, not a second copy of the content set -- and not the [0]
+        placeholder, which masks token id 0 and looks armed."""
+        self.assertEqual(self.ep.fsm_content_notools_forbid_buf.tolist(), [TOOL_START])
+        self.assertEqual(self.ep.fsm_content_notools_forbid_buf.dtype, torch.long)
+        self.assertIsNot(
+            self.ep.fsm_content_notools_row_buf, self.ep.fsm_content_row_buf
+        )
+        self.assertEqual(
+            self.ep.fsm_content_notools_row_buf.shape, (self.max_bs * self.stride,)
+        )
+        self.assertFalse(self.ep.fsm_content_notools_row_buf.any())
+
+    def test_a_notools_row_loses_the_opener_and_the_shared_set(self):
+        """The layering, measured on the logits: the shared content mask and the
+        opener both land on a no-tools row. Delete the third apply_folded_mask
+        call and only the opener survives here."""
+        logits = self._logits()
+        self.ep.set_fsm_content_rows([True] * self.stride + [False] * self.stride)
+        self.ep.set_fsm_content_notools_rows(
+            [True] * self.stride + [False] * self.stride
+        )
+        self.ep._apply_fsm_mask(self.max_bs)
+        self.assertTrue(torch.isneginf(logits[0, THINK_START]))
+        self.assertTrue(torch.isneginf(logits[0, TOOL_START]))
+        # The tools-available row keeps the opener open.
+        self.assertFalse(torch.isneginf(logits[self.stride, TOOL_START]))
+
+    def test_a_tools_row_keeps_the_opener_open(self):
+        """The pair. Arming every content row against the opener would break a
+        legal tool call, so the flags -- not the buffer -- decide."""
+        logits = self._logits()
+        self.ep.set_fsm_content_rows([True] * self.stride * self.max_bs)
+        self.ep.set_fsm_content_notools_rows(None)
+        self.ep._apply_fsm_mask(self.max_bs)
+        self.assertTrue(torch.isneginf(logits[0, THINK_START]))
+        self.assertFalse(torch.isneginf(logits[0, TOOL_START]))
+
+    def test_the_notools_setter_stages_exactly_the_flags(self):
+        flags = [True, False, True, False, False, False, False, True]
+        self.ep.set_fsm_content_notools_rows(flags)
+        self.assertEqual(self.ep.fsm_content_notools_row_buf.tolist(), flags)
+        self.ep.set_fsm_content_notools_rows(None)
+        self.assertFalse(self.ep.fsm_content_notools_row_buf.any())
+
+    def test_the_notools_setter_does_not_touch_the_other_buffers(self):
+        """Three staging calls into three buffers; a shared one would alias the
+        masks and this is the cheapest way to see it."""
+        self.ep.set_fsm_content_notools_rows([True] * self.stride * self.max_bs)
+        self.assertFalse(self.ep.fsm_row_buf.any())
+        self.assertFalse(self.ep.fsm_content_row_buf.any())
+
+    def test_the_notools_ids_are_checked_for_staleness(self):
+        """The buffer is a construction-time snapshot. If the FSM resolves after
+        this object is built, armed rows mask the wrong id with nothing in the
+        logs -- so the first staging call has to say so."""
+        self.ep.fsm_content_notools_forbid_buf = torch.tensor([0], dtype=torch.long)
+        self.ep._fsm_content_notools_ids_checked = False
+        with self.assertLogs(
+            "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
+        ) as cm:
+            self.ep.set_fsm_content_notools_rows([True] * self.stride)
+        self.assertIn("no-tools", "\n".join(cm.output))
+
+    def test_the_worker_arms_the_notools_mask_with_the_notools_flags(self):
+        """Source-shape guard, like the CONTENT one: the call is invisible to
+        every behavioural test in this file if it is simply absent."""
+        tree = ast.parse(inspect.getsource(dspark_worker_v2))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_fsm_content_notools_rows"
+        ]
+        self.assertEqual(len(calls), 1, "the no-tools mask must be armed once")
+        arg = calls[0].args[0]
+        self.assertIsInstance(arg, ast.Call)
+        self.assertEqual(arg.func.attr, "folded_content_notools_mask_flags")
 
 
 if __name__ == "__main__":
