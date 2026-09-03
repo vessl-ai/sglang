@@ -44,6 +44,8 @@ def _cfg(**over):
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
+    fsm.CFG.content_done_forbidden = (THINK_START,)
+    fsm.CFG.content_fresh_forbidden = (THINK_START, EOS)
     fsm.CFG.spec_always_eager = False
     # Budgets here are pinned by hand: one effort, 3072 tokens.
     fsm.CFG.effort_budgets = {"high": 3072}
@@ -94,6 +96,8 @@ class TestSolarFsmMaskGate(CustomTestCase):
                 "hard_limit",
                 "leading_newline_forbidden",
                 "reasoning_open_forbidden",
+                "content_done_forbidden",
+                "content_fresh_forbidden",
             )
         }
         _cfg()
@@ -102,6 +106,49 @@ class TestSolarFsmMaskGate(CustomTestCase):
         for k, v in self._saved.items():
             setattr(fsm.CFG, k, v)
         fsm.CFG._mask_cache.clear()
+
+    def test_content_with_progress_is_flagged_for_the_content_mask(self):
+        """The row plan_gate leaves on the folded path is the row the CONTENT
+        mask has to carry: a drafted sentinel there is otherwise accepted
+        unmasked, which is how a control token reaches the client as text."""
+        _cfg()
+        req = _req([7, THINK_END, 7])
+        self.assertFalse(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [True] * 8)
+
+    def test_fresh_content_is_left_to_the_eager_path(self):
+        """Fresh CONTENT takes the stricter set (EOS and <|im:end|> shut), which
+        only plan_verify writes, so the gate fires and the flag stays False."""
+        _cfg()
+        req = _req([7, THINK_END])
+        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_reasoning_row_is_not_flagged_for_the_content_mask(self):
+        """The two flag sets are disjoint: a row is REASONING or CONTENT."""
+        _cfg()
+        req = _req([7] * 44)
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_content_under_a_grammar_is_not_flagged(self):
+        """Structured outputs own CONTENT; masking it here would fight them."""
+        _cfg()
+        req = _req([7, THINK_END, 7])
+        req.sampling_params.json_schema = '{"type": "object"}'
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_no_content_row_is_left_unmasked(self):
+        """The pairing, for CONTENT: for every content-with-progress row
+        plan_verify would mask, either the gate fired or the flag is set."""
+        _cfg()
+        for out in ([7, THINK_END, 7], [7, THINK_END, 7, 7], [7, THINK_END] + [7] * 9):
+            with self.subTest(out=out):
+                req = _req(out)
+                gated = fsm.plan_gate([req], 8)
+                flags = fsm.folded_content_mask_flags([req], 8)
+                self.assertTrue(gated or all(flags))
 
     def test_reasoning_row_far_from_the_budget_is_flagged(self):
         """The defect's own case. 44 tokens into a 3072-token budget is nowhere

@@ -704,6 +704,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1]),
                 _solar_fsm.CFG.reasoning_forbidden,
             )
+            epilogue.set_fsm_content_rows(
+                _solar_fsm.folded_content_mask_flags(batch.reqs, verify_ids_2d.shape[1])
+            )
 
         # Must stay ahead of the target verify launch below. The Solar FSM plans
         # off the same host copy of the chain.

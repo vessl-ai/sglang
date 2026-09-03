@@ -1247,6 +1247,49 @@ def _content_needs_eager(fsm, *, req) -> bool:
     return not fsm.content_progress and not _has_grammar(req)
 
 
+def folded_content_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
+    """Per-(request, chain position) flags for the in-graph CONTENT mask.
+
+    True where the request's **committed** state is CONTENT with content
+    already produced and no grammar -- exactly the rows :func:`plan_gate`
+    declines to send eager, and therefore the rows whose forbidden set nothing
+    else applies. Without this the second bullet of
+    :func:`folded_mask_flags` is open: a drafted ``<|think:start|>`` (or any
+    other sentinel CONTENT does not allow) is accepted unmasked on a
+    content-with-progress row, which is how a control token reaches the client
+    as text.
+
+    Committed state only, for the same reason as ``folded_mask_flags``: the
+    draft chain lives on device and reading it before the target launch is the
+    sync this path exists to avoid. The two therefore disagree wherever a draft
+    moves the state, and in the same bounded way -- at most ``stride - 1`` rows,
+    cleared once the next step's committed state catches up.
+
+    Fresh CONTENT is not flagged: ``plan_gate`` sends those rows eager, where
+    ``plan_verify`` applies the stricter fresh set (EOS and ``<|im:end|>``
+    shut). Rows under a grammar are not flagged either -- the grammar owns
+    CONTENT.
+
+    Returns None when the FSM is inactive, so the caller keeps stock behaviour.
+    """
+    if not is_active() or not reqs or stride <= 0:
+        return None
+    flags: List[bool] = []
+    for req in reqs:
+        fsm = getattr(req, "_solar_fsm", None)
+        if fsm is None or _fsm_stale(req):
+            # plan_gate sent this step eager; plan_verify will judge it with
+            # fresh state after the barrier.
+            flags.extend([False] * stride)
+            continue
+        fsm.advance(req.output_ids)
+        on = bool(
+            fsm.state == CONTENT and fsm.content_progress and not _has_grammar(req)
+        )
+        flags.extend([on] * stride)
+    return flags
+
+
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
@@ -1254,12 +1297,15 @@ def plan_gate(reqs, stride: int) -> bool:
     ``plan_verify`` runs after the grammar barrier, so what only plan_verify
     can do -- named by the two row predicates above -- must be decided here,
     per row, from committed state. Outside a tool call a generation spends
-    only its boundary steps eager. The reasoning mask itself is applied inside
-    the graph (``folded_mask_flags``), and the budget window is ``2 * stride``
+    only its boundary steps eager. The masks themselves are applied inside the
+    graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
+    for content-with-progress), and the budget window is ``2 * stride``
     because the state read here can lag by one accepted run. Known folded-path
     gaps, each <= stride-1 chain rows and closed by the next step's committed
-    state: a drafted sentinel on a content-with-progress row or under a
-    grammar. Host-only and sync-free: it never touches the draft tokens.
+    state: a drafted sentinel under a grammar, and on a content-with-progress
+    row the no-tools variant of the CONTENT set -- the in-graph buffer carries
+    the tools-available one. Host-only and sync-free: it never touches the
+    draft tokens.
     """
     if not is_active():
         return False
@@ -1289,7 +1335,8 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     True where the request's **committed** state is in REASONING with budget
     left. A row whose budget is spent needs a forced ``<|think:end|>`` instead,
     which only ``plan_verify`` can write, and :func:`plan_gate` has already sent
-    that step to the eager path -- so it is left False here.
+    that step to the eager path -- so it is left False here. The CONTENT rows
+    this leaves False are armed by :func:`folded_content_mask_flags` instead.
 
     Committed state only, which is what keeps this sync-free: the draft chain
     lives on device and reading it before the target launch is the sync this
@@ -1303,10 +1350,11 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       model may legitimately want it, so a non-EOS token is accepted and
       committed after the answer. It is the cheaper error.
     * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
-      that position; these flags stay False, and ``plan_gate`` does not fire
-      on a content-with-progress row without a grammar. That row goes
-      unmasked -- the error this mask exists to prevent, and closing it needs
-      the chain here.
+      that position; these flags stay False. The row is not unmasked, though:
+      it is a content-with-progress row, so :func:`folded_content_mask_flags`
+      arms it with the CONTENT set, which forbids ``<|think:start|>`` in the
+      first place. What is left is undermasking of the following rows against
+      the *reasoning* set, bounded the same way as above.
 
     Returns None when the FSM is inactive, so the caller keeps stock behaviour.
     """

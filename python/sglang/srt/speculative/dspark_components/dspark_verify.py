@@ -509,6 +509,21 @@ def _fsm_forbidden_ids() -> List[int]:
     return [0]
 
 
+def _fsm_content_forbidden_ids() -> List[int]:
+    """The content-with-progress forbidden set, resolved at construction.
+
+    Same placeholder contract as :func:`_fsm_forbidden_ids`. Only the
+    tools-available variant is carried: the set differs for a request that
+    offers no tools (``<|tool_call:start|>`` joins it), and one static buffer
+    cannot hold both. That difference only matters in fresh CONTENT, which
+    ``plan_gate`` already sends eager, so what is left open here is a tool-call
+    opener on a row that has already produced content and can end normally.
+    """
+    if _fsm.is_active() and _fsm.CFG.content_done_forbidden:
+        return list(_fsm.CFG.content_done_forbidden)
+    return [0]
+
+
 class DsparkVerifyEpilogue:
 
     def __init__(
@@ -575,6 +590,13 @@ class DsparkVerifyEpilogue:
         self.fsm_forbid_buf = torch.tensor(
             _fsm_forbidden_ids(), dtype=torch.long, device=device
         )
+        # The CONTENT half, armed for the rows plan_gate leaves on this path.
+        self.fsm_content_row_buf = torch.zeros(
+            (self.max_bs * self.stride,), dtype=torch.bool, device=device
+        )
+        self.fsm_content_forbid_buf = torch.tensor(
+            _fsm_content_forbidden_ids(), dtype=torch.long, device=device
+        )
         self._fsm_ids_checked = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
@@ -604,6 +626,23 @@ class DsparkVerifyEpilogue:
             if bs < self.max_bs:
                 self.verify_lens_buf[bs:].zero_()
         self.inject_gate_buf.fill_(1 if armed else 0)
+
+    def set_fsm_content_rows(self, flags) -> None:
+        """Stage the in-graph CONTENT mask for the step about to launch.
+
+        The companion of :meth:`set_fsm_rows` for the rows ``plan_gate`` keeps
+        on the folded path: ``solar_open2_fsm.folded_content_mask_flags``.
+        None disarms it for this step.
+        """
+        if not flags:
+            self.fsm_content_row_buf.zero_()
+            return
+        n = min(len(flags), self.fsm_content_row_buf.shape[0])
+        self.fsm_content_row_buf[:n].copy_(
+            torch.tensor(flags[:n], dtype=torch.bool), non_blocking=True
+        )
+        if n < self.fsm_content_row_buf.shape[0]:
+            self.fsm_content_row_buf[n:].zero_()
 
     def set_fsm_rows(self, flags, forbidden_ids=None) -> None:
         """Stage the in-graph reasoning mask for the step about to launch.
@@ -661,6 +700,12 @@ class DsparkVerifyEpilogue:
         n = bs * self.stride
         _fsm.apply_folded_mask(
             self.strided_logits[:n], self.fsm_row_buf[:n], self.fsm_forbid_buf
+        )
+        # Disjoint by construction: a row is REASONING or CONTENT, never both.
+        _fsm.apply_folded_mask(
+            self.strided_logits[:n],
+            self.fsm_content_row_buf[:n],
+            self.fsm_content_forbid_buf,
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
