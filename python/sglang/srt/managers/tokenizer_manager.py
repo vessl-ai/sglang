@@ -171,8 +171,9 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
-# Bound on remembered orphan rids; evicting one costs a duplicate abort. The
-# abort is fire-and-forget, so a lost one is retried once the window passes.
+# Bound on remembered orphan rids; evicting one costs a duplicate abort.
+# How long an attempt suppresses the next one: the abort is fire-and-forget,
+# so a lost one has to be retried rather than assumed delivered.
 _MAX_TRACKED_ORPHAN_RIDS = 4096
 _ORPHAN_ABORT_RETRY_S = 30.0
 
@@ -589,6 +590,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # request rather than once per output message, and retried if it did
         # not take.
         self._aborted_orphan_rids: Dict[str, Tuple[float, bool]] = {}
+        self._orphan_evict_warn_at = 0.0
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -2010,7 +2012,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._aborted_orphan_rids.pop(rid, None)
         self._aborted_orphan_rids[rid] = (now, sent)
         while len(self._aborted_orphan_rids) > _MAX_TRACKED_ORPHAN_RIDS:
-            self._aborted_orphan_rids.pop(next(iter(self._aborted_orphan_rids)))
+            victim = next(iter(self._aborted_orphan_rids))
+            victim_at, _ = self._aborted_orphan_rids.pop(victim)
+            if (
+                now - victim_at < _ORPHAN_ABORT_RETRY_S
+                and now - self._orphan_evict_warn_at >= _ORPHAN_ABORT_RETRY_S
+            ):
+                # Evicting an entry past its window is free. Evicting one still
+                # inside it un-throttles that rid -- its abort, its log and the
+                # collision scan go back to once per output message -- so the
+                # degradation says so rather than looking like more orphans.
+                self._orphan_evict_warn_at = now
+                logger.error(
+                    f"Orphan abort throttle full at {_MAX_TRACKED_ORPHAN_RIDS} "
+                    f"rids; evicted {victim=} {now - victim_at:.1f}s into its "
+                    f"{_ORPHAN_ABORT_RETRY_S}s window. Throttling is degraded: "
+                    "orphan aborts and their logs may repeat per output message."
+                )
 
     def _abort_orphaned_rid(self, rid: str) -> None:
         """Abort a request the scheduler is still generating for but this
@@ -2031,6 +2049,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids on two different workers is not, and is inherent to ``startswith``
         matching -- ``abort_request`` has it too. An ``exact`` flag on
         ``AbortReq`` is what would close both.
+
+        The caller filters health-check rids before calling; those pop their
+        own state by design and are not orphans. An abort echo trails that
+        rid's last output on the same scheduler-to-manager path, so a request
+        already aborted through ``_handle_abort_req`` is not re-aborted here.
 
         Output keeps arriving until the scheduler acts, so every outcome --
         sent, declined, failed -- is recorded and not revisited for
@@ -2071,17 +2094,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
 
-        logger.error(
-            f"Received output for {rid=} but the state was deleted in "
-            f"TokenizerManager; aborting it on the scheduler"
-            f"{' again' if last is not None and last[1] else ''}."
-        )
         sent = False
         try:
             self._dispatch_to_scheduler(
                 AbortReq(rid=rid, abort_message="orphaned output, no consumer")
             )
             sent = True
+            # Logged only once the abort is really on its way: the failure
+            # branch below is the only line the other path should produce.
+            logger.error(
+                f"Received output for {rid=} but the state was deleted in "
+                f"TokenizerManager; aborted it on the scheduler"
+                f"{' again' if last is not None and last[1] else ''}."
+            )
         except Exception:
             # handle_loop has no handler and print_exception_wrapper kills the
             # process tree, so a failed abort must not propagate. Recorded
@@ -2092,8 +2117,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 f"Failed to abort orphaned {rid=}; retrying in "
                 f"{_ORPHAN_ABORT_RETRY_S}s."
             )
+        already_counted = last is not None and last[1]
         self._remember_orphan_abort(rid, now, sent=sent)
-        if sent and self.enable_metrics:
+        # Retries are automatic, not caller-driven: counting each one would
+        # report N aborted requests for one request.
+        if sent and not already_counted and self.enable_metrics:
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
             )
