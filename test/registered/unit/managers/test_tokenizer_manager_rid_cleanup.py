@@ -128,6 +128,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.server_args.dp_size = 1
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
+    tm._aborted_orphan_rids = set()
     tm.enable_metrics = False
     tm.enable_trace = False
     tm.enable_lora = False
@@ -317,6 +318,76 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestOrphanedOutputAborts(CustomTestCase):
+    """Output for a rid with no state means the scheduler is still generating
+    for a request nobody is reading: it must be aborted, once."""
+
+    def _sent_aborts(self, tm):
+        return [
+            call.args[1]
+            for call in tm._sent
+            if isinstance(call.args[1], AbortReq)
+        ]
+
+    def _capture_dispatch(self, tm):
+        tm._sent = []
+        tm._dispatch_to_scheduler = lambda obj: tm._sent.append(Mock(args=(None, obj)))
+
+    def test_orphaned_output_aborts_on_the_scheduler(self):
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        rid = "orphan_rid"
+        # No rid_to_state entry: the state was deleted while the scheduler ran on.
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+
+        aborts = self._sent_aborts(tm)
+        self.assertEqual(len(aborts), 1)
+        self.assertEqual(aborts[0].rid, rid)
+        self.assertFalse(aborts[0].abort_all)
+
+    def test_abort_is_sent_once_per_rid(self):
+        """Output keeps arriving until the scheduler acts on the abort."""
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        rid = "orphan_repeat_rid"
+        for _ in range(5):
+            asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+
+        self.assertEqual(len(self._sent_aborts(tm)), 1)
+
+    def test_health_check_rid_is_not_aborted(self):
+        """The /health_generate race pops its own rid; that is not an orphan."""
+        from sglang.srt.managers.tokenizer_manager import HEALTH_CHECK_RID_PREFIX
+
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        asyncio.run(
+            tm._handle_batch_output(_make_batch_str_output(HEALTH_CHECK_RID_PREFIX + "x"))
+        )
+
+        self.assertEqual(self._sent_aborts(tm), [])
+
+    def test_known_rid_is_not_aborted(self):
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        rid = "live_rid"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+
+        self.assertEqual(self._sent_aborts(tm), [])
+
+    def test_tracking_set_is_bounded(self):
+        from sglang.srt.managers.tokenizer_manager import _MAX_TRACKED_ORPHAN_RIDS
+
+        tm = _make_tokenizer_manager(self)
+        self._capture_dispatch(tm)
+        tm._aborted_orphan_rids = {f"r{i}" for i in range(_MAX_TRACKED_ORPHAN_RIDS)}
+        tm._abort_orphaned_rid("one_past_the_cap")
+
+        self.assertEqual(len(tm._aborted_orphan_rids), 1)
+        self.assertIn("one_past_the_cap", tm._aborted_orphan_rids)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

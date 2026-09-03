@@ -34,7 +34,7 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Awaitable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import fastapi
 import numpy as np
@@ -170,6 +170,9 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+# Cap on remembered orphan rids (see _abort_orphaned_rid).
+_MAX_TRACKED_ORPHAN_RIDS = 4096
 
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
@@ -579,6 +582,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # rids already aborted by _abort_orphaned_rid, so the abort goes out
+        # once per request rather than once per output message.
+        self._aborted_orphan_rids: Set[str] = set()
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -1988,6 +1994,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
+    def _abort_orphaned_rid(self, rid: str) -> None:
+        """Abort a request the scheduler is still generating for but this
+        manager has no state for.
+
+        A stream that breaks (a worker-to-router SSE error, a client that goes
+        away mid-generation) deletes the state here, but nothing tells the
+        scheduler, so it runs the request to ``max_new_tokens`` with no
+        consumer -- measured at ~250 tok/s for 17 minutes on one such request.
+        ``abort_request`` cannot be used: it returns early for exactly this
+        case (a rid with no state), so the AbortReq goes out directly.
+
+        Output for an aborted rid keeps arriving until the scheduler acts on
+        the abort, so the rid is remembered and the abort sent once. The set
+        is cleared wholesale when it grows past its cap: a re-abort costs one
+        message and the alternative is unbounded growth.
+        """
+        if rid in self._aborted_orphan_rids:
+            return
+        if len(self._aborted_orphan_rids) >= _MAX_TRACKED_ORPHAN_RIDS:
+            self._aborted_orphan_rids.clear()
+        self._aborted_orphan_rids.add(rid)
+        logger.warning(f"Aborting orphaned {rid=} on the scheduler.")
+        self._dispatch_to_scheduler(AbortReq(rid=rid))
+
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
@@ -2235,6 +2265,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
+                self._abort_orphaned_rid(rid)
                 continue
 
             # Build meta_info and return value
