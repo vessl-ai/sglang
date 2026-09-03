@@ -63,8 +63,10 @@ _CFG_FIELDS = (
 def _cfg():
     fsm.CFG.enabled = True
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
+    # configure_ids puts every sentinel in all_controls; a fixture that lists
+    # fewer than its forbidden tables describes a world it cannot build.
     fsm.CFG.all_controls = frozenset(
-        {THINK_START, THINK_END, TOOL_START, TOOL_ARG_VALUE}
+        {THINK_START, THINK_END, TOOL_START, *TOOL_INTERNALS}
     )
     fsm.CFG.transitions = {THINK_START: fsm.REASONING, THINK_END: fsm.CONTENT}
     # Disjoint on purpose: it is the only way this suite can tell the two masks
@@ -175,7 +177,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 self.assertFalse(self.ep.fsm_content_row_buf.any())
 
     def test_set_fsm_content_rows_does_not_touch_the_reasoning_buffer(self):
-        self.ep.set_fsm_rows([True] * self.stride * self.max_bs, (EOS,))
+        self.ep.set_fsm_rows([True] * self.stride * self.max_bs)
         self.ep.set_fsm_content_rows([False] * self.stride * self.max_bs)
         self.assertTrue(self.ep.fsm_row_buf.all())
 
@@ -184,7 +186,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         apply_folded_mask call in _apply_fsm_mask and this is what fails."""
         logits = self._logits()
         # rows 0..3 = request 0 (REASONING), rows 4..7 = request 1 (CONTENT).
-        self.ep.set_fsm_rows([True] * self.stride + [False] * self.stride, (EOS,))
+        self.ep.set_fsm_rows([True] * self.stride + [False] * self.stride)
         self.ep.set_fsm_content_rows([False] * self.stride + [True] * self.stride)
         self.ep._apply_fsm_mask(bs=self.max_bs)
 
@@ -234,7 +236,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         sets shut, no exception -- so the failure surfaces in the flag tests."""
         logits = self._logits()
         n = self.max_bs * self.stride
-        self.ep.set_fsm_rows([True] * n, (EOS,))
+        self.ep.set_fsm_rows([True] * n)
         self.ep.set_fsm_content_rows([True] * n)
         self.ep._apply_fsm_mask(bs=self.max_bs)
         self.assertTrue(torch.isinf(logits[:, EOS]).all())
@@ -311,7 +313,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         with self.assertLogs(
             "sglang.srt.speculative.dspark_components.dspark_verify", level="ERROR"
         ) as logs:
-            self.ep.set_fsm_rows(rows, fsm.CFG.reasoning_forbidden)
+            self.ep.set_fsm_rows(rows)
             self.ep.set_fsm_content_rows(rows)
             self.ep.set_fsm_content_notools_rows(rows)
         self.assertEqual(len(self.ep._ids_checked), 3, self.ep._ids_checked)
@@ -367,7 +369,12 @@ class TestEpilogueFsmMasks(CustomTestCase):
         opener both land on a no-tools row. Delete the third apply_folded_mask
         call and only the opener survives here."""
         logits = self._logits()
-        self.ep.set_fsm_content_rows([True] * self.stride + [False] * self.stride)
+        # Both rows carry the shared mask; only the first is no-tools. Giving
+        # the two setters the same flags would leave row `stride` armed by
+        # neither, and then every assertion below about it holds vacuously --
+        # including under a mutation that points the third mask at the shared
+        # row buffer, which would mask the opener on every tools request.
+        self.ep.set_fsm_content_rows([True] * self.stride * self.max_bs)
         self.ep.set_fsm_content_notools_rows(
             [True] * self.stride + [False] * self.stride
         )
@@ -382,6 +389,9 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.assertFalse(torch.isneginf(logits[self.stride, TOOL_START]))
         for tid in TOOL_INTERNALS:
             self.assertFalse(torch.isneginf(logits[self.stride, tid]), tid)
+        # ...while still carrying the shared set, which is what makes the row a
+        # control for the no-tools mask rather than an unarmed row.
+        self.assertTrue(torch.isneginf(logits[self.stride, THINK_START]))
 
     def test_the_notools_setter_stages_exactly_the_flags(self):
         flags = [True, False, True, False, False, False, False, True]
@@ -414,6 +424,25 @@ class TestEpilogueFsmMasks(CustomTestCase):
         ) as cm:
             self.ep.set_fsm_content_notools_rows([True] * self.stride)
         self.assertIn("no-tools", "\n".join(cm.output))
+
+    def test_the_worker_arms_the_reasoning_mask_from_the_reasoning_flags(self):
+        """The guard its two siblings have. Hand this setter the content flags
+        instead and every test here still passes, while content rows take the
+        reasoning set -- EOS forbidden after the answer is done, so generation
+        runs to max_new_tokens. That is the shape this port was written to
+        fix."""
+        tree = ast.parse(inspect.getsource(dspark_worker_v2))
+        calls = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "set_fsm_rows"
+        ]
+        self.assertEqual(len(calls), 1, "the reasoning mask must be armed once")
+        arg = calls[0].args[0]
+        self.assertIsInstance(arg, ast.Call)
+        self.assertEqual(arg.func.attr, "folded_mask_flags")
 
     def test_the_worker_arms_the_notools_mask_with_the_notools_flags(self):
         """Source-shape guard, like the CONTENT one: the call is invisible to

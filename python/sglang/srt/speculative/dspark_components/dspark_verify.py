@@ -516,14 +516,14 @@ def _fsm_content_forbidden_ids() -> List[int]:
     from ``CFG.content_done_forbidden``, because this buffer is armed per
     request off committed state and then applied to every chain row:
 
-    * the tool-call internals (``<|tool_arg:start|>``, ``<|tool_arg:value|>``,
+    the tool-call internals (``<|tool_arg:start|>``, ``<|tool_arg:value|>``,
       ``<|tool_arg:end|>``, ``<|tool_call:end|>``). A chain may legally open a
       tool call -- ``<|tool_call:start|>`` is allowed in CONTENT -- and the
       rows after it are in tool states, which need exactly those sentinels.
       Masking them there would not reject the row, it would commit a different
       token and hand back a malformed call. Committed tool states go eager
       (``_content_needs_eager``), so the eager plan covers them properly.
-    Nothing else is dropped: what remains (``<|think:start|>``, ``<|think:end|>``,
+    Nothing else is dropped -- what remains (``<|think:start|>``, ``<|think:end|>``,
       ``<|im:start|>``, ``<|im:content|>``, ``<|tool_response:*|>``) is illegal
       in CONTENT and in every state one chain can reach from it.
 
@@ -553,15 +553,14 @@ def _fsm_content_notools_forbidden_ids() -> List[int]:
     """The whole CONTENT forbidden set for a request that offers no tools.
 
     Not the difference against :func:`_fsm_content_forbidden_ids` -- the whole
-    set, applied on top of it, because the two subtractions that shape the
+    set, applied on top of it (it also holds ``<|tool_call:start|>``, which the
+    shared buffer never carries), because the subtraction that shape the
     shared buffer both lose their justification here:
 
-    * the tool-call internals are dropped there because a chain may legally
+    the tool-call internals are dropped there because a chain may legally
       open a tool call and the rows after it need them. No tools makes
       ``<|tool_call:start|>`` illegal in every state, so no such chain exists
       and there is no legal call for masking them to break.
-    * ``<|tool_call:start|>`` itself, which the shared buffer never carries.
-
     Carrying the full set needs no coordination with what the shared buffer
     holds, which is the point: a difference-set buffer would silently
     under-mask the moment ``configure_ids`` made the two tables differ by
@@ -764,7 +763,7 @@ class DsparkVerifyEpilogue:
         )
         self._stage_rows(buf=self.fsm_content_notools_row_buf, flags=flags)
 
-    def set_fsm_rows(self, flags, forbidden_ids=None) -> None:
+    def set_fsm_rows(self, flags) -> None:
         """Stage the in-graph reasoning mask for the step about to launch.
 
         Host-side, before the target verify, in the same window ``begin_step``
@@ -779,7 +778,7 @@ class DsparkVerifyEpilogue:
             return
         self._check_forbid_ids(
             buf=self.fsm_forbid_buf,
-            want=lambda: list(forbidden_ids or ()),
+            want=_fsm_forbidden_ids,
             label="reasoning",
         )
         self._stage_rows(buf=self.fsm_row_buf, flags=flags)

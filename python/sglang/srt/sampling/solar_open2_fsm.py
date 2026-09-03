@@ -1347,29 +1347,40 @@ def folded_content_notools_mask_flags(reqs, stride: int) -> Optional[List[bool]]
 def plan_gate(reqs, stride: int) -> bool:
     """Whether this verify step must leave the folded in-graph accept path.
 
-    The folded epilogue accepts inside the cuda graph off its own buffers and
-    ``plan_verify`` runs after the grammar barrier, so what only plan_verify
-    can do -- named by the two row predicates above -- must be decided here,
-    per row, from committed state. Outside a tool call a generation spends
-    only its boundary steps eager. The masks themselves are applied inside the
-    graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
-    for content-with-progress, and ``folded_content_notools_mask_flags``
-    layered over those of its rows that offer no tools), and the budget window
-    is ``2 * stride`` because the state read here can lag by one accepted run.
-    A grammar never reaches here at all -- ``fold_eligible`` requires
-    ``not batch.has_grammar`` -- so the grammar rows below are about the
-    request's own constraint, not a folded step.
+        The folded epilogue accepts inside the cuda graph off its own buffers and
+        ``plan_verify`` runs after the grammar barrier, so what only plan_verify
+        can do -- named by the two row predicates above -- must be decided here,
+        per row, from committed state. Outside a tool call a generation spends
+        only its boundary steps eager. The masks themselves are applied inside the
+        graph (``folded_mask_flags`` for REASONING, ``folded_content_mask_flags``
+        for content-with-progress, and ``folded_content_notools_mask_flags``
+        layered over those of its rows that offer no tools), and the budget window
+        is ``2 * stride`` because the state read here can lag by one accepted run.
+    Three folded-path gaps remain, all from applying one per-request
+        forbidden set to every chain row of a step:
 
-    Two folded-path gaps remain, both from applying one per-request forbidden
-    set to every chain row. Lag-derived and bounded at <= stride-1 rows: a
-    drafted ``<|think:start|>`` (see ``folded_mask_flags``). Not lag-derived
-    and therefore recurring on every folded step of such a request: the rows
-    after a legally drafted ``<|tool_call:start|>`` are in tool states, which
-    forbid bare EOS and ``<|im:end|>``, but carry the CONTENT set, which allows
-    both -- and ``_fsm_content_forbidden_ids`` drops the tool internals from
-    chain row 0 too, where no draft has moved the state. Closing either needs
-    a per-position buffer, not another per-request one. Host-only and
-    sync-free: it never touches the draft tokens.
+        * A drafted ``<|think:end|>`` leaves the rows after it in fresh CONTENT,
+          which forbids that token, while they still carry the reasoning set,
+          which allows it. A second ``<|think:end|>`` is accepted into the answer.
+        * A drafted ``<|think:start|>`` undermasks the rows after it against the
+          reasoning set (see ``folded_mask_flags``).
+        * The rows after a legally drafted ``<|tool_call:start|>`` are in tool
+          states, which forbid bare EOS and ``<|im:end|>``, but carry the CONTENT
+          set, which allows both -- so a drafted EOS ends the turn mid call. This
+          one has a companion that is *not* lag-derived:
+          ``_fsm_content_forbidden_ids`` drops the tool internals from chain row 0
+          too, where no draft has moved the state, so it recurs every folded step.
+
+        The first three are bounded at <= stride-1 rows and close themselves on the
+        next step's committed state. Making the last one eager would close both
+        tool-state holes -- ``_content_needs_eager`` returning True for any request
+        that offers tools does it in one clause -- at the cost of the folded accept
+        for all tool traffic. That is a throughput trade, not an impossibility, and
+        it is left untaken deliberately: nothing here masks per chain position, so
+        the alternative is a per-position buffer.
+
+        Host-only and
+        sync-free: it never touches the draft tokens.
     """
     if not is_active():
         return False

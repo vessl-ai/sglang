@@ -701,8 +701,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         epilogue = self._verify_executor.verify_epilogue
         if epilogue is not None:
             epilogue.set_fsm_rows(
-                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1]),
-                _solar_fsm.CFG.reasoning_forbidden,
+                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1])
             )
             epilogue.set_fsm_content_rows(
                 _solar_fsm.folded_content_mask_flags(batch.reqs, verify_ids_2d.shape[1])

@@ -40,15 +40,20 @@ TOOL_START = 102
 def _cfg(**over):
     fsm.CFG.enabled = True
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
-    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
+    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END, TOOL_START})
     fsm.CFG.transitions = {THINK_START: fsm.REASONING, THINK_END: fsm.CONTENT}
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
-    fsm.CFG.content_done_forbidden = (THINK_START,)
-    fsm.CFG.content_fresh_forbidden = (THINK_START, EOS)
-    fsm.CFG.content_done_forbidden_notools = (THINK_START, TOOL_START)
-    fsm.CFG.content_fresh_forbidden_notools = (THINK_START, TOOL_START, EOS)
+    fsm.CFG.content_done_forbidden = (THINK_START, THINK_END)
+    fsm.CFG.content_fresh_forbidden = (THINK_START, THINK_END, EOS)
+    fsm.CFG.content_done_forbidden_notools = (THINK_START, THINK_END, TOOL_START)
+    fsm.CFG.content_fresh_forbidden_notools = (
+        THINK_START,
+        THINK_END,
+        TOOL_START,
+        EOS,
+    )
     # plan_verify resolves CONTENT through _forbidden_for, which reads these;
     # without them a pairing test measures whatever the process left behind.
     fsm.CFG.forbidden = {
