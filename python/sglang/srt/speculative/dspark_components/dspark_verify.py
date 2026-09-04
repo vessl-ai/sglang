@@ -819,6 +819,16 @@ class DsparkVerifyEpilogue:
 
         The tensor work itself is ``solar_open2_fsm.apply_folded_mask``, which
         is where it is unit-tested.
+
+        This runs on every compact step, and ``VerifyPlan.apply`` may run over
+        the same tensor on the same step -- ``plan_gate`` decides whether the
+        eager plan is built, not whether these kernels fire. Both only ever
+        write ``-inf`` and neither restores a logit, so the applied mask is the
+        **union** of the two, never the eager one alone. That is why
+        ``SOLAR_FSM_SPEC_ALWAYS_EAGER`` can only narrow what is reachable: it
+        adds the eager plan to a step, and cannot take this one away. An arm
+        that flips it therefore does not isolate the in-graph mask, and a null
+        result from one says nothing about it.
         """
         if self.strided_logits is None:
             return

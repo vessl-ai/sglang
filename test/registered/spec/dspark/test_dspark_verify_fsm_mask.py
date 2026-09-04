@@ -356,6 +356,46 @@ class TestEpilogueFsmMasks(CustomTestCase):
             ):
                 self.fail("the greedy test is negated or compared, not required")
 
+    def test_the_in_graph_mask_is_not_gated(self):
+        """It fires on every compact step, and `VerifyPlan.apply` may write over
+        the same tensor on the same one -- `plan_gate` decides whether the eager
+        plan is built, not whether these kernels run. Both only write -inf, so
+        the applied mask is the union.
+
+        Putting `_apply_fsm_mask` behind a condition would look like a saving
+        and would silently unmask a replayed graph, because a graph is captured
+        once: the kernels have to be in it whether or not the FSM is on. It
+        would also make `SOLAR_FSM_SPEC_ALWAYS_EAGER` mean what a reader expects
+        it to mean, which it does not -- that flag adds the eager plan and
+        cannot take this one away.
+        """
+        # The class, not the module: both the call and the method live in it,
+        # and scoping here keeps an unrelated helper elsewhere in the file from
+        # answering for the one the epilogue runs.
+        epilogue = ast.parse(inspect.getsource(DsparkVerifyEpilogue))
+        calls = [
+            n
+            for n in ast.walk(epilogue)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_apply_fsm_mask"
+        ]
+        self.assertEqual(len(calls), 1, "_apply_fsm_mask is called once")
+        guarded = [
+            n
+            for n in ast.walk(epilogue)
+            if isinstance(n, (ast.If, ast.IfExp))
+            and any(
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute)
+                and c.func.attr == "_apply_fsm_mask"
+                for c in ast.walk(n)
+            )
+        ]
+        self.assertEqual(
+            guarded, [], "_apply_fsm_mask must not sit under a condition"
+        )
+
     def test_the_fold_gate_requires_the_fsm_to_stand_down(self):
         """Leg B. `plan_gate` decides, per step, that the committed state is
         too close to a boundary for the in-graph masks to be right -- a spent
