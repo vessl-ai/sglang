@@ -138,13 +138,12 @@ class TestParallelToolCalls(unittest.TestCase):
 
 
 class TestSolarOpen2ParallelToolCallsFalse(unittest.TestCase):
-    """The legacy structural tag solar_open2 uses for required/named
-    tool_choice (see SolarOpen2Detector.structure_info) only exposes
-    ``at_least_one``; it has no knob to cap the number of calls. So
-    ``parallel_tool_calls=False`` is not enforced by the grammar here —
-    OpenAIServingChat._solar_single_call_stop_matched enforces it instead,
-    by injecting ``<|tool_call:end|>`` as a stop string and gluing it back
-    onto the trimmed text before handing it to the detector.
+    """required/named tool_choice use the JSON-schema array constraint, whose
+    ``maxItems=1`` caps the call count for ``parallel_tool_calls=False``. For
+    ``auto`` (no grammar) OpenAIServingChat enforces it instead: it injects
+    ``<|tool_call:end|>`` as a stop string (solar_open2_serving rule 3) and
+    glues it back onto the trimmed text before handing it to the detector
+    (rule 4).
     """
 
     def setUp(self):
@@ -164,13 +163,14 @@ class TestSolarOpen2ParallelToolCallsFalse(unittest.TestCase):
         ]
         self.parser = FunctionCallParser(self.tools, "solar_open2")
 
-    def test_structural_tag_ignores_parallel_tool_calls_false(self):
+    def test_json_schema_caps_parallel_tool_calls_false(self):
         result = self.parser.get_structure_constraint(
             "required", parallel_tool_calls=False
         )
         self.assertIsNotNone(result)
-        self.assertEqual(result[0], "structural_tag")
-        self.assertTrue(result[1].at_least_one)
+        self.assertEqual(result[0], "json_schema")
+        self.assertEqual(result[1]["minItems"], 1)
+        self.assertEqual(result[1]["maxItems"], 1)
 
     def test_stop_trimmed_call_glued_back_yields_one_call_non_stream(self):
         trimmed = '<|tool_call:start|>get_weather\n{"location": "Seoul"}'

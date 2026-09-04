@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     mamba_extra_buffer_lazy_enabled,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -663,9 +664,7 @@ class SchedulerBatchResultProcessor:
         # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
 
-        # --- solar-open2 FSM commit advance (injected) ---
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
+        # --- solar-open2 FSM commit advance ---
         _solar_fsm.advance_committed(result, batch)
 
         predict_tokens = []

@@ -1,8 +1,12 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
 import json
+import os
+import re
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.parser import reasoning_parser as reasoning_parser_module
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
@@ -1631,9 +1635,11 @@ class TestSolarOpen2NoEndTag(CustomTestCase):
 
     A stop string or the token budget can end generation inside the think
     block. The text stays on the reasoning channel and content is empty --
-    the contract Upstage states for this model (2026-09-01). The reference
-    parser (UpstageAI/vllm) returns the whole output as content instead,
-    which this class asserted until the behaviour was measured end to end:
+    the contract Upstage states for this model (2026-09-01). The vendor's
+    current parser (2026-09-01 patch set) does the same when the request's
+    effort opened the block; its older parser returned the whole output as
+    content, which this class asserted until the behaviour was measured end
+    to end:
     ``stop:["**"]`` came back as ``content="Thinking Process:\n\n1.  "``
     with ``finish_reason: "stop"``, so a caller reads a few tokens of
     thinking preamble as a complete short answer. Any stop string occurring
@@ -1723,10 +1729,6 @@ class TestSolarOpen2NoEndTag(CustomTestCase):
         self.assertEqual(content, "Hello")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
     """Continuing an assistant turn resumes inside the think block.
 
@@ -1774,3 +1776,194 @@ class TestSolarOpen2ContinueFinalMessage(CustomTestCase):
         ret = detector.detect_and_parse("still thinking")
         self.assertEqual(ret.reasoning_text, "still thinking")
         self.assertEqual(ret.normal_text, "")
+
+
+class TestSolarOpen2ForceReasoning(CustomTestCase):
+    """The chat template opens the think block only for medium/high, so the
+    parser must start inside reasoning exactly then -- through the module
+    function and through ReasoningParser(request=...)."""
+
+    CASES = (
+        (None, True),
+        ("medium", True),
+        ("High", True),
+        (" high ", True),
+        ("low", False),
+        ("none", False),
+        ("minimal", False),
+        ("xhigh", False),  # folded to "high" by the serving layer before here
+    )
+
+    def test_effort_decides_the_initial_state(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.parser.reasoning_parser import (
+            ReasoningParser,
+            solar_open2_force_reasoning,
+        )
+
+        # No request object at all (scheduler-side parsers): the template
+        # default, i.e. the block opens.
+        self.assertTrue(solar_open2_force_reasoning(None))
+        for effort, expected in self.CASES:
+            for route in ("field", "chat_template_kwargs"):
+                with self.subTest(effort=effort, route=route):
+                    if route == "field":
+                        req = SimpleNamespace(
+                            reasoning_effort=effort, chat_template_kwargs=None
+                        )
+                    else:
+                        req = SimpleNamespace(
+                            reasoning_effort=None,
+                            chat_template_kwargs=(
+                                {"reasoning_effort": effort} if effort else None
+                            ),
+                        )
+                    self.assertEqual(solar_open2_force_reasoning(req), expected)
+                    parser = ReasoningParser("solar_open2", request=req)
+                    self.assertEqual(parser.detector._in_reasoning, expected)
+                    text = "answer only"
+                    reasoning, normal = parser.parse_non_stream(text)
+                    self.assertEqual(
+                        (reasoning, normal), (text, "") if expected else ("", text)
+                    )
+
+    def test_non_streaming_keeps_a_sentinel_fragment_as_content(self):
+        """Non-streaming follows the vendor: a fragment of <|think:end|> at the
+        head of the content region stays content (streaming drops it)."""
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        ret = SolarOpen2Detector(force_reasoning=True).detect_and_parse(
+            "thinking<|think:end|><|thi"
+        )
+        self.assertEqual((ret.reasoning_text, ret.normal_text), ("thinking", "<|thi"))
+
+    def test_split_partial_sentinel_at_eos_is_dropped_too(self):
+        """A sentinel fragment after <|think:end|> is dropped at stream end
+        whether it arrived in the same delta or a later one."""
+        from sglang.srt.parser.reasoning_parser import SolarOpen2Detector
+
+        for pieces in (
+            ["thinking", "<|think:end|><|think"],
+            ["thinking", "<|think:end|>", "<|think"],
+        ):
+            with self.subTest(pieces=pieces):
+                detector = SolarOpen2Detector(force_reasoning=True)
+                content = ""
+                for piece in pieces:
+                    content += detector.parse_streaming_increment(piece).normal_text
+                with self.assertLogs("sglang.srt.parser.reasoning_parser", "WARNING"):
+                    content += detector.finish().normal_text
+                self.assertEqual(content, "")
+
+
+class TestSolarOpen2OpenerInsideReasoning(CustomTestCase):
+    """INF-451: the model spells the tool-call opener inside its reasoning
+    (quoting the format) and closes the block properly afterwards.
+
+    Non-streaming splits at ``<|think:end|>`` first
+    (BaseReasoningFormatDetector._detect_and_parse_impl), so the opener stays
+    reasoning. Streaming decides per chunk (_parse_streaming_increment_impl):
+    a chunk holding the closer splits there too, but a chunk holding the opener
+    and not yet the closer ends reasoning at the opener (the tool escape), after
+    which the closer reaches the client as content (the tool detector holds an
+    opener that never parses and releases it at stream end). Pinned as the
+    documented divergence; how often the model does this is live-only.
+    """
+
+    OPENER = "<|tool_call:start|>"
+    END = "<|think:end|>"
+    TEXT = f"about {OPENER} format{END}Answer"
+    WHOLE_BLOCK = (f"about {OPENER} format", "Answer")
+    EARLY_CUT = ("about ", f"{OPENER} format{END}Answer")
+
+    def _feed(self, chunk_size):
+        detector = SolarOpen2Detector()
+        reasoning = normal = ""
+        for i in range(0, len(self.TEXT), chunk_size):
+            ret = detector.parse_streaming_increment(self.TEXT[i : i + chunk_size])
+            reasoning += ret.reasoning_text
+            normal += ret.normal_text
+        ret = detector.finish()
+        return reasoning + ret.reasoning_text, normal + ret.normal_text
+
+    def test_non_stream_keeps_the_opener_in_reasoning(self):
+        ret = SolarOpen2Detector().detect_and_parse(self.TEXT)
+        self.assertEqual((ret.reasoning_text, ret.normal_text), self.WHOLE_BLOCK)
+        self.assertEqual(
+            ReasoningParser("solar_open2").parse_non_stream(self.TEXT),
+            self.WHOLE_BLOCK,
+        )
+
+    def test_streaming_is_chunk_dependent(self):
+        """A chunk that carries both sentinels (or the whole closer before the
+        opener completes) splits at the closer; smaller chunks complete the
+        opener first and escape there."""
+        for chunk_size in (1, 2, 3, 5, 7, 11):
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(self._feed(chunk_size), self.EARLY_CUT)
+        for chunk_size in (23, 1000):
+            with self.subTest(chunk_size=chunk_size):
+                self.assertEqual(self._feed(chunk_size), self.WHOLE_BLOCK)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestSolarOpen2EffortSetMatchesTheTemplate(CustomTestCase):
+    """`solar_open2_force_reasoning` decides whether the reasoning detector
+    starts inside the think block, and it must agree with the chat template's
+    own branch: the template opens `<|think:start|>` for some efforts and
+    pre-closes it for the rest.
+
+    Nothing tied the two together. If they disagree for an effort the template
+    opens, the detector starts in content and the whole think block -- the
+    literal `<|think:end|>` with it, since that token is not special -- is
+    served to the client as the answer. The checkpoint's template is checked in
+    at test/srt/fixtures/solar_open2_chat_template.jinja and, until this ran,
+    was referenced by nothing at all.
+    """
+
+    # .../test/registered/unit/parser/<this file> -> .../test/srt/fixtures/
+    TEMPLATE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        *([os.pardir] * 3),
+        "srt",
+        "fixtures",
+        "solar_open2_chat_template.jinja",
+    )
+
+    def test_the_generation_prompt_branch_lists_the_same_efforts(self):
+        with open(self.TEMPLATE) as f:
+            template = f.read()
+        # The one branch that decides whether the prompt ends with an open
+        # think block, rather than a pre-closed pair.
+        match = re.search(
+            r"\{%-\s*if\s+reasoning_effort\s+in\s*\[([^\]]*)\]\s*-%\}\s*"
+            r'\{\{-\s*"<\|im:start\|>assistant<\|im:content\|><\|think:start\|>"\s*\}\}',
+            template,
+        )
+        self.assertIsNotNone(
+            match, "the template's think-open branch moved; this test is blind"
+        )
+        efforts = tuple(re.findall(r'"([^"]+)"', match.group(1)))
+        self.assertEqual(
+            efforts,
+            reasoning_parser_module._SOLAR_OPEN2_THINK_OPEN_EFFORTS,
+            "the parser and the template disagree about which efforts open a "
+            "think block; the ones only the template opens leak their whole "
+            "reasoning into content",
+        )
+
+    def test_every_effort_the_template_opens_forces_reasoning(self):
+        """The same property through the function, not the constant."""
+        for effort in reasoning_parser_module._SOLAR_OPEN2_THINK_OPEN_EFFORTS:
+            with self.subTest(effort):
+                self.assertTrue(
+                    reasoning_parser_module.solar_open2_force_reasoning(
+                        SimpleNamespace(
+                            reasoning_effort=effort, chat_template_kwargs=None
+                        )
+                    )
+                )

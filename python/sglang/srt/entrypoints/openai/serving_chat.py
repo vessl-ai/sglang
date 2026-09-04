@@ -25,6 +25,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import chat_encoding, encoding_dsv4, encoding_dsv32
+from sglang.srt.entrypoints.openai import solar_open2_serving as solar
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageGenericParam,
     ChatCompletionRequest,
@@ -66,9 +67,6 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.solar_open2_detector import (
-    TOOL_CALL_END as SOLAR_OPEN2_TOOL_CALL_END,
-)
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -76,9 +74,14 @@ from sglang.srt.function_call.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.sampling.solar_open2_fsm import EFFORT_PARAM as SOLAR_OPEN2_EFFORT_PARAM
-from sglang.srt.sampling.solar_open2_fsm import TOOLS_PARAM as SOLAR_OPEN2_TOOLS_PARAM
+from sglang.srt.parser.reasoning_parser import (
+    ReasoningParser,
+    solar_open2_force_reasoning,
+)
+
+# Safety cap for the stream-end drain of a required/named JSON array (see
+# _drain_json_array); the loop stops earlier as soon as a step yields nothing.
+_JSON_ARRAY_DRAIN_MAX_STEPS = 512
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -194,6 +197,32 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def _drain_json_array(parser: JsonArrayParser, tools: List[Tool]):
+    """Stream-end drain of a required/named JSON array.
+
+    The base JSON detector advances one call one step (its name, or its
+    arguments) per increment. When the last delta carries the rest of the
+    array -- a short call under the grammar, or the close of one call plus
+    the whole of the next -- there is no next increment, so feed empty steps
+    until one yields no call and no real text. Whitespace the drain releases
+    from the array's tail is not content. Returns (text, calls)."""
+    text, calls = "", []
+    for _ in range(_JSON_ARRAY_DRAIN_MAX_STEPS):
+        step = parser.parse_streaming_increment("", tools)
+        step_text = step.normal_text or ""
+        if not step.calls and not step_text.strip():
+            return text, calls
+        if step_text.strip():
+            text += step_text
+        calls.extend(step.calls)
+    logger.warning(
+        "Tool-call array drain stopped at %d steps with output still buffered; "
+        "the client receives a truncated call list",
+        _JSON_ARRAY_DRAIN_MAX_STEPS,
+    )
+    return text, calls
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -733,6 +762,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
+            finishing = finish_reason_type is not None and finish_reason_type != "abort"
+            glue_terminator = self._solar_single_call_stop_matched(
+                request,
+                effective_tools=self._effective_tools(request),
+                finish_reason=content["meta_info"].get("finish_reason"),
+            )
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -741,36 +776,33 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
+                # The stream-end flush runs after the glue below: the detector
+                # is still holding the trimmed call, and the terminator must
+                # reach it before finish() releases held text as content.
+                flush=finishing and not glue_terminator,
             ):
                 if chunk:
                     yield chunk
 
+            if glue_terminator and index in parser_dict:
+                # solar_open2_serving rule 4: feed the trimmed terminator back
+                # (only onto an open call) as one more increment, then flush,
+                # before the finish_reason chunk goes out.
+                async for chunk in self._process_tool_call_stream(
+                    index,
+                    solar.glue_for_stream(parser_dict[index]),
+                    parser_dict,
+                    content,
+                    request,
+                    has_tool_calls,
+                    continuous_usage_stats,
+                    flush=finishing,
+                ):
+                    if chunk:
+                        yield chunk
+
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
-                if self._solar_single_call_stop_matched(
-                    request,
-                    self._effective_tools(request),
-                    content["meta_info"].get("finish_reason"),
-                ):
-                    # The stop string that halted generation was the
-                    # terminator this call needs to close (see
-                    # _solar_single_call_stop_matched) and the detokenizer
-                    # trimmed it; feed it back in as one more increment so
-                    # the buffered detector emits the completed call before
-                    # the finish_reason chunk goes out.
-                    async for chunk in self._process_tool_call_stream(
-                        index,
-                        SOLAR_OPEN2_TOOL_CALL_END,
-                        parser_dict,
-                        content,
-                        request,
-                        has_tool_calls,
-                        continuous_usage_stats,
-                    ):
-                        if chunk:
-                            yield chunk
-
                 parser = parser_dict[index]
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
@@ -864,6 +896,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and not effective_tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+
+        if solar.is_solar_cell(self.reasoning_parser, self.tool_call_parser):
+            solar_error = solar.validate_request(request)
+            if solar_error:
+                return solar_error
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not effective_tools:
@@ -1073,80 +1110,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    # The solar_open2 chat template opens thinking only for medium/high
-    # (reasoning_parser._SOLAR_OPEN2_THINK_OPEN_EFFORTS); any other value
-    # pre-closes the think block, so an effort above high would silently
-    # disable reasoning. Fold those values into "high" before the template,
-    # require_reasoning, and the reasoning parser read the request.
-    _SOLAR_OPEN2_EFFORT_FOLD = ("xhigh", "max")
-
-    def _normalize_solar_open2_reasoning_effort(
-        self, request: ChatCompletionRequest
-    ) -> None:
-        effort = request.reasoning_effort
-        ctk = request.chat_template_kwargs
-        requested = (
-            effort if effort is not None else (ctk or {}).get("reasoning_effort")
-        )
-        # The scheduler-side FSM sizes the reasoning budget from the effort the
-        # request asked for (solar_open2_fsm: low 4K .. max 128K), so hand it
-        # over before the fold below hides xhigh/max from the template.
-        # custom_params rides SamplingParams to the Req. The entrypoint owns
-        # the key: a value a client put there itself is not a budget override.
-        custom = dict(request.custom_params or {})
-        custom.pop(SOLAR_OPEN2_EFFORT_PARAM, None)
-        if isinstance(requested, str) and requested.strip():
-            custom[SOLAR_OPEN2_EFFORT_PARAM] = requested.strip().lower()
-        # Whether a tool call can be answered at all -- the tool-call parser's
-        # own condition (tools offered, tool_choice not "none", a parser
-        # configured). Otherwise the FSM forbids <|tool_call:start|> in
-        # CONTENT, where a model shut out of EOS takes it as the exit.
-        custom[SOLAR_OPEN2_TOOLS_PARAM] = self._tool_call_parsing_active(request)
-        request.custom_params = custom
-        if isinstance(effort, str) and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD:
-            request.reasoning_effort = "high"
-        if ctk:
-            effort = ctk.get("reasoning_effort")
-            if (
-                isinstance(effort, str)
-                and effort.lower() in self._SOLAR_OPEN2_EFFORT_FOLD
-            ):
-                ctk["reasoning_effort"] = "high"
-            if isinstance(request.reasoning_effort, str) and "reasoning_effort" in ctk:
-                # One source for the template: the request's (folded) effort.
-                # A server default in --default-chat-template-kwargs lands in
-                # ctk after the client's own value was moved to the request
-                # field, and the template reads ctk last -- without this the
-                # template would follow the server default while the budget
-                # follows the client.
-                ctk["reasoning_effort"] = request.reasoning_effort
-
     def _solar_single_call_stop_matched(
         self,
         request: ChatCompletionRequest,
+        *,
         effective_tools: List[Tool],
         finish_reason: Optional[Dict[str, Any]],
     ) -> bool:
-        """True when this request injected the Solar Open2 per-call
-        terminator as a stop string (parallel_tool_calls=False; the legacy
-        structural tag built from SolarOpen2Detector.structure_info has no
-        call-count limit — only at_least_one — so the cap is enforced by
-        halting generation at the first call's terminator instead) and
-        generation halted on exactly that stop. The detokenizer trims a
-        matched stop string from the output by default, so the terminator
-        the detector requires must be glued back on before parsing -- unless
-        no_stop_trim asked to keep it, in which case it is already in the
-        text and the parser already consumed it; gluing it back on again
-        would leak a second copy."""
-        return bool(
-            self.tool_call_parser == "solar_open2"
-            and request.tool_choice != "none"
-            and effective_tools
-            and request.parallel_tool_calls is False
-            and not request.no_stop_trim
-            and finish_reason
-            and finish_reason.get("type") == "stop"
-            and finish_reason.get("matched") == SOLAR_OPEN2_TOOL_CALL_END
+        """solar_open2_serving rule 4 (the injected terminator halted
+        generation and was trimmed)."""
+        return solar.single_call_stop_matched(
+            self.tool_call_parser,
+            request=request,
+            effective_tools=effective_tools,
+            finish_reason=finish_reason,
         )
 
     def _process_messages(
@@ -1162,8 +1139,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
-        if self.reasoning_parser == "solar_open2":
-            self._normalize_solar_open2_reasoning_effort(request)
+        if solar.is_solar_cell(self.reasoning_parser, self.tool_call_parser):
+            solar.normalize_reasoning_effort(
+                request, tools_available=self._tool_call_parsing_active(request)
+            )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -1207,20 +1186,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
                     tool_call_stop = parser.detector.eot_token
-                elif (
-                    self.tool_call_parser == "solar_open2"
-                    and request.parallel_tool_calls is False
+                elif solar.injects_single_call_stop(
+                    self.tool_call_parser,
+                    request=request,
+                    effective_tools=effective_tools,
                 ):
-                    # The structural tag (when tool_choice is required/named
-                    # or strict) forces each call's envelope but has no
-                    # call-count knob — only at_least_one — and for auto
-                    # there is no constraint at all, so parallel_tool_calls
-                    # =False is enforced by halting generation at the first
-                    # call's terminator instead. Unlike kimi_k3's stop (a
+                    # solar_open2_serving rule 3. Unlike kimi_k3's stop (a
                     # section-envelope closer outside each call, harmless to
-                    # trim), this terminator is required inside every call,
-                    # so _process_tool_calls / _process_tool_call_stream glue
-                    # it back onto the text before parsing.
+                    # trim), this terminator is required inside every call, so
+                    # the response paths glue it back before parsing (rule 4).
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
@@ -1745,10 +1719,21 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
+                matched_stop = finish_reason_data.get("matched")
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
-
-                matched_stop = finish_reason_data.get("matched")
+                    # As on the non-streaming path: a stop that was rewritten
+                    # to tool_calls does not expose the (internal) stop string
+                    # -- for Solar Open2 that is the call terminator itself.
+                    matched_stop = None
+                elif self._solar_single_call_stop_matched(
+                    request,
+                    effective_tools=self._effective_tools(request),
+                    finish_reason=finish_reason_data,
+                ):
+                    # The injected terminator halted generation but nothing
+                    # parsed as a call: still not a client-visible stop string.
+                    matched_stop = None
 
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
@@ -1928,9 +1913,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
 
             if self._solar_single_call_stop_matched(
-                request, effective_tools, finish_reason
+                request, effective_tools=effective_tools, finish_reason=finish_reason
             ):
-                text += SOLAR_OPEN2_TOOL_CALL_END
+                # solar_open2_serving rule 4: the internal stop is never
+                # reported as matched_stop; the terminator is glued back only
+                # onto an open call.
+                finish_reason["matched"] = None
+                text += solar.glue_for_text(text)
 
             # Handle reasoning content
             reasoning_text = None
@@ -2144,17 +2133,21 @@ class OpenAIServingChat(OpenAIServingBase):
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
+                    raw_text = text
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
                         logger.warning(
                             "Tool call marker present but no complete call parsed "
-                            "from %s output; dropping the incomplete call",
+                            "from %s output; the parser's content (%d of %d chars) "
+                            "is returned",
                             self.tool_call_parser,
+                            len(text),
+                            len(raw_text),
                         )
                         logger.debug(
                             "Unparsed tool call output (%d chars): %r",
-                            len(text),
-                            text[:2000],
+                            len(raw_text),
+                            raw_text[:2000],
                         )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
@@ -2470,10 +2463,6 @@ class OpenAIServingChat(OpenAIServingBase):
             # scheduler's usage counter (Req.update_reasoning_tokens) would
             # then label every completion token as reasoning. Same rule as
             # the reasoning parser (solar_open2_force_reasoning).
-            from sglang.srt.parser.reasoning_parser import (
-                solar_open2_force_reasoning,
-            )
-
             return solar_open2_force_reasoning(request)
 
         if self.reasoning_parser == "minimax-m3":
@@ -2600,7 +2589,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
+            # Under the array constraint the output is the array; whitespace
+            # around it is not content.
+            normal_text = (
+                result.normal_text if (result.normal_text or "").strip() else ""
+            )
+            calls = result.calls
+            if flush:
+                tail_text, tail_calls = _drain_json_array(parser, effective_tools)
+                normal_text = (normal_text or "") + tail_text
+                calls = list(calls) + tail_calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

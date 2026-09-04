@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.sampling import solar_open2_fsm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -56,22 +57,22 @@ def _req(
 def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     """Build a SolarReqFSM with explicit state, bypassing the prompt walk."""
     fsm = solar_open2_fsm.SolarReqFSM.__new__(solar_open2_fsm.SolarReqFSM)
-    fsm.in_reasoning = in_reasoning
+    fsm.state = solar_open2_fsm.REASONING if in_reasoning else solar_open2_fsm.CONTENT
     fsm.count = count
     fsm.consumed = consumed
     fsm.budget = budget
     fsm.forced = False
     fsm.content_progress = False
     fsm.at_think_open = False
+    fsm.tools = True
     return fsm
 
 
-class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
+class SolarOpen2FsmVerifyTestBase(CustomTestCase):
     """Wires CFG to a tiny fake vocab and undoes it after every test."""
 
     _CFG_FIELDS = (
         "enabled",
-        "budget_policy",
         "effort_budgets",
         "default_effort",
         "hard_limit",
@@ -83,12 +84,10 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         "think_end",
         "im_end",
         "all_controls",
+        "transitions",
         "reasoning_forbidden",
         "content_fresh_forbidden",
         "content_done_forbidden",
-        "budget_ratio",
-        "budget_abs",
-        "content_mask",
         "spec_always_eager",
     )
 
@@ -100,6 +99,10 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.think_end = THINK_END
         cfg.im_end = IM_END
         cfg.all_controls = frozenset({THINK_START, THINK_END, IM_END})
+        cfg.transitions = {
+            THINK_START: solar_open2_fsm.REASONING,
+            THINK_END: solar_open2_fsm.CONTENT,
+        }
         cfg.reasoning_forbidden = (EOS, IM_END)
         cfg.leading_newline_forbidden = ()
         cfg.reasoning_open_forbidden = (EOS, IM_END)
@@ -107,15 +110,13 @@ class SolarOpen2FsmVerifyTestBase(unittest.TestCase):
         cfg.content_done_forbidden = ()
         cfg.content_fresh_forbidden_notools = (EOS,)
         cfg.content_done_forbidden_notools = ()
-        # These suites pin the budget by hand; keep the legacy formula so the
-        # per-effort table cannot reach past the fixture's budget_abs.
-        cfg.budget_policy = "legacy"
-        cfg.budget_ratio = 0.75
-        cfg.budget_abs = 1000
-        cfg.content_mask = False
+        # These suites pin the budget by hand: one effort, 1000 tokens.
+        cfg.effort_budgets = {"high": 1000}
+        cfg.default_effort = "high"
+        cfg.hard_limit = 1000
         cfg.spec_always_eager = False
         cfg._mask_cache.clear()
-        solar_open2_fsm._CONFLICT_LOG["last"] = 0.0
+        solar_open2_fsm._CONFLICT_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
         solar_open2_fsm._CONFLICT_LOG["num_suppressed"] = 0
 
     def tearDown(self):
@@ -201,8 +202,31 @@ class TestNonSpecApplyForceGuard(SolarOpen2FsmVerifyTestBase):
         original_row0 = logits[0].clone()
 
         sampling_info = types.SimpleNamespace(solar_fsm_rows=[req0, req1])
-        with self.assertLogs(solar_open2_fsm.logger, level="WARNING"):
+        with self.assertLogs(solar_open2_fsm.logger, level="INFO") as logs:
             solar_open2_fsm.apply(logits, sampling_info)
+        # One warning for the row left to the grammar, one info for the forced
+        # row; a second pass on the same request does not log the force again.
+        self.assertEqual(
+            [l.split(":")[0] for l in logs.output], ["WARNING", "INFO"], logs.output
+        )
+        self.assertIn("r1", logs.output[1])
+        self.assertFalse(fsm0.forced)
+        self.assertTrue(fsm1.forced)
+        with self.assertNoLogs(solar_open2_fsm.logger, level="INFO"):
+            solar_open2_fsm.apply(logits, sampling_info)
+        # The conflict warning is rate-limited per row: with both rows now
+        # closed by the grammar, one suppressed pass counts two, and the next
+        # report carries that count.
+        logits[1, THINK_END] = float("-inf")
+        with self.assertNoLogs(solar_open2_fsm.logger, level="INFO"):
+            solar_open2_fsm.apply(logits, sampling_info)
+        self.assertEqual(solar_open2_fsm._CONFLICT_LOG["num_suppressed"], 3)
+        solar_open2_fsm._CONFLICT_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
+        with self.assertLogs(solar_open2_fsm.logger, level="WARNING") as logs:
+            solar_open2_fsm.apply(logits, sampling_info)
+        self.assertIn("3 earlier occurrence(s) suppressed", logs.output[0])
+        self.assertEqual(solar_open2_fsm._CONFLICT_LOG["num_suppressed"], 0)
+        logits[1, THINK_END] = 0.0
 
         # Row 0: forced skipped, logits unchanged, still has finite entries.
         self.assertTrue(torch.equal(logits[0], original_row0))

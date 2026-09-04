@@ -628,7 +628,7 @@ def attach_additional_stop_token_ids(tokenizer):
     tokenizer.additional_stop_token_ids = stop_ids or None
 
 
-# --- solar-open2 port (injected) ---
+# --- solar-open2 port ---
 try:
     from sglang.srt.configs.solar_open2 import SolarOpen2Config as _SolarOpen2Config
 
@@ -640,7 +640,6 @@ try:
             "already used" not in str(_solar_err).lower()
         ):
             raise
-    logger.info("[SOLAR-PATCH] registered SolarOpen2Config (model_type=solar_open2)")
 except Exception as _solar_err:  # fail loudly: a silent skip means a wrong model
     logger.error("[SOLAR-PATCH] SolarOpen2Config registration FAILED: %s", _solar_err)
     raise

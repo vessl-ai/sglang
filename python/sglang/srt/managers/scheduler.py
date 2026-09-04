@@ -46,6 +46,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -1873,11 +1874,9 @@ class Scheduler(
         Also advances the Solar reasoning FSM over the same committed run, so its
         verify plan and the grammar bitmask are built from the same state.
         """
-        from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
-
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
-            # --- solar-open2 FSM commit advance (injected) ---
+            # --- solar-open2 FSM commit advance ---
             _solar_fsm.advance_committed(prev_result, prev_batch)
 
     @scheduler_nvtx_method("scheduler.process_input_requests")

@@ -5189,13 +5189,14 @@ class TestGemma4Detector(unittest.TestCase):
 
 
 class TestSolarOpen2Detector(unittest.TestCase):
-    """Grammar-forced tool_choice="required"/named relies on SolarOpen2Detector
-    inheriting the base-class capability defaults (supports_structural_tag()
-    True, parses_required_natively() False) so FunctionCallParser routes
-    required/named tool_choice through the legacy structural tag instead of
-    best-effort prompting. Under that tag xgrammar fills a JSON object
-    between the call markers instead of ``<|tool_arg:*|>`` runs; these tests
-    cover both the capability defaults and that JSON-body envelope.
+    """Grammar-forced tool_choice="required"/named: SolarOpen2Detector
+    overrides supports_structural_tag() to False (parses_required_natively()
+    stays False), so FunctionCallParser routes required/named through the
+    JSON-schema array constraint -- the vendor's vLLM path -- and never
+    through best-effort prompting. The detector still accepts a JSON-object
+    call body (the shape the legacy structural tag used to force); these
+    tests cover the capability flags, the json_schema constraints and that
+    JSON-body envelope.
     """
 
     def setUp(self):
@@ -5229,49 +5230,588 @@ class TestSolarOpen2Detector(unittest.TestCase):
             ),
         ]
 
-    def test_capability_defaults_are_inherited(self):
-        """No override of supports_structural_tag/parses_required_natively:
-        reintroducing either override silently brings back the bug this
-        issue fixes (required/named tool_choice skipping grammar
-        constraints and falling back to best-effort prompting)."""
+    def test_required_named_take_the_json_schema_path(self):
+        """supports_structural_tag is False on purpose: required/named
+        tool_choice are constrained by the JSON-schema array (the JSON path
+        the vendor's vLLM serving uses), not by the legacy structural tag,
+        whose closing marker xgrammar matches as a string and the model may
+        spell out as text -- which leaves the sentinel-tracking FSM inside
+        the call. parses_required_natively stays False: the call is still
+        grammar-forced, never prompt-driven best-effort (INF-373)."""
         detector = SolarOpen2Detector()
-        self.assertTrue(detector.supports_structural_tag())
+        self.assertFalse(detector.supports_structural_tag())
         self.assertFalse(detector.parses_required_natively())
-        self.assertNotIn("supports_structural_tag", SolarOpen2Detector.__dict__)
+        self.assertIn("supports_structural_tag", SolarOpen2Detector.__dict__)
         self.assertNotIn("parses_required_natively", SolarOpen2Detector.__dict__)
 
-    def test_structure_info_envelope(self):
-        detector = SolarOpen2Detector()
-        info = detector.structure_info()("get_weather")
-        self.assertEqual(info.begin, f"{TOOL_CALL_START}get_weather\n")
-        self.assertEqual(info.end, TOOL_CALL_END)
-        self.assertEqual(info.trigger, TOOL_CALL_START)
+    def test_streaming_two_calls_of_the_same_tool_get_distinct_indices(self):
+        """A client accumulates streamed tool-call deltas by index; two calls
+        of one tool must not share it (2026-09-03 review C2)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
-    def test_required_tool_choice_uses_structural_tag(self):
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}\n"
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Tokyo{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        calls = []
+        for i in range(0, len(text), 7):
+            _, chunk_calls = parser.parse_stream_chunk(text[i : i + 7])
+            calls.extend(chunk_calls)
+        self.assertEqual([c.name for c in calls], ["get_weather", "get_weather"])
+        self.assertEqual([c.tool_index for c in calls], [0, 1])
+        self.assertEqual(
+            [json.loads(c.parameters)["location"] for c in calls], ["Paris", "Tokyo"]
+        )
+
+    def _stream_all(self, text, size):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        texts, calls = [], []
+        for i in range(0, len(text), size):
+            t, c = parser.parse_stream_chunk(text[i : i + size])
+            texts.append(t or "")
+            calls.extend(c)
+        t, c = parser.parse_stream_end()
+        texts.append(t or "")
+        calls.extend(c)
+        return "".join(texts), calls
+
+    def test_unparsable_call_output_matches_non_stream_whatever_the_chunking(self):
+        """A call closed by <|tool_call:end|> that the grammar does not match
+        (no newline after the name) follows the vendor's non-streaming rule
+        in both modes and at any chunk size: with no parsed call the whole
+        output is content (nothing vanishes, review round 2 I-1); after a
+        parsed call it is not content and no sentinel leaks (round 3 C1)."""
+        bad = f"{TOOL_CALL_START}get_weather{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        cases = {
+            "bad alone": (bad, bad, 0),
+            "prose then bad": ("Sure: " + bad, "Sure: " + bad, 0),
+            "bad, prose, good": (bad + "\nand\n" + good, "", 1),
+            "good then bad": (good + "\n" + bad, "", 1),
+            "prose, good, bad": ("Hi\n" + good + "\n" + bad, "Hi\n", 1),
+        }
+        for name, (text, want_text, want_calls) in cases.items():
+            non_stream = detector.detect_and_parse(text, self.tools)
+            self.assertEqual(
+                (non_stream.normal_text, len(non_stream.calls)),
+                (want_text, want_calls),
+                name,
+            )
+            for size in (len(text), 5):
+                with self.subTest(case=name, size=size):
+                    if want_calls:
+                        # A parsed call makes the malformed one not-content
+                        # silently, as in non-streaming (and the vendor).
+                        got_text, got_calls = self._stream_all(text, size)
+                        self.assertNotIn(TOOL_CALL_START, got_text)
+                    else:
+                        with self.assertLogs(
+                            "sglang.srt.function_call.solar_open2_detector",
+                            "WARNING",
+                        ):
+                            got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual(
+                        (got_text, len(got_calls)), (want_text, want_calls)
+                    )
+
+    def test_streaming_text_after_a_call_follows_the_vendor_streaming_rule(self):
+        """After a call, real text between or after calls is content and a
+        whitespace run is not when it abuts the next opener or the end (the
+        vendor's streaming parser: pending whitespace, rstripped body) --
+        however the chunks are cut (review round 2: a separator newline
+        became a content delta with small chunks while prose vanished with
+        large ones)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for sep, want in (("\n", ""), ("\n\n", ""), ("\nAlso:\n", "\nAlso:")):
+            with self.subTest(sep=repr(sep)):
+                text = call + sep + call
+                for size in (len(text), 5, 1):
+                    parser = FunctionCallParser(self.tools, "solar_open2")
+                    texts, calls = [], []
+                    for i in range(0, len(text), size):
+                        t, c = parser.parse_stream_chunk(text[i : i + size])
+                        texts.append(t or "")
+                        calls.extend(c)
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual("".join(texts), want)
+                    # After the last call: real text is content, whitespace
+                    # (and the whitespace trailing that text) is not.
+                    tail = "\nDone.\n" if sep.strip() else "\n"
+                    tail_texts = []
+                    for i in range(0, len(tail), size):
+                        t, c = parser.parse_stream_chunk(tail[i : i + size])
+                        tail_texts.append(t or "")
+                        self.assertEqual(c, [])
+                    end_text, end_calls = parser.parse_stream_end()
+                    self.assertEqual(end_calls, [])
+                    self.assertEqual(
+                        "".join(tail_texts) + end_text,
+                        tail.rstrip() if sep.strip() else "",
+                    )
+
+    def test_whitespace_only_prefix_before_the_first_call_is_not_content(self):
+        """The vendor drops a prefix that is all whitespace (content None)
+        but keeps whitespace that trails real text before the first call;
+        both modes, any chunking (review round 4)."""
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        for prefix, want in (("\n\n", ""), ("Sure.\n", "Sure.\n"), ("", "")):
+            with self.subTest(prefix=repr(prefix)):
+                text = prefix + call
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual((result.normal_text, len(result.calls)), (want, 1))
+                for size in (len(text), 5, 1):
+                    got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual((got_text, len(got_calls)), (want, 1), size)
+
+    def test_stream_end_after_a_call_keeps_text_before_a_partial_opener(self):
+        """The last increment closes a call and ends in a partial sentinel:
+        only the partial is dropped, the text before it is content, however
+        the bytes were cut (review round 4)."""
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        text = call + "See 5<"
+        for size in (len(text), 5, 1):
+            got_text, got_calls = self._stream_all(text, size)
+            self.assertEqual((got_text, len(got_calls)), ("See 5", 1), size)
+
+    def test_unparsed_call_sharing_a_chunk_with_parsed_calls(self):
+        """An unparsable closed call between or after parsed calls: the prose
+        before it is content and nothing from its opener on is, whether the
+        calls share one chunk or arrive split (review round 4: one chunk
+        leaked the raw call as content between two parsed calls, and dropped
+        the prose before a trailing one)."""
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        cases = {
+            "good, bad, good": (good + "\n" + bad + "\n" + good, "", 2),
+            "good, prose, bad, prose, good": (
+                good + "\nAlso:\n" + bad + "\nMore\n" + good,
+                "\nAlso:\nMore",
+                2,
+            ),
+            "good, prose, bad": (good + "\nAlso:\n" + bad, "\nAlso:", 1),
+            "good, prose, unfinished": (
+                good + "\nmid\n" + f"{TOOL_CALL_START}get_time\n",
+                "\nmid",
+                1,
+            ),
+        }
+        for name, (text, want_text, want_calls) in cases.items():
+            for size in (len(text), 5, 1):
+                with self.subTest(case=name, size=size):
+                    with self.assertLogs(
+                        "sglang.srt.function_call.solar_open2_detector", "WARNING"
+                    ):
+                        got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual(
+                        (got_text, len(got_calls)), (want_text, want_calls)
+                    )
+                    self.assertNotIn(TOOL_CALL_START, got_text)
+
+    def test_newlines_before_the_name_parse_as_the_vendor_does(self):
+        """The vendor's lazy name group plus strip() accepts newlines between
+        the opener and the name (FSM-legal); the sentinel-stopping group must
+        keep accepting them (review round 4)."""
+        detector = SolarOpen2Detector()
+        for lead in ("\n", "\n\n"):
+            with self.subTest(lead=repr(lead)):
+                text = (
+                    f"{TOOL_CALL_START}{lead}get_weather\n"
+                    f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+                    f"{TOOL_CALL_END}"
+                )
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual([c.name for c in result.calls], ["get_weather"])
+                self.assertEqual(result.normal_text, "")
+                got_text, got_calls = self._stream_all(text, 5)
+                self.assertEqual((got_text, len(got_calls)), ("", 1))
+
+    def test_empty_name_makes_the_output_content_like_the_vendor(self):
+        """A call whose name is blank yields no call at all; the whole output
+        is content in non-streaming and at stream end (vendor rule)."""
+        text = (
+            f"{TOOL_CALL_START}   \n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            result = detector.detect_and_parse(text, self.tools)
+        self.assertEqual((result.normal_text, result.calls), (text, []))
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            got_text, got_calls = self._stream_all(text, len(text))
+        self.assertEqual((got_text, got_calls), (text, []))
+
+    def test_prose_held_behind_an_unparsed_opener_is_dropped_with_a_warning(self):
+        """Prose after an opener that did not parse is held; when a later call
+        parses it is dropped -- with a warning that names the non-whitespace
+        chars lost, not a debug line (review round 6)."""
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        text = f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\nHere:\n" + good
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            got_text, got_calls = self._stream_all(text, 5)
+        self.assertEqual((got_text, len(got_calls)), ("", 1))
+        self.assertTrue(any("not whitespace" in m for m in logs.output))
+
+    def test_partial_opener_at_stream_end_after_a_call_is_logged(self):
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            got_text, got_calls = self._stream_all(
+                good + "\nSee 5<|tool_", len(good) + 9
+            )
+        self.assertEqual((got_text, len(got_calls)), ("\nSee 5", 1))
+        self.assertTrue(any("partial opener" in m for m in logs.output))
+
+    def test_non_string_schema_type_keeps_the_string(self):
+        # A type that is not a string (5, None) is no type: the value stays a
+        # string. (The reference nulls a value under ``"type": null``; kept
+        # delta.)
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for schema_type in (5, None):
+            with self.subTest(type=schema_type):
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name="get_weather",
+                            parameters={
+                                "type": "object",
+                                "properties": {"location": {"type": schema_type}},
+                            },
+                        ),
+                    )
+                ]
+                result = SolarOpen2Detector().detect_and_parse(text, tools)
+                self.assertEqual(
+                    json.loads(result.calls[0].parameters), {"location": "Paris"}
+                )
+
+    def test_non_function_tools_are_skipped_for_the_schema(self):
+        # Reference parity: only ``type == "function"`` tools declare schemas.
+        tools = [
+            Tool(
+                type="custom",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"days": {"type": "integer"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": "3"})
+
+    def test_duplicate_tool_names_take_the_first_declaring_schema(self):
+        # Reference parity: a same-named tool without a usable schema is
+        # skipped in favour of the next one.
+        tools = [
+            Tool(
+                type="function", function=Function(name="get_weather", parameters="x")
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"days": {"type": "integer"}},
+                    },
+                ),
+            ),
+        ]
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"days": 3})
+
+    def test_non_dict_parameters_or_properties_leave_values_as_strings(self):
+        # A schema that is not a JSON Schema object still yields the call; the
+        # reference falls back to "string" the same way.
+        text = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}days{TOOL_ARG_VALUE}3{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        for params in (None, "x", {"type": "object", "properties": "x"}):
+            with self.subTest(params=params):
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(name="get_weather", parameters=params),
+                    )
+                ]
+                result = SolarOpen2Detector().detect_and_parse(text, tools)
+                self.assertEqual(json.loads(result.calls[0].parameters), {"days": "3"})
+                streamed = SolarOpen2Detector().parse_streaming_increment(text, tools)
+                self.assertEqual(
+                    json.loads(streamed.calls[0].parameters), {"days": "3"}
+                )
+
+    def test_blank_name_call_next_to_parsed_calls(self):
+        """A blank-name call is an unparsed segment in streaming: the calls
+        around it are emitted (dropped after a call, held before one), at
+        any chunking. Non-streaming keeps the whole-output rule."""
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        blank = f"{TOOL_CALL_START}  \n{TOOL_CALL_END}"
+        for name, text, want_calls in (
+            ("good, blank, good", good + "\n" + blank + "\n" + good, 2),
+            ("good then blank", good + "\n" + blank, 1),
+            ("blank then good", blank + "\n" + good, 1),
+        ):
+            for size in (len(text), 5, 1):
+                with self.subTest(case=name, size=size):
+                    got_text, got_calls = self._stream_all(text, size)
+                    self.assertEqual((got_text, len(got_calls)), ("", want_calls))
+            non_stream = SolarOpen2Detector().detect_and_parse(text, self.tools)
+            self.assertEqual(
+                (non_stream.normal_text, non_stream.calls), (text, []), name
+            )
+
+    def test_prose_around_an_unparsed_call_after_an_earlier_delta_call(self):
+        """A call was emitted in an earlier delta; the next delta carries an
+        unparsed call with prose around it (and maybe a parsed call): the
+        prose is content whatever the chunking (review round 5)."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        for name, rest, want in (
+            ("bad, prose, good", "\n" + bad + "\nand\n" + good, ("\nand", 2)),
+            ("bad, prose, bad", "\n" + bad + "\nand\n" + bad, ("\nand", 1)),
+            ("bad, prose", "\n" + bad + "\nand", ("\nand", 1)),
+        ):
+            for size in (len(rest), 5, 1):
+                with self.subTest(case=name, size=size):
+                    parser = FunctionCallParser(self.tools, "solar_open2")
+                    texts, calls = [], []
+                    t, c = parser.parse_stream_chunk(good)
+                    texts.append(t or "")
+                    calls.extend(c)
+                    for i in range(0, len(rest), size):
+                        t, c = parser.parse_stream_chunk(rest[i : i + size])
+                        texts.append(t or "")
+                        calls.extend(c)
+                    t, c = parser.parse_stream_end()
+                    texts.append(t or "")
+                    calls.extend(c)
+                    self.assertEqual(("".join(texts), len(calls)), want)
+
+    def test_unfinished_call_then_a_good_call_yields_the_good_call(self):
+        """The body group stops at an opener, so an unfinished call followed
+        by a well-formed one does not merge into one fake call (vendor: it
+        does); reachable only with the FSM off."""
+        text = (
+            f"{TOOL_CALL_START}get_time\n"
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}"
+        )
+        result = SolarOpen2Detector().detect_and_parse(text, self.tools)
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in result.calls],
+            [("get_weather", {"location": "Paris"})],
+        )
+        self.assertEqual(self._stream_all(text, 5)[1][0].name, "get_weather")
+
+    def test_call_missing_its_newline_does_not_swallow_the_next_call(self):
+        """A call without the newline after its name followed by a well-formed
+        call: with the vendor's ``(.+?)`` name group the two parse as one
+        fake call named "<name><|tool_call:end|>..."; the name group here
+        stops at a sentinel, so the good call parses and the bad one is
+        reported (review round 3)."""
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        good = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        detector = SolarOpen2Detector()
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ) as logs:
+            result = detector.detect_and_parse(bad + "\n" + good, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertEqual(result.normal_text, "")
+        self.assertTrue(any("did not parse" in m for m in logs.output))
+
+    def test_stream_end_after_a_call_drops_a_cut_second_call(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        call = (
+            f"{TOOL_CALL_START}get_weather\n"
+            f"{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n"
+            f"{TOOL_CALL_END}"
+        )
+        _, calls = parser.parse_stream_chunk(call + f"\n{TOOL_CALL_START}get_time\n")
+        self.assertEqual(len(calls), 1)
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            end_text, end_calls = parser.parse_stream_end()
+        self.assertEqual((end_text, end_calls), ("", []))
+
+    def test_stream_end_releases_held_text(self):
+        """Text held back for a marker that never arrives (a partial opener,
+        an unfinished call cut by max_tokens) is released as content at the
+        end of the stream instead of being dropped."""
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        normal, calls = parser.parse_stream_chunk("Here is:\n<|tool_ca")
+        self.assertEqual(calls, [])
+        end_text, end_calls = parser.parse_stream_end()
+        # The trailing whitespace and the partial opener come out at the end.
+        self.assertEqual((normal + end_text, end_calls), ("Here is:\n<|tool_ca", []))
+        self.assertTrue(end_text.endswith("<|tool_ca"))
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        cut = (
+            f"{TOOL_CALL_START}get_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Par"
+        )
+        normal, calls = parser.parse_stream_chunk(cut)
+        self.assertEqual((normal, calls), ("", []))
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            end_text, end_calls = parser.parse_stream_end()
+        self.assertEqual(end_text, cut)
+        self.assertEqual(end_calls, [])
+
+    def test_boolean_argument_that_is_not_a_boolean_keeps_the_string(self):
+        """Vendor _coerce: an unrecognised boolean literal is returned as the
+        original string with a warning, not collapsed to False."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="set_flag",
+                    parameters={
+                        "type": "object",
+                        "properties": {"on": {"type": "boolean"}},
+                    },
+                ),
+            )
+        ]
+        detector = SolarOpen2Detector()
+        text = (
+            f"{TOOL_CALL_START}set_flag\n"
+            f"{TOOL_ARG_START}on{TOOL_ARG_VALUE}maybe{TOOL_ARG_END}\n{TOOL_CALL_END}"
+        )
+        with self.assertLogs(
+            "sglang.srt.function_call.solar_open2_detector", "WARNING"
+        ):
+            result = detector.detect_and_parse(text, tools)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"on": "maybe"})
+        for literal, expect in (("Yes", True), ("0", False), ("TRUE", True)):
+            text = (
+                f"{TOOL_CALL_START}set_flag\n"
+                f"{TOOL_ARG_START}on{TOOL_ARG_VALUE}{literal}{TOOL_ARG_END}\n"
+                f"{TOOL_CALL_END}"
+            )
+            self.assertEqual(
+                json.loads(detector.detect_and_parse(text, tools).calls[0].parameters),
+                {"on": expect},
+            )
+
+    def test_structure_info_is_not_used(self):
+        # required/named tool_choice go through the JSON-schema array
+        # (supports_structural_tag is False), so no structural tag exists.
+        with self.assertRaises(NotImplementedError):
+            SolarOpen2Detector().structure_info()
+
+    def test_required_tool_choice_uses_json_schema(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         parser = FunctionCallParser(self.tools, "solar_open2")
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
-        self.assertEqual(result[0], "structural_tag")
-        tag = result[1]
-        self.assertTrue(tag.at_least_one)
-        self.assertEqual(tag.triggers, [TOOL_CALL_START])
-        begins = {s.begin for s in tag.structures}
-        ends = {s.end for s in tag.structures}
-        self.assertIn(f"{TOOL_CALL_START}get_weather\n", begins)
-        self.assertIn(f"{TOOL_CALL_START}get_time\n", begins)
-        self.assertEqual(ends, {TOOL_CALL_END})
+        self.assertEqual(result[0], "json_schema")
+        schema = result[1]
+        self.assertEqual(schema["type"], "array")
+        self.assertEqual(schema["minItems"], 1)
+        names = {
+            item["properties"]["name"]["enum"][0]
+            for item in schema["items"].get("anyOf", [schema["items"]])
+        }
+        self.assertEqual(names, {"get_weather", "get_time"})
 
-        named_choice = ToolChoice(
-            type="function", function=ToolChoiceFuncName(name="get_weather")
+    def test_named_tool_choice_uses_json_schema(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.tools, "solar_open2")
+        result = parser.get_structure_constraint(
+            ToolChoice(type="function", function=ToolChoiceFuncName(name="get_time"))
         )
-        named_result = parser.get_structure_constraint(named_choice)
-        self.assertIsNotNone(named_result)
-        self.assertEqual(named_result[0], "structural_tag")
-        self.assertTrue(named_result[1].at_least_one)
-
-        self.assertIsNone(parser.get_structure_constraint("auto"))
+        self.assertEqual(result[0], "json_schema")
+        self.assertEqual(result[1]["items"]["properties"]["name"]["enum"], ["get_time"])
 
     def test_json_body_envelope_parses_non_stream(self):
         detector = SolarOpen2Detector()
@@ -5414,6 +5954,474 @@ class TestSolarOpen2Detector(unittest.TestCase):
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "not_a_tool")
         self.assertEqual(json.loads(result.calls[0].parameters), {"x": 1})
+
+
+class TestSolarOpen2VendorDifferential(unittest.TestCase):
+    """Our detector against the reference tool parser (a verbatim copy in
+    ``test/srt/fixtures/solar_open2_vendor_reference.py``), shape by shape: non-stream must
+    agree exactly; streaming must agree on calls and, unless a shape says
+    ``"calls"``, on content up to whitespace (the documented streaming
+    deltas: rstripped whitespace before an opener, held unparsed output);
+    and ours must be identical at whole / 5-char / 1-char chunking. Shapes
+    where the vendor itself misbehaves (its lazy name group swallows a
+    following call after a call that lacks its newline) or where its
+    streaming parser emits a partial call are compared only where a
+    comparison is meaningful, and say so. A new difference here is a
+    detector bug unless it is added to
+    the documented deltas in CONTEXT/the detector docstring."""
+
+    TOOLS = [
+        Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "days": {"type": "integer"},
+                        "temp": {"type": "number"},
+                        "urgent": {"type": "boolean"},
+                        # One alias per family, plus array/object/none.
+                        "note": {"type": "text"},
+                        "count": {"type": "int"},
+                        "ratio": {"type": "float"},
+                        "flag": {"type": "bool"},
+                        "tags": {"type": "array"},
+                        "opts": {"type": "object"},
+                        "nothing": {"type": "none"},
+                    },
+                },
+            ),
+        ),
+        Tool(
+            type="function",
+            function=Function(
+                name="get_time",
+                parameters={
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                },
+            ),
+        ),
+        Tool(type="function", function=Function(name="ping", parameters=None)),
+        # Not a function tool: its schema must not type the arguments.
+        Tool(
+            type="custom",
+            function=Function(
+                name="get_time",
+                parameters={
+                    "type": "object",
+                    "properties": {"timezone": {"type": "integer"}},
+                },
+            ),
+        ),
+        # A coding agent's tool: code-shaped values, and the schema shapes
+        # without a plain ``type`` (_param_type: first non-null entry of a
+        # list, None -> string).
+        Tool(
+            type="function",
+            function=Function(
+                name="write_file",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                        "lines": {"type": "array"},
+                        "meta": {"type": "object"},
+                        "n": {"type": "integer"},
+                        "mode": {"enum": ["r", "w"]},
+                        "opt": {"type": ["string", "null"]},
+                        "any": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                        "nullable_int": {"type": ["null", "integer"]},
+                    },
+                },
+            ),
+        ),
+    ]
+
+    # A code-shaped string value: newlines, indentation, braces, quotes and a
+    # backslash-escaped quote.
+    CODE = 'def f(x):\n    return {"a": [1, 2], "b": "q\\"uote"}\n'
+
+    @staticmethod
+    def _call(name="get_weather", **args):
+        body = "".join(
+            f"{TOOL_ARG_START}{k}{TOOL_ARG_VALUE}{v}{TOOL_ARG_END}\n"
+            for k, v in args.items()
+        )
+        return f"{TOOL_CALL_START}{name}\n{body}{TOOL_CALL_END}"
+
+    @classmethod
+    def shapes(cls):
+        good = cls._call(location="Paris")
+        good2 = cls._call("get_time", timezone="UTC")
+        bad = f"{TOOL_CALL_START}get_time{TOOL_CALL_END}"
+        unfinished = f"{TOOL_CALL_START}get_time\n"
+        # name -> (text, vendor_nonstream_comparable, vendor_stream_comparable)
+        return {
+            "call": (good, True, True),
+            "ws prefix": ("\n\n" + good, True, True),
+            "prose prefix": ("Sure.\n" + good, True, True),
+            "prose prefix no ws": ("Sure." + good, True, True),
+            "two calls": (good + "\n" + good2, True, True),
+            "two calls prose between": (good + "\nAlso:\n" + good2, True, True),
+            "trailing prose": (good + "\nDone.", True, True),
+            "trailing ws": (good + "\n\n", True, True),
+            "prose call prose": ("Let me check. " + good + " there", True, True),
+            "typed args": (
+                cls._call(location="Paris", days="3", urgent="true"),
+                True,
+                True,
+            ),
+            "null arg": (cls._call(location="null"), True, True),
+            # The vendor's non-streaming parser accepts newlines before the
+            # name (lazy group + strip); its streaming parser reads an empty
+            # name at the first newline and emits no call. Ours parses it in
+            # both modes.
+            "newline before name": (
+                f"{TOOL_CALL_START}\nget_weather\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                False,
+            ),
+            "no call": ("Just text.", True, True),
+            # The vendor's streaming parser never flushes a trailing whitespace
+            # run (no end-of-stream hook); ours releases it as non-streaming
+            # does. Streaming compared on calls only (none either way).
+            "whitespace only": ("\n \n", True, "calls"),
+            # The vendor's streaming parser waits for the name's newline and
+            # emits nothing from the opener on (prose before it streams); ours
+            # releases the output as content at stream end (the vendor's
+            # non-streaming rule).
+            "bad only": (bad, True, "calls"),
+            "prose then bad": ("Hi " + bad, True, "calls"),
+            "good then bad": (good + "\n" + bad, True, True),
+            "empty name": (
+                f"{TOOL_CALL_START}  \n{TOOL_ARG_START}a{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                True,
+            ),
+            "null any case": (cls._call(location=" NULL "), True, True),
+            "no schema": (cls._call("ping", x="1"), True, True),
+            "custom-typed tool ignored": (
+                cls._call("get_time", timezone="3"),
+                True,
+                True,
+            ),
+            "integral number": (cls._call(location="Paris", temp="3"), True, True),
+            "alias args": (
+                cls._call(
+                    note="hi",
+                    count="2",
+                    ratio="1.5",
+                    flag="true",
+                    tags="[1, 2]",
+                    opts='{"a": 1}',
+                    nothing="x",
+                ),
+                True,
+                True,
+            ),
+            "bad typed args": (
+                cls._call(days="abc", temp="x", tags="[1,", opts="{", urgent="maybe"),
+                True,
+                True,
+            ),
+            "fractional number": (cls._call(location="Paris", temp="3.5"), True, True),
+            # CRLF line ends: the reference's non-streaming regex backtracks into
+            # a garbage name with no arguments; its streaming parser and ours
+            # parse the call.
+            "crlf": (
+                f"{TOOL_CALL_START}get_weather\r\n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\r\n{TOOL_CALL_END}",
+                False,
+                True,
+            ),
+            # Whitespace lines inside the body: the vendor's non-streaming regex
+            # backtracks into a garbage name with no arguments; its streaming
+            # parser and ours parse the call.
+            "whitespace in body": (
+                f"{TOOL_CALL_START}get_weather\n  \n{TOOL_ARG_START}location{TOOL_ARG_VALUE}Paris{TOOL_ARG_END}\n  \n{TOOL_CALL_END}",
+                False,
+                True,
+            ),
+            # A blank-name call next to parsed calls: both non-streaming parsers
+            # make the whole output content; both streaming parsers keep the
+            # calls around it, but the reference leaks the blank call's sentinel
+            # text as content while ours drops it -- calls compared only.
+            "good, blank, good": (
+                good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good2,
+                True,
+                "calls",
+            ),
+            "good then blank": (
+                good + "\n" + f"{TOOL_CALL_START}  \n{TOOL_CALL_END}",
+                True,
+                "calls",
+            ),
+            "blank then good": (
+                f"{TOOL_CALL_START}  \n{TOOL_CALL_END}" + "\n" + good,
+                True,
+                "calls",
+            ),
+            # The vendor's lazy name group swallows the following call after a
+            # call missing its newline (a fake call): not comparable at all.
+            "bad then good": (bad + "\n" + good, False, False),
+            "good, prose, bad, prose, good": (
+                good + "\nAlso:\n" + bad + "\nMore\n" + good2,
+                False,
+                False,
+            ),
+            # The vendor streams the name of an unfinished call; ours emits
+            # complete calls only and keeps the text as content at the end.
+            "unfinished": (unfinished, True, False),
+            "good then unfinished": (good + "\n" + unfinished, True, False),
+            # Code-shaped argument values (a coding agent's write_file); the
+            # exact parsed values are pinned in test_code_shaped_values_parse
+            # _exactly, the parity and chunk invariance here.
+            "code value": (
+                cls._call("write_file", path="a.py", content=cls.CODE),
+                True,
+                True,
+            ),
+            "unicode value": (
+                cls._call("write_file", content="한국어 ✓ 🚀"),
+                True,
+                True,
+            ),
+            "long value": (cls._call("write_file", content="x" * 20000), True, True),
+            "empty value": (cls._call("write_file", content=""), True, True),
+            "int with spaces": (cls._call("write_file", n="  3  "), True, True),
+            # dict last-wins on both sides.
+            "dup arg names": (
+                f"{TOOL_CALL_START}write_file\n"
+                f"{TOOL_ARG_START}n{TOOL_ARG_VALUE}1{TOOL_ARG_END}\n"
+                f"{TOOL_ARG_START}n{TOOL_ARG_VALUE}2{TOOL_ARG_END}\n{TOOL_CALL_END}",
+                True,
+                True,
+            ),
+            # An argument without its value sentinel is not skipped: the lazy
+            # argument regex (ours and the vendor's) runs the name on to the
+            # next value sentinel, so the good argument lands under a garbage
+            # name that holds the sentinels between.
+            "arg missing value sentinel": (
+                f"{TOOL_CALL_START}write_file\n"
+                f"{TOOL_ARG_START}path{TOOL_ARG_END}\n"
+                f"{TOOL_ARG_START}content{TOOL_ARG_VALUE}x{TOOL_ARG_END}\n"
+                f"{TOOL_CALL_END}",
+                True,
+                True,
+            ),
+            "no-arg call": (f"{TOOL_CALL_START}ping\n{TOOL_CALL_END}", True, True),
+            "nested object": (
+                cls._call("write_file", meta='{"k": {"j": [1, {"z": "}"}]}}'),
+                True,
+                True,
+            ),
+            "array of objects": (
+                cls._call("write_file", lines='[{"n": 1}, {"n": 2}]'),
+                True,
+                True,
+            ),
+            # A value that is a prefix of a sentinel: the streaming holdback
+            # must not swallow it.
+            "sentinel prefix value": (
+                cls._call("write_file", content="see <|tool_arg"),
+                True,
+                True,
+            ),
+            # Schemas without a plain ``type``: the value stays a string
+            # (enum-only, anyOf-only), a type list takes its first non-null
+            # entry.
+            "enum only": (cls._call("write_file", mode="w"), True, True),
+            "string or null": (cls._call("write_file", opt="x"), True, True),
+            "anyOf only": (cls._call("write_file", any="3"), True, True),
+            "null then integer": (
+                cls._call("write_file", nullable_int="3"),
+                True,
+                True,
+            ),
+        }
+
+    def test_code_shaped_values_parse_exactly(self):
+        """The exact arguments of the code-shaped shapes above
+        (SolarOpen2Detector.detect_and_parse -> _parse_arguments / _coerce /
+        _param_type; streaming agrees by
+        test_streaming_calls_match_non_stream). The JSON is written with
+        ensure_ascii=False (_item), so the unicode value round-trips
+        verbatim."""
+        expected = {
+            "code value": {"path": "a.py", "content": self.CODE},
+            "unicode value": {"content": "한국어 ✓ 🚀"},
+            "long value": {"content": "x" * 20000},
+            "empty value": {"content": ""},
+            "int with spaces": {"n": 3},
+            "dup arg names": {"n": 2},
+            "arg missing value sentinel": {
+                f"path{TOOL_ARG_END}\n{TOOL_ARG_START}content": "x",
+            },
+            "no-arg call": {},
+            "nested object": {"meta": {"k": {"j": [1, {"z": "}"}]}}},
+            "array of objects": {"lines": [{"n": 1}, {"n": 2}]},
+            "sentinel prefix value": {"content": "see <|tool_arg"},
+            "enum only": {"mode": "w"},
+            "string or null": {"opt": "x"},
+            "anyOf only": {"any": "3"},
+            "null then integer": {"nullable_int": 3},
+        }
+        shapes = self.shapes()
+        for name, arguments in expected.items():
+            with self.subTest(shape=name):
+                result = SolarOpen2Detector().detect_and_parse(
+                    shapes[name][0], self.TOOLS
+                )
+                self.assertEqual(result.normal_text, "")
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(json.loads(result.calls[0].parameters), arguments)
+        raw = SolarOpen2Detector().detect_and_parse(
+            shapes["unicode value"][0], self.TOOLS
+        )
+        self.assertIn("한국어 ✓ 🚀", raw.calls[0].parameters)
+
+    @classmethod
+    def _reference(cls):
+        if not hasattr(cls, "_ref"):
+            import importlib.util
+            import os
+
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..",
+                "..",
+                "..",
+                "srt",
+                "fixtures",
+                "solar_open2_vendor_reference.py",
+            )
+            spec = importlib.util.spec_from_file_location(
+                "solar_open2_vendor_reference", path
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            cls._ref = module
+        return cls._ref
+
+    def _vendor(self):
+        ref = self._reference()
+
+        tools = [
+            ref._Record(
+                type=t.type,
+                function=ref._Record(
+                    name=t.function.name, parameters=t.function.parameters
+                ),
+            )
+            for t in self.TOOLS
+        ]
+        return ref, ref.ChatCompletionRequest(tools=tools)
+
+    @staticmethod
+    def _args(raw):
+        """Arguments as a canonical JSON string (3 and 3.0 must differ)."""
+        try:
+            return json.dumps(json.loads(raw) if raw else {}, sort_keys=True)
+        except json.JSONDecodeError:
+            return raw
+
+    def _vendor_nonstream(self, text):
+        ref, req = self._vendor()
+        r = ref.SolarOpen2ToolParser(tokenizer=None).extract_tool_calls(text, req)
+        return r.content or "", [
+            (t.function.name, self._args(t.function.arguments)) for t in r.tool_calls
+        ]
+
+    def _vendor_stream(self, text, size):
+        ref, req = self._vendor()
+        parser = ref.SolarOpen2ToolParser(tokenizer=None)
+        prev, content, calls = "", "", {}
+        for i in range(0, len(text), size):
+            delta = text[i : i + size]
+            cur = prev + delta
+            out = parser.extract_tool_calls_streaming(prev, cur, delta, [], [], [], req)
+            prev = cur
+            if out is None:
+                continue
+            content += out.content or ""
+            for tc in out.tool_calls or []:
+                entry = calls.setdefault(tc.index, ["", ""])
+                fn = getattr(tc, "function", None)
+                if getattr(fn, "name", None):
+                    entry[0] = fn.name
+                entry[1] += getattr(fn, "arguments", None) or ""
+        return content, [(n, self._args(a)) for _, (n, a) in sorted(calls.items())]
+
+    def _ours_nonstream(self, text):
+        r = SolarOpen2Detector().detect_and_parse(text, self.TOOLS)
+        return r.normal_text, [(c.name, self._args(c.parameters)) for c in r.calls]
+
+    def _ours_stream(self, text, size):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(self.TOOLS, "solar_open2")
+        texts, calls = [], []
+        for i in range(0, len(text), size):
+            t, c = parser.parse_stream_chunk(text[i : i + size])
+            texts.append(t or "")
+            calls.extend(c)
+        t, c = parser.parse_stream_end()
+        texts.append(t or "")
+        calls.extend(c)
+        return "".join(texts), [(x.name, self._args(x.parameters)) for x in calls]
+
+    @staticmethod
+    def _ws(s):
+        return " ".join(s.split())
+
+    def test_non_stream_matches_the_vendor(self):
+        for name, (text, comparable, _) in self.shapes().items():
+            if not comparable:
+                continue
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    self._ours_nonstream(text), self._vendor_nonstream(text)
+                )
+
+    def test_streaming_is_chunk_invariant_and_matches_the_vendor(self):
+        for name, (text, _, comparable) in self.shapes().items():
+            with self.subTest(shape=name):
+                whole = self._ours_stream(text, max(1, len(text)))
+                for size in (5, 1):
+                    self.assertEqual(self._ours_stream(text, size), whole, size)
+                if not comparable:
+                    continue
+                for size in (max(1, len(text)), 5, 1):
+                    v_content, v_calls = self._vendor_stream(text, size)
+                    self.assertEqual(whole[1], v_calls, size)
+                    if comparable == "calls":
+                        continue
+                    if size == 1:
+                        # Token by token the vendor cuts whitespace before an
+                        # opener as we do: content must match exactly.
+                        self.assertEqual(whole[0], v_content, size)
+                        continue
+                    # Larger deltas: content up to whitespace (the documented
+                    # streaming delta), but whitespace-only vs none must not
+                    # hide.
+                    self.assertEqual(self._ws(whole[0]), self._ws(v_content), size)
+                    self.assertEqual(bool(whole[0]), bool(v_content), size)
+
+    # Shapes with a blank-name call: non-streaming follows the vendor's
+    # whole-output rule (no calls), streaming keeps the calls around it.
+    _STREAM_KEEPS_CALLS = ("good, blank, good", "good then blank", "blank then good")
+
+    def test_streaming_calls_match_non_stream(self):
+        for name, (text, _, _) in self.shapes().items():
+            if name in self._STREAM_KEEPS_CALLS:
+                continue
+            with self.subTest(shape=name):
+                self.assertEqual(
+                    self._ours_stream(text, 5)[1], self._ours_nonstream(text)[1]
+                )
 
 
 if __name__ == "__main__":

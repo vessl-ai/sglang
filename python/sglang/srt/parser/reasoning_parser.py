@@ -1,4 +1,5 @@
 import inspect
+import logging
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -45,6 +46,8 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_CONTROL_TOKENS,
     MESSAGE_MODEL,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingParseResult:
@@ -1939,10 +1942,9 @@ class ReasoningParser:
         if model_type.lower() == "minimax-m3" and force_reasoning is None:
             force_reasoning = chat_template_kwargs.get("thinking_mode") == "enabled"
 
-        # --- solar-open2 force_reasoning override (injected) ---
-        # The solar_open2 template pre-closes the think block for
-        # reasoning_effort none/low, so whether the stream starts inside
-        # reasoning depends on the request, not on the detector default.
+        # The solar_open2 template pre-closes the think block for every
+        # reasoning_effort other than medium/high, so whether the stream starts
+        # inside reasoning depends on the request, not on the detector default.
         if model_type.lower() == "solar_open2":
             force_reasoning = solar_open2_force_reasoning(request)
 
@@ -2007,7 +2009,7 @@ class ReasoningParser:
         return ret.reasoning_text, ret.normal_text
 
 
-# --- solar-open2 reasoning parser (injected) ---
+# --- Solar Open2 reasoning parser ---
 from sglang.srt.function_call import solar_open2_detector as _solar_tool_detector
 
 _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
@@ -2016,9 +2018,10 @@ _SOLAR_OPEN2_THINK_OPEN_EFFORTS = ("medium", "high")
 def solar_open2_force_reasoning(request) -> bool:
     """Mirror chat_template.jinja: thinking is opened in the generation prompt
     only when reasoning_effort is medium/high (unset -> template default
-    "high")."""
-    if request is None:
-        return True
+    "high"). The template's test is exact and case-sensitive; this
+    case-folds as the serving layer does before the template. xhigh/max are
+    folded to high by the serving layer before this runs, so a raw request
+    carrying them answers False here."""
     effort = getattr(request, "reasoning_effort", None)
     if effort is None:
         effort = (getattr(request, "chat_template_kwargs", None) or {}).get(
@@ -2026,50 +2029,36 @@ def solar_open2_force_reasoning(request) -> bool:
         )
     if effort is None:
         return True
-    return str(effort).lower() in _SOLAR_OPEN2_THINK_OPEN_EFFORTS
+    return str(effort).strip().lower() in _SOLAR_OPEN2_THINK_OPEN_EFFORTS
 
 
 class SolarOpen2Detector(BaseReasoningFormatDetector):
-    """Solar Open2 reasoning detector.
+    """Reasoning detector for the Solar Open2 chat format.
 
     ``<|think:start|>`` / ``<|think:end|>`` are single special tokens. The chat
-    template opens thinking (prefills ``<|think:start|>`` into the generation
-    prompt) only when ``reasoning_effort`` is ``medium``/``high`` (default
-    "high" when unset); for ``none``/``low``/anything else it emits an
-    already-closed ``<|think:start|><|think:end|>`` block and the model
-    answers directly, so the generated stream starts in content, not
-    reasoning. Whether the stream starts inside reasoning therefore depends
-    on the request (see ``solar_open2_force_reasoning`` and the
-    ``ReasoningParser.__init__`` override below), not on a fixed default.
+    template prefills ``<|think:start|>`` only for ``reasoning_effort``
+    medium/high (default "high"); any other effort renders a closed
+    ``<|think:start|><|think:end|>`` pair and the stream starts in content, so
+    ``force_reasoning`` follows the request (``solar_open2_force_reasoning``).
 
-    A tool call opened while the think block is still unclosed ends reasoning
-    at the opener and routes the rest of the stream to the tool-call parser:
-    the real ``<|tool_call:start|>`` marker via the base class's
-    ``tool_start_token`` escape, and the fence-opened degenerate shape
-    (`` ```name `` followed by ``<|tool_arg:start|>`` — see
-    ``solar_open2_detector.FENCE_CALL_OPEN``) via the overrides below.
-    Without the escape, the call would ride the think block to its end and
-    never reach the tool-call parser as a parseable block.
+    Three rules on top of the base detector:
 
-    The content region may open with *redundant* ``<|think:end|>`` sentinels.
-    The FSM (``srt/sampling/solar_open2_fsm.py``) force-closes reasoning once
-    the reasoning budget is spent, and the model frequently emits its own close
-    immediately after with nothing in between. Whichever split ends reasoning
-    consumes exactly one sentinel, so every extra one opens ``content`` and
-    reaches the client verbatim -- ``<|think:end|>`` is ``special=False`` in the
-    tokenizer, so nothing downstream strips it. This detector consumes the
-    whole run instead. CONTENT is deliberately unmasked by the FSM ("parser
-    owns it"), and doing this here also covers surplus sentinels the FSM had no
-    hand in.
-
-    When ``<|think:end|>`` never arrives at all — a stop string or the token
-    budget ends generation inside the think block — nothing was answered, so
-    the text stays reasoning and content is empty. That is the contract
-    Upstage states for this model; the reference parser (UpstageAI/vllm
-    ``SolarOpen2ReasoningParser.extract_reasoning``) instead returns the whole
-    output as content, which presents a thinking fragment as a complete
-    answer. Only a request with reasoning off puts this text on the content
-    channel, and such a request never opens a think block to leave unclosed.
+    * a ``<|tool_call:start|>`` inside an unclosed think block ends reasoning
+      there (the base class's ``tool_start_token`` escape), so the call reaches
+      the tool-call parser;
+    * the content region may open with a run of redundant ``<|think:end|>``
+      sentinels (the FSM forces one at a spent budget; a drafted one on the
+      speculative path leaves the following rows under the REASONING set,
+      which still allows another, and a model that closes the block itself
+      may repeat the sentinel).
+      The run is consumed, streaming included, where a fragment that could
+      still be a sentinel is held back and dropped if the stream ends inside
+      it; non-streaming keeps such a fragment as content (vendor rule);
+    * a stream that ends with the think block still open answered nothing:
+      the text stays reasoning and content is empty. Only a request with
+      reasoning off would put such text on the content channel, and that
+      request never opens a block to leave unclosed (unless the model opens
+      one itself, e.g. after a tool result -- then it is reasoning here).
     """
 
     def __init__(
@@ -2102,14 +2091,10 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         return text
 
     def _scrub_content_head(self, ret: StreamingParseResult) -> StreamingParseResult:
-        """Consume redundant sentinels at the head of the content region.
-
-        Streaming only: the sentinel run can be split across chunks, so a
-        fragment that is still a prefix of the sentinel is held rather than
-        streamed. The hold is bounded by the sentinel's length and is dropped
-        by ``finish()`` if the stream ends inside it -- a fragment of a control
-        sentinel is never part of an answer.
-        """
+        """Streaming: consume the redundant sentinel run at the head of the
+        content region; a fragment that is still a prefix of the sentinel is
+        held rather than streamed (dropped by ``finish`` if the stream ends
+        inside it -- a fragment of a control sentinel is never an answer)."""
         if self._content_started:
             return ret
         text = self._content_head_hold + ret.normal_text
@@ -2128,89 +2113,30 @@ class SolarOpen2Detector(BaseReasoningFormatDetector):
         self._content_started = True
         return ret
 
-    @staticmethod
-    def _fence_escape_offset(text: str) -> Optional[int]:
-        """Offset where a fence-opened tool call starts in ``text``, or None."""
-        m = _solar_tool_detector.FENCE_CALL_OPEN.search(text)
-        if m is None:
-            return None
-        return m.start() + (1 if text[m.start()] == "\n" else 0)
-
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         ret = super().detect_and_parse(text)
-        if ret.reasoning_text and not ret.normal_text:
-            cut = self._fence_escape_offset(ret.reasoning_text)
-            if cut is not None:
-                return StreamingParseResult(
-                    reasoning_text=ret.reasoning_text[:cut],
-                    normal_text=ret.reasoning_text[cut:],
-                )
-            if self.think_end_token not in text:
-                # ``<|think:end|>`` never arrived: a stop string or the token
-                # budget ended generation inside the think block. Nothing was
-                # answered, so the text stays on the reasoning channel and
-                # content is empty -- the contract Upstage states for this
-                # model (2026-09-01). The reference parser (UpstageAI/vllm
-                # ``SolarOpen2ReasoningParser.extract_reasoning``) returns it
-                # all as content instead, which presents a few tokens of
-                # thinking preamble as a complete answer: measured through the
-                # proxy, ``stop:["**"]`` returned "Thinking Process:\n\n1.  "
-                # with ``finish_reason: "stop"``. Only a request with reasoning
-                # off puts this text on the content channel, and such a request
-                # never opens a think block to leave unclosed.
-                return StreamingParseResult(reasoning_text=ret.reasoning_text)
         ret.normal_text = self._consume_leading_think_end(ret.normal_text)
         return ret
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
-        return self._scrub_content_head(self._parse_increment(new_text))
+        return self._scrub_content_head(super().parse_streaming_increment(new_text))
 
     def finish(self) -> StreamingParseResult:
-        self._content_head_hold = ""
-        # A stream that ends inside the think block needs nothing added here.
-        # Its reasoning deltas are already out on the reasoning channel, which
-        # is where the text belongs, and content stays empty -- the same rule
-        # ``detect_and_parse`` applies. Re-emitting the accumulated text once
-        # on the content channel, which this did, put the identical string on
-        # both channels and made a thinking fragment read as the answer.
-        return super().finish()
-
-    def _parse_increment(self, new_text: str) -> StreamingParseResult:
-        if not self._in_reasoning:
-            return super().parse_streaming_increment(new_text)
-        pending = self._buffer + new_text
-        if self.think_end_token not in pending:
-            cut = self._fence_escape_offset(pending)
-            if cut is not None:
-                self._buffer = ""
-                self._in_reasoning = False
-                reasoning_text = pending[:cut]
-                think_start = self.think_start_token + self.think_start_self_label
-                if not self.stripped_think_start and think_start in reasoning_text:
-                    reasoning_text = reasoning_text.replace(think_start, "", 1)
-                    self.stripped_think_start = True
-                return StreamingParseResult(
-                    reasoning_text=reasoning_text, normal_text=pending[cut:]
-                )
-            # Hold back a trailing possible fence opener so the fence line is
-            # not streamed away as reasoning before its argument marker
-            # arrives.
-            hold = _solar_tool_detector.partial_fence_open_len(pending)
-            if hold:
-                if len(pending) == hold:
-                    self._buffer = pending
-                    return StreamingParseResult()
-                self._buffer = ""
-                ret = super().parse_streaming_increment(pending[:-hold])
-                self._buffer += pending[-hold:]
-                return ret
-        self._buffer = ""
-        return super().parse_streaming_increment(pending)
+        # A stream that ends inside the think block adds no content: the base
+        # class hands the block back as reasoning (streamed already, or flushed
+        # here with stream_reasoning off), the same rule detect_and_parse
+        # applies. Whatever is still held after the last scrub is a sentinel
+        # fragment at the head of the content region, and a fragment of a
+        # control sentinel is never an answer.
+        ret = self._scrub_content_head(super().finish())
+        if self._content_head_hold:
+            logger.warning(
+                "solar_open2: dropping a %d-char sentinel fragment at the end of "
+                "the stream",
+                len(self._content_head_hold),
+            )
+            self._content_head_hold = ""
+        return ret
 
 
 ReasoningParser.DetectorMap["solar_open2"] = SolarOpen2Detector
-import logging as _solar_logging
-
-_solar_logging.getLogger(__name__).info(
-    "[SOLAR-PATCH] registered reasoning parser 'solar_open2'"
-)

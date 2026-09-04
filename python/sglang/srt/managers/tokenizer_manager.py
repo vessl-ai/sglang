@@ -171,6 +171,12 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+# Bound on remembered orphan rids; evicting one costs a duplicate abort.
+# How long an attempt suppresses the next one: the abort is fire-and-forget,
+# so a lost one has to be retried rather than assumed delivered.
+_MAX_TRACKED_ORPHAN_RIDS = 4096
+_ORPHAN_ABORT_RETRY_S = 30.0
+
 
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
@@ -579,6 +585,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # rid -> (monotonic time of the last _abort_orphaned_rid attempt,
+        # whether it actually went out), so an attempt is made once per
+        # request rather than once per output message, and retried if it did
+        # not take.
+        self._aborted_orphan_rids: Dict[str, Tuple[float, bool]] = {}
+        self._orphan_evict_warn_at = float("-inf")
+        self._orphan_evicted_in_window = 0
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -1988,6 +2001,136 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
+    def _remember_orphan_abort(self, rid: str, now: float, *, sent: bool) -> None:
+        """Record an attempt, newest last, capped.
+
+        Re-inserting moves the rid to the end, so insertion order is recency
+        order and the oldest entry is the one nearest the end of its retry
+        window -- evicting it costs at most one duplicate abort, which the
+        scheduler ignores. ``sent`` distinguishes an abort that went out from
+        one this declined to send, so the log can say which.
+        """
+        self._aborted_orphan_rids.pop(rid, None)
+        self._aborted_orphan_rids[rid] = (now, sent)
+        while len(self._aborted_orphan_rids) > _MAX_TRACKED_ORPHAN_RIDS:
+            victim = next(iter(self._aborted_orphan_rids))
+            victim_at, _ = self._aborted_orphan_rids.pop(victim)
+            if now - victim_at >= _ORPHAN_ABORT_RETRY_S:
+                continue
+            self._orphan_evicted_in_window += 1
+            if now - self._orphan_evict_warn_at >= _ORPHAN_ABORT_RETRY_S:
+                # Evicting an entry past its window is free. Evicting one still
+                # inside it un-throttles that rid -- its abort, its log and the
+                # collision scan go back to once per output message -- so the
+                # degradation says so rather than looking like more orphans.
+                logger.error(
+                    f"Orphan abort throttle full at {_MAX_TRACKED_ORPHAN_RIDS} "
+                    f"rids; {self._orphan_evicted_in_window} entries evicted "
+                    f"inside their {_ORPHAN_ABORT_RETRY_S}s window since the "
+                    f"last report (latest {victim=}, {now - victim_at:.1f}s in). "
+                    "Throttling is degraded: orphan aborts and their logs may "
+                    "repeat per output message."
+                )
+                self._orphan_evict_warn_at = now
+                self._orphan_evicted_in_window = 0
+
+    def _abort_orphaned_rid(self, rid: str) -> None:
+        """Abort a request the scheduler is still generating for but this
+        manager has no state for.
+
+        A stream that breaks (a worker-to-router SSE error, a client that goes
+        away mid-generation) deletes the state here, but nothing tells the
+        scheduler, so it runs the request to ``max_new_tokens`` with no
+        consumer. ``abort_request`` is not usable: in single-tokenizer-worker
+        mode it returns early for exactly this case (a rid with no state), and
+        in either mode it lacks the prefix guard and the throttle below.
+
+        The scheduler matches an abort by ``startswith``, so an empty rid
+        would abort everything, and an orphaned ``X_1`` would finish a live
+        ``X_10`` (a batch expands a caller's rid into ``<rid>_0 .. <rid>_N``).
+        Batch siblings all live in the worker that received the request, so
+        that collision is visible here; a collision between *caller-supplied*
+        rids on two different workers is not, and is inherent to ``startswith``
+        matching -- ``abort_request`` has it too. An ``exact`` flag on
+        ``AbortReq`` is what would close both.
+
+        The caller filters health-check rids before calling; those pop their
+        own state by design and are not orphans. An abort echo trails that
+        rid's last output on the same scheduler-to-manager path, so a request
+        already aborted through ``_handle_abort_req`` is not re-aborted here.
+
+        Output keeps arriving until the scheduler acts, so every outcome --
+        sent, declined, failed -- is recorded and not revisited for
+        ``_ORPHAN_ABORT_RETRY_S``. That throttle is what keeps the O(live
+        requests) collision scan off the per-message path, at the price of a
+        blocked orphan waiting out one more window after its collision clears.
+        """
+        now = time.monotonic()
+        last = self._aborted_orphan_rids.get(rid)
+        if last is not None and now - last[0] < _ORPHAN_ABORT_RETRY_S:
+            return
+
+        if not rid:
+            # Not just an internal bug: a caller may send rid="", which the
+            # request normalizers leave alone (they only replace None).
+            self._remember_orphan_abort(rid, now, sent=False)
+            logger.error(
+                "Received orphaned output with an empty rid; not aborting "
+                "(an empty rid matches every request on the scheduler). "
+                f"Suppressed for {_ORPHAN_ABORT_RETRY_S}s."
+            )
+            return
+
+        # Only reachable with no state for `rid`, so any live rid matching
+        # here extends it: a real orphan this cannot kill without collateral.
+        collision = next(
+            (live for live in self.rid_to_state if live.startswith(rid)), None
+        )
+        if collision is not None:
+            self._remember_orphan_abort(rid, now, sent=False)
+            # Worse than the case below -- this leak is not being cured --
+            # so it is not logged one level quieter than the cure.
+            logger.error(
+                f"Orphaned {rid=} left running: live {collision=} has it as a "
+                f"prefix and the scheduler matches aborts by startswith, so "
+                f"aborting it would finish {collision} too. It generates with "
+                f"no consumer until {collision} ends."
+            )
+            return
+
+        # Built outside the try: a signature change is a programming error,
+        # not a transport failure, and should fail at the call site.
+        abort = AbortReq(rid=rid, abort_message="orphaned output, no consumer")
+        sent = False
+        try:
+            self._dispatch_to_scheduler(abort)
+            sent = True
+            # Logged only once the abort is really on its way: the failure
+            # branch below is the only line the other path should produce.
+            logger.error(
+                f"Received output for {rid=} but the state was deleted in "
+                f"TokenizerManager; aborted it on the scheduler"
+                f"{' again' if last is not None and last[1] else ''}."
+            )
+        except Exception:
+            # handle_loop has no handler and print_exception_wrapper kills the
+            # process tree, so a failed abort must not propagate. Recorded
+            # anyway below: these sends fail permanently (closed socket,
+            # unencodable object), and retrying per output message would flood
+            # the loop every stream shares with tracebacks.
+            logger.exception(
+                f"Failed to abort orphaned {rid=}; retrying in "
+                f"{_ORPHAN_ABORT_RETRY_S}s."
+            )
+        already_counted = last is not None and last[1]
+        self._remember_orphan_abort(rid, now, sent=sent)
+        # Retries are automatic, not caller-driven: counting each one would
+        # report N aborted requests for one request.
+        if sent and not already_counted and self.enable_metrics:
+            self.metrics_collector.observe_one_aborted_request(
+                self.metrics_collector.labels
+            )
+
     def abort_request(self, rid: str = "", abort_all: bool = False):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
@@ -2232,9 +2375,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
+                self._abort_orphaned_rid(rid)
                 continue
 
             # Build meta_info and return value
@@ -3407,6 +3548,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
+            # Live again: forget the abort sent for its previous incarnation,
+            # or a second orphaning of the same rid would be suppressed.
+            self._aborted_orphan_rids.pop(rid, None)
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state

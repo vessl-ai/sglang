@@ -15,7 +15,6 @@ half is MLA and is replaced here by RadixAttention GQA.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Optional
 
@@ -187,33 +186,46 @@ class SolarOpen2MoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
 
-        # Router stays unquantized (checkpoint ignores ``mlp.gate$``).
-        # SOLAR_GATE_FP32=1 reproduces the Upstage vLLM fork, which runs the
-        # router in float32 (nn.Linear(dtype=float32) + float32
-        # e_score_correction_bias + router_logits_dtype=float32). Same shape as
-        # glm4_moe's "GLM requires FP32 gate projection". Default 0 keeps the
-        # KimiMoE convention (bf16) this port started from, so the two are an
-        # OFAT pair.
-        self.gate_fp32 = os.environ.get("SOLAR_GATE_FP32", "0") == "1"
-        gate_dtype = torch.float32 if self.gate_fp32 else None
+        # Router stays unquantized (checkpoint ignores ``mlp.gate$``). Weights
+        # stay bf16 and only the GEMM output is float32 -- the shape
+        # ``minimax_m3`` uses (`models/minimax_m3.py:504-511`). fp32 router
+        # *logits* are this tree's norm, but the other two sites get there with
+        # fp32 *parameters* (`minimax_m2.py:557`, `glm4_moe.py:376`); that costs
+        # a real fp32 GEMM here, because `--enable-tf32-matmul` is off by
+        # default (`server_args.py:762`, `model_executor/model_runner.py:378`),
+        # and buys nothing -- both operands are bf16 on disk and `torch.mm`
+        # already accumulates in fp32.
+        #
+        # The only precision actually lost is the rounding of this GEMM's
+        # output, and it *is* lost: for this config (`n_group=1`, 320 experts,
+        # top-8) the dispatch lands on the one branch that forwards the logits
+        # to `moe_fused_gate` uncast (`layers/moe/topk.py:1693-1704`), where the
+        # kernel upcasts and does the sigmoid (`moe_fused_gate.py:139-142`), the
+        # bias add (:147) and the ranking (:200-230) in fp32. `out_dtype`
+        # removes that rounding. The bf16 the port started from came from
+        # `kimi_linear.py:102`.
+        #
+        # Unlike `minimax_m3` this keeps no `_is_npu` fallback for the missing
+        # `aten::mm.dtype`, and no `is_hip()` upcast of the kind
+        # `inkling_common/moe.py:66-72` carries: this cell is CUDA-only, and the
+        # sibling router GEMMs that are (`nemotron_h.py:294`, `kimi_k3.py:206`)
+        # take the same unguarded form.
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
             quant_config=None,
-            params_dtype=gate_dtype,
             prefix=add_prefix("gate", prefix),
         )
         self.gate.e_score_correction_bias = nn.Parameter(
             torch.empty(
                 config.num_experts,
-                dtype=torch.float32 if self.gate_fp32 else torch.get_default_dtype(),
+                dtype=torch.float32,
             )
         )
         if layer_id == 0:
             logger.info(
-                "[SOLAR-GATE] MoE router dtype: gate_fp32=%s (weight=%s bias=%s)",
-                self.gate_fp32,
+                "[SOLAR-GATE] MoE router: weight=%s bias=%s",
                 self.gate.weight.dtype,
                 self.gate.e_score_correction_bias.dtype,
             )
@@ -267,8 +279,9 @@ class SolarOpen2MoE(nn.Module):
         if self.shared_experts is not None and hidden_states.shape[0] > 0:
             shared_output = self.shared_experts(hidden_states)
 
-        gate_in = hidden_states.to(torch.float32) if self.gate_fp32 else hidden_states
-        router_logits, _ = self.gate(gate_in)
+        router_logits = torch.mm(
+            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
+        )
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 

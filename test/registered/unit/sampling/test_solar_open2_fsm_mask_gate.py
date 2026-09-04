@@ -9,9 +9,10 @@ Two mechanisms cover it, and the invariant is that together they leave no gap:
 
 * ``plan_gate`` sends the step to the eager path, where ``plan_verify`` writes
   the mask. It fires only for what the eager path is *needed* for -- a forced
-  ``<|think:end|>`` at a spent budget, and the ``content_mask`` sets -- because
-  forcing eager on every thinking step would cost the folded in-graph accept
-  for most of a generation.
+  ``<|think:end|>`` at a spent budget, the content sets (a fresh
+  CONTENT row and every step inside a tool call), and the leading-newline set
+  right after ``<|think:start|>`` -- because forcing eager on every thinking
+  step would cost the folded in-graph accept for most of a generation.
 * ``folded_mask_flags`` carries the reasoning mask into the graph instead, one
   flag per (request, chain position) row.
 
@@ -28,30 +29,55 @@ from types import SimpleNamespace
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 THINK_START, THINK_END, EOS = 100, 101, 2
+TOOL_START = 102
 
 
 def _cfg(**over):
     fsm.CFG.enabled = True
     fsm.CFG.think_start, fsm.CFG.think_end = THINK_START, THINK_END
-    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END})
+    fsm.CFG.all_controls = frozenset({THINK_START, THINK_END, TOOL_START})
+    fsm.CFG.transitions = {THINK_START: fsm.REASONING, THINK_END: fsm.CONTENT}
     fsm.CFG.reasoning_forbidden = (EOS,)
     fsm.CFG.leading_newline_forbidden = ()
     fsm.CFG.reasoning_open_forbidden = (EOS,)
-    fsm.CFG.content_mask = False
+    fsm.CFG.content_done_forbidden = (THINK_START, THINK_END)
+    fsm.CFG.content_fresh_forbidden = (THINK_START, THINK_END, EOS)
+    fsm.CFG.content_done_forbidden_notools = (THINK_START, THINK_END, TOOL_START)
+    fsm.CFG.content_fresh_forbidden_notools = (
+        THINK_START,
+        THINK_END,
+        TOOL_START,
+        EOS,
+    )
+    # plan_verify resolves CONTENT through _forbidden_for, which reads these;
+    # without them a pairing test measures whatever the process left behind.
+    fsm.CFG.forbidden = {
+        (fsm.REASONING, False): (EOS,),
+        (fsm.REASONING, True): (EOS,),
+        (fsm.CONTENT, False): fsm.CFG.content_fresh_forbidden,
+        (fsm.CONTENT, True): fsm.CFG.content_done_forbidden,
+    }
+    fsm.CFG.forbidden_notools = {
+        (fsm.REASONING, False): (EOS,),
+        (fsm.REASONING, True): (EOS,),
+        (fsm.CONTENT, False): fsm.CFG.content_fresh_forbidden_notools,
+        (fsm.CONTENT, True): fsm.CFG.content_done_forbidden_notools,
+    }
     fsm.CFG.spec_always_eager = False
-    # Budgets here are pinned by hand: keep the legacy formula so the
-    # per-effort table cannot reach past budget_abs.
-    fsm.CFG.budget_policy = "legacy"
-    fsm.CFG.budget_abs, fsm.CFG.budget_ratio = 3072, 0.75
+    # Budgets here are pinned by hand: one effort, 3072 tokens.
+    fsm.CFG.effort_budgets = {"high": 3072}
+    fsm.CFG.default_effort = "high"
+    fsm.CFG.hard_limit = 3072
     for k, v in over.items():
         setattr(fsm.CFG, k, v)
 
 
-def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
+def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True, tools=None):
     """A request whose FSM state is already built, which is what plan_gate
     judges. Without priming it takes the "no committed state yet" branch and
     gates unconditionally, so an unprimed fixture cannot measure the predicate
@@ -65,12 +91,14 @@ def _req(output_ids, *, in_think=True, max_new_tokens=4096, primed=True):
         output_ids=list(output_ids),
         sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
     )
+    if tools is not None:
+        req.sampling_params.custom_params = {fsm.TOOLS_PARAM: tools}
     if primed:
         fsm._req_fsm(req).advance(req.output_ids)
     return req
 
 
-class TestSolarFsmMaskGate(unittest.TestCase):
+class TestSolarFsmMaskGate(CustomTestCase):
     def setUp(self):
         # CFG is module-global. Configuring it here rather than inside each test
         # keeps a fixture built in a loop header -- which Python evaluates before
@@ -84,14 +112,20 @@ class TestSolarFsmMaskGate(unittest.TestCase):
                 "think_start",
                 "think_end",
                 "all_controls",
+                "transitions",
                 "reasoning_forbidden",
-                "content_mask",
                 "spec_always_eager",
-                "budget_abs",
-                "budget_ratio",
-                "budget_policy",
+                "effort_budgets",
+                "default_effort",
+                "hard_limit",
                 "leading_newline_forbidden",
                 "reasoning_open_forbidden",
+                "content_done_forbidden",
+                "content_fresh_forbidden",
+                "content_done_forbidden_notools",
+                "content_fresh_forbidden_notools",
+                "forbidden",
+                "forbidden_notools",
             )
         }
         _cfg()
@@ -100,6 +134,208 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         for k, v in self._saved.items():
             setattr(fsm.CFG, k, v)
         fsm.CFG._mask_cache.clear()
+
+    def test_content_with_progress_is_flagged_for_the_content_mask(self):
+        """The row plan_gate leaves on the folded path is the row the CONTENT
+        mask has to carry: a drafted sentinel there is otherwise accepted
+        unmasked, which is how a control token reaches the client as text."""
+        _cfg()
+        req = _req([7, THINK_END, 7])
+        self.assertFalse(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [True] * 8)
+
+    def test_fresh_content_is_left_to_the_eager_path(self):
+        """Fresh CONTENT takes the stricter set (EOS and <|im:end|> shut), which
+        only plan_verify writes, so the gate fires and the flag stays False."""
+        _cfg()
+        req = _req([7, THINK_END])
+        self.assertTrue(fsm.plan_gate([req], 8))
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_reasoning_row_is_not_flagged_for_the_content_mask(self):
+        """The two flag sets are disjoint: a row is REASONING or CONTENT."""
+        _cfg()
+        req = _req([7] * 44)
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_a_row_that_left_content_is_not_flagged(self):
+        """The two sets kept apart, actually measured. content_progress is
+        sticky, so a row that produced content and then re-entered REASONING
+        still carries it -- only the state check keeps that row off the CONTENT
+        mask. The fixture above never had content_progress, so it cannot see
+        that check at all."""
+        _cfg()
+        req = _req([7, THINK_END, 7, THINK_START])
+        f = fsm._req_fsm(req)
+        f.advance(req.output_ids)
+        self.assertTrue(f.in_reasoning, "fixture must have re-entered REASONING")
+        self.assertTrue(f.content_progress, "fixture must carry content_progress")
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_mask_flags([req], 8), [True] * 8)
+
+    def test_content_under_a_grammar_is_not_flagged(self):
+        """Structured outputs own CONTENT; masking it here would fight them."""
+        _cfg()
+        req = _req([7, THINK_END, 7])
+        req.sampling_params.json_schema = '{"type": "object"}'
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
+
+    def test_a_drafted_think_start_on_a_content_row_is_masked(self):
+        """The defect itself. plan_verify enters REASONING at that chain
+        position while folded_mask_flags stays False there, so the row is
+        covered only because the CONTENT set forbids <|think:start|>."""
+        import torch
+
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7])
+        self.assertFalse(fsm.plan_gate([req], stride))
+        self.assertEqual(fsm.folded_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        plan = fsm.plan_verify([req], torch.tensor([[7, THINK_START, 7, 7]]), stride)
+        self.assertIn(
+            0,
+            plan.mask_rows.get(fsm.CFG.content_done_forbidden, []),
+            "row 0 is the position that would emit the sentinel",
+        )
+
+    def test_content_flags_match_plan_verify_row_for_row_in_a_mixed_batch(self):
+        """Both sides index row = i*stride + w. A single-request fixture cannot
+        tell request-major from chain-major."""
+        import torch
+
+        _cfg()
+        stride = 4
+        reqs = [_req([7] * 44), _req([7, THINK_END, 7])]
+        self.assertFalse(fsm.plan_gate(reqs, stride))
+        flags = fsm.folded_content_mask_flags(reqs, stride)
+        plan = fsm.plan_verify(reqs, torch.tensor([[7] * stride] * 2), stride)
+        self.assertEqual(
+            {r for r, on in enumerate(flags) if on},
+            set(plan.mask_rows.get(fsm.CFG.content_done_forbidden, [])),
+        )
+        # The line that actually pins the order.
+        self.assertEqual(flags, [False] * stride + [True] * stride)
+
+    def test_a_no_tools_request_is_armed_against_the_opener_too(self):
+        """The gap that used to live here: the shared content buffer carries the
+        tools-available set, which leaves <|tool_call:start|> open. A no-tools
+        row is now flagged for both -- the shared set and, on top of it, the one
+        id that is the whole difference between the two tables."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [True] * stride
+        )
+
+    def test_a_request_with_tools_is_not_armed_against_the_opener(self):
+        """The other half of the pair, or the flags could be all-True: opening a
+        tool call is legal for a request that offers tools, and masking the
+        opener there would commit some other token instead."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=True)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
+        )
+
+    def test_a_no_tools_row_under_a_grammar_is_flagged_for_neither(self):
+        """Mutation guard: drop `not _has_grammar` from the no-tools predicate
+        and this row goes shared=False / no-tools=True -- armed for the no-tools
+        set with the shared mask absent, which is the layering violation the
+        two masks exist to avoid. Every other no-tools fixture omits a grammar,
+        so nothing else can see it."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        req.sampling_params.json_schema = '{"type": "object"}'
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
+        )
+
+    def test_a_stale_no_tools_row_is_flagged_for_neither(self):
+        """The same guard for `_fsm_stale`: a retracted request's committed
+        state describes a prefix that no longer exists, and plan_gate has
+        already sent the step eager."""
+        _cfg()
+        stride = 4
+        req = _req([7, THINK_END, 7], tools=False)
+        req.retraction_count = 1
+        self.assertTrue(fsm._fsm_stale(req), "fixture must be stale")
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(
+            fsm.folded_content_notools_mask_flags([req], stride), [False] * stride
+        )
+
+    def test_a_committed_state_behind_the_output_is_advanced_first(self):
+        """plan_gate returns True at the first request needing eager, so the
+        rest of the batch is never advanced there -- but staging runs on every
+        step regardless. Without the advance in _folded_flags those requests
+        are armed off a state one step stale: here the FSM still says REASONING
+        while the output has left it, so the reasoning mask would be armed on a
+        content row and the content mask on none."""
+        _cfg()
+        stride = 4
+        req = _req([7] * 4)
+        f = fsm._req_fsm(req)
+        f.advance(req.output_ids)
+        self.assertTrue(f.in_reasoning, "fixture must start inside the block")
+        req.output_ids = [7] * 4 + [THINK_END, 7]
+        self.assertEqual(fsm.folded_mask_flags([req], stride), [False] * stride)
+        self.assertEqual(fsm.folded_content_mask_flags([req], stride), [True] * stride)
+
+    def test_no_tools_flags_are_a_subset_of_the_content_flags(self):
+        """The layering contract: the extra id is applied on top of the shared
+        set, never instead of it, so a no-tools row must be armed for both. A
+        row armed only for the opener would lose the rest of the set."""
+        _cfg()
+        stride = 4
+        reqs = [
+            _req([7, THINK_END, 7], tools=False),
+            _req([7, THINK_END, 7], tools=True),
+            _req([7] * 44, tools=False),
+            _req([7, THINK_END], tools=False),
+        ]
+        shared = fsm.folded_content_mask_flags(reqs, stride)
+        notools = fsm.folded_content_notools_mask_flags(reqs, stride)
+        self.assertEqual(len(shared), len(notools))
+        for i, (a, b) in enumerate(zip(shared, notools)):
+            self.assertFalse(b and not a, f"row {i} armed for the opener alone")
+        self.assertEqual(notools, [True] * stride + [False] * stride * 3)
+
+    def test_content_flags_equal_the_rows_plan_verify_would_mask(self):
+        """The pairing, for CONTENT -- equality, not implication: an all-True
+        implementation satisfies implication and would write the content set
+        over reasoning and padding rows too."""
+        import torch
+
+        _cfg()
+        stride = 4
+        for label, out in (
+            ("content with progress", [7, THINK_END, 7]),
+            ("fresh content", [7, THINK_END]),
+            ("reasoning", [7] * 44),
+        ):
+            with self.subTest(label):
+                req = _req(out)
+                gated = fsm.plan_gate([req], stride)
+                flags = fsm.folded_content_mask_flags([req], stride) or []
+                plan = fsm.plan_verify([req], torch.tensor([[7] * stride]), stride)
+                masked = set(plan.mask_rows.get(fsm.CFG.content_done_forbidden, []))
+                flagged = {r for r, on in enumerate(flags) if on}
+                for row in masked:
+                    self.assertTrue(gated or row in flagged, f"{label}: row {row}")
+                if not gated:
+                    self.assertEqual(flagged, masked, label)
+                else:
+                    # Gated rows are plan_verify's; the flags must stay off.
+                    self.assertEqual(flagged, set(), label)
 
     def test_reasoning_row_far_from_the_budget_is_flagged(self):
         """The defect's own case. 44 tokens into a 3072-token budget is nowhere
@@ -207,6 +443,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         req.retraction_count = 1
         self.assertTrue(fsm.plan_gate([req], 8))
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
+        self.assertEqual(fsm.folded_content_mask_flags([req], 8), [False] * 8)
 
     def test_content_row_is_not_flagged(self):
         _cfg()
@@ -214,11 +451,12 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertEqual(fsm.folded_mask_flags([req], 8), [False] * 8)
         self.assertFalse(fsm.plan_gate([req], 8))
 
-    def test_content_mask_gates_only_a_fresh_content_row(self):
-        """The content sets have no in-graph carrier, so a row whose turn has
-        no content yet must go eager; once it has content the fold is kept
-        (its rows then only lack the content_done set, a documented gap)."""
-        _cfg(content_mask=True)
+    def test_fresh_content_row_gates(self):
+        """Fresh CONTENT takes the stricter set (EOS and <|im:end|> shut),
+        which only plan_verify writes, so the row must go eager; once it has
+        content the fold is kept and folded_content_mask_flags arms it with
+        the content_done set instead."""
+        _cfg()
         self.assertTrue(fsm.plan_gate([_req([7, THINK_END])], 8))
         self.assertFalse(fsm.plan_gate([_req([7, THINK_END, 7])], 8))
 
@@ -250,6 +488,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         try:
             self.assertFalse(fsm.plan_gate([req], 8))
             self.assertIsNone(fsm.folded_mask_flags([req], 8))
+            self.assertIsNone(fsm.folded_content_mask_flags([req], 8))
         finally:
             if prev is None:
                 os.environ.pop("SOLAR_FSM", None)
@@ -263,7 +502,7 @@ class TestSolarFsmMaskGate(unittest.TestCase):
         self.assertTrue(fsm.plan_gate([req], 8))
 
 
-class TestApplyFoldedMask(unittest.TestCase):
+class TestApplyFoldedMask(CustomTestCase):
     """The row-wise mask itself. It is the piece the folded accept path depends
     on, and the piece a live boot cannot check: a row/column transposition or a
     broadcast mistake writes -inf somewhere plausible and the engine keeps
