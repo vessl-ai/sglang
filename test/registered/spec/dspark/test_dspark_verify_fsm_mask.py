@@ -356,6 +356,44 @@ class TestEpilogueFsmMasks(CustomTestCase):
             ):
                 self.fail("the greedy test is negated or compared, not required")
 
+    def test_the_fold_gate_requires_the_fsm_to_stand_down(self):
+        """Leg B. `plan_gate` decides, per step, that the committed state is
+        too close to a boundary for the in-graph masks to be right -- a spent
+        budget, fresh CONTENT, a tool state. That verdict only binds if
+        `fold_eligible` requires it; delete the conjunct and every one of those
+        steps folds anyway, wearing a mask built for the state it just left.
+
+        Structural for the same reason as leg A: `fold_eligible` is an inline
+        expression, and a grep survives a negation.
+        """
+        worker = ast.parse(inspect.getsource(dspark_worker_v2))
+        binds = [
+            n.value
+            for n in ast.walk(worker)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "fold_eligible" for t in n.targets
+            )
+        ]
+        self.assertEqual(len(binds), 1, "fold_eligible is bound once")
+        conj = binds[0]
+        self.assertIsInstance(conj, ast.BoolOp)
+        self.assertIsInstance(conj.op, ast.And)
+        gated = [
+            v
+            for v in conj.values
+            if isinstance(v, ast.UnaryOp)
+            and isinstance(v.op, ast.Not)
+            and isinstance(v.operand, ast.Name)
+            and v.operand.id == "_solar_fsm_gate"
+        ]
+        self.assertEqual(
+            len(gated),
+            1,
+            "fold_eligible must carry exactly `and not _solar_fsm_gate`; the "
+            "gate is advisory without it",
+        )
+
     def test_the_folded_accept_is_gated_on_fold_eligible(self):
         """Leg A decides whether a batch may fold; this is where that decision
         is used. Both legs pass with `fold_eligible and` deleted from here --

@@ -1432,6 +1432,16 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
       committed state catches up. It is not free: EOS is forbidden where the
       model may legitimately want it, so a non-EOS token is accepted and
       committed after the answer. It is the cheaper error.
+
+      The same rows undermask in one place: the REASONING set leaves
+      ``<|think:end|>`` open, so a second one can be drafted and committed on
+      a row whose real state is CONTENT, where the vendor forbids it. It costs
+      a stray sentinel in the text, not a state divergence -- ``_step`` sends
+      ``<|think:end|>`` to CONTENT either way and does not touch
+      ``content_progress`` -- and it is bounded by the same ``stride - 1``.
+      Closing it means shutting a token the row may still legitimately need at
+      chain position 0, so it waits for a measured change rather than riding
+      along with an unrelated one.
     * A drafted ``<|think:start|>`` puts ``plan_verify`` *into* REASONING from
       that position; these flags stay False. The row is not unmasked, though:
       it is a content-with-progress row, so :func:`folded_content_mask_flags`
