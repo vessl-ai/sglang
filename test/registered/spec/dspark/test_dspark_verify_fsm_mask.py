@@ -392,9 +392,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 for c in ast.walk(n)
             )
         ]
-        self.assertEqual(
-            guarded, [], "_apply_fsm_mask must not sit under a condition"
-        )
+        self.assertEqual(guarded, [], "_apply_fsm_mask must not sit under a condition")
 
     def test_the_fold_gate_requires_the_fsm_to_stand_down(self):
         """Leg B. `plan_gate` decides, per step, that the committed state is
