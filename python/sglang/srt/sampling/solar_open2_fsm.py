@@ -48,6 +48,16 @@ the ceiling), ``SOLAR_REASONING_BUDGET_DEFAULT_EFFORT``,
 themselves always come from the tokenizer), and
 ``SOLAR_FSM_SPEC_ALWAYS_EAGER=1`` (speculative decoding: mask every verify step
 instead of only the steps the folded path cannot cover).
+
+A forced close lands wherever the budget runs out, and a sentinel that follows
+mid-word gives the model a prefix its training never showed it: it answers the
+next step by ending the turn instead of the block.
+``SOLAR_FSM_FORCE_SEQ=nl_te`` forces a newline one step ahead of
+``<|think:end|>``, taking the newline id from the served vocabulary. It
+defaults to ``off``, where nothing is forced but the sentinel. The reasoning
+mask on a budget-spent row is not part of the arm and holds either way: a row
+the grammar has shut on both tokens keeps its envelope rather than spending
+that step with EOS open.
 """
 
 from __future__ import annotations
@@ -164,6 +174,8 @@ _NO_HARD_LIMIT = 1 << 62  # SOLAR_REASONING_BUDGET_HARD_LIMIT=0: no ceiling
 # Leading-newline rule after <|think:start|>: ids resolved by
 # _leading_newline_ids.
 _NEWLINE_BYTELEVEL = "Ċ"  # byte-level "\n"
+# forced-exit sequences. "off" keeps the single <|think:end|>.
+_FORCE_SEQS = frozenset(("off", "nl_te"))
 # custom_params key the chat entrypoint uses to hand the request's reasoning
 # effort to the scheduler-side FSM (solar_open2_serving.normalize_reasoning_effort).
 EFFORT_PARAM = "solar_reasoning_effort"
@@ -231,6 +243,12 @@ class _Config:
     # accept, so by default only the steps the folded path cannot cover leave
     # it (plan_gate). True masks every verify step (fuller enforcement, slower).
     spec_always_eager: bool = False
+    # Forced-exit sequence. "off" = the historical single
+    # <|think:end|>. "nl_te" forces one newline the step before it, matching
+    # the in-tree ThinkingBudgetLogitProcessor contract
+    # (ThinkingBudgetLogitProcessor.__call__ in custom_logit_processor.py).
+    force_seq: str = "off"
+    force_newline: Optional[int] = None
     _mask_cache: Dict[Tuple[Tuple[int, ...], str], torch.Tensor] = {}
 
 
@@ -367,14 +385,7 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
     override = _env_id_list("SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS")
     if override is not None:
         return tuple(sorted(override))
-    tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
-    vocab = {}
-    if os.path.isfile(tk_path):
-        with open(tk_path, encoding="utf-8") as f:
-            model = json.load(f).get("model") or {}
-        vocab = model.get("vocab") if isinstance(model.get("vocab"), dict) else {}
-    table = dict(vocab)
-    table.update(_added_token_ids(tokenizer_dir))
+    table = _vocab_table(tokenizer_dir)
     ids = {
         int(tid)
         for text, tid in table.items()
@@ -389,6 +400,38 @@ def _leading_newline_ids(tokenizer_dir: str) -> Tuple[int, ...]:
             "to [] to switch the rule off"
         )
     return tuple(sorted(ids))
+
+
+def _vocab_table(tokenizer_dir: str) -> Dict[str, int]:
+    """``tokenizer.json``'s vocab plus the added tokens, text -> id.
+
+    Both newline lookups read it, so neither carries its own copy of the
+    parsing. It is read at boot and not cached: each call re-parses the
+    file."""
+    table: Dict[str, int] = {}
+    tk_path = os.path.join(tokenizer_dir, "tokenizer.json")
+    if os.path.isfile(tk_path):
+        with open(tk_path, encoding="utf-8") as f:
+            model = json.load(f).get("model") or {}
+        if isinstance(model.get("vocab"), dict):
+            table.update(model["vocab"])
+    table.update(_added_token_ids(tokenizer_dir))
+    return table
+
+
+def _force_newline_id(tokenizer_dir: str) -> Optional[int]:
+    """the id of a single newline token, or None when the vocab has none.
+
+    Byte-level "C with dot above" (U+010A) first, then the literal text. It is
+    read off the vocabulary by its text, so what comes back is a newline and
+    nothing else -- forcing a composite like " problem.\n" would append that
+    text to the customer's reasoning block. ``init_from_env`` refuses ``nl_te``
+    when this returns None."""
+    table = _vocab_table(tokenizer_dir)
+    for key in (_NEWLINE_BYTELEVEL, "\n"):
+        if key in table:
+            return int(table[key])
+    return None
 
 
 _LOG_INTERVAL = 60.0
@@ -546,8 +589,16 @@ def configure_ids(
     CFG.content_fresh_forbidden_notools = CFG.forbidden_notools[(CONTENT, False)]
     CFG.content_done_forbidden_notools = CFG.forbidden_notools[(CONTENT, True)]
     CFG.leading_newline_forbidden = tuple(sorted(set(leading_newline)))
+    # think_end comes back out: the leading-newline ids are operator-overridable
+    # (SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS) and arrive unchecked, so one
+    # naming think_end would leave the FSM masking the token it forces on that
+    # same row -- the block could then never close. reasoning_forbidden keeps
+    # think_end open by construction; this set has to hold the same invariant.
     CFG.reasoning_open_forbidden = tuple(
-        sorted(set(CFG.reasoning_forbidden) | set(CFG.leading_newline_forbidden))
+        sorted(
+            (set(CFG.reasoning_forbidden) | set(CFG.leading_newline_forbidden))
+            - {CFG.think_end}
+        )
     )
     CFG._mask_cache.clear()
 
@@ -563,13 +614,26 @@ def init_from_env() -> None:
     _configure_from_tokenizer(tok_dir)
     _configure_budget_from_env()
     CFG.spec_always_eager = os.environ.get("SOLAR_FSM_SPEC_ALWAYS_EAGER", "0") == "1"
+    # default OFF -> byte-identical behaviour to the base build.
+    seq = (os.environ.get("SOLAR_FSM_FORCE_SEQ") or "off").strip() or "off"
+    if seq not in _FORCE_SEQS:
+        raise RuntimeError(
+            f"SOLAR_FSM_FORCE_SEQ must be one of {sorted(_FORCE_SEQS)}, got {seq!r}"
+        )
+    if seq == "nl_te" and CFG.force_newline is None:
+        raise RuntimeError(
+            f"SOLAR_FSM_FORCE_SEQ=nl_te but {tok_dir} carries no single "
+            "newline token, so the arm has no boundary to force"
+        )
+    CFG.force_seq = seq
     _warn_retired_env()
     CFG.enabled = True
     logger.info(
         "[SOLAR-FSM] enabled: think_start=%s think_end=%s im_end=%s | "
         "forbidden reasoning=%s reasoning_open=%s content_fresh=%s "
         "content_done=%s (no tools: %s / %s) tool states=%s | "
-        "budget per effort %s default=%s hard_limit=%s",
+        "budget per effort %s default=%s hard_limit=%s | "
+        "force_seq=%s newline=%s",
         CFG.think_start,
         CFG.think_end,
         CFG.im_end,
@@ -583,9 +647,11 @@ def init_from_env() -> None:
             _STATE_NAMES[st]: CFG.forbidden[(st, False)]
             for st in range(TOOL_CALL_BEGIN, TOOL_CALL_END + 1)
         },
-        CFG.effort_budgets,
+        {e: _budget_for(e) for e in CFG.effort_budgets},
         CFG.default_effort,
         "off" if CFG.hard_limit >= _NO_HARD_LIMIT else CFG.hard_limit,
+        CFG.force_seq,
+        CFG.force_newline,
     )
 
 
@@ -602,6 +668,7 @@ def _configure_from_tokenizer(tok_dir: str) -> None:
         eos=_eos_ids(tok_dir),
         leading_newline=_leading_newline_ids(tok_dir),
     )
+    CFG.force_newline = _force_newline_id(tok_dir)
 
 
 def _configure_budget_from_env() -> None:
@@ -689,6 +756,7 @@ class SolarReqFSM:
         "consumed",
         "budget",
         "forced",
+        "forced_tok",
         "content_progress",
         "tools",
     )
@@ -718,6 +786,17 @@ class SolarReqFSM:
         self.budget = _budget_for(effort)
         self.tools = bool(tools)
         self.forced = False
+        # What the previous step told this row to emit, or None when it was
+        # not forced. Read on the non-speculative path only: there
+        # req.output_ids lags a step behind what the FSM has consumed, so this
+        # is the only record of a forced token the next step can trust.
+        # plan_verify has the chain anchor instead and never touches it.
+        #
+        # Cleared whenever the budget is not spent, which is what lets a second
+        # think block be forced: <|think:start|> puts ``count`` back to zero, so
+        # without the reset the first block's close would still be recorded and
+        # the second would never be closed at all.
+        self.forced_tok = None
 
     def _step(self, tok: int) -> None:
         """Per-token transition. Reused verbatim as ``_SimState.step``, which
@@ -886,17 +965,56 @@ def _mask_tensor(ids: Tuple[int, ...], *, device: torch.device) -> torch.Tensor:
     return t
 
 
+def _force_token(state, *, last_tok) -> int:
+    """the one token a budget-spent row must emit now.
+
+    ``nl_te`` puts a single newline one step ahead of ``<|think:end|>``, which
+    is what the in-tree ThinkingBudgetLogitProcessor does for GLM / Qwen3 /
+    DeepSeek-R1 / Inkling: force the newline unless the last emitted token
+    already was one, then the end token.
+
+    What decides the outcome is whether the token immediately before the final
+    ``<|think:end|>`` is a boundary, not how many sentinels are forced. Replayed
+    on 58 prefixes, the fragment rate after a forced close is 1.00 for
+    ``word TE``, 0.24 for ``word \\n TE``, 0.19 for ``word \\n\\n TE`` and
+    0.10 for ``word TE TE``; against a close the model chose itself, all five
+    shapes sit at zero. So the newline goes strictly *before* the end token: the
+    same replay puts ``word \\n TE \\n`` back down at 0.23 for rows that
+    answered,
+    which is why nothing here forces a newline after the close.
+    The second step arrives on its own -- a newline is not a control token and
+    the state is REASONING, so ``_step`` only bumps ``count``, which is already
+    at or past the budget.
+
+    ``at_think_open`` is exempt: ``reasoning_open_forbidden`` has already shut
+    the leading-newline ids on that row, so asking for one there only earns the
+    promotion to ``<|think:end|>`` and a warning about a boundary nobody could
+    have supplied. The row closes on the same token either way.
+    """
+    if (
+        CFG.force_seq == "nl_te"
+        and CFG.force_newline is not None
+        and not state.at_think_open
+        and last_tok != CFG.force_newline
+    ):
+        return CFG.force_newline
+    return CFG.think_end
+
+
 def _mask_and_force(
     logits: torch.Tensor,
     *,
     mask_rows: Dict[Tuple[int, ...], List[int]],
-    force_rows: List[int],
-) -> Tuple[List[int], List[int]]:
-    """Write ``NEG_INF`` over each forbidden set in its rows, then force
-    ``<|think:end|>`` on ``force_rows``. A row the grammar has already closed
-    to ``<|think:end|>`` would become fully -inf if forced -- the sampler then
-    returns an arbitrary id that the grammar rejects on accept -- so it is left
-    to the grammar. Returns ``(forced rows, rows left to the grammar)``."""
+    force_rows: Dict[int, List[int]],
+) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """Write ``NEG_INF`` over each forbidden set in its rows, then force one
+    token per ``force_rows`` entry ({token id: rows}). A row the grammar has
+    already closed to that token would become fully -inf if forced -- the
+    sampler then returns an arbitrary id that the grammar rejects on accept --
+    so it is left to the grammar. Returns ``((row, token actually forced), (row, token left
+    to the grammar), (row, boundary the grammar refused))`` -- the forced token
+    is not always the requested one, since a blocked boundary is closed on
+    ``<|think:end|>`` instead, and the third list is those rows."""
     for ids, rows_i in mask_rows.items():
         if not ids or not rows_i:
             continue
@@ -904,52 +1022,94 @@ def _mask_and_force(
         rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
         logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
     if not force_rows:
-        return [], []
-    rsel = torch.tensor(force_rows, dtype=torch.long, device=logits.device)
-    allowed = torch.isfinite(logits[rsel, CFG.think_end]).tolist()
-    forced = [r for r, ok in zip(force_rows, allowed) if ok]
-    blocked = [r for r, ok in zip(force_rows, allowed) if not ok]
-    if forced:
-        rsel = torch.tensor(forced, dtype=torch.long, device=logits.device)
-        keep = logits[rsel, CFG.think_end].clone()
-        logits[rsel, :] = NEG_INF
-        logits[rsel, CFG.think_end] = keep
-    return forced, blocked
+        return [], [], []
+    forced_all: List[Tuple[int, int]] = []  # (row, the token actually forced)
+    blocked_all: List[Tuple[int, int]] = []  # (row, the token that was blocked)
+    promoted_all: List[Tuple[int, int]] = []  # (row, the boundary that was refused)
+    for tok, rows_i in force_rows.items():
+        if not rows_i:
+            continue
+        rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
+        allowed = torch.isfinite(logits[rsel, tok]).tolist()
+        forced = [r for r, ok in zip(rows_i, allowed) if ok]
+        blocked = [r for r, ok in zip(rows_i, allowed) if not ok]
+        if blocked and tok != CFG.think_end:
+            # A boundary token has no guarantee of being open: strict-thinking
+            # grammars must leave <|think:end|> reachable, nothing says that of
+            # a newline. Leaving the row to the grammar would re-force the same
+            # blocked token every step until max_tokens, so close on think_end
+            # instead -- the boundary is an improvement on the close, not a
+            # precondition for it.
+            bsel = torch.tensor(blocked, dtype=torch.long, device=logits.device)
+            second = torch.isfinite(logits[bsel, CFG.think_end]).tolist()
+            promoted = [r for r, ok2 in zip(blocked, second) if ok2]
+            blocked = [r for r, ok2 in zip(blocked, second) if not ok2]
+            if promoted:
+                psel = torch.tensor(promoted, dtype=torch.long, device=logits.device)
+                keep = logits[psel, CFG.think_end].clone()
+                logits[psel, :] = NEG_INF
+                logits[psel, CFG.think_end] = keep
+                forced_all.extend((r, CFG.think_end) for r in promoted)
+                promoted_all.extend((r, tok) for r in promoted)
+        if forced:
+            fsel = torch.tensor(forced, dtype=torch.long, device=logits.device)
+            keep = logits[fsel, tok].clone()
+            logits[fsel, :] = NEG_INF
+            logits[fsel, tok] = keep
+        forced_all.extend((r, tok) for r in forced)
+        blocked_all.extend((r, tok) for r in blocked)
+    return forced_all, blocked_all, promoted_all
 
 
 _CONFLICT_LOG = {"last": -_LOG_INTERVAL, "num_suppressed": 0}
 
 
-def _log_force_conflict(rows, *, stride: int, rids) -> None:
-    """Report rows where the FSM wanted to force <|think:end|> but something
-    had already forbidden it, so forcing would leave the row fully masked.
+_PROMOTE_LOG = {"last": -_LOG_INTERVAL, "num_suppressed": 0}
 
-    Two sources, and the message names both because they are not
-    distinguishable here: a grammar reading different committed state, and the
-    in-graph CONTENT mask, which forbids ``<|think:end|>`` on a row committed
-    in CONTENT-with-progress. The second reaches this only for a zero-budget
-    request (effort ``none``/``minimal``) whose chain drafts a
-    ``<|think:start|>``: ``plan_verify`` then wants the budget force on a row
-    the content mask has already shut. Rate-limited like
-    ``_warn_unknown_effort``."""
-    num_suppressed = _rate_limited(_CONFLICT_LOG, count=len(rows))
+
+def _log_rows(rows, *, state, stride: int, rids, message: str) -> None:
+    """Report ``(row, token id)`` pairs once per ``_LOG_INTERVAL``.
+
+    ``state`` is the caller's own rate-limit dict, so a burst of one kind does
+    not suppress the other. The token id travels with the row because the
+    forced token is not always ``<|think:end|>`` -- it may be the boundary
+    newline -- and naming the wrong id sends an operator after the wrong token.
+    Logs are the only view into which arm is live."""
+    num_suppressed = _rate_limited(state, count=len(rows))
     if num_suppressed is None:
         return
-    if rids is not None and stride > 0:
-        named = [rids[r // stride] for r in rows if r // stride < len(rids)]
-    else:
-        named = []
+    named = (
+        [rids[r // stride] for r, _ in rows if r // stride < len(rids)]
+        if rids is not None and stride > 0
+        else []
+    )
     logger.warning(
-        "[SOLAR-FSM] <|think:end|> (id=%s) is already forbidden by the grammar "
-        "or by the in-graph CONTENT mask on %d row(s) %s (reqs %s); skipping "
-        "the budget force there so the row keeps the set it already has. "
-        "%d earlier occurrence(s) suppressed.",
-        CFG.think_end,
+        "[SOLAR-FSM] " + message + " %d earlier occurrence(s) suppressed.",
         len(rows),
         rows,
         named,
         num_suppressed,
     )
+
+
+_PROMOTED_MSG = (
+    "the boundary token the arm wanted is forbidden on %d row(s) %s "
+    "(reqs %s); closing on <|think:end|> there, so those rows get the "
+    "unprescribed close."
+)
+
+# Two sources, and the message names both because they are not distinguishable
+# here: a grammar reading different committed state, and the in-graph CONTENT
+# mask, which forbids <|think:end|> on a row committed in CONTENT-with-progress.
+# The second reaches this only for a zero-budget request (effort none/minimal)
+# whose chain drafts a <|think:start|>: plan_verify then wants the budget force
+# on a row the content mask has already shut.
+_CONFLICT_MSG = (
+    "neither the forced token nor <|think:end|> is reachable on %d row(s) %s "
+    "(reqs %s); the budget force is skipped there. The reasoning mask still "
+    "holds, so the row stays inside the think block but keeps generating past "
+    "its budget and will hit this again next step."
+)
 
 
 # --------------------------------------------------------------------------
@@ -1087,16 +1247,73 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
     if not rows:
         return
 
-    force_rows: List[int] = []
+    force_rows: Dict[int, List[int]] = {}
     mask_rows: Dict[Tuple[int, ...], List[int]] = {}
     for i, req in enumerate(rows):
         fsm = _req_fsm(req)
         fsm.advance(req.output_ids)
         if fsm.in_reasoning:
-            if fsm.budget_exhausted():
-                force_rows.append(i)
+            last_tok = req.output_ids[-1] if req.output_ids else None
+            if not fsm.budget_exhausted():
+                tok = fsm.forced_tok = None
+            elif CFG.force_seq != "off" and fsm.forced_tok == CFG.think_end:
+                # The sequence this arm prescribes is finished. output_ids has
+                # yet to catch up, so deciding from it again would read the same
+                # stale anchor and emit the boundary a second time; the mask
+                # below holds the row until advance() sees the close.
+                #
+                # Only when an arm is on. With ``off`` the repeat is what puts
+                # the second sentinel out, and that doubled close is the one
+                # boundary the non-speculative path has always had -- taking it
+                # away would leave that path with the bare mid-word close this
+                # module exists to avoid.
+                #
+                # It is the non-speculative path alone that gets it: plan_verify
+                # commits immediately and forces once, so an ``off`` cell closes
+                # on ``word TE TE`` without speculative decoding and on the bare
+                # ``word TE`` with it. A speculative cell has to turn the arm on
+                # to have a boundary at all.
+                #
+                # That rescue is an accident of the overlap lag, not a design:
+                # with --disable-overlap-schedule, or on the delayed-sample path
+                # a grammar request takes, output_ids is current and the close
+                # is forced once. So ``off`` behaves differently depending on
+                # the deployment shape, which is why nl_te is the prescription
+                # rather than a tuning knob. The second sentinel costs nothing
+                # where it does appear: usage counts reasoning tokens to the
+                # first one, and the reasoning parser scrubs a redundant run.
+                #
+                # One slot and no timeout: a close that is emitted but never
+                # commits leaves the row masked-only past its budget. Add a
+                # consumed-count guard if that is ever observed.
+                tok = None
             else:
-                mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
+                # The token this row last actually emitted outranks output_ids,
+                # which lags behind it. Recorded after the write, not here: a
+                # row the grammar blocked took no write and has to be offered
+                # the same boundary again next step.
+                tok = _force_token(
+                    fsm,
+                    last_tok=last_tok if fsm.forced_tok is None else fsm.forced_tok,
+                )
+            # The reasoning mask goes on either way. A forced row overwrites
+            # it a moment later -- the force writes the whole row -- but a row
+            # the grammar blocks on both tokens gets no write at all, and
+            # without this it would spend that step with EOS and every sentinel
+            # open, free to end the turn inside the think block.
+            #
+            # The mask lands on top of whatever the grammar already wrote and
+            # cannot empty the row. A request with a reasoning parser takes no
+            # vocabulary mask at all inside the think block, and the one case
+            # that does -- strict thinking with the token filter on, at its own
+            # think budget -- leaves exactly <|think:end|> open, a token this
+            # state permits and the force then takes. What produces a blocked
+            # row is the in-graph CONTENT mask meeting a chain that walks back
+            # into REASONING; the union of the two is sentinels plus EOS, and
+            # the ordinary vocabulary stays finite.
+            mask_rows.setdefault(_reasoning_forbidden(fsm), []).append(i)
+            if tok is not None:
+                force_rows.setdefault(tok, []).append(i)
         elif fsm.state == CONTENT and _has_grammar(req):
             continue  # structured outputs own the CONTENT phase
         else:
@@ -1111,19 +1328,36 @@ def apply(logits: torch.Tensor, sampling_info) -> None:
                 [],
             ).append(i)
 
-    forced, blocked = _mask_and_force(
+    forced, blocked, promoted = _mask_and_force(
         logits, mask_rows=mask_rows, force_rows=force_rows
     )
+    if promoted:
+        _log_rows(
+            promoted,
+            state=_PROMOTE_LOG,
+            stride=1,
+            rids=[r.rid for r in rows],
+            message=_PROMOTED_MSG,
+        )
     if blocked:
-        _log_force_conflict(blocked, stride=1, rids=[r.rid for r in rows])
-    for i in forced:
+        _log_rows(
+            blocked,
+            state=_CONFLICT_LOG,
+            stride=1,
+            rids=[r.rid for r in rows],
+            message=_CONFLICT_MSG,
+        )
+    for i, tok in forced:
         fsm = rows[i]._solar_fsm
+        # What was written, not what was planned.
+        fsm.forced_tok = tok
         if not fsm.forced:
             fsm.forced = True
             logger.info(
-                "[SOLAR-FSM] reasoning budget %d exhausted -> forcing "
-                "<|think:end|> (req %s)",
+                "[SOLAR-FSM] reasoning budget %d exhausted -> forcing token "
+                "id=%s (req %s)",
                 fsm.budget,
+                tok,
                 rows[i].rid,
             )
 
@@ -1183,7 +1417,7 @@ class _SimState:
 class VerifyPlan(msgspec.Struct, kw_only=True):
     """Per-(request, chain position) masks for one target-verify step."""
 
-    force_rows: List[int]
+    force_rows: Dict[int, List[int]]
     mask_rows: Dict[Tuple[int, ...], List[int]]
     stride: int
     bs: int
@@ -1206,13 +1440,29 @@ class VerifyPlan(msgspec.Struct, kw_only=True):
                     valid.add(i * self.stride + w)
 
         keep = lambda rs: [r for r in rs if valid is None or r in valid]
-        _, blocked = _mask_and_force(
+        # The forced list goes unread here: on the speculative path the log is
+        # written at plan time, in plan_verify's w == 0 branch.
+        _, blocked, promoted = _mask_and_force(
             logits,
             mask_rows={ids: keep(rows_i) for ids, rows_i in self.mask_rows.items()},
-            force_rows=keep(self.force_rows),
+            force_rows={tok: keep(rows_i) for tok, rows_i in self.force_rows.items()},
         )
+        if promoted:
+            _log_rows(
+                promoted,
+                state=_PROMOTE_LOG,
+                stride=self.stride,
+                rids=self.rids,
+                message=_PROMOTED_MSG,
+            )
         if blocked:
-            _log_force_conflict(blocked, stride=self.stride, rids=self.rids)
+            _log_rows(
+                blocked,
+                state=_CONFLICT_LOG,
+                stride=self.stride,
+                rids=self.rids,
+                message=_CONFLICT_MSG,
+            )
 
 
 def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
@@ -1239,7 +1489,7 @@ def apply_folded_mask(logits, row_flags, forbid_ids) -> None:
 
 def _reasoning_needs_eager(fsm, *, window: int) -> bool:
     """Inside the think block: the leading-newline set on the step after
-    ``<|think:start|>`` and the forced ``<|think:end|>`` at a spent budget
+    ``<|think:start|>`` and the forced close at or after a spent budget
     (also every step of a zero-budget none/minimal block) are plan_verify's
     alone. Judged only while inside the block -- a spent or zero budget must
     not keep a request that has left reasoning eager for the rest of its
@@ -1416,9 +1666,9 @@ def folded_mask_flags(reqs, stride: int) -> Optional[List[bool]]:
     """Per-(request, chain position) flags for the in-graph reasoning mask.
 
     True where the request's **committed** state is in REASONING with budget
-    left. A row whose budget is spent needs a forced ``<|think:end|>`` instead,
-    which only ``plan_verify`` can write, and :func:`plan_gate` has already sent
-    that step to the eager path -- so it is left False here. The CONTENT rows
+    left. A row whose budget is spent needs whatever ``_force_token`` returns,
+    a boundary or ``<|think:end|>``, which only ``plan_verify`` can write, so
+    it is left False here. The CONTENT rows
     this leaves False are armed by :func:`folded_content_mask_flags` instead.
 
     Committed state only, which is what keeps this sync-free: the draft chain
@@ -1473,7 +1723,7 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
 
     chain = chain_ids.tolist()
     bs = min(len(reqs), len(chain))
-    force_rows: List[int] = []
+    force_rows: Dict[int, List[int]] = {}
     mask_rows: Dict[Tuple[int, ...], List[int]] = {}
     rids = [reqs[i].rid for i in range(bs)]
 
@@ -1493,18 +1743,40 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                 sim.step(int(row_ids[w]))
             row = i * stride + w
             if sim.in_reasoning:
-                if sim.exhausted(fsm.budget):
-                    force_rows.append(row)
+                # The token committed just before this row: the draft at w for
+                # w > 0, and at w == 0 the anchor row_ids[0] -- NOT
+                # req.output_ids[-1], which lags a step behind what the FSM
+                # has consumed. nl_te forces the newline unless the last token
+                # already was one, so a stale value there injects a second
+                # newline into the block.
+                if w > 0 and w < len(row_ids):
+                    last_tok = int(row_ids[w])
+                elif row_ids:
+                    last_tok = int(row_ids[0])
+                else:
+                    last_tok = req.output_ids[-1] if req.output_ids else None
+                tok = (
+                    _force_token(sim, last_tok=last_tok)
+                    if sim.exhausted(fsm.budget)
+                    else None
+                )
+                # See apply(): the mask goes on even when the row is forced,
+                # so a row the grammar blocks on both tokens keeps its envelope.
+                mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
+                if tok is not None:
+                    force_rows.setdefault(tok, []).append(row)
                     if w == 0 and not fsm.forced:
                         fsm.forced = True
+                        # The plan's token, not necessarily the one applied: a
+                        # boundary the grammar forbids is closed on think_end
+                        # instead, and VerifyPlan.apply logs that.
                         logger.info(
                             "[SOLAR-FSM] reasoning budget %d exhausted -> "
-                            "forcing <|think:end|> (req %s, verify)",
+                            "planning token id=%s (req %s, verify)",
                             fsm.budget,
+                            tok,
                             rids[i],
                         )
-                else:
-                    mask_rows.setdefault(_reasoning_forbidden(sim), []).append(row)
             elif sim.state == CONTENT and _has_grammar(reqs[i]):
                 continue  # structured outputs own the CONTENT phase
             else:
