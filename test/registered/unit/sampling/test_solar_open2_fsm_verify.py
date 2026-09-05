@@ -10,6 +10,7 @@ the grammar's time base, and the defense-in-depth guard in ``VerifyPlan.apply``
 ``<|think:end|>``.
 """
 
+import time
 import types
 import unittest
 
@@ -62,10 +63,22 @@ def _fsm(budget, in_reasoning=True, count=0, consumed=0):
     fsm.consumed = consumed
     fsm.budget = budget
     fsm.forced = False
+    fsm.forced_tok = None
     fsm.content_progress = False
     fsm.at_think_open = False
     fsm.tools = True
     return fsm
+
+
+def _forced(plan):
+    """Rows the plan forces, flattened.
+
+    ``force_rows`` used to be a flat row list, all of them forced to
+    ``<|think:end|>``. It is now {token id: rows}, because a budget-forced row
+    may be told to emit a boundary first, so a test that asks "is row 0 forced"
+    has to look inside the values.
+    """
+    return sorted(r for rows in plan.force_rows.values() for r in rows)
 
 
 class SolarOpen2FsmVerifyTestBase(CustomTestCase):
@@ -89,6 +102,11 @@ class SolarOpen2FsmVerifyTestBase(CustomTestCase):
         "content_fresh_forbidden",
         "content_done_forbidden",
         "spec_always_eager",
+        # The forced-close arm. init_from_env writes both, so a test that
+        # turns the arm on leaks into the rest of the process unless they are
+        # saved and restored like the rest.
+        "force_seq",
+        "force_newline",
     )
 
     def setUp(self):
@@ -116,8 +134,12 @@ class SolarOpen2FsmVerifyTestBase(CustomTestCase):
         cfg.hard_limit = 1000
         cfg.spec_always_eager = False
         cfg._mask_cache.clear()
-        solar_open2_fsm._CONFLICT_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
-        solar_open2_fsm._CONFLICT_LOG["num_suppressed"] = 0
+        # Both share _rate_limited, so a second test touching the promote path
+        # within the interval would log nothing and fail on the assertLogs
+        # rather than on what it is testing.
+        for state in (solar_open2_fsm._CONFLICT_LOG, solar_open2_fsm._PROMOTE_LOG):
+            state["last"] = -solar_open2_fsm._LOG_INTERVAL
+            state["num_suppressed"] = 0
 
     def tearDown(self):
         cfg = solar_open2_fsm.CFG
@@ -141,7 +163,7 @@ class TestPlanVerifyUsesCommittedState(SolarOpen2FsmVerifyTestBase):
         plan = solar_open2_fsm.plan_verify([req], chain, stride=3)
 
         self.assertIsNotNone(plan)
-        self.assertNotIn(0, plan.force_rows)
+        self.assertNotIn(0, _forced(plan))
 
     def test_uncommitted_stale_state_forces_row0(self):
         # Negative control: without the commit() feed, the FSM is still sitting
@@ -153,7 +175,10 @@ class TestPlanVerifyUsesCommittedState(SolarOpen2FsmVerifyTestBase):
         plan = solar_open2_fsm.plan_verify([req], chain, stride=3)
 
         self.assertIsNotNone(plan)
-        self.assertIn(0, plan.force_rows)
+        # The token matters as much as the row: since [H27-FORCE-SEQ] a forced
+        # row may be told to emit a boundary first, and flattening would pass
+        # either way.
+        self.assertIn(0, plan.force_rows.get(THINK_END, []))
 
 
 class TestVerifyPlanForceGuard(SolarOpen2FsmVerifyTestBase):
@@ -163,7 +188,7 @@ class TestVerifyPlanForceGuard(SolarOpen2FsmVerifyTestBase):
         original = logits.clone()
 
         plan = solar_open2_fsm.VerifyPlan(
-            force_rows=[0], mask_rows={}, stride=1, bs=1, rids=["r0"]
+            force_rows={THINK_END: [0]}, mask_rows={}, stride=1, bs=1, rids=["r0"]
         )
         with self.assertLogs(solar_open2_fsm.logger, level="WARNING"):
             plan.apply(logits)
@@ -179,7 +204,7 @@ class TestVerifyPlanForceGuard(SolarOpen2FsmVerifyTestBase):
         original_think_end = logits[0, THINK_END].item()
 
         plan = solar_open2_fsm.VerifyPlan(
-            force_rows=[0], mask_rows={}, stride=1, bs=1, rids=["r0"]
+            force_rows={THINK_END: [0]}, mask_rows={}, stride=1, bs=1, rids=["r0"]
         )
         plan.apply(logits)
 
@@ -228,9 +253,15 @@ class TestNonSpecApplyForceGuard(SolarOpen2FsmVerifyTestBase):
         self.assertEqual(solar_open2_fsm._CONFLICT_LOG["num_suppressed"], 0)
         logits[1, THINK_END] = 0.0
 
-        # Row 0: forced skipped, logits unchanged, still has finite entries.
-        self.assertTrue(torch.equal(logits[0], original_row0))
+        # Row 0: the force was skipped, so the row keeps the reasoning mask it
+        # would have had anyway and still has finite entries to sample from.
+        # Leaving it untouched would open EOS and every sentinel for that step.
         self.assertTrue(torch.isfinite(logits[0]).any())
+        for tid in solar_open2_fsm.CFG.reasoning_forbidden:
+            self.assertEqual(logits[0, tid].item(), float("-inf"), tid)
+        for i in range(VOCAB_SIZE):
+            if i not in solar_open2_fsm.CFG.reasoning_forbidden:
+                self.assertEqual(logits[0, i].item(), original_row0[i].item(), i)
         # Row 1: forced -- -inf everywhere except think_end.
         for i in range(VOCAB_SIZE):
             if i == THINK_END:
@@ -248,7 +279,7 @@ class TestPlanVerifyReasoningMask(SolarOpen2FsmVerifyTestBase):
         plan = solar_open2_fsm.plan_verify([req], chain, stride=stride)
 
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.force_rows, [])
+        self.assertEqual(_forced(plan), [])
         self.assertEqual(
             sorted(plan.mask_rows[solar_open2_fsm.CFG.reasoning_forbidden]),
             [0, 1, 2],
@@ -414,6 +445,311 @@ class TestAdvanceCommitted(SolarOpen2FsmVerifyTestBase):
         fsm = solar_open2_fsm._req_fsm(req)
         self.assertEqual(fsm.count, 1)
         self.assertEqual(fsm.consumed, 1)
+
+
+class TestForcedCloseBoundary(SolarOpen2FsmVerifyTestBase):
+    """What a budget-spent row is forced to emit, and where that travels."""
+
+    # This suite has no vocabulary table; _arm sets the ids directly.
+    NL = 5
+
+    def _arm(self):
+        cfg = solar_open2_fsm.CFG
+        cfg.force_seq = "nl_te"
+        cfg.force_newline = self.NL
+
+    def _decide(self, last_tok, at_think_open=False):
+        state = _fsm(budget=100, count=100)
+        state.at_think_open = at_think_open
+        return solar_open2_fsm._force_token(state, last_tok=last_tok)
+
+    def test_the_think_open_row_is_never_forced_to_a_newline(self):
+        # reasoning_open_forbidden already shuts the leading-newline ids on the
+        # token right after <|think:start|>, so forcing one there would leave
+        # the row fully -inf and the sampler would return an id the grammar
+        # rejects. That row closes on <|think:end|> instead.
+        self._arm()
+        self.assertEqual(self._decide(last_tok=99, at_think_open=True), THINK_END)
+
+    def test_the_arm_stays_off_unless_the_env_turns_it_on(self):
+        # The whole gate: with force_seq off the module forces the sentinel and
+        # nothing before it, whatever newline id happens to be resolved.
+        cfg = solar_open2_fsm.CFG
+        cfg.force_seq, cfg.force_newline = "off", self.NL
+        self.assertEqual(self._decide(last_tok=99), THINK_END)
+
+    def test_non_spec_apply_does_not_force_the_boundary_twice(self):
+        # req.output_ids lags a step on this path, and advance() is monotonic,
+        # so the same anchor would be read again and the boundary forced a
+        # second time -- the block would commit "word \n \n TE". The token
+        # this row was told to emit last step is what the next one must read.
+        self._arm()
+        req = _req(rid="r0", output_ids=[99], fsm=_fsm(budget=1, count=1))
+        info = types.SimpleNamespace(solar_fsm_rows=[req])
+        first = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(first, info)
+        self.assertEqual(first[0, self.NL].item(), 0.0)
+        second = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(second, info)
+        self.assertEqual(second[0, THINK_END].item(), 0.0)
+        self.assertEqual(second[0, self.NL].item(), float("-inf"))
+        # And once the close is out, nothing more is forced: the row keeps the
+        # mask until advance() sees it leave the block.
+        third = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(third, info)
+        self.assertEqual(third[0, THINK_END].item(), 0.0)
+        self.assertEqual(third[0, self.NL].item(), 0.0)
+
+    def test_a_blocked_row_is_offered_the_boundary_again(self):
+        # forced_tok records what was written, not what was decided. A row the
+        # grammar shut on both tokens took no write, so the next step has to
+        # offer it the same boundary rather than move on as if it had closed.
+        self._arm()
+        req = _req(rid="r0", output_ids=[99], fsm=_fsm(budget=1, count=1))
+        info = types.SimpleNamespace(solar_fsm_rows=[req])
+        shut = torch.zeros(1, VOCAB_SIZE)
+        shut[0, self.NL] = float("-inf")
+        shut[0, THINK_END] = float("-inf")
+        with self.assertLogs(solar_open2_fsm.logger, level="WARNING"):
+            solar_open2_fsm.apply(shut, info)
+        self.assertIsNone(req._solar_fsm.forced_tok)
+        open_again = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(open_again, info)
+        self.assertEqual(open_again[0, self.NL].item(), 0.0)
+
+    def test_a_reopened_think_block_is_forced_again(self):
+        # <|think:start|> puts count back to zero, so one request can open the
+        # block twice. Without the reset the first block's close stays recorded
+        # and the second block is never closed at all.
+        self._arm()
+        # The counter is back to zero and the budget is not spent, which is
+        # what the second block looks like on its first steps.
+        fsm = _fsm(budget=5, count=0)
+        fsm.forced_tok = THINK_END  # ... left over from the first block
+        req = _req(rid="r0", output_ids=[99], fsm=fsm)
+        info = types.SimpleNamespace(solar_fsm_rows=[req])
+        solar_open2_fsm.apply(torch.zeros(1, VOCAB_SIZE), info)
+        self.assertIsNone(fsm.forced_tok)
+        fsm.count = 5  # the second block now spends its own budget
+        logits = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(logits, info)
+        self.assertEqual(logits[0, self.NL].item(), 0.0)
+
+    def test_off_still_repeats_the_close_while_output_ids_lag(self):
+        # The unprescribed arm is left exactly as it was: it has no sequence to
+        # finish, and the repeat is what supplies the second sentinel that the
+        # non-speculative path has always closed on.
+        cfg = solar_open2_fsm.CFG
+        cfg.force_seq, cfg.force_newline = "off", self.NL
+        req = _req(rid="r0", output_ids=[99], fsm=_fsm(budget=1, count=1))
+        info = types.SimpleNamespace(solar_fsm_rows=[req])
+        for _ in range(2):
+            logits = torch.zeros(1, VOCAB_SIZE)
+            solar_open2_fsm.apply(logits, info)
+            self.assertEqual(logits[0, THINK_END].item(), 0.0)
+            self.assertEqual(logits[0, self.NL].item(), float("-inf"))
+
+    def test_the_plan_log_names_the_token_it_planned(self):
+        # An operator reading "planning token id=..." has to be able to trust
+        # it: naming think_end where the plan holds the boundary sends them
+        # after the wrong id.
+        self._arm()
+        req = _req(output_ids=[99], fsm=_fsm(budget=100, count=100))
+        with self.assertLogs(solar_open2_fsm.logger, level="INFO") as logs:
+            solar_open2_fsm.plan_verify([req], torch.tensor([[99, 30, 31]]), stride=3)
+        self.assertIn(f"id={self.NL}", logs.output[0])
+
+    def test_nl_te_emits_newline_then_think_end(self):
+        # Without the "last_tok is already the newline" guard the newline is
+        # forced forever and the block never closes.
+        self._arm()
+        self.assertEqual(self._decide(last_tok=99), self.NL)
+        self.assertEqual(self._decide(last_tok=self.NL), THINK_END)
+
+    def test_blocked_boundary_is_promoted_and_logged(self):
+        # The promote path had a NameError for four review rounds because no
+        # test ever made _mask_and_force return a non-empty promoted list. It
+        # only fires when the grammar forbids the boundary, which is exactly
+        # the case an arm cannot see from its own configuration.
+        self._arm()
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, self.NL] = float("-inf")  # the grammar forbids the boundary
+        forced, blocked, promoted = solar_open2_fsm._mask_and_force(
+            logits, mask_rows={}, force_rows={self.NL: [0]}
+        )
+        self.assertEqual(promoted, [(0, self.NL)])
+        self.assertEqual(forced, [(0, THINK_END)])
+        self.assertEqual(blocked, [])
+        # The row closes on think_end rather than being left to the grammar,
+        # which would re-force the same forbidden token every step.
+        self.assertEqual(logits[0, THINK_END].item(), 0.0)
+
+    def test_row_blocked_on_both_tokens_is_left_to_the_grammar(self):
+        self._arm()
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, self.NL] = float("-inf")
+        logits[0, THINK_END] = float("-inf")
+        forced, blocked, promoted = solar_open2_fsm._mask_and_force(
+            logits, mask_rows={}, force_rows={self.NL: [0]}
+        )
+        self.assertEqual(promoted, [])
+        self.assertEqual(forced, [])
+        self.assertEqual(blocked, [(0, self.NL)])
+
+    def test_plan_verify_carries_the_decided_token_into_force_rows(self):
+        # The decision function has its own tests above; this one pins where
+        # the decision travels. Without a check on the key of force_rows,
+        # plan_verify could throw the answer away and force think_end anyway
+        # with the suite still green, which deletes the nl_te arm.
+        self._arm()
+        fsm = _fsm(budget=100, count=100)
+        req = _req(output_ids=[99], fsm=fsm)
+        plan = solar_open2_fsm.plan_verify(
+            [req], torch.tensor([[99, 30, 31]]), stride=3
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn(0, plan.force_rows.get(self.NL, []))
+        self.assertNotIn(THINK_END, plan.force_rows)
+
+    def test_verify_plan_reads_the_chain_anchor_not_stale_output_ids(self):
+        # req.output_ids lags a step behind what the FSM has consumed, so at
+        # w == 0 the anchor is row_ids[0]. Reading the stale value here forces
+        # a newline onto a row whose last committed token already was one,
+        # putting a second newline into the block.
+        self._arm()
+        fsm = _fsm(budget=100, count=100)
+        req = _req(output_ids=[99], fsm=fsm)
+        chain = torch.tensor([[self.NL, 30, 31]])
+        plan = solar_open2_fsm.plan_verify([req], chain, stride=3)
+        self.assertIsNotNone(plan)
+        self.assertIn(0, plan.force_rows.get(THINK_END, []))
+        self.assertNotIn(0, plan.force_rows.get(self.NL, []))
+
+    def test_a_draft_that_already_carries_the_boundary_closes_on_it(self):
+        # The rows past w == 0 are planned against draft tokens, so they only
+        # ever commit when the draft matched what was forced. When it did, the
+        # anchor for the next row is the boundary itself and that row has to
+        # close rather than force a second one.
+        self._arm()
+        fsm = _fsm(budget=100, count=100)
+        req = _req(output_ids=[99], fsm=fsm)
+        chain = torch.tensor([[99, self.NL, 31]])
+        plan = solar_open2_fsm.plan_verify([req], chain, stride=3)
+        self.assertIn(0, plan.force_rows.get(self.NL, []))
+        self.assertIn(1, plan.force_rows.get(THINK_END, []))
+
+    def test_non_spec_apply_forces_the_decided_token(self):
+        # The same guard on the non-speculative entry point, read off the
+        # logits rather than the plan: the boundary is the only column left
+        # finite, so forcing think_end here instead would fail.
+        self._arm()
+        fsm = _fsm(budget=1, count=1)
+        req = _req(rid="r0", output_ids=[99], fsm=fsm)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        solar_open2_fsm.apply(logits, types.SimpleNamespace(solar_fsm_rows=[req]))
+        self.assertEqual(logits[0, self.NL].item(), 0.0)
+        self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
+
+    def test_a_row_blocked_on_both_tokens_keeps_its_envelope(self):
+        # A forced row that the grammar closes on both tokens gets no tensor
+        # write from the force loop. Without the reasoning mask underneath it,
+        # that step leaves EOS and every sentinel open and the model can end
+        # the turn inside the think block, which the parser then drops whole.
+        self._arm()
+        fsm = _fsm(budget=1, count=1)
+        req = _req(rid="r0", output_ids=[99], fsm=fsm)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        logits[0, self.NL] = float("-inf")
+        logits[0, THINK_END] = float("-inf")
+        with self.assertLogs(solar_open2_fsm.logger, level="WARNING"):
+            solar_open2_fsm.apply(logits, types.SimpleNamespace(solar_fsm_rows=[req]))
+        for tid in solar_open2_fsm.CFG.reasoning_forbidden:
+            self.assertEqual(logits[0, tid].item(), float("-inf"), tid)
+
+    def test_two_tokens_are_forced_in_one_batch(self):
+        # One batch forces a boundary on one row and the close on another, so
+        # _mask_and_force has to carry more than one key.
+        self._arm()
+        logits = torch.zeros(2, VOCAB_SIZE)
+        forced, blocked, promoted = solar_open2_fsm._mask_and_force(
+            logits, mask_rows={}, force_rows={self.NL: [0], THINK_END: [1]}
+        )
+        self.assertEqual(sorted(forced), [(0, self.NL), (1, THINK_END)])
+        self.assertEqual((blocked, promoted), ([], []))
+        self.assertEqual(logits[0, self.NL].item(), 0.0)
+        self.assertEqual(logits[0, THINK_END].item(), float("-inf"))
+        self.assertEqual(logits[1, THINK_END].item(), 0.0)
+        self.assertEqual(logits[1, self.NL].item(), float("-inf"))
+
+    def test_the_promote_log_is_wired_into_both_entry_points(self):
+        # The wiring, not the two functions: deleting either `if promoted:`
+        # block leaves the promotion silent, which is the whole point of it.
+        self._arm()
+        for build in (
+            lambda lg: solar_open2_fsm.VerifyPlan(
+                force_rows={self.NL: [0]}, mask_rows={}, stride=1, bs=1, rids=["r0"]
+            ).apply(lg),
+            lambda lg: solar_open2_fsm.apply(
+                lg,
+                types.SimpleNamespace(
+                    solar_fsm_rows=[
+                        _req(rid="r0", output_ids=[99], fsm=_fsm(budget=1, count=1))
+                    ]
+                ),
+            ),
+        ):
+            # The conflict limit is held shut so the promotion has to reach
+            # the log on its own state: the two say different things about
+            # which arm is live, and a burst of one must not swallow the other.
+            solar_open2_fsm._CONFLICT_LOG["last"] = time.monotonic()
+            solar_open2_fsm._CONFLICT_LOG["num_suppressed"] = 0
+            solar_open2_fsm._PROMOTE_LOG["last"] = -solar_open2_fsm._LOG_INTERVAL
+            solar_open2_fsm._PROMOTE_LOG["num_suppressed"] = 0
+            logits = torch.zeros(1, VOCAB_SIZE)
+            logits[0, self.NL] = float("-inf")
+            with self.assertLogs(solar_open2_fsm.logger, level="WARNING") as logs:
+                build(logits)
+            self.assertTrue(
+                any("the boundary token the arm wanted" in l for l in logs.output),
+                logs.output,
+            )
+
+
+class TestFileShape(CustomTestCase):
+    """The CI runner executes each registered file with ``python3 <file>``, so
+    ``__name__`` is ``"__main__"`` and anything defined after the
+    ``unittest.main()`` call never exists. Eight tests in this file were dead
+    for four review rounds that way, and the registration sanity check only
+    asks whether a main block is present, not whether it is last."""
+
+    def test_registered_files_put_the_main_block_last(self):
+        # Checked across the directory, not just this file: a file whose own
+        # main block is misplaced stops executing before its checks run, so it
+        # cannot catch its own defect. A sibling has to.
+        import ast as _ast
+        import pathlib
+
+        here = pathlib.Path(__file__).resolve().parent
+        checked = 0
+        for path in sorted(here.glob("test_*.py")):
+            body = _ast.parse(path.read_text(encoding="utf-8")).body
+            mains = [
+                i
+                for i, node in enumerate(body)
+                if isinstance(node, _ast.If) and "__name__" in _ast.dump(node.test)
+            ]
+            if not mains:
+                continue
+            checked += 1
+            self.assertEqual(
+                mains[-1],
+                len(body) - 1,
+                f"{path.name}: the __main__ block must be the last statement. "
+                "The CI runner executes each registered file directly, so "
+                "anything defined after unittest.main() never exists and its "
+                "tests are silently absent.",
+            )
+        self.assertGreater(checked, 1, "expected sibling files to check")
 
 
 if __name__ == "__main__":

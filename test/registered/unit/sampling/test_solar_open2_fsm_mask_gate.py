@@ -379,10 +379,17 @@ class TestSolarFsmMaskGate(CustomTestCase):
                         if forbidden == fsm.CFG.reasoning_forbidden:
                             masked.update(rows)
                 flagged = {r for r, on in enumerate(flags) if on}
-                if label in ("content", "spent budget"):
-                    # Nothing to mask: content is the parser's, and a spent
-                    # budget is forced rather than masked.
+                if label == "content":
+                    # Nothing to mask here: CONTENT is the parser's.
                     self.assertEqual(masked, set(), label)
+                elif label == "spent budget":
+                    # Forced *and* masked. The force overwrites the mask on
+                    # every row it lands on, but a row the grammar blocks on
+                    # both tokens takes no write at all and would otherwise
+                    # spend the step with EOS and every sentinel open.
+                    self.assertTrue(masked, label)
+                    forced = {r for rows in plan.force_rows.values() for r in rows}
+                    self.assertEqual(masked, forced, label)
                 else:
                     self.assertTrue(
                         masked,

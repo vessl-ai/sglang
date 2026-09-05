@@ -152,6 +152,11 @@ _CFG_FIELDS = (
     "hard_limit",
     "no_reasoning_efforts",
     "spec_always_eager",
+    # [H27/H35/H38] the forced-close arm. init_from_env writes all of these,
+    # so a test that turns an arm on leaks into the rest of the process unless
+    # they are saved and restored like the rest.
+    "force_seq",
+    "force_newline",
 )
 
 
@@ -270,7 +275,9 @@ class TestLeadingNewline(_FsmCase):
         self.assertEqual(plan.mask_rows[fsm.CFG.content_done_forbidden], [0])
         self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_open_forbidden], [1])
         self.assertEqual(plan.mask_rows[fsm.CFG.reasoning_forbidden], [2])
-        self.assertEqual(plan.force_rows, [])
+        self.assertEqual(
+            sorted(r for rows in plan.force_rows.values() for r in rows), []
+        )
 
     def test_verify_plan_writes_the_open_set(self):
         req = _req([7], prompt=(1, 2, 3))
@@ -512,8 +519,13 @@ class TestInitFromEnv(_FsmCase):
 
     def _init(self, **env):
         with mock.patch.dict(os.environ, {**self.base_env, **env}):
+            # Skip what this call asked for: self.clear is the ambient
+            # environment as it stood at setUp, and on a serving host that
+            # already carries SOLAR_FSM_* the loop would drop the very value
+            # under test.
             for k in self.clear:
-                os.environ.pop(k, None)
+                if k not in env:
+                    os.environ.pop(k, None)
             for k in list(os.environ):
                 if (
                     k.startswith(
@@ -575,6 +587,17 @@ class TestInitFromEnv(_FsmCase):
         self.assertEqual(fsm.CFG.effort_budgets["medium"], 777)
         self.assertEqual(fsm.CFG.effort_budgets["max"], 50000)
         self.assertEqual(fsm.CFG.effort_budgets["high"], 32 * 1024)
+
+    def test_think_end_survives_the_leading_newline_override(self):
+        # The override arrives unchecked, so one naming <|think:end|> would put
+        # the FSM's own mask over the token it forces on that same row: the
+        # force is refused as blocked and the block never closes. REASONING
+        # keeps think_end open by construction and the think-open row has to
+        # hold the same invariant.
+        self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS=f"[{NL}, {THINK_END}]")
+        self.assertNotIn(THINK_END, fsm.CFG.reasoning_open_forbidden)
+        self.assertNotIn(THINK_END, fsm.CFG.reasoning_forbidden)
+        self.assertIn(NL, fsm.CFG.reasoning_open_forbidden)
 
     def test_newline_rule_can_be_switched_off(self):
         self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="[]")
@@ -660,6 +683,45 @@ class TestInitFromEnv(_FsmCase):
     def test_explicit_newline_ids_override_the_vocab(self):
         self._init(SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS="[7, 9]")
         self.assertEqual(fsm.CFG.leading_newline_forbidden, (7, 9))
+
+    def test_forced_close_arm_defaults_to_off(self):
+        self._init()
+        self.assertEqual(fsm.CFG.force_seq, "off")
+        # The arm is off, but the id it would need is still resolved, so a
+        # later boot that turns it on does not depend on a second code path.
+        self.assertEqual(fsm.CFG.force_newline, NL)
+
+    def test_unknown_force_seq_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "SOLAR_FSM_FORCE_SEQ"):
+            self._init(SOLAR_FSM_FORCE_SEQ="te_nl")
+
+    def test_nl_te_without_a_newline_in_the_vocab_is_refused(self):
+        self._strip_newlines_from_the_vocabulary()
+        with self.assertRaisesRegex(RuntimeError, "no single newline token"):
+            self._init(
+                SOLAR_FSM_FORCE_SEQ="nl_te",
+                SOLAR_OPEN2_THINK_LEADING_FORBIDDEN_IDS=f"[{NL}]",
+            )
+
+    def _strip_newlines_from_the_vocabulary(self):
+        """Leave the sentinels in place and take every newline token out."""
+        path = os.path.join(self.dir, "tokenizer_config.json")
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["added_tokens_decoder"] = {
+            tid: body
+            for tid, body in cfg["added_tokens_decoder"].items()
+            if "Ċ" not in body["content"]
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        with open(os.path.join(self.dir, "tokenizer.json"), "w", encoding="utf-8") as f:
+            json.dump({"model": {"vocab": {"a": 9}}}, f)
+
+    def test_the_arm_boots_when_every_check_passes(self):
+        self._init(SOLAR_FSM_FORCE_SEQ="nl_te")
+        self.assertEqual(fsm.CFG.force_seq, "nl_te")
+        self.assertEqual(fsm.CFG.force_newline, NL)
 
     def test_bad_default_effort_fails_loud(self):
         with self.assertRaises(RuntimeError):
@@ -1159,7 +1221,9 @@ class TestSpecPathToolStates(_FsmCase):
         self.assertEqual(
             plan.mask_rows[fsm.CFG.forbidden[(fsm.TOOL_ARG_NAME, False)]], [2]
         )
-        self.assertEqual(plan.force_rows, [])
+        self.assertEqual(
+            sorted(r for rows in plan.force_rows.values() for r in rows), []
+        )
 
     def test_the_shared_buffer_never_masks_what_a_tool_state_needs(self):
         """`_fsm_content_forbidden_ids` subtracts four ids by name. What makes
