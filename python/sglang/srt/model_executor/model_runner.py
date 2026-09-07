@@ -1048,10 +1048,13 @@ class ModelRunner:
 
     def load_model(self):
         tic_total = time.perf_counter()
+        # One probe, not two. get_available_gpu_memory empties the CUDA cache on
+        # every call, and the log line was calling it a second time one
+        # statement after the first; the value logged is the same one already
+        # measured. Keep the cache emptying itself -- measured, dropping it
+        # cancels the saving.
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        logger.info(f"Load weight begin. avail mem={before_avail_memory:.2f} GB")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
