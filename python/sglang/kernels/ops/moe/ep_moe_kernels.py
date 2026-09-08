@@ -213,8 +213,10 @@ def _fused_stable_rank_kernel(topk_ids_ptr, src2dst_ptr, N, BLOCK: tl.constexpr)
 # Above this the general sort wins; decode sits far below it (batch*topk).
 # CUDA graphs fix the shape, so N is a constant at capture time.
 _FUSED_RANK_MAX_N = 256
-# Runtime gate for A/B measurement; 0 restores the torch.sort path.
-_FUSED_RANK_ON = os.environ.get("SOLAR_FUSED_RANK", "1") == "1"
+# Opt-in, so merging this is behaviour-neutral for the W4A8 deployment that
+# already runs `cutlass_w4_run_moe_ep_preproess`. Set SOLAR_FUSED_RANK=1 to take
+# the fused path; 0 (the default) keeps the torch.sort path.
+_FUSED_RANK_ON = os.environ.get("SOLAR_FUSED_RANK", "0") == "1"
 
 
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
