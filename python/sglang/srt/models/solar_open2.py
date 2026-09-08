@@ -15,6 +15,7 @@ half is MLA and is replaced here by RadixAttention GQA.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 from typing import Optional
 
