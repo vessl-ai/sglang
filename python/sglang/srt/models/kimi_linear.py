@@ -216,7 +216,16 @@ class KimiDeltaAttention(nn.Module):
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
         # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = quant_config is None
+        #
+        # A caller may assert that these projections are unquantized even when a
+        # global quant_config exists -- Solar-Open2 keeps its KDA attention in the
+        # compressed-tensors ignore list, so the fused path is valid there. The
+        # fused Linears are then built with quant_config=None: their prefixes
+        # (fused_qkvbfg_a_proj / fused_fg_b_proj) do not match the ignore regexes,
+        # so passing the real config would send them down a quantized path.
+        self._force_fuse_qkvbfg = bool(kwargs.get("force_fuse_qkvbfg", False))
+        self.do_fuse_qkvbfg = (quant_config is None) or self._force_fuse_qkvbfg
+        _fuse_quant_config = None if self._force_fuse_qkvbfg else quant_config
 
         if self.do_fuse_qkvbfg:
             # Fuse: q, k, v, beta (column parallel) + f_a, g_a (replicated)
@@ -232,7 +241,7 @@ class KimiDeltaAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,  # Column parallel
                 self.fg_sizes,  # Replicated: f_a, g_a
-                quant_config=quant_config,
+                quant_config=_fuse_quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
