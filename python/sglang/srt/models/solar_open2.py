@@ -462,6 +462,18 @@ class SolarOpen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Publish this step's real (non-padded) token count to the MoE layers.
+        # Full/BCG CUDA graphs capture only this function, so the call has to be
+        # here for the masking ops to end up inside the captured region.
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            set_padding_mask,
+        )
+
+        set_padding_mask(
+            getattr(forward_batch, "num_token_non_padded", None),
+            hidden_states.shape[0],
+        )
+
         total_num_layers = self.end_layer - self.start_layer
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2,
