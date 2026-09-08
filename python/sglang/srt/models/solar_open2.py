@@ -797,20 +797,37 @@ class SolarOpen2ForCausalLM(nn.Module):
             scale = getattr(experts, "w2_weight_scale", None)
             if scale is not None:
                 expected_groups = self.config.moe_intermediate_size // 128
+                # Which axis holds the groups depends on the quantization
+                # scheme, so do not pin the check to the last one. The W4A8
+                # cutlass MoE stores [E, N, groups], but the W4A16 marlin MoE
+                # registers [E, groups, N] -- see
+                # `compressed_tensors_wNa16_moe.create_weights`, which allocates
+                # `torch.ones(num_experts, num_groups_w2, hidden_size)`. Reading
+                # only `shape[-1]` therefore rejects a perfectly good marlin
+                # checkpoint at startup:
+                #
+                #   w2_weight_scale.shape=(128, 8, 2048) (last dim 2048, expected 8)
+                #
+                # What the guard is actually for is a MoE sharded on TP instead
+                # of EP, which silently floors the group count (moe_intermediate
+                # 1280 / 128 == 10; TP4 gives 320 // 128 == 2). Looking for the
+                # expected count on either candidate axis keeps that intact.
+                candidate_axes = tuple(scale.shape[-2:])
+                groups_ok = expected_groups in candidate_axes
                 logger.info(
-                    "[SOLAR-GATE] w2_weight_scale.shape=%s last_dim=%d expected=%d ok=%s",
+                    "[SOLAR-GATE] w2_weight_scale.shape=%s group axes=%s expected=%d ok=%s",
                     tuple(scale.shape),
-                    scale.shape[-1],
+                    candidate_axes,
                     expected_groups,
-                    scale.shape[-1] == expected_groups,
+                    groups_ok,
                 )
-                if scale.shape[-1] != expected_groups:
+                if not groups_ok:
                     raise ValueError(
                         "SolarOpen2 MoE int4 scale groups mismatch: "
                         f"w2_weight_scale.shape={tuple(scale.shape)} "
-                        f"(last dim {scale.shape[-1]}, expected {expected_groups}). "
-                        "Shard the MoE with expert parallelism (--ep-size == --tp), "
-                        "not tensor parallelism."
+                        f"(trailing axes {candidate_axes}, expected {expected_groups} "
+                        "on one of them). Shard the MoE with expert parallelism "
+                        "(--ep-size == --tp), not tensor parallelism."
                     )
             else:
                 logger.info(
