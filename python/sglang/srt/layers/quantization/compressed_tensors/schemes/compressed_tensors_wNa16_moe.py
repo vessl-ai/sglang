@@ -461,6 +461,15 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         topk_weights, topk_ids, router_logits = topk_output
 
+        # Padded CUDA-graph rows carry stale topk_ids; routing them to expert 0
+        # with weight 0 keeps the expert histogram -- and therefore Marlin's
+        # k-split -- deterministic across replays. No-op when no mask is staged.
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            mask_padded_routing,
+        )
+
+        topk_weights, topk_ids = mask_padded_routing(topk_weights, topk_ids)
+
         # Get expert_map for EP support
         expert_map = None
         global_num_experts = -1

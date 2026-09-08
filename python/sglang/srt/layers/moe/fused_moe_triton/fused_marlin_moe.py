@@ -1,5 +1,7 @@
 from typing import Optional
 
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -129,6 +131,84 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     gate = input[:, :d].clamp(max=gemm1_limit)
     up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
+
+
+# --- Determinism: pin CUDA-graph padding rows out of the expert histogram ---
+#
+# Under CUDA graphs the token batch is padded to a captured bucket size. The
+# padded rows keep whatever `topk_ids` the previous replay left there, and those
+# stale ids scatter across experts. The expert histogram therefore changes from
+# step to step for the *same* prompt, which changes Marlin's k-split count,
+# which changes the floating-point accumulation order. Observed max delta 0.0078
+# -- enough to flip a near-tie argmax and diverge the whole generation.
+#
+# Triton's fused_moe does not show this because it is row-independent: which
+# tile a token lands in does not affect its result. Marlin's k-split does.
+
+_PAD_MASK = [None]
+_CANON = [os.environ.get("SGLANG_MARLIN_CANON_ALIGN", "1") == "1"]
+
+
+def set_padding_mask(num_token_non_padded, num_tokens: int) -> None:
+    """Build the keep mask once per forward; every MoE layer reuses it.
+
+    Called from the model's forward so that it lands inside the graph capture
+    region. Graph-safe: no device synchronisation.
+    """
+    if num_token_non_padded is None or num_tokens is None or num_tokens <= 0:
+        _PAD_MASK[0] = None
+        return
+    n = num_token_non_padded
+    rows = torch.arange(num_tokens, device=n.device, dtype=n.dtype).unsqueeze(1)
+    _PAD_MASK[0] = rows < n
+
+
+def canonicalize_sorted_ids(sorted_ids, expert_ids, num_post, block_size, num_experts):
+    """Normalise the token placement produced by ``moe_align_block_size``.
+
+    The CUDA ``moe_align`` claims slots inside an expert bucket with atomicAdd,
+    so the token order within a bucket differs run to run for identical input
+    (the kernel's own comment says as much). Marlin is sensitive to it because
+    the tile a token lands in (``par_id``) selects that token's k-split, i.e.
+    its reduction order.
+
+    ``expert_ids`` (block -> expert) is deterministic, so sorting by value
+    within each expert's span gives a unique canonical form. The padding
+    sentinel (== numel) is the maximum and naturally sorts to the end of its
+    span. Entries past ``num_post`` are left untouched -- the kernel may not
+    read them. Graph-safe: no device synchronisation.
+    """
+    n = sorted_ids.shape[0]
+    nb = expert_ids.shape[0]
+    dev = sorted_ids.device
+    pos = torch.arange(n, device=dev, dtype=torch.int64)
+    eb = expert_ids.to(torch.int64).clamp_min(0)
+    eb = eb.unsqueeze(1).expand(nb, block_size).reshape(-1)[:n]
+    stride = n + 1
+    big = (num_experts + 2) * stride
+    valid = pos < num_post.to(torch.int64)
+    key = torch.where(valid, eb * stride + sorted_ids.to(torch.int64), big + pos)
+    key = torch.sort(key).values
+    return torch.where(valid, (key % stride).to(torch.int32), sorted_ids).contiguous()
+
+
+def mask_padded_routing(topk_weights, topk_ids):
+    """Pin padded rows to expert 0 with weight 0.
+
+    Weight 0 keeps them out of the output, and routing them all to one expert
+    makes the histogram a deterministic function of (real-token routing, padding
+    count) -- so Marlin's k-split stops moving between replays.
+
+    A no-op when no mask was staged or its shape does not match, which keeps
+    non-graph and non-Solar callers on the previous behaviour.
+    Graph-safe: no device synchronisation.
+    """
+    keep = _PAD_MASK[0]
+    if keep is None or keep.shape[0] != topk_ids.shape[0]:
+        return topk_weights, topk_ids
+    topk_ids = torch.where(keep, topk_ids, torch.zeros_like(topk_ids))
+    topk_weights = torch.where(keep, topk_weights, torch.zeros_like(topk_weights))
+    return topk_weights, topk_ids
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -261,6 +341,15 @@ def fused_marlin_moe(
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, block_size_m, global_num_experts
+        )
+
+    if _CANON[0]:
+        sorted_token_ids = canonicalize_sorted_ids(
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            block_size_m,
+            global_num_experts,
         )
 
     if workspace is None:
