@@ -36,6 +36,9 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -56,6 +59,49 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix
+
+# Fuse the KDA q/k/v/beta/f_a/g_a projections into one GEMM and f_b/g_b into a
+# batched one: 6 GEMMs per KDA layer become 2. KimiDeltaAttention gates this on
+# `quant_config is None`, which is too coarse here -- this model's KDA attention
+# is unquantized (the config class widens the compressed-tensors ignore list for
+# it), so the fused path is valid. Off by default; set SOLAR_FUSE_KDA=1 to enable.
+_FUSE_KDA = os.environ.get("SOLAR_FUSE_KDA", "0") == "1"
+
+_KDA_A_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
+
+
+def _assert_kda_unquantized(quant_config, prefix: str) -> None:
+    """Verify the premise `force_fuse_qkvbfg` relies on, instead of assuming it.
+
+    Forcing the fused path bypasses `KimiDeltaAttention`'s `quant_config is None`
+    gate and builds the fused Linear with `quant_config=None`. That is only sound
+    if the projections it absorbs are genuinely excluded from quantization -- on a
+    checkpoint that *does* quantize them, the fused Linear would allocate
+    unquantized parameters and the packed weights would load into them silently,
+    producing garbage rather than an error. So check the exclusion and refuse to
+    start when it does not hold.
+    """
+    if quant_config is None:
+        return
+
+    ignore = getattr(quant_config, "ignore", None)
+    if ignore is None:
+        raise ValueError(
+            "SOLAR_FUSE_KDA=1 requires a quantization config that declares an "
+            f"`ignore` list so the KDA projections under {prefix!r} can be "
+            f"verified unquantized; got {type(quant_config).__name__}."
+        )
+
+    fused_mapping = getattr(quant_config, "packed_modules_mapping", None) or {}
+    for proj in _KDA_A_PROJECTIONS:
+        name = f"{prefix}.{proj}"
+        if not should_ignore_layer(name, ignore=ignore, fused_mapping=fused_mapping):
+            raise ValueError(
+                f"SOLAR_FUSE_KDA=1 but {name} is not excluded from quantization "
+                "by the checkpoint's `ignore` list. Fusing it would load packed "
+                "weights into an unquantized Linear. Unset SOLAR_FUSE_KDA."
+            )
+
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +356,8 @@ class SolarOpen2DecoderLayer(nn.Module):
             # KimiDeltaAttention on its *unfused* q/k/v/b/f/g path; the
             # projections themselves resolve to unquantized because the config
             # class widened the compressed-tensors ignore list for KDA layers.
+            if _FUSE_KDA:
+                _assert_kda_unquantized(quant_config, add_prefix("self_attn", prefix))
             self.self_attn = KimiDeltaAttention(
                 layer_idx=layer_id,
                 hidden_size=config.hidden_size,
@@ -317,6 +365,7 @@ class SolarOpen2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 rms_norm_eps=config.rms_norm_eps,
                 prefix=add_prefix("self_attn", prefix),
+                force_fuse_qkvbfg=_FUSE_KDA,
             )
         else:
             self.self_attn = SolarOpen2Attention(
@@ -621,7 +670,23 @@ class SolarOpen2ForCausalLM(nn.Module):
         return False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
+        stacked_params_mapping = (
+            [
+                # Fused KDA path. Must precede the unfused entries: the loop takes
+                # the first mapping whose target parameter exists, and both sets
+                # match the same checkpoint tensor names.
+                (".fused_qkvbfg_a_proj", ".q_proj", 0),
+                (".fused_qkvbfg_a_proj", ".k_proj", 1),
+                (".fused_qkvbfg_a_proj", ".v_proj", 2),
+                (".fused_qkvbfg_a_proj", ".b_proj", 3),
+                (".fused_qkvbfg_a_proj", ".f_a_proj", 4),
+                (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
+                (".fused_fg_b_proj", ".f_b_proj", 0),
+                (".fused_fg_b_proj", ".g_b_proj", 1),
+            ]
+            if _FUSE_KDA
+            else []
+        ) + [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),

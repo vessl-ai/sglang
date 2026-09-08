@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -187,7 +188,46 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     return reorder_topk_ids, src2dst, seg_indptr
 
 
+@triton.jit
+def _fused_stable_rank_kernel(topk_ids_ptr, src2dst_ptr, N, BLOCK: tl.constexpr):
+    """Compute the stable-sort rank directly, for small N.
+
+    Replaces torch.sort + compute_src2dst. For a decode step topk_ids holds
+    batch*topk entries -- 4 at batch 1 -- and a general sort is far more
+    machinery than that needs.
+
+        src2dst[i] = #{j : e_j < e_i} + #{j < i : e_j == e_i}
+    """
+    offs = tl.arange(0, BLOCK)
+    m = offs < N
+    e = tl.load(topk_ids_ptr + offs, mask=m, other=2147483647)
+    ei = e[:, None]
+    ej = e[None, :]
+    vj = offs[None, :] < N
+    less = (ej < ei) & vj
+    eq_before = (ej == ei) & (offs[None, :] < offs[:, None]) & vj
+    rank = tl.sum(less.to(tl.int32), axis=1) + tl.sum(eq_before.to(tl.int32), axis=1)
+    tl.store(src2dst_ptr + offs, rank, mask=m)
+
+
+# Above this the general sort wins; decode sits far below it (batch*topk).
+# CUDA graphs fix the shape, so N is a constant at capture time.
+_FUSED_RANK_MAX_N = 256
+# Runtime gate for A/B measurement; 0 restores the torch.sort path.
+_FUSED_RANK_ON = os.environ.get("SOLAR_FUSED_RANK", "1") == "1"
+
+
 def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
+    n = topk_ids.numel()
+    if _FUSED_RANK_ON and n <= _FUSED_RANK_MAX_N:
+        src2dst = torch.empty(n, device=topk_ids.device, dtype=torch.int32)
+        block = 1 << max(0, (n - 1).bit_length())
+        block = max(block, 16)
+        _fused_stable_rank_kernel[(1,)](
+            topk_ids.view(-1), src2dst, n, BLOCK=block, num_warps=4
+        )
+        return src2dst
+
     _, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
 
     BLOCK_SIZE = 512
