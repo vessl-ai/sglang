@@ -653,24 +653,9 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management.
-        // For streaming: increment at dispatch (the same instant select read load()),
-        // then move the guards into the response body so load stays counted for the
-        // whole stream. This closes the select->first-token window where streaming load
-        // was invisible and bursts herded onto the same still-zero worker (preemptive-load).
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
-        // Streaming dispatch guards: +1 now, moved into the body on the success path,
-        // dropped (decrement) in place on any error early-return.
-        let mut stream_guards: Option<(WorkerLoadGuard, WorkerLoadGuard)> =
-            context.is_stream.then(|| {
-                (
-                    WorkerLoadGuard::new(prefill.clone(), headers),
-                    WorkerLoadGuard::new(decode.clone(), headers),
-                )
-            });
+        // Count both workers before either request can yield its first response.
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        let mut decode_guard = Some(WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -779,11 +764,44 @@ impl PDRouter {
             return response;
         }
 
-        // Prefill ok: take decode's result, awaiting it if still pending.
-        let decode_result = match decode_early {
-            Some(dr) => dr,
-            None => (&mut decode_fut).await,
+        // send() completes at headers; drain prefill while continuing to poll decode.
+        let mut prefill_body_fut = Box::pin(async {
+            let result = self
+                .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
+                .await;
+            drop(prefill_guard);
+            result
+        });
+        let decode_response_fut = async {
+            match decode_early {
+                Some(dr) => dr,
+                None => (&mut decode_fut).await,
+            }
         };
+        tokio::pin!(decode_response_fut);
+        let mut prefill_processed = None;
+        let decode_result = loop {
+            tokio::select! {
+                result = &mut prefill_body_fut, if prefill_processed.is_none() => {
+                    prefill_processed = Some(result);
+                }
+                result = &mut decode_response_fut => break result,
+            }
+        };
+        // Decode errors must not wait for an unfinished prefill body.
+        let prefill_body = if matches!(&decode_result, Ok(res) if res.status().is_success()) {
+            let result = match prefill_processed {
+                Some(result) => result,
+                None => (&mut prefill_body_fut).await,
+            };
+            match result {
+                Ok((_, body)) => body,
+                Err(error_response) => return error_response,
+            }
+        } else {
+            None
+        };
+        drop(prefill_body_fut);
 
         events::RequestReceivedEvent {}.emit();
 
@@ -802,9 +820,8 @@ impl PDRouter {
                     );
 
                     // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
+                    // response takes over. Prefill returned successful headers,
+                    // so the decode-driven failure must not penalize it. For
                     // non-streaming the response carries no tracked stream
                     // so record decode's outcome here too — but treat 4xx
                     // as a client fault rather than a worker fault, matching
@@ -816,14 +833,7 @@ impl PDRouter {
                     // decode on drop, so skip to avoid double-counting.
                     // Mark the response so the outer dispatcher skips its
                     // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
+                    prefill.record_outcome(true);
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
                         decode.record_outcome(decode_ok);
@@ -835,30 +845,6 @@ impl PDRouter {
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -883,7 +869,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
-                        stream_guards.take(),
+                        decode_guard.take(),
                     )
                 } else {
                     // Non-streaming response
@@ -928,22 +914,12 @@ impl PDRouter {
                 // stream will ever wrap a response (streaming path) and
                 // we shortcut past the outer non-streaming
                 // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
+                // directly. Prefill returned successful headers, so the
+                // decode-driven 502 must not penalize a healthy prefill. Mark the response so the outer
                 // dispatcher skips its status-derived `record_outcome`
                 // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                prefill.record_outcome(true);
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",
@@ -1124,7 +1100,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         _prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        attached_guards: Option<(WorkerLoadGuard, WorkerLoadGuard)>,
+        decode_guard: Option<WorkerLoadGuard>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1220,12 +1196,8 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        // Attach the guards created at dispatch time (preemptive-load). When None
-        // (the synthetic-error SSE from handle_decode_error_response, or any caller that
-        // does not track load) the response carries no guard — the dispatch guard for
-        // that path was already dropped at its error branch.
-        match attached_guards {
-            Some(guards) => AttachedBody::wrap_response(response, guards),
+        match decode_guard {
+            Some(guard) => AttachedBody::wrap_response(response, guard),
             None => response,
         }
     }
@@ -1974,6 +1946,299 @@ mod tests {
         assert_eq!(decode_worker.load(), 0);
     }
 
+    struct DispatchFixture {
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        prefill_body: tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        decode_body: tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>,
+        decode_headers: Arc<tokio::sync::Notify>,
+        dispatch: tokio::task::JoinHandle<Response>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Drop for DispatchFixture {
+        fn drop(&mut self) {
+            self.dispatch.abort();
+            for server in &self.servers {
+                server.abort();
+            }
+        }
+    }
+
+    async fn dispatch_fixture(
+        is_stream: bool,
+        prefill_status: StatusCode,
+        decode_status: StatusCode,
+    ) -> DispatchFixture {
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        let mut bodies = Vec::new();
+        let mut arrivals = Vec::new();
+        let decode_headers = Arc::new(tokio::sync::Notify::new());
+        for is_decode in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            let (tx, rx) =
+                tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+            bodies.push(tx);
+            let body = Arc::new(tokio::sync::Mutex::new(Some(rx)));
+            let arrived = Arc::new(tokio::sync::Notify::new());
+            let arrived_handler = arrived.clone();
+            let headers = decode_headers.clone();
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let body = body.clone();
+                    let arrived = arrived_handler.clone();
+                    let headers = headers.clone();
+                    async move {
+                        arrived.notify_one();
+                        if is_decode {
+                            headers.notified().await;
+                        }
+                        let body = body.lock().await.take().unwrap();
+                        let mut response =
+                            Response::new(Body::from_stream(UnboundedReceiverStream::new(body)));
+                        *response.status_mut() = if is_decode {
+                            decode_status
+                        } else {
+                            prefill_status
+                        };
+                        response
+                    }
+                }),
+            );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            arrivals.push(arrived);
+        }
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            urls[0].clone(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            urls[1].clone(),
+            WorkerType::Decode,
+            true,
+        ));
+        let p = prefill.clone();
+        let d = decode.clone();
+        let dispatch = tokio::spawn(async move {
+            create_test_pd_router()
+                .execute_dual_dispatch_internal(
+                    None,
+                    json!({"text": "hello", "stream": is_stream}),
+                    PDRequestContext {
+                        route: "/generate",
+                        batch_size: None,
+                        is_stream,
+                        return_logprob: false,
+                        request_text: None,
+                        model_id: None,
+                        headers: None,
+                    },
+                    p,
+                    d,
+                    Instant::now(),
+                )
+                .await
+        });
+        for arrived in arrivals {
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+                .await
+                .unwrap();
+        }
+        DispatchFixture {
+            prefill,
+            decode,
+            prefill_body: bodies.remove(0),
+            decode_body: bodies.remove(0),
+            decode_headers,
+            dispatch,
+            servers,
+        }
+    }
+
+    async fn wait_for_load(worker: &Arc<dyn Worker>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while worker.load() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker load did not reach expected value");
+    }
+
+    async fn check_dispatch_load_lifetime(is_stream: bool, cancel_response: bool) {
+        let mut fixture = dispatch_fixture(is_stream, StatusCode::OK, StatusCode::OK).await;
+        wait_for_load(&fixture.prefill, 1).await;
+        assert_eq!(fixture.decode.load(), 1);
+        fixture
+            .prefill_body
+            .send(Ok(bytes::Bytes::from_static(b"{}")))
+            .unwrap();
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut fixture.prefill_body, closed));
+        wait_for_load(&fixture.prefill, 0).await;
+        assert_eq!(fixture.decode.load(), 1);
+        assert!(!fixture.dispatch.is_finished());
+        fixture.decode_headers.notify_one();
+        if is_stream {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.dispatch)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(fixture.decode.load(), 1);
+            if cancel_response {
+                drop(response);
+            } else {
+                fixture
+                    .decode_body
+                    .send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")))
+                    .unwrap();
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+            }
+        } else {
+            assert_eq!(fixture.decode.load(), 1);
+            fixture
+                .decode_body
+                .send(Ok(bytes::Bytes::from_static(b"{}")))
+                .unwrap();
+            let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+            drop(std::mem::replace(&mut fixture.decode_body, closed));
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.dispatch)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(fixture.prefill.load(), 0);
+        wait_for_load(&fixture.decode, 0).await;
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_releases_prefill_before_decode_headers_streaming() {
+        check_dispatch_load_lifetime(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_releases_prefill_before_decode_headers_nonstreaming() {
+        check_dispatch_load_lifetime(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_releases_decode_on_stream_drop() {
+        check_dispatch_load_lifetime(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_keeps_prefill_load_until_body_eof() {
+        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK).await;
+        fixture
+            .prefill_body
+            .send(Ok(bytes::Bytes::from_static(b"{")))
+            .unwrap();
+        fixture.decode_headers.notify_one();
+        let released_before_eof =
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                while fixture.prefill.load() == 1 && !fixture.dispatch.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        assert!(
+            released_before_eof.is_err(),
+            "prefill headers must not release its load"
+        );
+        assert_eq!(fixture.decode.load(), 1);
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut fixture.prefill_body, closed));
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(fixture.prefill.load(), 0);
+        assert_eq!(fixture.decode.load(), 1);
+        drop(response);
+        assert_eq!(fixture.decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_cancellation_releases_both_loads() {
+        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK).await;
+        wait_for_load(&fixture.prefill, 1).await;
+        assert_eq!(fixture.decode.load(), 1);
+        fixture.dispatch.abort();
+        assert!((&mut fixture.dispatch)
+            .await
+            .as_ref()
+            .unwrap_err()
+            .is_cancelled());
+        assert_eq!(fixture.prefill.load(), 0);
+        assert_eq!(fixture.decode.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_decode_error_does_not_wait_for_prefill_body() {
+        let mut fixture =
+            dispatch_fixture(true, StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR).await;
+        fixture
+            .prefill_body
+            .send(Ok(bytes::Bytes::from_static(b"{")))
+            .unwrap();
+        fixture
+            .decode_body
+            .send(Ok(bytes::Bytes::from_static(b"decode failed")))
+            .unwrap();
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut fixture.decode_body, closed));
+        fixture.decode_headers.notify_one();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(fixture.prefill.load(), 0);
+        assert_eq!(fixture.decode.load(), 0);
+        assert!(response
+            .extensions()
+            .get::<BreakerOutcomesRecorded>()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_prefill_failure_releases_both_loads() {
+        let mut fixture = dispatch_fixture(true, StatusCode::BAD_REQUEST, StatusCode::OK).await;
+        fixture
+            .prefill_body
+            .send(Ok(bytes::Bytes::from_static(b"bad request")))
+            .unwrap();
+        let (closed, _) = tokio::sync::mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut fixture.prefill_body, closed));
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.dispatch)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fixture.prefill.load(), 0);
+        assert_eq!(fixture.decode.load(), 0);
+        assert!(response
+            .extensions()
+            .get::<BreakerOutcomesRecorded>()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
@@ -2015,31 +2280,28 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
-                Some((
-                    WorkerLoadGuard::new(prefill_ref.clone(), None),
-                    WorkerLoadGuard::new(decode_ref.clone(), None),
-                )),
+                Some(WorkerLoadGuard::new(decode_ref.clone(), None)),
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Only decode remains counted after prefill completion.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode remains counted while its response body exists.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
 
-            // Response (and its body with guards) dropped here
+            // Dropping the response releases the decode guard.
             drop(response);
         }
 
-        // Guards dropped when response dropped
+        // Neither worker retains load after response drop.
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
     }
