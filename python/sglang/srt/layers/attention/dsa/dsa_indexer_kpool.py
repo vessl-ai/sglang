@@ -47,7 +47,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -933,24 +933,72 @@ class IndexerKPool(MultiPlatformOp):
         )
         return topk_result
 
+    # [R13-MARGIN] class-level state for the margin-safe budget calc, mirrors
+    # dsa_indexer.py:189-195 (Indexer._MQA_LOGITS_TOTAL_MEM_FRACTION /
+    # _mqa_logits_budget_bytes / _mqa_logits_free_mem_fraction).
+    _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    _mqa_logits_budget_bytes: Dict[int, int] = {}
+
+    @staticmethod
+    def _mqa_logits_free_mem_fraction() -> float:
+        return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
+
+    def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
+        """[R13-MARGIN] Ported from dsa_indexer.py:_get_mqa_logits_budget_bytes
+        (sibling implementation). R12-OOMGUARD (2026-08-28) copied this
+        module's guard call site but not this margin calc, so the guard sized
+        its fallback chunk to 100% of a live mem_get_info() snapshot with no
+        headroom -- see this patch's apply.py docstring for the crash this
+        caused (2026-09-13)."""
+        free_mem_fraction = self._mqa_logits_free_mem_fraction()
+        cached_budget = self._mqa_logits_budget_bytes.get(device_index)
+        if cached_budget is not None:
+            return cached_budget
+
+        total_mem = torch.cuda.get_device_properties(device_index).total_memory
+        total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
+        mem_fraction_static = get_schedule().mem_fraction_static
+        if mem_fraction_static is None:
+            static_budget = total_mem_budget
+        else:
+            static_free_mem = int(total_mem * max(0.0, 1.0 - mem_fraction_static))
+            static_budget = min(
+                int(static_free_mem * free_mem_fraction), total_mem_budget
+            )
+        static_budget = max(1, static_budget)
+
+        # Keep the static serving-memory guard during CUDA graph capture without
+        # caching it, mirrors dsa_indexer.py (capture-mode allocator state is
+        # transient and not representative of steady-state serving free_mem).
+        if get_is_capture_mode():
+            return static_budget
+
+        free_mem, _ = torch.cuda.mem_get_info(device_index)
+        budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
+        budget_bytes = max(1, budget_bytes)
+        self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        return budget_bytes
+
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
     ) -> Tuple[bool, int]:
         """
         Detect whether we need to chunk the MQA logits computation to avoid OOM
-        Return: (need_chunk, free_mem)
+        Return: (need_chunk, logits_budget_bytes)
         """
+        # [R13-MARGIN] fixed 2026-09-13: budget_bytes below is now a
+        # margin-safe value (>= 20% headroom by default), not raw 100% of a
+        # live free_mem snapshot -- see apply.py docstring.
         # Quick static check for normal batches
         if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
             return False, 0
 
-        free_mem, total_mem = torch.cuda.mem_get_info(device)
         bytes_per_elem = 4  # float32
         logits_bytes = num_q * num_k * bytes_per_elem
+        logits_budget_bytes = self._get_mqa_logits_budget_bytes(device.index)
 
-        # Logits should not exceed 50% of free memory or 30% of total memory
-        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
-        return need_chunk, free_mem
+        need_chunk = logits_bytes > logits_budget_bytes
+        return need_chunk, logits_budget_bytes
 
     # [R12-OOMGUARD-MARKER] ------------------------------------------------------
     # `_should_chunk_mqa_logits` above existed but had ZERO call sites in this file,
@@ -1027,13 +1075,16 @@ class IndexerKPool(MultiPlatformOp):
             bytes_per_row = num_k * self._MQA_LOGITS_BYTES_PER_ELEM
             max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
             max_rows = min(max_rows, n_rows)
+            live_free_mem_gib = torch.cuda.mem_get_info(q_rows.device)[0] / 2**30
             logger.warning(
-                "[R12-OOMGUARD] chunking mqa logits: rows=%d num_k=%d "
-                "logits=%.2f GiB free=%.2f GiB -> max_rows=%d",
+                "[R13-MARGIN] chunking mqa logits: rows=%d num_k=%d "
+                "logits=%.2f GiB budget=%.2f GiB(margin-safe, was=100%%-of-free "
+                "pre-patch) live_free=%.2f GiB -> max_rows=%d",
                 n_rows,
                 num_k,
                 n_rows * bytes_per_row / 2**30,
                 logits_budget_bytes / 2**30,
+                live_free_mem_gib,
                 max_rows,
             )
             parts = []
