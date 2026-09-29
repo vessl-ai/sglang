@@ -770,7 +770,11 @@ impl PDRouter {
                 .process_prefill_response(prefill_result, prefill.url(), context.return_logprob)
                 .await;
             drop(prefill_guard);
-            result
+            result.map_err(|mut response| {
+                prefill.record_outcome(false);
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            })
         });
         let decode_response_fut = async {
             match decode_early {
@@ -783,7 +787,10 @@ impl PDRouter {
         let decode_result = loop {
             tokio::select! {
                 result = &mut prefill_body_fut, if prefill_processed.is_none() => {
-                    prefill_processed = Some(result);
+                    match result {
+                        Ok(response) => prefill_processed = Some(Ok(response)),
+                        Err(error_response) => return error_response,
+                    }
                 }
                 result = &mut decode_response_fut => break result,
             }
@@ -1322,24 +1329,18 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
-                Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
-                    None
-                }
-            }
-        } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
-            }
-            None
-        };
+        let body = prefill_response.bytes().await.map_err(|e| {
+            error!(
+                prefill_url,
+                error = %e,
+                "Failed to read prefill response body"
+            );
+            error::bad_gateway(
+                "prefill_read_failed",
+                "Failed to read prefill response body",
+            )
+        })?;
+        let prefill_body = return_logprob.then_some(body);
 
         Ok((prefill_status, prefill_body))
     }
@@ -1969,6 +1970,7 @@ mod tests {
         is_stream: bool,
         prefill_status: StatusCode,
         decode_status: StatusCode,
+        return_logprob: bool,
     ) -> DispatchFixture {
         let mut servers = Vec::new();
         let mut urls = Vec::new();
@@ -2036,7 +2038,7 @@ mod tests {
                         route: "/generate",
                         batch_size: None,
                         is_stream,
-                        return_logprob: false,
+                        return_logprob,
                         request_text: None,
                         model_id: None,
                         headers: None,
@@ -2074,7 +2076,7 @@ mod tests {
     }
 
     async fn check_dispatch_load_lifetime(is_stream: bool, cancel_response: bool) {
-        let mut fixture = dispatch_fixture(is_stream, StatusCode::OK, StatusCode::OK).await;
+        let mut fixture = dispatch_fixture(is_stream, StatusCode::OK, StatusCode::OK, false).await;
         wait_for_load(&fixture.prefill, 1).await;
         assert_eq!(fixture.decode.load(), 1);
         fixture
@@ -2141,7 +2143,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_keeps_prefill_load_until_body_eof() {
-        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK).await;
+        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK, false).await;
         fixture
             .prefill_body
             .send(Ok(bytes::Bytes::from_static(b"{")))
@@ -2174,7 +2176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_cancellation_releases_both_loads() {
-        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK).await;
+        let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK, false).await;
         wait_for_load(&fixture.prefill, 1).await;
         assert_eq!(fixture.decode.load(), 1);
         fixture.dispatch.abort();
@@ -2189,8 +2191,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_decode_error_does_not_wait_for_prefill_body() {
-        let mut fixture =
-            dispatch_fixture(true, StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut fixture = dispatch_fixture(
+            true,
+            StatusCode::OK,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+        )
+        .await;
         fixture
             .prefill_body
             .send(Ok(bytes::Bytes::from_static(b"{")))
@@ -2217,8 +2224,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dispatch_prefill_body_error_cancels_decode() {
+        for is_stream in [false, true] {
+            for return_logprob in [false, true] {
+                for decode_started in [false, true] {
+                    let mut fixture =
+                        dispatch_fixture(is_stream, StatusCode::OK, StatusCode::OK, return_logprob)
+                            .await;
+                    wait_for_load(&fixture.prefill, 1).await;
+                    assert_eq!(fixture.decode.load(), 1);
+                    fixture
+                        .prefill_body
+                        .send(Ok(bytes::Bytes::from_static(b"{")))
+                        .unwrap();
+                    if decode_started {
+                        fixture.decode_headers.notify_one();
+                    }
+                    fixture
+                        .prefill_body
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "prefill body interrupted",
+                        )))
+                        .unwrap();
+                    let response = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        &mut fixture.dispatch,
+                    )
+                    .await
+                    .expect("prefill body failure must not wait for decode")
+                    .unwrap();
+                    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+                    assert!(response
+                        .extensions()
+                        .get::<BreakerOutcomesRecorded>()
+                        .is_some());
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"]["code"], "prefill_read_failed");
+                    assert_eq!(fixture.prefill.load(), 0);
+                    assert_eq!(fixture.decode.load(), 0);
+                    assert_eq!(fixture.prefill.circuit_breaker().total_failures(), 1);
+                    assert_eq!(fixture.decode.circuit_breaker().total_failures(), 0);
+                    assert_eq!(fixture.decode.circuit_breaker().total_successes(), 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_dispatch_prefill_failure_releases_both_loads() {
-        let mut fixture = dispatch_fixture(true, StatusCode::BAD_REQUEST, StatusCode::OK).await;
+        let mut fixture =
+            dispatch_fixture(true, StatusCode::BAD_REQUEST, StatusCode::OK, false).await;
         fixture
             .prefill_body
             .send(Ok(bytes::Bytes::from_static(b"bad request")))
