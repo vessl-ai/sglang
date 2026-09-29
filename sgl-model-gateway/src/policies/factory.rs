@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    PrefillTokensPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -19,6 +19,7 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::PrefillTokens => Arc::new(PrefillTokensPolicy::default()),
             PolicyConfig::LeastLoad => Arc::new(LeastLoadPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,

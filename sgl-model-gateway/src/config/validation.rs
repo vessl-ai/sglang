@@ -149,6 +149,7 @@ impl ConfigValidator {
         match policy {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
+            | PolicyConfig::PrefillTokens
             | PolicyConfig::LeastLoad
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
@@ -552,6 +553,31 @@ impl ConfigValidator {
     }
 
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        let prefill_tokens = matches!(
+            &config.mode,
+            RoutingMode::PrefillDecode {
+                prefill_policy: Some(PolicyConfig::PrefillTokens),
+                ..
+            }
+        );
+        let invalid_token_policy = matches!(config.policy, PolicyConfig::PrefillTokens)
+            || matches!(
+                &config.mode,
+                RoutingMode::PrefillDecode {
+                    decode_policy: Some(PolicyConfig::PrefillTokens),
+                    ..
+                }
+            );
+        if invalid_token_policy
+            || (prefill_tokens
+                && (config.enable_igw
+                    || !matches!(config.connection_mode, crate::core::ConnectionMode::Http)))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason: "prefill_tokens is supported only as an HTTP PD prefill policy".into(),
+            });
+        }
+
         if config.enable_igw {
             return Ok(());
         }

@@ -270,6 +270,9 @@ pub enum PolicyConfig {
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
+    #[serde(rename = "prefill_tokens")]
+    PrefillTokens,
+
     #[serde(rename = "least_load")]
     LeastLoad,
 
@@ -349,6 +352,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad => "least_load",
+            PolicyConfig::PrefillTokens => "prefill_tokens",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",

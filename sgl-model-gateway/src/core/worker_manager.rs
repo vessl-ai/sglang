@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
-    policies::PolicyRegistry,
+    policies::{PolicyRegistry, PrefillTokensPolicy},
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
 
@@ -304,10 +304,7 @@ impl LoadMonitor {
             return;
         }
 
-        info!(
-            "Starting load monitoring with interval: {:?}",
-            self.interval
-        );
+        info!("Starting worker load monitoring");
 
         let worker_registry = Arc::clone(&self.worker_registry);
         let policy_registry = Arc::clone(&self.policy_registry);
@@ -316,7 +313,24 @@ impl LoadMonitor {
         let tx = self.tx.clone();
 
         let handle = tokio::spawn(async move {
-            Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+            if policy_registry
+                .get_prefill_policy()
+                .as_any()
+                .is::<PrefillTokensPolicy>()
+            {
+                tokio::join!(
+                    Self::monitor_loop(
+                        worker_registry.clone(),
+                        policy_registry.clone(),
+                        client.clone(),
+                        interval,
+                        tx
+                    ),
+                    Self::prefill_token_loop(worker_registry, policy_registry, client),
+                );
+            } else {
+                Self::monitor_loop(worker_registry, policy_registry, client, interval, tx).await;
+            }
         });
 
         *handle_guard = Some(handle);
@@ -373,6 +387,22 @@ impl LoadMonitor {
                 let _ = tx.send(loads);
             } else {
                 warn!("No loads fetched from workers");
+            }
+        }
+    }
+
+    async fn prefill_token_loop(
+        worker_registry: Arc<WorkerRegistry>,
+        policy_registry: Arc<PolicyRegistry>,
+        client: reqwest::Client,
+    ) {
+        let mut timer = tokio::time::interval(Duration::from_millis(250));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let policy = policy_registry.get_prefill_policy();
+            if let Some(policy) = policy.as_any().downcast_ref::<PrefillTokensPolicy>() {
+                policy.refresh(&worker_registry.get_all(), &client).await;
             }
         }
     }

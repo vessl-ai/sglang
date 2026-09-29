@@ -28,6 +28,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
+        "prefill_tokens": PolicyType.PrefillTokens,
         "bucket": PolicyType.Bucket,
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
