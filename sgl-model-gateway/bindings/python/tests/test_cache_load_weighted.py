@@ -1,7 +1,6 @@
 import argparse
 
 import pytest
-
 from sglang_router.router import Router as RouterWrapper
 from sglang_router.router import policy_from_str
 from sglang_router.router_args import RouterArgs
