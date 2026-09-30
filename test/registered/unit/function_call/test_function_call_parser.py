@@ -3802,7 +3802,7 @@ class TestJsonArrayParser(unittest.TestCase):
             before_close,
             chunk_size,
         ) in itertools.product(
-            ["", " ", "\n", "\n  "],
+            ["", " ", "\n", "\n  ", "\t", "\r\n"],
             ["", " ", "\n"],
             ["", "\n"],
             ["", "\n"],
@@ -3838,6 +3838,31 @@ class TestJsonArrayParser(unittest.TestCase):
                     self._assert_streamed_calls(
                         expected, *self._stream_array(text, tools, chunk_size)
                     )
+
+    def test_text_after_array_keeps_whitespace(self):
+        """Whitespace that is not followed by the "," between calls, such as
+        the leading space of text after the closing "]", is streamed as
+        normal text instead of being dropped."""
+        tools = self._permissive_tools(["f", "g"])
+        expected = [("f", {"q": "x"}), ("g", {"xs": [1, 2, 3]})]
+        objs = [
+            json.dumps({"name": name, "parameters": arguments})
+            for name, arguments in expected
+        ]
+        text = "[" + ", ".join(objs) + "] then some words"
+        for chunk_size in [1, 3, 1000]:
+            with self.subTest(chunk_size=chunk_size):
+                calls, normal_text, logged_error = self._stream_array(
+                    text, tools, chunk_size
+                )
+                self.assertFalse(
+                    logged_error, "Error in parse_streaming_increment logged"
+                )
+                self.assertEqual(set(calls), {0, 1})
+                for index, (name, arguments) in enumerate(expected):
+                    self.assertEqual(calls[index][0], name)
+                    self.assertEqual(json.loads(calls[index][1]), arguments)
+                self.assertEqual(normal_text, " then some words")
 
 
 class TestLfm2Detector(unittest.TestCase):

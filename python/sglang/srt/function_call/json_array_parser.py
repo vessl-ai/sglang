@@ -41,12 +41,15 @@ class JsonArrayParser(BaseFormatDetector):
         Streaming incremental parsing with tool validation.
         """
         if self.current_tool_id > 0:
-            # The grammar allows whitespace before the "," between calls, but the
-            # base implementation only finds the next call when the buffer starts
-            # with the separator; otherwise it searches for "[", which matches an
-            # array inside the next call's arguments.
-            self._buffer = (self._buffer + new_text).lstrip()
-            new_text = ""
+            # The grammar allows JSON whitespace before the "," between calls, but
+            # the base implementation only finds the next call when the buffer
+            # starts with the separator; otherwise it searches for "[", which
+            # matches an array inside the next call's arguments. Drop whitespace
+            # that precedes a separator and leave any other text untouched.
+            pending = (self._buffer + new_text).lstrip(" \t\n\r")
+            if pending.startswith(self.tool_call_separator):
+                self._buffer = pending
+                new_text = ""
         return super().parse_streaming_increment(new_text, tools)
 
     def structure_info(self) -> callable:
