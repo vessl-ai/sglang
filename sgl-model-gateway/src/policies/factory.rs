@@ -36,6 +36,15 @@ impl PolicyFactory {
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
+            PolicyConfig::CacheLoadWeighted {
+                cache_weight,
+                eviction_interval_secs,
+                max_tree_size,
+            } => Arc::new(CacheAwarePolicy::with_weighted_config(
+                *cache_weight,
+                *eviction_interval_secs,
+                *max_tree_size,
+            )),
             PolicyConfig::Bucket {
                 balance_abs_threshold,
                 balance_rel_threshold,

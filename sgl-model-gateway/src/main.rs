@@ -204,8 +204,16 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "cache_load_weighted", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
+
+    /// Fraction of the weighted prefill score assigned to estimated prefix reuse (0.0-1.0)
+    #[arg(
+        long,
+        required_if_eq("prefill_policy", "cache_load_weighted"),
+        help_heading = "PD Disaggregation"
+    )]
+    prefill_cache_weight: Option<f64>,
 
     /// Specific policy for decode nodes in PD mode
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
@@ -779,6 +787,13 @@ impl CliArgs {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+            },
+            "cache_load_weighted" => PolicyConfig::CacheLoadWeighted {
+                cache_weight: self
+                    .prefill_cache_weight
+                    .expect("prefill-cache-weight is required"),
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },

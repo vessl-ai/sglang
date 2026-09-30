@@ -267,6 +267,13 @@ pub enum PolicyConfig {
         max_tree_size: usize,
     },
 
+    #[serde(rename = "cache_load_weighted")]
+    CacheLoadWeighted {
+        cache_weight: f64,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -347,6 +354,7 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::CacheLoadWeighted { .. } => "cache_load_weighted",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",

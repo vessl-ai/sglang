@@ -1,10 +1,40 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if matches!(config.policy, PolicyConfig::CacheLoadWeighted { .. })
+            || matches!(
+                &config.mode,
+                RoutingMode::PrefillDecode {
+                    decode_policy: Some(PolicyConfig::CacheLoadWeighted { .. }),
+                    ..
+                }
+            )
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_load_weighted".into(),
+                value: "policy placement".into(),
+                reason: "Only supported as an explicit prefill policy in PD mode".into(),
+            });
+        }
+        if matches!(
+            &config.mode,
+            RoutingMode::PrefillDecode {
+                prefill_policy: Some(PolicyConfig::CacheLoadWeighted { .. }),
+                ..
+            }
+        ) && !matches!(config.connection_mode, ConnectionMode::Http)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "cache_load_weighted".into(),
+                value: "connection mode".into(),
+                reason: "Requires HTTP PD routing for prefill completion accounting".into(),
+            });
+        }
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -188,6 +218,26 @@ impl ConfigValidator {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::CacheLoadWeighted {
+                cache_weight,
+                eviction_interval_secs,
+                max_tree_size,
+            } => {
+                if !(0.0..=1.0).contains(cache_weight) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache_weight".into(),
+                        value: cache_weight.to_string(),
+                        reason: "Must be finite and between 0.0 and 1.0".into(),
+                    });
+                }
+                if *eviction_interval_secs == 0 || *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cache tree limits".into(),
+                        value: format!("{eviction_interval_secs}/{max_tree_size}"),
+                        reason: "Must be > 0".into(),
                     });
                 }
             }
@@ -655,6 +705,41 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::core::ConnectionMode;
+
+    #[test]
+    fn weighted_requires_valid_weight_and_prefill_http_placement() {
+        let policy = PolicyConfig::CacheLoadWeighted {
+            cache_weight: 0.4,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+        };
+        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let invalid_policy = PolicyConfig::CacheLoadWeighted {
+                cache_weight: invalid,
+                eviction_interval_secs: 30,
+                max_tree_size: 10000,
+            };
+            assert!(ConfigValidator::validate_policy(&invalid_policy).is_err());
+        }
+        let mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://p:8000".into(), Some(8998))],
+            decode_urls: vec!["http://d:8000".into()],
+            prefill_policy: Some(policy.clone()),
+            decode_policy: Some(PolicyConfig::LeastLoad),
+        };
+        let mut config = RouterConfig::new(mode, PolicyConfig::Random);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.connection_mode = ConnectionMode::Grpc { port: None };
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.connection_mode = ConnectionMode::Http;
+        config.policy = policy.clone();
+        assert!(ConfigValidator::validate(&config).is_err());
+        config.policy = PolicyConfig::Random;
+        if let RoutingMode::PrefillDecode { decode_policy, .. } = &mut config.mode {
+            *decode_policy = Some(policy);
+        }
+        assert!(ConfigValidator::validate(&config).is_err());
+    }
 
     #[test]
     fn test_validate_regular_mode() {
