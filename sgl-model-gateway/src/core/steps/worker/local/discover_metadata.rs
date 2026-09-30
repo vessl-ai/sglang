@@ -288,15 +288,14 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 // optional so that a slow worker still reaches create_worker --
                 // but a silent failure is what made the 2026-09-01 incident
                 // invisible, so each one is logged.
-                let server_info = match get_server_info(&config.url, config.api_key.as_deref())
-                    .await
-                {
-                    Ok(info) => Some(info),
-                    Err(e) => {
-                        warn!("/server_info failed for {}: {}", config.url, e);
-                        None
-                    }
-                };
+                let server_info =
+                    match get_server_info(&config.url, config.api_key.as_deref()).await {
+                        Ok(info) => Some(info),
+                        Err(e) => {
+                            warn!("/server_info failed for {}: {}", config.url, e);
+                            None
+                        }
+                    };
                 let model_info = match get_model_info(&config.url, config.api_key.as_deref()).await
                 {
                     Ok(info) => Some(info),

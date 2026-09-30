@@ -187,15 +187,17 @@ impl LoadBalancingPolicy for PrefillTokensPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+    use serde_json::{json, Value};
+
     use super::*;
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, LoadMonitor, WorkerRegistry},
         policies::{PolicyFactory, PolicyRegistry},
     };
-    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
-    use serde_json::{json, Value};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
