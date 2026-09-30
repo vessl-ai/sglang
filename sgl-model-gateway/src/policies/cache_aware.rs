@@ -215,22 +215,26 @@ impl CacheAwarePolicy {
         }
         let idx = best_indices[rand::rng().random_range(0..best_indices.len())];
         if info.request_text.is_some() {
-            tree.insert(text, workers[idx].url());
-            if let Some(ref mesh_sync) = self.mesh_sync {
-                use smg_mesh::tree_ops::TreeInsertOp;
-                let op = TreeOperation::Insert(TreeInsertOp {
-                    text: text.to_owned(),
-                    tenant: workers[idx].url().to_owned(),
-                });
-                if let Err(e) = mesh_sync
-                    .sync_tree_operation(Self::normalize_mesh_model_id(tree_key).to_owned(), op)
-                {
-                    warn!("Failed to sync tree insert operation to mesh: {}", e);
-                }
-            }
+            self.record_request(&tree, tree_key, text, workers[idx].url());
         }
         workers[idx].increment_processed();
         Some(idx)
+    }
+
+    fn record_request(&self, tree: &Tree, tree_key: &str, text: &str, worker_url: &str) {
+        tree.insert(text, worker_url);
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            use smg_mesh::tree_ops::TreeInsertOp;
+            let op = TreeOperation::Insert(TreeInsertOp {
+                text: text.to_owned(),
+                tenant: worker_url.to_owned(),
+            });
+            if let Err(e) = mesh_sync
+                .sync_tree_operation(Self::normalize_mesh_model_id(tree_key).to_owned(), op)
+            {
+                warn!("Failed to sync tree insert operation to mesh: {}", e);
+            }
+        }
     }
 
     /// Set mesh sync manager (can be called after construction)
@@ -425,22 +429,7 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                // Now we can work with the tree without holding the HashMap lock
-                tree.insert(text, worker_url);
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: worker_url.to_string(),
-                    });
-                    let mesh_key = Self::normalize_mesh_model_id(tree_key);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_key.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                self.record_request(&tree, tree_key, text, workers[min_load_idx].url());
             } else {
                 warn!(
                     "cache_aware: no tree found for key '{}', skipping cache update — \
@@ -547,21 +536,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: workers[idx].url().to_string(),
-                    });
-                    let mesh_key = Self::normalize_mesh_model_id(&tree_key);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_key.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                self.record_request(&tree, &tree_key, text, workers[idx].url());
 
                 // Increment processed counter
                 workers[idx].increment_processed();
