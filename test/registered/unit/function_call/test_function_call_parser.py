@@ -1,6 +1,8 @@
+import itertools
 import json
 import unittest
 import warnings
+from unittest import mock
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -3734,6 +3736,116 @@ class TestJsonArrayParser(unittest.TestCase):
         # Verify all tool calls were parsed correctly
         total_calls = len(result1_2.calls) + len(result2_2.calls) + len(result3_2.calls)
         self.assertEqual(total_calls, 3, "Should have parsed exactly 3 tool calls")
+
+    @staticmethod
+    def _fg_tools():
+        return [
+            Tool(
+                type="function",
+                function=Function(
+                    name=name, parameters={"type": "object", "properties": {}}
+                ),
+            )
+            for name in ["f", "g"]
+        ]
+
+    @staticmethod
+    def _call_objs(expected):
+        return [
+            json.dumps({"name": name, "parameters": arguments})
+            for name, arguments in expected
+        ]
+
+    def _stream_array(self, text, tools, chunk_size):
+        """Feed `text` in `chunk_size` pieces plus 8 empty increments (as the
+        serving layer's stream-end drain does). Returns (calls, normal_text,
+        logged_error), where calls maps tool_index -> [name, parameters]."""
+        parser = JsonArrayParser()
+        calls, normal_text = {}, ""
+        increments = [
+            text[i : i + chunk_size] for i in range(0, len(text), chunk_size)
+        ] + [""] * 8
+        with mock.patch(
+            "sglang.srt.function_call.base_format_detector.logger.error"
+        ) as log_error:
+            for increment in increments:
+                result = parser.parse_streaming_increment(increment, tools)
+                normal_text += result.normal_text or ""
+                for call in result.calls:
+                    entry = calls.setdefault(call.tool_index, [None, ""])
+                    if call.name:
+                        entry[0] = call.name
+                    entry[1] += call.parameters or ""
+        return calls, normal_text, log_error.called
+
+    def _assert_streamed_calls(
+        self, expected, calls, normal_text, logged_error, expected_text=""
+    ):
+        self.assertFalse(logged_error, "Error in parse_streaming_increment logged")
+        self.assertEqual(set(calls), set(range(len(expected))))
+        for index, (name, arguments) in enumerate(expected):
+            self.assertEqual(calls[index][0], name)
+            self.assertEqual(json.loads(calls[index][1]), arguments)
+        self.assertEqual(normal_text.strip(), expected_text.strip())
+
+    def test_whitespace_before_separator_streams_every_call(self):
+        """The JSON-schema grammar allows whitespace around the "," between
+        calls. With whitespace before the comma, the parser used to look for
+        the next call at the first "[" in the buffer, which is an array inside
+        the next call's arguments: only the first call was streamed and every
+        later increment logged a parse error."""
+        tools = self._fg_tools()
+        expected = [
+            ("f", {"q": "x"}),
+            ("g", {"xs": [1, 2, 3]}),
+            ("f", {"ys": ["ab", "c]d"], "n": {"k": [[1], ["z"]]}}),
+        ]
+        objs = self._call_objs(expected)
+        for pre, post, opened, closed, size in itertools.product(
+            ["", " ", "\n", "\n  ", "\t", "\r\n"],
+            ["", " ", "\n"],
+            ["", "\n"],
+            ["", "\n"],
+            [1, 2, 3, 7, 50, 1000],
+        ):
+            text = "[" + opened + (pre + "," + post).join(objs) + closed + "]"
+            with self.subTest(text=text, chunk_size=size):
+                self._assert_streamed_calls(
+                    expected, *self._stream_array(text, tools, size)
+                )
+
+    def test_single_call_array_streams(self):
+        """A single-call array, which has no "," between calls, keeps
+        streaming the call's name and arguments."""
+        tools = self._fg_tools()
+        expected = [("f", {"q": "x"})]
+        text = "[" + ", ".join(self._call_objs(expected)) + "]"
+        for chunk_size in [1, 3, 1000]:
+            with self.subTest(chunk_size=chunk_size):
+                self._assert_streamed_calls(
+                    expected, *self._stream_array(text, tools, chunk_size)
+                )
+
+    def test_text_after_array_keeps_whitespace(self):
+        """Whitespace that is not followed by the "," between calls, such as
+        the leading space of text after the closing "]", is streamed as
+        normal text instead of being dropped."""
+        tools = self._fg_tools()
+        expected = [("f", {"q": "x"}), ("g", {"xs": [1, 2, 3]})]
+        text = "[" + ", ".join(self._call_objs(expected)) + "] then some words"
+        for chunk_size in [1, 3, 1000]:
+            with self.subTest(chunk_size=chunk_size):
+                calls, normal_text, logged_error = self._stream_array(
+                    text, tools, chunk_size
+                )
+                self._assert_streamed_calls(
+                    expected,
+                    calls,
+                    normal_text,
+                    logged_error,
+                    expected_text=" then some words",
+                )
+                self.assertEqual(normal_text, " then some words")
 
 
 class TestLfm2Detector(unittest.TestCase):
