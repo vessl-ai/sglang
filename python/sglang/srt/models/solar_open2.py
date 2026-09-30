@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Optional
 
 import torch
@@ -34,7 +34,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    FusedMoeWeightScaleSupported,
+)
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -65,7 +68,8 @@ from sglang.srt.utils.common import BumpAllocator, add_prefix
 # batched one: 6 GEMMs per KDA layer become 2. KimiDeltaAttention gates this on
 # `quant_config is None`, which is too coarse here -- this model's KDA attention
 # is unquantized (the config class widens the compressed-tensors ignore list for
-# it), so the fused path is valid. Off by default; set SOLAR_FUSE_KDA=1 to enable.
+# it; a float-quantized f_b/g_b is dequantized at load), so the fused path is
+# valid. Off by default; set SOLAR_FUSE_KDA=1 to enable.
 _FUSE_KDA = os.environ.get("SOLAR_FUSE_KDA", "0") == "1"
 
 _KDA_A_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
@@ -80,7 +84,8 @@ def _assert_kda_unquantized(quant_config, prefix: str) -> None:
     checkpoint that *does* quantize them, the fused Linear would allocate
     unquantized parameters and the packed weights would load into them silently,
     producing garbage rather than an error. So check the exclusion and refuse to
-    start when it does not hold.
+    start when it does not hold. `f_b_proj`/`g_b_proj` are exempt: a
+    float-quantized one is dequantized by `_FloatQuantDequantizer` at load.
     """
     if quant_config is None:
         return
@@ -102,6 +107,62 @@ def _assert_kda_unquantized(quant_config, prefix: str) -> None:
                 "by the checkpoint's `ignore` list. Fusing it would load packed "
                 "weights into an unquantized Linear. Unset SOLAR_FUSE_KDA."
             )
+
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+class _FloatQuantDequantizer:
+    """Loads a float-quantized Linear that this model builds unquantized.
+
+    A full-FP8 checkpoint quantizes `g_proj` and the KDA `f_b_proj`/`g_b_proj`,
+    which are built unquantized, so their FP8 `weight` would load without its
+    `weight_scale`. `wrap` joins each such pair, in either arrival order, and
+    yields `weight * weight_scale` instead. `unquantized_dtype(prefix)` gives
+    the dtype of the parameter `prefix.weight` loads into, or None when the
+    module owns a `weight_scale` parameter or has no weight parameter; those
+    tensors pass through unchanged.
+    """
+
+    def __init__(self, unquantized_dtype: Callable[[str], Optional[torch.dtype]]):
+        self._unquantized_dtype = unquantized_dtype
+        self._weights: dict[str, torch.Tensor] = {}
+        self._scales: dict[str, torch.Tensor] = {}
+        self.dequantized = 0
+
+    def wrap(self, weights: Iterable[tuple]) -> Iterator[tuple]:
+        for args in weights:
+            name, tensor = args[:2]
+            if name.endswith(".weight_scale"):
+                prefix, is_scale = name[: -len(".weight_scale")], True
+            elif name.endswith(".weight") and tensor.dtype in _FP8_DTYPES:
+                prefix, is_scale = name[: -len(".weight")], False
+            else:
+                yield args
+                continue
+            dtype = self._unquantized_dtype(prefix)
+            if dtype is None:
+                yield args
+                continue
+            mine, theirs = (
+                (self._scales, self._weights)
+                if is_scale
+                else (self._weights, self._scales)
+            )
+            partner = theirs.pop(prefix, None)
+            if partner is None:
+                mine[prefix] = tensor
+                continue
+            weight, scale = (partner, tensor) if is_scale else (tensor, partner)
+            self.dequantized += 1
+            dequantized = weight.to(torch.float32) * scale.to(torch.float32)
+            yield (f"{prefix}.weight", dequantized.to(dtype), *args[2:])
+
+    def unpaired(self) -> list[str]:
+        return sorted(
+            [f"{p}.weight_scale" for p in self._scales]
+            + [f"{p}.weight" for p in self._weights]
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -173,9 +234,10 @@ class SolarOpen2Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Output gate. bf16 on disk (listed in the checkpoint's quant ignore),
-        # so it is built unquantized. Dropping it boots and produces plausible
-        # text - the loss is silent, hence the explicit load-count gate below.
+        # Output gate. Built unquantized: bf16 on disk (listed in the quant
+        # ignore), or FP8 dequantized at load. Dropping it boots and produces
+        # plausible text - the loss is silent, hence the explicit load-count
+        # gate below.
         self.use_gqa_gate = bool(getattr(config, "use_gqa_gate", True))
         if self.use_gqa_gate:
             self.g_proj = ColumnParallelLinear(
@@ -706,13 +768,41 @@ class SolarOpen2ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+
+        def unquantized_dtype(prefix: str) -> Optional[torch.dtype]:
+            # FusedMoE owns every expert scale; skip the expert-mapping scan.
+            if ".mlp.experts." in prefix:
+                return None
+            if self._resolve_param_name(
+                f"{prefix}.weight_scale",
+                stacked_params_mapping,
+                expert_params_mapping,
+                params_dict,
+            ):
+                return None
+            weight = self._resolve_param_name(
+                f"{prefix}.weight",
+                stacked_params_mapping,
+                expert_params_mapping,
+                params_dict,
+            )
+            return None if weight is None else params_dict[weight].dtype
+
+        dequantizer = _FloatQuantDequantizer(unquantized_dtype)
+        orphaned_scales: list[str] = []
+        skipped_q_scales = 0
         loaded_params: set[str] = set()
-        for args in weights:
+        for args in dequantizer.wrap(weights):
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
             if self._is_non_local_pp_weight(name):
                 continue
             if "rotary_emb.inv_freq" in name:
+                continue
+            # Query observer scale from the checkpoint's kv_cache_scheme; the KV
+            # cache dtype is ours, so nothing consumes it.
+            if name.endswith(".q_scale") and name not in params_dict:
+                skipped_q_scales += 1
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -756,6 +846,8 @@ class SolarOpen2ForCausalLM(nn.Module):
                     if name is None:
                         continue
                     if name not in params_dict:
+                        if name.endswith(".weight_scale"):
+                            orphaned_scales.append(name)
                         logger.warning(
                             "[SOLAR-GATE] unexpected checkpoint tensor with no "
                             "matching parameter: %s",
@@ -769,7 +861,44 @@ class SolarOpen2ForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        unpaired = orphaned_scales + dequantizer.unpaired()
+        if unpaired:
+            raise ValueError(
+                f"SolarOpen2: {len(unpaired)} float-quantized checkpoint tensors "
+                "were neither loaded nor dequantized (a weight_scale with no "
+                "parameter or weight to apply to, or an FP8 weight with no "
+                f"weight_scale): {unpaired}"
+            )
+        logger.info(
+            "[SOLAR-GATE] float-quantized Linear weights dequantized at load=%d",
+            dequantizer.dequantized,
+        )
+        if skipped_q_scales:
+            logger.info(
+                "[SOLAR-GATE] q_scale tensors skipped (unused)=%d", skipped_q_scales
+            )
+
         self._log_load_gates(params_dict, loaded_params)
+
+    @staticmethod
+    def _resolve_param_name(
+        name: str, stacked_params_mapping, expert_params_mapping, params_dict
+    ) -> Optional[str]:
+        """The parameter `load_weights` would load checkpoint tensor `name` into."""
+        for param_name, weight_name, _ in stacked_params_mapping:
+            if weight_name not in name:
+                continue
+            if ("mlp.experts." in name) and name not in params_dict:
+                continue
+            mapped = name.replace(weight_name, param_name)
+            if mapped in params_dict:
+                return mapped
+        for param_name, weight_name, _, _ in expert_params_mapping:
+            if weight_name in name:
+                mapped = name.replace(weight_name, param_name)
+                return mapped if mapped in params_dict else None
+        remapped = maybe_remap_kv_scale_name(name, params_dict)
+        return remapped if remapped in params_dict else None
 
     def _log_load_gates(self, params_dict, loaded_params: set[str]) -> None:
         """Boot-time gates for the three silent-failure modes of this port."""
@@ -796,7 +925,17 @@ class SolarOpen2ForCausalLM(nn.Module):
         try:
             experts = self.model.layers[self.model.start_layer].mlp.experts
             scale = getattr(experts, "w2_weight_scale", None)
-            if scale is not None:
+            per_channel = (
+                getattr(scale, "quant_method", None)
+                == FusedMoeWeightScaleSupported.CHANNEL.value
+            )
+            if scale is not None and per_channel:
+                # One scale per output channel (FP8): no groups for TP to floor.
+                logger.info(
+                    "[SOLAR-GATE] w2_weight_scale.shape=%s per-channel, no group check",
+                    tuple(scale.shape),
+                )
+            elif scale is not None:
                 expected_groups = self.config.moe_intermediate_size // 128
                 # Which axis holds the groups depends on the quantization
                 # scheme, so do not pin the check to the last one. The W4A8
