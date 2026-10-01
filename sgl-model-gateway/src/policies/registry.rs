@@ -299,7 +299,7 @@ impl PolicyRegistry {
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if matches!(policy.name(), "cache_aware" | "cache_load_weighted") {
+            if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     debug!(
                         "Initializing cache-aware policy with {} workers for model {}",
@@ -317,7 +317,7 @@ impl PolicyRegistry {
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
         // Get the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if matches!(policy.name(), "cache_aware" | "cache_load_weighted") {
+            if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
@@ -354,7 +354,7 @@ impl PolicyRegistry {
 
         // Initialize decode policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(decode_policy) = self.decode_policy.get() {
-            if matches!(decode_policy.name(), "cache_aware" | "cache_load_weighted") {
+            if decode_policy.name() == "cache_aware" {
                 if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
                     if !decode_workers.is_empty() {
@@ -421,7 +421,7 @@ impl PolicyRegistry {
     ) {
         // Try to find the policy for this model
         if let Some(policy) = self.get_policy(model_id) {
-            if matches!(policy.name(), "cache_aware" | "cache_load_weighted") {
+            if policy.name() == "cache_aware" {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
@@ -429,10 +429,7 @@ impl PolicyRegistry {
         }
 
         // Also check default policy if it's cache-aware
-        if matches!(
-            self.default_policy.name(),
-            "cache_aware" | "cache_load_weighted"
-        ) {
+        if self.default_policy.name() == "cache_aware" {
             if let Some(cache_aware) = self
                 .default_policy
                 .as_any()
@@ -454,7 +451,7 @@ impl PolicyRegistry {
         }
 
         if let Some(decode_policy) = self.decode_policy.get() {
-            if matches!(decode_policy.name(), "cache_aware" | "cache_load_weighted") {
+            if decode_policy.name() == "cache_aware" {
                 if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
                     cache_aware.apply_remote_tree_operation(model_id, operation);
