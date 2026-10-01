@@ -1,10 +1,10 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -138,6 +138,32 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
+/// Active requests with their dispatch times.
+#[derive(Debug, Default)]
+pub struct ActiveDispatches {
+    next_id: AtomicU64,
+    entries: dashmap::DashMap<u64, Instant>,
+}
+
+impl ActiveDispatches {
+    fn insert(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries.insert(id, Instant::now());
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        self.entries.remove(&id);
+    }
+
+    pub fn count_since(&self, since: Instant) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| *entry.value() >= since)
+            .count() as u64
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -218,6 +244,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
+
+    fn active_dispatches(&self) -> &ActiveDispatches;
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -657,6 +685,7 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
+    pub active_dispatches: Arc<ActiveDispatches>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
     /// Set once when the registry removes the worker; gates the health gauge
@@ -838,6 +867,10 @@ impl Worker for BasicWorker {
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         &self.worker_routing_key_load
+    }
+
+    fn active_dispatches(&self) -> &ActiveDispatches {
+        &self.active_dispatches
     }
 
     fn processed_requests(&self) -> usize {
@@ -1100,6 +1133,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.worker_routing_key_load()
     }
 
+    fn active_dispatches(&self) -> &ActiveDispatches {
+        self.base_worker.active_dispatches()
+    }
+
     fn processed_requests(&self) -> usize {
         self.base_worker.processed_requests()
     }
@@ -1176,6 +1213,7 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    dispatch_id: Option<u64>,
 }
 
 impl WorkerLoadGuard {
@@ -1193,12 +1231,25 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            dispatch_id: None,
         }
+    }
+
+    pub fn with_dispatch_tracking(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+    ) -> Self {
+        let mut guard = Self::new(worker, headers);
+        guard.dispatch_id = Some(guard.worker.active_dispatches().insert());
+        guard
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        if let Some(id) = self.dispatch_id {
+            self.worker.active_dispatches().remove(id);
+        }
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);

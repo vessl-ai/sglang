@@ -654,7 +654,7 @@ impl PDRouter {
         _start_time: Instant,
     ) -> Response {
         // Count both workers before either request can yield its first response.
-        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        let prefill_guard = WorkerLoadGuard::with_dispatch_tracking(prefill.clone(), headers);
         let mut decode_guard = Some(WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
@@ -1955,6 +1955,13 @@ mod tests {
         decode_headers: Arc<tokio::sync::Notify>,
         dispatch: tokio::task::JoinHandle<Response>,
         servers: Vec<tokio::task::JoinHandle<()>>,
+        created_at: Instant,
+    }
+
+    impl DispatchFixture {
+        fn in_flight_requests(&self, worker: &Arc<dyn Worker>) -> u64 {
+            worker.active_dispatches().count_since(self.created_at)
+        }
     }
 
     impl Drop for DispatchFixture {
@@ -1972,6 +1979,7 @@ mod tests {
         decode_status: StatusCode,
         return_logprob: bool,
     ) -> DispatchFixture {
+        let created_at = Instant::now();
         let mut servers = Vec::new();
         let mut urls = Vec::new();
         let mut bodies = Vec::new();
@@ -2039,7 +2047,7 @@ mod tests {
                         batch_size: None,
                         is_stream,
                         return_logprob,
-                        request_text: None,
+                        request_text: Some("hello".to_string()),
                         model_id: None,
                         headers: None,
                     },
@@ -2062,6 +2070,7 @@ mod tests {
             decode_headers,
             dispatch,
             servers,
+            created_at,
         }
     }
 
@@ -2079,6 +2088,8 @@ mod tests {
         let mut fixture = dispatch_fixture(is_stream, StatusCode::OK, StatusCode::OK, false).await;
         wait_for_load(&fixture.prefill, 1).await;
         assert_eq!(fixture.decode.load(), 1);
+        assert_eq!(fixture.in_flight_requests(&fixture.prefill), 1);
+        assert_eq!(fixture.in_flight_requests(&fixture.decode), 0);
         fixture
             .prefill_body
             .send(Ok(bytes::Bytes::from_static(b"{}")))
@@ -2086,6 +2097,7 @@ mod tests {
         let (closed, _) = tokio::sync::mpsc::unbounded_channel();
         drop(std::mem::replace(&mut fixture.prefill_body, closed));
         wait_for_load(&fixture.prefill, 0).await;
+        assert_eq!(fixture.in_flight_requests(&fixture.prefill), 0);
         assert_eq!(fixture.decode.load(), 1);
         assert!(!fixture.dispatch.is_finished());
         fixture.decode_headers.notify_one();
@@ -2179,6 +2191,7 @@ mod tests {
         let mut fixture = dispatch_fixture(true, StatusCode::OK, StatusCode::OK, false).await;
         wait_for_load(&fixture.prefill, 1).await;
         assert_eq!(fixture.decode.load(), 1);
+        assert_eq!(fixture.in_flight_requests(&fixture.prefill), 1);
         fixture.dispatch.abort();
         assert!((&mut fixture.dispatch)
             .await
@@ -2187,6 +2200,7 @@ mod tests {
             .is_cancelled());
         assert_eq!(fixture.prefill.load(), 0);
         assert_eq!(fixture.decode.load(), 0);
+        assert_eq!(fixture.in_flight_requests(&fixture.prefill), 0);
     }
 
     #[tokio::test]
@@ -2265,6 +2279,7 @@ mod tests {
                     let body: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(body["error"]["code"], "prefill_read_failed");
                     assert_eq!(fixture.prefill.load(), 0);
+                    assert_eq!(fixture.in_flight_requests(&fixture.prefill), 0);
                     assert_eq!(fixture.decode.load(), 0);
                     assert_eq!(fixture.prefill.circuit_breaker().total_failures(), 1);
                     assert_eq!(fixture.decode.circuit_breaker().total_failures(), 0);
@@ -2292,6 +2307,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(fixture.prefill.load(), 0);
         assert_eq!(fixture.decode.load(), 0);
+        assert_eq!(fixture.in_flight_requests(&fixture.prefill), 0);
         assert!(response
             .extensions()
             .get::<BreakerOutcomesRecorded>()
