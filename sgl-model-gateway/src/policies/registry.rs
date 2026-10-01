@@ -337,7 +337,7 @@ impl PolicyRegistry {
     ) {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
+            if matches!(prefill_policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) =
                     prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
@@ -381,7 +381,7 @@ impl PolicyRegistry {
             crate::core::WorkerType::Regular => return,
         };
         if let Some(policy) = policy {
-            if policy.name() == "cache_aware" {
+            if matches!(policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.remove_worker(worker);
                     debug!(
@@ -441,7 +441,7 @@ impl PolicyRegistry {
 
         // Check prefill and decode policies for PD mode
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
+            if matches!(prefill_policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) =
                     prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {

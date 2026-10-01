@@ -52,6 +52,7 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
+    prefill_cache_weight: Optional[float] = None
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
@@ -292,7 +293,7 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=_POLICY_CHOICES,
+            choices=(*_POLICY_CHOICES, "cache_load_weighted"),
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
@@ -301,6 +302,12 @@ class RouterArgs:
             default=None,
             choices=_POLICY_CHOICES,
             help="Specific policy for decode nodes in PD mode. If not specified, uses the main policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-cache-weight",
+            type=float,
+            default=None,
+            help="Fraction of weighted prefill score assigned to estimated prefix reuse (0.0-1.0); required for cache_load_weighted",
         )
         routing_group.add_argument(
             f"--{prefix}cache-threshold",
@@ -1026,6 +1033,17 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        if self.prefill_policy == "cache_load_weighted":
+            if not self.pd_disaggregation:
+                raise ValueError("cache_load_weighted requires PD mode")
+            if (
+                self.prefill_cache_weight is None
+                or not 0.0 <= self.prefill_cache_weight <= 1.0
+            ):
+                raise ValueError(
+                    "prefill_cache_weight must be provided and between 0.0 and 1.0"
+                )
+
         # Validate configuration based on mode
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode
