@@ -16,6 +16,7 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    PrefillTokens,
 }
 
 #[pyclass(eq)]
@@ -470,6 +471,7 @@ impl Router {
 
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
+                PolicyType::PrefillTokens => ConfigPolicyConfig::PrefillTokens,
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {

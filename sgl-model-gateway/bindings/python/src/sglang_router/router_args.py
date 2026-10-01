@@ -292,7 +292,7 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=_POLICY_CHOICES,
+            choices=(*_POLICY_CHOICES, "prefill_tokens"),
             help="Specific policy for prefill nodes in PD mode. If not specified, uses the main policy",
         )
         routing_group.add_argument(
