@@ -38,10 +38,12 @@ impl PolicyFactory {
             }
             PolicyConfig::CacheLoadWeighted {
                 cache_weight,
+                load_weight,
                 eviction_interval_secs,
                 max_tree_size,
             } => Arc::new(CacheAwarePolicy::with_weighted_config(
                 *cache_weight,
+                *load_weight,
                 *eviction_interval_secs,
                 *max_tree_size,
             )),

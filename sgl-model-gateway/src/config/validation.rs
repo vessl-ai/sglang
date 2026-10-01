@@ -223,14 +223,26 @@ impl ConfigValidator {
             }
             PolicyConfig::CacheLoadWeighted {
                 cache_weight,
+                load_weight,
                 eviction_interval_secs,
                 max_tree_size,
             } => {
-                if !(0.0..=1.0).contains(cache_weight) {
+                for (field, weight) in
+                    [("cache_weight", cache_weight), ("load_weight", load_weight)]
+                {
+                    if !(weight.is_finite() && *weight >= 0.0) {
+                        return Err(ConfigError::InvalidValue {
+                            field: field.into(),
+                            value: weight.to_string(),
+                            reason: "Must be finite and >= 0.0".into(),
+                        });
+                    }
+                }
+                if *cache_weight == 0.0 && *load_weight == 0.0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "cache_weight".into(),
-                        value: cache_weight.to_string(),
-                        reason: "Must be finite and between 0.0 and 1.0".into(),
+                        field: "cache_weight/load_weight".into(),
+                        value: "0/0".into(),
+                        reason: "At least one weight must be > 0.0".into(),
                     });
                 }
                 if *eviction_interval_secs == 0 || *max_tree_size == 0 {
@@ -707,20 +719,22 @@ mod tests {
     use crate::core::ConnectionMode;
 
     #[test]
-    fn weighted_requires_valid_weight_and_prefill_http_placement() {
-        let policy = PolicyConfig::CacheLoadWeighted {
-            cache_weight: 0.4,
+    fn weighted_requires_valid_weights_and_prefill_http_placement() {
+        let weighted = |cache_weight, load_weight| PolicyConfig::CacheLoadWeighted {
+            cache_weight,
+            load_weight,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
         };
-        for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
-            let invalid_policy = PolicyConfig::CacheLoadWeighted {
-                cache_weight: invalid,
-                eviction_interval_secs: 30,
-                max_tree_size: 10000,
-            };
-            assert!(ConfigValidator::validate_policy(&invalid_policy).is_err());
+        for (cache_weight, load_weight) in [(1.0, 0.0), (0.0, 1.0), (2.5, 1.0)] {
+            assert!(ConfigValidator::validate_policy(&weighted(cache_weight, load_weight)).is_ok());
         }
+        for invalid in [f64::NAN, f64::INFINITY, -0.1] {
+            assert!(ConfigValidator::validate_policy(&weighted(invalid, 1.0)).is_err());
+            assert!(ConfigValidator::validate_policy(&weighted(1.0, invalid)).is_err());
+        }
+        assert!(ConfigValidator::validate_policy(&weighted(0.0, 0.0)).is_err());
+        let policy = weighted(1.0, 1.0);
         let mode = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://p:8000".into(), Some(8998))],
             decode_urls: vec!["http://d:8000".into()],

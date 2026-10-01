@@ -270,6 +270,7 @@ pub enum PolicyConfig {
     #[serde(rename = "cache_load_weighted")]
     CacheLoadWeighted {
         cache_weight: f64,
+        load_weight: f64,
         eviction_interval_secs: u64,
         max_tree_size: usize,
     },

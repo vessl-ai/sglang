@@ -391,7 +391,9 @@ struct Router {
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     #[pyo3(get)]
-    prefill_cache_weight: Option<f64>,
+    prefill_cache_weight: f64,
+    #[pyo3(get)]
+    prefill_load_weight: f64,
     decode_policy: Option<PolicyType>,
     max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
@@ -471,13 +473,6 @@ impl Router {
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
-        if matches!(self.prefill_policy, Some(PolicyType::CacheLoadWeighted))
-            && self.prefill_cache_weight.is_none()
-        {
-            return Err(config::ConfigError::MissingRequired {
-                field: "prefill_cache_weight".into(),
-            });
-        }
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -490,7 +485,8 @@ impl Router {
                     max_tree_size: self.max_tree_size,
                 },
                 PolicyType::CacheLoadWeighted => ConfigPolicyConfig::CacheLoadWeighted {
-                    cache_weight: self.prefill_cache_weight.unwrap_or(f64::NAN),
+                    cache_weight: self.prefill_cache_weight,
+                    load_weight: self.prefill_load_weight,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
                 },
@@ -778,7 +774,8 @@ impl Router {
         pool_max_idle_per_host = 500,
         tcp_keepalive_secs = 30,
         enable_wasm = false,
-        prefill_cache_weight = None,
+        prefill_cache_weight = 1.0,
+        prefill_load_weight = 1.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -872,7 +869,8 @@ impl Router {
         pool_max_idle_per_host: usize,
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
-        prefill_cache_weight: Option<f64>,
+        prefill_cache_weight: f64,
+        prefill_load_weight: f64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -928,6 +926,7 @@ impl Router {
             decode_urls,
             prefill_policy,
             prefill_cache_weight,
+            prefill_load_weight,
             decode_policy,
             max_concurrent_requests,
             cors_allowed_origins,

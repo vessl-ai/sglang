@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -52,7 +53,8 @@ class RouterArgs:
 
     # Routing policy
     policy: str = "cache_aware"
-    prefill_cache_weight: Optional[float] = None
+    prefill_cache_weight: float = 1.0
+    prefill_load_weight: float = 1.0
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
     worker_startup_timeout_secs: int = 1800
@@ -306,8 +308,14 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}prefill-cache-weight",
             type=float,
-            default=None,
-            help="Fraction of weighted prefill score assigned to estimated prefix reuse (0.0-1.0); required for cache_load_weighted",
+            default=RouterArgs.prefill_cache_weight,
+            help="Weight of the prefix-reuse term in the cache_load_weighted prefill score",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-load-weight",
+            type=float,
+            default=RouterArgs.prefill_load_weight,
+            help="Weight of the load term in the cache_load_weighted prefill score",
         )
         routing_group.add_argument(
             f"--{prefix}cache-threshold",
@@ -1036,12 +1044,15 @@ class RouterArgs:
         if self.prefill_policy == "cache_load_weighted":
             if not self.pd_disaggregation:
                 raise ValueError("cache_load_weighted requires PD mode")
-            if (
-                self.prefill_cache_weight is None
-                or not 0.0 <= self.prefill_cache_weight <= 1.0
+            for name, weight in (
+                ("prefill_cache_weight", self.prefill_cache_weight),
+                ("prefill_load_weight", self.prefill_load_weight),
             ):
+                if not (math.isfinite(weight) and weight >= 0.0):
+                    raise ValueError(f"{name} must be finite and >= 0.0")
+            if self.prefill_cache_weight == 0.0 and self.prefill_load_weight == 0.0:
                 raise ValueError(
-                    "prefill_cache_weight must be provided and between 0.0 and 1.0"
+                    "prefill_cache_weight and prefill_load_weight cannot both be 0.0"
                 )
 
         # Validate configuration based on mode
