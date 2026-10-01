@@ -400,9 +400,8 @@ mod tests {
         WorkflowStatus,
     };
 
-    use crate::core::ConnectionMode;
-
     use super::*;
+    use crate::core::ConnectionMode;
 
     type Engine = WorkflowEngine<LocalWorkerWorkflowData, InMemoryStore<LocalWorkerWorkflowData>>;
 
