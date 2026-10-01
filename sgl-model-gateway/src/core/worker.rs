@@ -1,10 +1,10 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -138,6 +138,35 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
+/// Estimated input tokens of in-flight requests sent to a worker, each with
+/// the time it was sent.
+#[derive(Debug, Default)]
+pub struct ActiveDispatches {
+    next_id: AtomicU64,
+    entries: dashmap::DashMap<u64, (Instant, u64)>,
+}
+
+impl ActiveDispatches {
+    fn insert(&self, tokens: u64) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.entries.insert(id, (Instant::now(), tokens));
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        self.entries.remove(&id);
+    }
+
+    /// Tokens of the in-flight requests sent at or after `since`.
+    pub fn tokens_since(&self, since: Instant) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.0 >= since)
+            .map(|entry| entry.1)
+            .sum()
+    }
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -218,6 +247,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
+
+    fn active_dispatches(&self) -> &ActiveDispatches;
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -657,6 +688,7 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
+    pub active_dispatches: Arc<ActiveDispatches>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
     /// Set once when the registry removes the worker; gates the health gauge
@@ -838,6 +870,10 @@ impl Worker for BasicWorker {
 
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad {
         &self.worker_routing_key_load
+    }
+
+    fn active_dispatches(&self) -> &ActiveDispatches {
+        &self.active_dispatches
     }
 
     fn processed_requests(&self) -> usize {
@@ -1100,6 +1136,10 @@ impl Worker for DPAwareWorker {
         self.base_worker.worker_routing_key_load()
     }
 
+    fn active_dispatches(&self) -> &ActiveDispatches {
+        self.base_worker.active_dispatches()
+    }
+
     fn processed_requests(&self) -> usize {
         self.base_worker.processed_requests()
     }
@@ -1176,6 +1216,7 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    dispatch_id: Option<u64>,
 }
 
 impl WorkerLoadGuard {
@@ -1193,12 +1234,28 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            dispatch_id: None,
         }
+    }
+
+    /// Like `new`, and also keeps `input_tokens` in the worker's active
+    /// dispatches until the guard drops.
+    pub fn with_input_tokens(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        input_tokens: u64,
+    ) -> Self {
+        let mut guard = Self::new(worker, headers);
+        guard.dispatch_id = Some(guard.worker.active_dispatches().insert(input_tokens));
+        guard
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        if let Some(id) = self.dispatch_id {
+            self.worker.active_dispatches().remove(id);
+        }
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);

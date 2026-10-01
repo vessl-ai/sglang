@@ -60,17 +60,25 @@
     during the next eviction cycle.
 */
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use rand::{seq::IteratorRandom, Rng};
 use smg_mesh::{tree_ops::TreeOperation, OptionalMeshSyncManager};
 use tracing::{debug, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
-    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    CacheAwareConfig, LoadBalancingPolicy, LoadReport, SelectWorkerInfo,
 };
 use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
 
@@ -100,6 +108,80 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
+const TIE_EPSILON: f64 = 1e-6;
+
+#[derive(Debug)]
+struct EngineLoad {
+    reported_tokens: u64,
+    queried_at: Instant,
+}
+
+/// Scoring state of the `cache_load_weighted` policy.
+#[derive(Debug)]
+struct WeightedScoring {
+    cache_weight: f64,
+    load_weight: f64,
+    /// Keyed by worker URL. A worker without an entry has no usable engine report.
+    engine_loads: Mutex<HashMap<String, EngineLoad>>,
+    rotor: AtomicUsize,
+}
+
+impl WeightedScoring {
+    /// Token load per candidate: the engine report plus the in-flight requests
+    /// sent to the worker since that report's query started. If any candidate
+    /// has no engine report, every candidate uses this router's in-flight
+    /// request count instead, so the min-max load score never compares tokens
+    /// against request counts.
+    fn candidate_loads(&self, workers: &[Arc<dyn Worker>], healthy: &[usize]) -> Vec<u64> {
+        let engine_loads = self.engine_loads.lock();
+        healthy
+            .iter()
+            .map(|&idx| {
+                let worker = &workers[idx];
+                engine_loads.get(worker.url()).map(|load| {
+                    load.reported_tokens
+                        .saturating_add(worker.active_dispatches().tokens_since(load.queried_at))
+                })
+            })
+            .collect::<Option<Vec<u64>>>()
+            .unwrap_or_else(|| {
+                healthy
+                    .iter()
+                    .map(|&idx| workers[idx].load() as u64)
+                    .collect()
+            })
+    }
+
+    /// Highest score wins. Scores within `TIE_EPSILON` of the best are tied;
+    /// among those the lowest load wins, and remaining ties rotate.
+    fn pick(&self, scores: &[f64], loads: &[u64]) -> Option<usize> {
+        let best = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let band: Vec<usize> = (0..scores.len())
+            .filter(|&i| scores[i] >= best - TIE_EPSILON)
+            .collect();
+        let min_load = band.iter().map(|&i| loads[i]).min()?;
+        let tied: Vec<usize> = band.into_iter().filter(|&i| loads[i] == min_load).collect();
+        Some(tied[self.rotor.fetch_add(1, Ordering::Relaxed) % tied.len()])
+    }
+
+    /// A negative value is a failed report and leaves the worker without an entry.
+    fn update_engine_loads(&self, loads: &HashMap<String, LoadReport>) {
+        *self.engine_loads.lock() = loads
+            .iter()
+            .filter_map(|(url, report)| {
+                let reported_tokens = u64::try_from(report.tokens).ok()?;
+                Some((
+                    url.clone(),
+                    EngineLoad {
+                        reported_tokens,
+                        queried_at: report.queried_at,
+                    },
+                ))
+            })
+            .collect();
+    }
+}
+
 /// Cache-aware routing policy
 ///
 /// Routes requests based on cache affinity when load is balanced,
@@ -111,6 +193,7 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
     config: CacheAwareConfig,
+    weighted: Option<WeightedScoring>,
     trees: Arc<DashMap<String, Arc<Tree>>>,
     mesh_sync: OptionalMeshSyncManager,
     _eviction_task: Option<PeriodicTask>,
@@ -151,9 +234,88 @@ impl CacheAwarePolicy {
 
         Self {
             config,
+            weighted: None,
             trees,
             mesh_sync: None,
             _eviction_task: eviction_task,
+        }
+    }
+
+    pub fn with_weighted_config(
+        cache_weight: f64,
+        load_weight: f64,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        let mut policy = Self::with_config(CacheAwareConfig {
+            eviction_interval_secs,
+            max_tree_size,
+            ..CacheAwareConfig::default()
+        });
+        policy.weighted = Some(WeightedScoring {
+            cache_weight,
+            load_weight,
+            engine_loads: Mutex::new(HashMap::new()),
+            rotor: AtomicUsize::new(0),
+        });
+        policy
+    }
+
+    fn select_weighted(
+        &self,
+        scoring: &WeightedScoring,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+        healthy: &[usize],
+        tree_key: &str,
+    ) -> Option<usize> {
+        let tree = self
+            .trees
+            .entry(tree_key.to_owned())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+        let text = info.request_text.unwrap_or("");
+        let input_chars = text.chars().count();
+        let loads = scoring.candidate_loads(workers, healthy);
+        let lo = *loads.iter().min()?;
+        let span = (*loads.iter().max()? - lo).max(1) as f64;
+        let scores: Vec<f64> = healthy
+            .iter()
+            .zip(&loads)
+            .map(|(&idx, &load)| {
+                let cache_score = if input_chars == 0 {
+                    0.0
+                } else {
+                    tree.prefix_match_tenant(text, workers[idx].url())
+                        .chars()
+                        .count() as f64
+                        / input_chars as f64
+                };
+                let load_score = 1.0 - (load - lo) as f64 / span;
+                scoring.cache_weight * cache_score + scoring.load_weight * load_score
+            })
+            .collect();
+        let idx = healthy[scoring.pick(&scores, &loads)?];
+        if info.request_text.is_some() {
+            self.record_request(&tree, tree_key, text, workers[idx].url());
+        }
+        workers[idx].increment_processed();
+        Some(idx)
+    }
+
+    fn record_request(&self, tree: &Tree, tree_key: &str, text: &str, worker_url: &str) {
+        tree.insert(text, worker_url);
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            use smg_mesh::tree_ops::TreeInsertOp;
+            let op = TreeOperation::Insert(TreeInsertOp {
+                text: text.to_owned(),
+                tenant: worker_url.to_owned(),
+            });
+            if let Err(e) = mesh_sync
+                .sync_tree_operation(Self::normalize_mesh_model_id(tree_key).to_owned(), op)
+            {
+                warn!("Failed to sync tree insert operation to mesh: {}", e);
+            }
         }
     }
 
@@ -168,8 +330,7 @@ impl CacheAwarePolicy {
     /// Initialize the tree with worker URLs (used only during initial setup)
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
         // Group workers by (pool, model) so each pool gets its own isolated tree.
-        let mut grouped: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
-            std::collections::HashMap::new();
+        let mut grouped: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in workers {
             grouped
                 .entry(tree_key_for_worker(worker.as_ref()))
@@ -349,22 +510,7 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                // Now we can work with the tree without holding the HashMap lock
-                tree.insert(text, worker_url);
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: worker_url.to_string(),
-                    });
-                    let mesh_key = Self::normalize_mesh_model_id(tree_key);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_key.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                self.record_request(&tree, tree_key, text, workers[min_load_idx].url());
             } else {
                 warn!(
                     "cache_aware: no tree found for key '{}', skipping cache update — \
@@ -400,6 +546,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         // so every healthy worker here belongs to the same pool and same model.
         let pivot = workers[healthy_indices[0]].as_ref();
         let tree_key = tree_key_for_worker(pivot);
+
+        if let Some(scoring) = &self.weighted {
+            return self.select_weighted(scoring, workers, info, &healthy_indices, &tree_key);
+        }
 
         // Get current load statistics - compute min/max in single pass without allocation
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
@@ -467,21 +617,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
-
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
-                if let Some(ref mesh_sync) = self.mesh_sync {
-                    use smg_mesh::tree_ops::TreeInsertOp;
-                    let op = TreeOperation::Insert(TreeInsertOp {
-                        text: text.to_string(),
-                        tenant: workers[idx].url().to_string(),
-                    });
-                    let mesh_key = Self::normalize_mesh_model_id(&tree_key);
-                    if let Err(e) = mesh_sync.sync_tree_operation(mesh_key.to_string(), op) {
-                        warn!("Failed to sync tree insert operation to mesh: {}", e);
-                    }
-                }
+                self.record_request(&tree, &tree_key, text, workers[idx].url());
 
                 // Increment processed counter
                 workers[idx].increment_processed();
@@ -538,11 +674,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     fn name(&self) -> &'static str {
-        "cache_aware"
+        if self.weighted.is_some() {
+            "cache_load_weighted"
+        } else {
+            "cache_aware"
+        }
     }
 
     fn needs_request_text(&self) -> bool {
         true // Cache-aware policy needs request text for cache affinity
+    }
+
+    fn update_loads(&self, loads: &HashMap<String, LoadReport>) {
+        if let Some(scoring) = &self.weighted {
+            scoring.update_engine_loads(loads);
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -559,7 +705,171 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerLoadGuard, WorkerType};
+
+    fn weighted_workers(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: None,
+                        })
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    fn weighted_policy(
+        cache_weight: f64,
+        load_weight: f64,
+        workers: &[Arc<dyn Worker>],
+    ) -> CacheAwarePolicy {
+        let policy = CacheAwarePolicy::with_weighted_config(cache_weight, load_weight, 0, 10000);
+        policy.init_workers(workers);
+        policy
+    }
+
+    fn seed_prefix(policy: &CacheAwarePolicy, worker: &Arc<dyn Worker>, text: &str) {
+        policy
+            .trees
+            .get(&tree_key_for_worker(worker.as_ref()))
+            .unwrap()
+            .insert(text, worker.url());
+    }
+
+    fn report_queried_at(
+        workers: &[Arc<dyn Worker>],
+        tokens: &[isize],
+        queried_at: Instant,
+    ) -> HashMap<String, LoadReport> {
+        workers
+            .iter()
+            .zip(tokens)
+            .map(|(w, &tokens)| (w.url().to_owned(), LoadReport { tokens, queried_at }))
+            .collect()
+    }
+
+    fn report(workers: &[Arc<dyn Worker>], tokens: &[isize]) -> HashMap<String, LoadReport> {
+        report_queried_at(workers, tokens, Instant::now())
+    }
+
+    async fn pick(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+    ) -> Option<usize> {
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        policy.select_worker(workers, &info).await
+    }
+
+    #[tokio::test]
+    async fn weighted_terms_scale_independently() {
+        let workers = weighted_workers(2);
+        for (cache_weight, load_weight, expected) in [(2.0, 1.0, 0), (1.0, 2.0, 1)] {
+            let policy = weighted_policy(cache_weight, load_weight, &workers);
+            seed_prefix(&policy, &workers[0], "hello");
+            policy.update_loads(&report(&workers, &[100, 0]));
+            assert_eq!(pick(&policy, &workers, "hello").await, Some(expected));
+        }
+    }
+
+    /// The load term is min-max scaled over the candidates: the middle worker
+    /// gets 0.5 regardless of absolute token counts, so a 0.6 prefix match
+    /// outweighs the idlest worker's full load score.
+    #[tokio::test]
+    async fn weighted_load_score_is_min_max_over_candidates() {
+        let workers = weighted_workers(3);
+        let policy = weighted_policy(1.0, 1.0, &workers);
+        seed_prefix(&policy, &workers[1], "abcdef");
+        policy.update_loads(&report(&workers, &[0, 500, 1000]));
+        assert_eq!(pick(&policy, &workers, "abcdefghij").await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn weighted_tie_band_prefers_lower_token_load_then_rotates() {
+        let workers = weighted_workers(3);
+        let policy = weighted_policy(1e-7, 0.0, &workers);
+        seed_prefix(&policy, &workers[0], "hello");
+        policy.update_loads(&report(&workers, &[100, 50, 50]));
+        workers[1].increment_load();
+        let mut picks = Vec::new();
+        for _ in 0..2 {
+            picks.push(pick(&policy, &workers, "").await);
+        }
+        picks.sort();
+        assert_eq!(picks, [Some(1), Some(2)]);
+
+        let policy = weighted_policy(1e-7, 0.0, &workers);
+        seed_prefix(&policy, &workers[0], "hello");
+        policy.update_loads(&report(&workers, &[100, 50, 60]));
+        assert_eq!(
+            pick(&policy, &workers, "hello").await,
+            Some(1),
+            "a score lead inside the tie band must not beat lower load"
+        );
+        let policy = weighted_policy(1e-5, 0.0, &workers);
+        seed_prefix(&policy, &workers[0], "hello");
+        policy.update_loads(&report(&workers, &[100, 50, 60]));
+        assert_eq!(pick(&policy, &workers, "hello").await, Some(0));
+    }
+
+    /// Load is the engine report plus the in-flight requests sent to that
+    /// worker since its query started. A request sent to worker 0 after its
+    /// query started stays counted when worker 1's report arrives later, and a
+    /// request sent before the query is not added on top of the report that
+    /// already counts it.
+    #[tokio::test]
+    async fn weighted_load_adds_in_flight_requests_sent_after_the_query() {
+        let workers = weighted_workers(2);
+        let policy = weighted_policy(0.0, 1.0, &workers);
+        let _counted = WorkerLoadGuard::with_input_tokens(workers[0].clone(), None, 100);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let queried_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let sent_after_query = WorkerLoadGuard::with_input_tokens(workers[0].clone(), None, 100);
+
+        policy.update_loads(&report_queried_at(&workers, &[100, 150], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(1), "200 vs 150");
+        policy.update_loads(&report_queried_at(&workers, &[100, 250], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(0), "200 vs 250");
+
+        drop(sent_after_query);
+        policy.update_loads(&report_queried_at(&workers, &[100, 150], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(0), "100 vs 150");
+    }
+
+    /// A failed (-1) or missing engine report must not read as an idle worker,
+    /// and must not mix token counts with request counts: every candidate
+    /// falls back to this router's in-flight request count.
+    #[tokio::test]
+    async fn weighted_missing_engine_report_falls_back_to_local_load_for_all() {
+        let workers = weighted_workers(2);
+        workers[0].increment_load();
+        workers[0].increment_load();
+        let policy = weighted_policy(1.0, 1.0, &workers);
+        for loads in [report(&workers, &[-1, 500]), report(&workers[1..], &[500])] {
+            policy.update_loads(&loads);
+            assert_eq!(pick(&policy, &workers, "").await, Some(1));
+        }
+        workers[1].set_healthy(false);
+        assert_eq!(pick(&policy, &workers, "").await, Some(0));
+        workers[0].set_healthy(false);
+        assert_eq!(pick(&policy, &workers, "").await, None);
+    }
+
+    #[tokio::test]
+    async fn weighted_cache_score_counts_unicode_chars_per_worker() {
+        let workers = weighted_workers(2);
+        let policy = weighted_policy(1.0, 1.0, &workers);
+        seed_prefix(&policy, &workers[0], "가");
+        seed_prefix(&policy, &workers[1], "가나다");
+        assert_eq!(pick(&policy, &workers, "가나다라").await, Some(1));
+    }
 
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {

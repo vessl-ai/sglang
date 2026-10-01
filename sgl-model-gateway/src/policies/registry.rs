@@ -254,12 +254,12 @@ impl PolicyRegistry {
             .unwrap_or_else(|| self.get_default_policy())
     }
 
-    /// Get all PowerOfTwo policies that need load updates (lock-free)
-    pub fn get_all_power_of_two_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        let mut power_of_two_policies = Vec::new();
+    /// Get all policies that consume engine loads from the LoadMonitor (lock-free)
+    pub fn get_load_monitor_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        let mut policies = Vec::new();
 
         if self.default_policy.name() == "power_of_two" {
-            power_of_two_policies.push(Arc::clone(&self.default_policy));
+            policies.push(Arc::clone(&self.default_policy));
         }
 
         // Get prefill and decode policies (lock-free via OnceLock::get)
@@ -267,8 +267,10 @@ impl PolicyRegistry {
         let decode_policy_opt = self.decode_policy.get();
 
         if let Some(policy) = prefill_policy_opt {
-            if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
-                power_of_two_policies.push(Arc::clone(policy));
+            if matches!(policy.name(), "power_of_two" | "cache_load_weighted")
+                && !Arc::ptr_eq(policy, &self.default_policy)
+            {
+                policies.push(Arc::clone(policy));
             }
         }
 
@@ -277,21 +279,21 @@ impl PolicyRegistry {
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
             {
-                power_of_two_policies.push(Arc::clone(policy));
+                policies.push(Arc::clone(policy));
             }
         }
 
         for entry in self.model_policies.iter() {
             let policy = entry.value();
             if policy.name() == "power_of_two" {
-                let already_added = power_of_two_policies.iter().any(|p| Arc::ptr_eq(p, policy));
+                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
                 if !already_added {
-                    power_of_two_policies.push(Arc::clone(policy));
+                    policies.push(Arc::clone(policy));
                 }
             }
         }
 
-        power_of_two_policies
+        policies
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -337,7 +339,7 @@ impl PolicyRegistry {
     ) {
         // Initialize prefill policy if it's cache-aware (lock-free via OnceLock::get)
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
+            if matches!(prefill_policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) =
                     prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
@@ -381,7 +383,7 @@ impl PolicyRegistry {
             crate::core::WorkerType::Regular => return,
         };
         if let Some(policy) = policy {
-            if policy.name() == "cache_aware" {
+            if matches!(policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
                     cache_aware.remove_worker(worker);
                     debug!(
@@ -441,7 +443,7 @@ impl PolicyRegistry {
 
         // Check prefill and decode policies for PD mode
         if let Some(prefill_policy) = self.prefill_policy.get() {
-            if prefill_policy.name() == "cache_aware" {
+            if matches!(prefill_policy.name(), "cache_aware" | "cache_load_weighted") {
                 if let Some(cache_aware) =
                     prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
                 {
@@ -533,5 +535,29 @@ mod tests {
         // Get default directly
         let default = registry.get_default_policy();
         assert_eq!(default.name(), "round_robin");
+    }
+
+    #[test]
+    fn load_monitor_feeds_weighted_prefill_policy_only() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let prefill = PolicyFactory::create_from_config(&PolicyConfig::CacheLoadWeighted {
+            cache_weight: 1.0,
+            load_weight: 1.0,
+            eviction_interval_secs: 30,
+            max_tree_size: 10000,
+        });
+        registry.set_prefill_policy(Arc::clone(&prefill));
+        registry.set_decode_policy(PolicyFactory::create_from_config(
+            &PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 30,
+                max_tree_size: 10000,
+            },
+        ));
+        let policies = registry.get_load_monitor_policies();
+        assert_eq!(policies.len(), 1);
+        assert!(Arc::ptr_eq(&policies[0], &prefill));
     }
 }
