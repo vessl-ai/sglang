@@ -3,7 +3,7 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use smg_mesh::OptionalMeshSyncManager;
@@ -75,7 +75,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
+    fn update_loads(&self, _loads: &HashMap<String, LoadReport>) {
         // Default: no-op for policies that don't use load information
     }
 
@@ -155,6 +155,16 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     } else {
         model_id
     }
+}
+
+/// One worker's engine load as fetched by the load monitor.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadReport {
+    /// Engine-reported tokens, or -1 when the worker gave no usable report.
+    pub tokens: isize,
+    pub requests: Option<u64>,
+    /// When the monitor started the request that produced this report.
+    pub queried_at: Instant,
 }
 
 /// Information passed to policy for worker selection

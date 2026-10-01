@@ -173,6 +173,7 @@ impl BasicWorkerBuilder {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
             worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
+            active_dispatches: Arc::default(),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),
             removed: Arc::new(AtomicBool::new(false)),

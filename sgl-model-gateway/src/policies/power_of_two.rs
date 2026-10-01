@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rand::Rng;
 use tracing::debug;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, LoadReport, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Power-of-two choices policy
@@ -110,9 +110,12 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         "power_of_two"
     }
 
-    fn update_loads(&self, loads: &HashMap<String, isize>) {
+    fn update_loads(&self, loads: &HashMap<String, LoadReport>) {
         if let Ok(mut cached) = self.cached_loads.write() {
-            *cached = loads.clone();
+            *cached = loads
+                .iter()
+                .map(|(url, report)| (url.clone(), report.tokens))
+                .collect();
         }
     }
 
@@ -129,8 +132,26 @@ impl Default for PowerOfTwoPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    fn reports(loads: &HashMap<String, isize>) -> HashMap<String, LoadReport> {
+        loads
+            .iter()
+            .map(|(url, &tokens)| {
+                (
+                    url.clone(),
+                    LoadReport {
+                        tokens,
+                        requests: None,
+                        queried_at: Instant::now(),
+                    },
+                )
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_power_of_two_selection() {
@@ -191,7 +212,7 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert("http://w1:8000".to_string(), 100);
         loads.insert("http://w2:8000".to_string(), 10);
-        policy.update_loads(&loads);
+        policy.update_loads(&reports(&loads));
 
         // Should prefer worker2 with lower cached load
         let mut w2_selected = 0;
@@ -256,7 +277,7 @@ mod tests {
         // Only Worker A gets a token report. Worker B is missing (e.g. monitor failure).
         let mut loads = HashMap::new();
         loads.insert("http://worker_a:8000".to_string(), 50_000); // 50k tokens load
-        policy.update_loads(&loads);
+        policy.update_loads(&reports(&loads));
 
         // 5. Run selection
         let selected_idx = policy
@@ -315,7 +336,7 @@ mod tests {
         let mut loads_1 = HashMap::new();
         loads_1.insert("http://a:8000".to_string(), 1_000);
         loads_1.insert("http://b:8000".to_string(), 100_000);
-        policy.update_loads(&loads_1);
+        policy.update_loads(&reports(&loads_1));
 
         let idx_1 = policy
             .select_worker(&workers_1, &SelectWorkerInfo::default())
@@ -337,7 +358,7 @@ mod tests {
         let mut loads_2 = HashMap::new();
         loads_2.insert("http://c:8000".to_string(), 1_000);
         // http://d:8000 is MISSING
-        policy.update_loads(&loads_2);
+        policy.update_loads(&reports(&loads_2));
 
         let idx_2 = policy
             .select_worker(&workers_2, &SelectWorkerInfo::default())
@@ -356,7 +377,7 @@ mod tests {
         let mut loads_3 = HashMap::new();
         // http://e:8000 is MISSING
         loads_3.insert("http://f:8000".to_string(), 1_000);
-        policy.update_loads(&loads_3);
+        policy.update_loads(&reports(&loads_3));
 
         let idx_3 = policy
             .select_worker(&workers_3, &SelectWorkerInfo::default())
@@ -373,7 +394,7 @@ mod tests {
         let workers_4: Vec<Arc<dyn Worker>> = vec![w_g.clone(), w_h.clone()];
 
         let loads_4 = HashMap::new();
-        policy.update_loads(&loads_4);
+        policy.update_loads(&reports(&loads_4));
 
         let idx_4 = policy
             .select_worker(&workers_4, &SelectWorkerInfo::default())
