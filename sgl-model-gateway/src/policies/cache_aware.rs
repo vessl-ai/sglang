@@ -66,6 +66,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -77,7 +78,7 @@ use tracing::{debug, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, tree::Tree, utils::PeriodicTask,
-    CacheAwareConfig, LoadBalancingPolicy, SelectWorkerInfo,
+    CacheAwareConfig, LoadBalancingPolicy, LoadReport, SelectWorkerInfo,
 };
 use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
 
@@ -109,15 +110,10 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
 
 const TIE_EPSILON: f64 = 1e-6;
 
-/// The HTTP PD path does not tokenize requests, so a request's input tokens are
-/// estimated from the UTF-8 byte length of its text.
-const BYTES_PER_TOKEN: usize = 4;
-
 #[derive(Debug)]
 struct EngineLoad {
     reported_tokens: u64,
-    /// Estimated input tokens this router sent to the worker after the report.
-    dispatched_tokens: u64,
+    queried_at: Instant,
 }
 
 /// Scoring state of the `cache_load_weighted` policy.
@@ -131,17 +127,21 @@ struct WeightedScoring {
 }
 
 impl WeightedScoring {
-    /// Token load per candidate. If any candidate has no engine report, every
-    /// candidate uses this router's in-flight request count instead, so the
-    /// min-max load score never compares tokens against request counts.
+    /// Token load per candidate: the engine report plus the in-flight requests
+    /// sent to the worker since that report's query started. If any candidate
+    /// has no engine report, every candidate uses this router's in-flight
+    /// request count instead, so the min-max load score never compares tokens
+    /// against request counts.
     fn candidate_loads(&self, workers: &[Arc<dyn Worker>], healthy: &[usize]) -> Vec<u64> {
         let engine_loads = self.engine_loads.lock();
         healthy
             .iter()
             .map(|&idx| {
-                engine_loads
-                    .get(workers[idx].url())
-                    .map(|load| load.reported_tokens.saturating_add(load.dispatched_tokens))
+                let worker = &workers[idx];
+                engine_loads.get(worker.url()).map(|load| {
+                    load.reported_tokens
+                        .saturating_add(worker.active_dispatches().tokens_since(load.queried_at))
+                })
             })
             .collect::<Option<Vec<u64>>>()
             .unwrap_or_else(|| {
@@ -164,25 +164,17 @@ impl WeightedScoring {
         Some(tied[self.rotor.fetch_add(1, Ordering::Relaxed) % tied.len()])
     }
 
-    fn record_dispatch(&self, worker_url: &str, tokens: u64) {
-        if let Some(load) = self.engine_loads.lock().get_mut(worker_url) {
-            load.dispatched_tokens = load.dispatched_tokens.saturating_add(tokens);
-        }
-    }
-
-    /// A negative value is a failed report and leaves the worker without an
-    /// entry. Dispatch totals restart at zero because the engine has already
-    /// counted the requests it received before reporting.
-    fn update_engine_loads(&self, loads: &HashMap<String, isize>) {
+    /// A negative value is a failed report and leaves the worker without an entry.
+    fn update_engine_loads(&self, loads: &HashMap<String, LoadReport>) {
         *self.engine_loads.lock() = loads
             .iter()
-            .filter_map(|(url, &tokens)| {
-                let reported_tokens = u64::try_from(tokens).ok()?;
+            .filter_map(|(url, report)| {
+                let reported_tokens = u64::try_from(report.tokens).ok()?;
                 Some((
                     url.clone(),
                     EngineLoad {
                         reported_tokens,
-                        dispatched_tokens: 0,
+                        queried_at: report.queried_at,
                     },
                 ))
             })
@@ -304,10 +296,6 @@ impl CacheAwarePolicy {
             })
             .collect();
         let idx = healthy[scoring.pick(&scores, &loads)?];
-        scoring.record_dispatch(
-            workers[idx].url(),
-            text.len().div_ceil(BYTES_PER_TOKEN) as u64,
-        );
         if info.request_text.is_some() {
             self.record_request(&tree, tree_key, text, workers[idx].url());
         }
@@ -697,7 +685,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
-    fn update_loads(&self, loads: &HashMap<String, isize>) {
+    fn update_loads(&self, loads: &HashMap<String, LoadReport>) {
         if let Some(scoring) = &self.weighted {
             scoring.update_engine_loads(loads);
         }
@@ -717,7 +705,7 @@ impl Default for CacheAwarePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerLoadGuard, WorkerType};
 
     fn weighted_workers(n: usize) -> Vec<Arc<dyn Worker>> {
         (0..n)
@@ -751,12 +739,20 @@ mod tests {
             .insert(text, worker.url());
     }
 
-    fn report(workers: &[Arc<dyn Worker>], tokens: &[isize]) -> HashMap<String, isize> {
+    fn report_queried_at(
+        workers: &[Arc<dyn Worker>],
+        tokens: &[isize],
+        queried_at: Instant,
+    ) -> HashMap<String, LoadReport> {
         workers
             .iter()
             .zip(tokens)
-            .map(|(w, &t)| (w.url().to_owned(), t))
+            .map(|(w, &tokens)| (w.url().to_owned(), LoadReport { tokens, queried_at }))
             .collect()
+    }
+
+    fn report(workers: &[Arc<dyn Worker>], tokens: &[isize]) -> HashMap<String, LoadReport> {
+        report_queried_at(workers, tokens, Instant::now())
     }
 
     async fn pick(
@@ -822,20 +818,29 @@ mod tests {
         assert_eq!(pick(&policy, &workers, "hello").await, Some(0));
     }
 
-    /// Load is the engine report plus input tokens dispatched after it; a new
-    /// report replaces both, so dispatches it already covers are not added again.
+    /// Load is the engine report plus the in-flight requests sent to that
+    /// worker since its query started. A request sent to worker 0 after its
+    /// query started stays counted when worker 1's report arrives later, and a
+    /// request sent before the query is not added on top of the report that
+    /// already counts it.
     #[tokio::test]
-    async fn weighted_engine_load_adds_only_dispatches_after_the_report() {
+    async fn weighted_load_adds_in_flight_requests_sent_after_the_query() {
         let workers = weighted_workers(2);
-        let policy = weighted_policy(1.0, 1.0, &workers);
-        let request = |c: char| c.to_string().repeat(400);
-        policy.update_loads(&report(&workers, &[0, 150]));
-        assert_eq!(pick(&policy, &workers, &request('a')).await, Some(0));
-        assert_eq!(pick(&policy, &workers, &request('b')).await, Some(0));
-        assert_eq!(pick(&policy, &workers, &request('c')).await, Some(1));
+        let policy = weighted_policy(0.0, 1.0, &workers);
+        let _counted = WorkerLoadGuard::with_input_tokens(workers[0].clone(), None, 100);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let queried_at = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let sent_after_query = WorkerLoadGuard::with_input_tokens(workers[0].clone(), None, 100);
 
-        policy.update_loads(&report(&workers, &[100, 120]));
-        assert_eq!(pick(&policy, &workers, &request('d')).await, Some(0));
+        policy.update_loads(&report_queried_at(&workers, &[100, 150], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(1), "200 vs 150");
+        policy.update_loads(&report_queried_at(&workers, &[100, 250], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(0), "200 vs 250");
+
+        drop(sent_after_query);
+        policy.update_loads(&report_queried_at(&workers, &[100, 150], queried_at));
+        assert_eq!(pick(&policy, &workers, "").await, Some(0), "100 vs 150");
     }
 
     /// A failed (-1) or missing engine report must not read as an idle worker,
