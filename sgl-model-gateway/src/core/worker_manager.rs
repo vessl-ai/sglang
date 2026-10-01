@@ -200,13 +200,11 @@ impl WorkerManager {
                     WorkerType::Decode => Some("decode".to_string()),
                 };
                 let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let dp_size = worker.dp_size().or_else(|| {
-                    worker
-                        .metadata()
-                        .labels
-                        .get("dp_size")
-                        .and_then(|size| size.parse().ok())
-                });
+                // A worker registered per DP rank has a rank-suffixed URL that
+                // does not serve `/v1/loads`, so it gets no report.
+                let dp_size = (!worker.is_dp_aware())
+                    .then(|| worker.metadata().labels.get("dp_size")?.parse().ok())
+                    .flatten();
                 let client = client.clone();
 
                 async move {
