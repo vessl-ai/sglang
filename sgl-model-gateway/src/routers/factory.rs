@@ -12,7 +12,7 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     core::ConnectionMode,
-    policies::PolicyFactory,
+    policies::{PolicyFactory, PrefillQueueTimePolicy},
 };
 
 /// Factory for creating router instances based on configuration
@@ -84,6 +84,14 @@ impl RouterFactory {
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
+
+        // Workers registered before the prefill policy was set missed the
+        // registration-time subscription.
+        if let Some(policy) =
+            PrefillQueueTimePolicy::of(ctx.policy_registry.get_prefill_policy().as_ref())
+        {
+            policy.subscribe_workers(&ctx.worker_registry.get_prefill_workers());
+        }
 
         let router = PDRouter::new(ctx).await?;
 

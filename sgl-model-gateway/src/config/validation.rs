@@ -150,6 +150,7 @@ impl ConfigValidator {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::LeastLoad
+            | PolicyConfig::PrefillQueueTime
             | PolicyConfig::Manual { .. }
             | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {

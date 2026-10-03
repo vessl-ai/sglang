@@ -41,6 +41,17 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+    pub kv_events: Option<KvEventsInfo>,
+}
+
+/// The `kv_events` block of `/server_info`, as `describe_kv_events_publisher` writes it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KvEventsInfo {
+    /// Number of per-rank publishers.
+    pub dp_size: u32,
+    /// Rank `r`'s load socket listens on this port plus `r`; absent unless the
+    /// engine runs with `--load-publish-endpoint`.
+    pub load_endpoint_port_base: Option<u16>,
 }
 
 /// Model information returned from /model_info endpoint.
@@ -418,5 +429,36 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reads_the_server_info_kv_events_block() {
+        let info: ServerInfo = serde_json::from_str(
+            r#"{"dp_size": 2, "kv_events": {"publisher": "zmq", "endpoint_host": "*",
+                "endpoint_port_base": 5557, "topic": "", "block_size": 1, "dp_size": 2,
+                "load_endpoint_port_base": 5559, "load_topic": "load"}}"#,
+        )
+        .unwrap();
+        let block = info.kv_events.unwrap();
+        assert_eq!(block.load_endpoint_port_base, Some(5559));
+        assert_eq!(block.dp_size, 2);
+
+        let without_load: ServerInfo = serde_json::from_str(
+            r#"{"kv_events": {"publisher": "zmq", "endpoint_host": "*",
+                "endpoint_port_base": 5557, "topic": "", "block_size": 1, "dp_size": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            without_load.kv_events.unwrap().load_endpoint_port_base,
+            None
+        );
+
+        let unset: ServerInfo = serde_json::from_str(r#"{"kv_events": null}"#).unwrap();
+        assert!(unset.kv_events.is_none());
     }
 }

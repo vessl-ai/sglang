@@ -8,7 +8,10 @@ use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
-use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
+use crate::{
+    core::{steps::workflow_data::WorkerRegistrationData, Worker},
+    policies::PrefillQueueTimePolicy,
+};
 
 /// Unified step to update policy registry for registered workers.
 ///
@@ -139,6 +142,12 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
                     .policy_registry
                     .init_pd_bucket_policies(&prefill_workers);
             }
+        }
+
+        if let Some(policy) =
+            PrefillQueueTimePolicy::of(app_context.policy_registry.get_prefill_policy().as_ref())
+        {
+            policy.subscribe_workers(workers);
         }
 
         // Initialize cache-aware policies for PD mode (prefill_policy / decode_policy

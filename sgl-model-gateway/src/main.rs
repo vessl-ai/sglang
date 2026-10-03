@@ -204,7 +204,7 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load", "prefill_queue_time"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
@@ -774,6 +774,7 @@ impl CliArgs {
         match policy_str {
             "random" => PolicyConfig::Random,
             "least_load" => PolicyConfig::LeastLoad,
+            "prefill_queue_time" => PolicyConfig::PrefillQueueTime,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,

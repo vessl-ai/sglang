@@ -24,6 +24,7 @@ pub(crate) fn strip_protocol(url: &str) -> String {
 pub use create_worker::CreateLocalWorkerStep;
 pub use detect_connection::DetectConnectionModeStep;
 pub use discover_dp::{get_dp_info, DiscoverDPInfoStep, DpInfo};
+pub(crate) use discover_metadata::get_server_info;
 pub use discover_metadata::DiscoverMetadataStep;
 pub use find_worker_to_update::FindWorkerToUpdateStep;
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};

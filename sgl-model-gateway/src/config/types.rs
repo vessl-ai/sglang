@@ -273,6 +273,9 @@ pub enum PolicyConfig {
     #[serde(rename = "least_load")]
     LeastLoad,
 
+    #[serde(rename = "prefill_queue_time")]
+    PrefillQueueTime,
+
     #[serde(rename = "bucket")]
     Bucket {
         /// Absolute load difference threshold for load balancing
@@ -349,6 +352,7 @@ impl PolicyConfig {
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::LeastLoad => "least_load",
+            PolicyConfig::PrefillQueueTime => "prefill_queue_time",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",

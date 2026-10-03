@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::core::steps::workflow_data::WorkerRemovalWorkflowData;
+use crate::{
+    core::steps::workflow_data::WorkerRemovalWorkflowData, policies::PrefillQueueTimePolicy,
+};
 
 /// Step to remove workers from the policy registry.
 ///
@@ -34,6 +36,9 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             workers_to_remove.len()
         );
 
+        let prefill_policy = app_context.policy_registry.get_prefill_policy();
+        let prefill_queue_time = PrefillQueueTimePolicy::of(prefill_policy.as_ref());
+
         for worker in workers_to_remove.iter() {
             let model_id = worker.model_id().to_string();
             let worker_url = worker.url();
@@ -48,6 +53,10 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             app_context
                 .policy_registry
                 .remove_pd_worker_from_cache_aware(worker.as_ref());
+
+            if let Some(policy) = prefill_queue_time {
+                policy.remove_worker(worker_url);
+            }
 
             // Notify policy registry
             app_context.policy_registry.on_worker_removed(&model_id);
