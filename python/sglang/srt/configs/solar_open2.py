@@ -229,7 +229,7 @@ class SolarOpen2Config(KimiLinearConfig):
         qc["ignore"] = ignore
         kwargs["quantization_config"] = qc
         logger.info(
-            "[SOLAR-GATE] compressed-tensors ignore widened with %d KDA layers " "x %s",
+            "[SOLAR-GATE] compressed-tensors ignore widened with %d KDA layers x %s",
             len(kda_layer_ids_0b),
             list(_KDA_UNQUANTIZED_PROJ),
         )

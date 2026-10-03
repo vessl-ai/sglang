@@ -42,8 +42,8 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
@@ -80,6 +80,30 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+def candidate_request_length_bound(
+    reqs, pending_verify_tokens: int = 0
+) -> Optional[int]:
+    """Bound committed positions without reading asynchronous acceptance results.
+    The overlap loop can hold one unprocessed result, so reserve its full width;
+    the runner adds the current verify width. Aborted/embedding/multimodal requests
+    return None: their visible token IDs may not track cache positions."""
+    if not reqs:
+        return None
+    longest = 0
+    for req in reqs:
+        budget = req.sampling_params.max_new_tokens
+        if (
+            not isinstance(budget, int)
+            or budget < 0
+            or getattr(req, "to_finish", None) is not None
+            or getattr(req, "input_embeds", None) is not None
+            or getattr(req, "multimodal_inputs", None) is not None
+        ):
+            return None
+        longest = max(longest, len(req.origin_input_ids) + budget)
+    return longest + pending_verify_tokens
+
+
 class TargetVerifyExecutor:
     def __init__(
         self,
@@ -89,11 +113,20 @@ class TargetVerifyExecutor:
         verify_num_draft_tokens: int,
         model_runner,
         kv_injector: TargetHiddenKvInjector,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
         self.target_worker = target_worker
+        # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
+        self._target_is_dsv41 = (
+            getattr(
+                target_worker.model_runner.model_config.hf_text_config,
+                "model_type",
+                None,
+            )
+            == "deepseek_v41"
+        )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self.model_runner = model_runner
@@ -137,15 +170,21 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
+            fused_argmax=self._target_is_dsv41,
         )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
 
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        site = (
+            SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
+            if sampling_info is None or sampling_info.is_all_greedy
+            else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
+        )
+        self._tp_sync.sync(site, correct_len)
+        self._tp_sync.sync(site, bonus)
+        self._tp_sync.sync(site, cap_trim_lens)
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -265,9 +304,9 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         result = self._forward_prepared_verify(
             batch=batch,
@@ -293,6 +332,10 @@ class TargetVerifyExecutor:
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
     ) -> TargetVerifyResult:
+        if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
+            verify_input.candidate_max_seq_len_upper_bound = (
+                candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
+            )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -472,11 +515,11 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    kv_injector: Optional[TargetHiddenKvInjector] = None
 
 
 class AcceptOuts(msgspec.Struct):
@@ -598,18 +641,19 @@ def _fsm_content_notools_forbidden_ids() -> List[int]:
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,
         max_bs: int,
         verify_num_draft_tokens: int,
         device,
-        tp_sync: DsparkTpSync,
+        tp_sync: SpecTpSync,
         commit_ctx: Optional[CommitInjectCtx] = None,
+        fused_argmax: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self._fused_argmax = bool(fused_argmax)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -646,9 +690,10 @@ class DsparkVerifyEpilogue:
         # Scope, precisely: these kernels are captured into the verify graph
         # (the epilogue runs from capture_tail_hooks), so they execute on every
         # replay of it and on nothing else. On a replayed step that covers both
-        # accept paths, because run_compact adopts strided_logits as
-        # next_token_logits exactly when the graph ran. A step that does not
-        # replay -- no epilogue, non-compact, or can_run_cuda_graph false --
+        # accept paths: run_compact adopts strided_logits as next_token_logits
+        # exactly when the graph ran, and the static epilogue masks the target
+        # logits in place. A step that does not replay -- no epilogue, a
+        # non-compact step outside static mode, or can_run_cuda_graph false --
         # never runs them, and dspark_worker_v2 falls back to plan_verify on
         # the eager path for that case.
         # Both buffers are allocated here, before graph capture, and both are
@@ -681,15 +726,22 @@ class DsparkVerifyEpilogue:
         # Which forbid buffers have had their ids checked against the FSM.
         # One check each, on the buffer's first armed staging call.
         self._ids_checked: set[str] = set()
+        self._static_step_state: Optional[tuple[int, bool]] = None
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
-        if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
+        if (
+            runner.model_runner.is_draft_worker
+            or not forward_batch.forward_mode.is_target_verify()
+        ):
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
             or out.hidden_states is None
         ):
+            return
+        if not runner.ragged_verify_mode:
+            self._static_epilogue(out, forward_batch)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -701,6 +753,7 @@ class DsparkVerifyEpilogue:
         )
 
     def begin_step(self, verify_lens, armed: bool) -> None:
+        self._static_step_state = None
         if verify_lens is None:
             self.verify_lens_buf.zero_()
         else:
@@ -804,11 +857,12 @@ class DsparkVerifyEpilogue:
         )
         self._stage_rows(buf=self.fsm_row_buf, flags=flags)
 
-    def _apply_fsm_mask(self, bs: int) -> None:
-        """Write -inf over the forbidden ids of every armed row.
+    def _apply_fsm_mask(self, logits: torch.Tensor, bs: int) -> None:
+        """Write -inf over the forbidden ids of every armed row of ``logits``.
 
-        Captured into the verify graph, between the scatter that fills
-        ``strided_logits`` and the accept that reads it. Shapes are static for a
+        Captured into the verify graph ahead of the in-graph accept: on the
+        ragged path ``logits`` is ``strided_logits`` after the scatter, on the
+        static path it is the target logits themselves. Shapes are static for a
         given ``bs``, which is what a captured graph requires; an unarmed step
         is an all-False row buffer, so the same kernels run and write nothing.
 
@@ -820,8 +874,8 @@ class DsparkVerifyEpilogue:
         The tensor work itself is ``solar_open2_fsm.apply_folded_mask``, which
         is where it is unit-tested.
 
-        This runs on every compact step, and ``VerifyPlan.apply`` may run over
-        the same tensor on the same step -- ``plan_gate`` decides whether the
+        This runs on every replayed verify step, and ``VerifyPlan.apply`` may
+        run over the same tensor on the same step -- ``plan_gate`` decides whether the
         eager plan is built, not whether these kernels fire. Both only ever
         write ``-inf`` and neither restores a logit, so the applied mask is the
         **union** of the two, never the eager one alone. That is why
@@ -830,24 +884,67 @@ class DsparkVerifyEpilogue:
         that flips it therefore does not isolate the in-graph mask, and a null
         result from one says nothing about it.
         """
-        if self.strided_logits is None:
-            return
         n = bs * self.stride
-        _fsm.apply_folded_mask(
-            self.strided_logits[:n], self.fsm_row_buf[:n], self.fsm_forbid_buf
-        )
+        _fsm.apply_folded_mask(logits[:n], self.fsm_row_buf[:n], self.fsm_forbid_buf)
         # Disjoint by construction: a row is REASONING or CONTENT, never both.
         _fsm.apply_folded_mask(
-            self.strided_logits[:n],
+            logits[:n],
             self.fsm_content_row_buf[:n],
             self.fsm_content_forbid_buf,
         )
         # Not disjoint from the call above -- deliberately a subset of it. The
         # no-tools rows carry the shared content set and the whole no-tools set.
         _fsm.apply_folded_mask(
-            self.strided_logits[:n],
+            logits[:n],
             self.fsm_content_notools_row_buf[:n],
             self.fsm_content_notools_forbid_buf,
+        )
+
+    def begin_static_step(self, bs: int, armed: bool) -> None:
+        state = (bs, armed)
+        if self._static_step_state == state:
+            return
+        self.verify_lens_buf[:bs].fill_(self.stride)
+        self.verify_lens_buf[bs:].zero_()
+        self.inject_gate_buf.fill_(int(armed))
+        self._static_step_state = state
+
+    def _static_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        verify_lens = self.verify_lens_buf[:bs]
+        candidates = forward_batch.input_ids.view(bs, self.stride)
+        # --- solar-open2 FSM in-graph reasoning mask ---
+        # Rows are (request-major, chain-minor) here too, so the staged row
+        # buffers line up; masked in place, so the eager path reads it as well.
+        self._apply_fsm_mask(out.next_token_logits, bs)
+        commit_lens = self._accept(
+            candidates=candidates,
+            logits=out.next_token_logits,
+            draft_tokens=candidates[:, 1:].contiguous(),
+            seq_lens=forward_batch.seq_lens,
+        )
+        if not self.folds_commit:
+            return
+        # Same staged locations as target verify; padded and fallback rows skip KV.
+        gated_commit_lens = (
+            torch.minimum(commit_lens, verify_lens.to(torch.int32))
+            * self.inject_gate_buf
+        )
+        cache_loc = forward_batch.out_cache_loc
+        state_slot = None
+        if is_unified_kv_triton():
+            state_slot = (
+                forward_batch.req_pool_indices.view(-1, 1)
+                .expand(bs, self.stride)
+                .reshape(-1)
+            )
+        self.commit_ctx.kv_injector.inject_target_hidden(
+            target_hidden=out.hidden_states,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(bs, self.stride),
+            positions=forward_batch.positions,
+            commit_lens=gated_commit_lens,
+            state_slot=state_slot,
         )
 
     def read_accept(self, bs: int) -> AcceptOuts:
@@ -903,8 +1000,24 @@ class DsparkVerifyEpilogue:
         self._scatter(compact_logits, compact_hidden, verify_lens, bs)
         # --- solar-open2 FSM in-graph reasoning mask ---
         # After the scatter fills strided_logits and before the accept reads it.
-        self._apply_fsm_mask(bs)
-        commit_lens = self._accept(input_ids, seq_lens, verify_lens, bs)
+        self._apply_fsm_mask(self.strided_logits, bs)
+        candidates = torch.zeros(
+            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
+        )
+        scatter_compact_to_strided_into(
+            compact=input_ids.view(-1, 1),
+            verify_lens=verify_lens,
+            out=candidates,
+            stride=self.stride,
+            fill_value=0,
+        )
+        commit_lens = self._accept(
+            candidates=candidates.view(bs, self.stride),
+            logits=self.strided_logits[: bs * self.stride],
+            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            seq_lens=seq_lens,
+            cutoff_verify_lens=verify_lens,
+        )
         if self.folds_commit:
             self._commit_inject(
                 commit_lens, verify_lens, seq_lens, req_pool_indices, bs
@@ -926,33 +1039,27 @@ class DsparkVerifyEpilogue:
             fill_value=0.0,
         )
 
-    def _accept(self, input_ids, seq_lens, verify_lens, bs: int) -> torch.Tensor:
-        candidates = torch.zeros(
-            (bs * self.stride, 1), dtype=input_ids.dtype, device=input_ids.device
-        )
-        scatter_compact_to_strided_into(
-            compact=input_ids.view(-1, 1),
-            verify_lens=verify_lens,
-            out=candidates,
-            stride=self.stride,
-            fill_value=0,
-        )
+    def _accept(
+        self, *, candidates, logits, draft_tokens, seq_lens, cutoff_verify_lens=None
+    ) -> torch.Tensor:
+        bs = candidates.shape[0]
         correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
+            candidates=candidates,
+            target_logits=logits,
             verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
+            cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=self._fused_argmax,
         )
-        self._tp_sync.sync(correct_len)
-        self._tp_sync.sync(bonus)
-        self._tp_sync.sync(cap_trim_lens)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, correct_len)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, bonus)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_ACCEPT_GRAPH, cap_trim_lens)
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
             prefix_lens=seq_lens[:bs],
         )
         out_tokens = BuildOutTokens.execute(
-            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            draft_tokens=draft_tokens,
             correct_len=correct_len,
             bonus=bonus,
             verify_num_draft_tokens=self.stride,
@@ -1013,6 +1120,7 @@ def accept_draft_tokens(
     gamma: int,
     verify_num_draft_tokens: int,
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
+    fused_argmax: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -1023,6 +1131,7 @@ def accept_draft_tokens(
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
+            fused_argmax=fused_argmax,
         )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
@@ -1047,6 +1156,7 @@ def accept_draft_tokens(
         target_logits=target_logits,
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
+        fused_argmax=fused_argmax,
     )
     sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
         candidates=candidates,

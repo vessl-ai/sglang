@@ -23,7 +23,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.solar_open2 import SolarOpen2Config
-from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -496,7 +496,7 @@ class SolarOpen2Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
@@ -527,9 +527,9 @@ class SolarOpen2Model(nn.Module):
             self.norm = PPMissingLayer()
 
         world_size = get_parallel().tp_size
-        assert (
-            config.num_attention_heads % world_size == 0
-        ), "num_attention_heads must be divisible by world_size"
+        assert config.num_attention_heads % world_size == 0, (
+            "num_attention_heads must be divisible by world_size"
+        )
 
         # Risk #1 gate, authoritative instance: this is the config the layers
         # were actually built from (HF also constructs throwaway defaults).
@@ -648,7 +648,7 @@ class SolarOpen2ForCausalLM(nn.Module):
         )
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

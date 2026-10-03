@@ -179,7 +179,6 @@ class _FsmCase(CustomTestCase):
 
 
 class TestEffortBudget(_FsmCase):
-
     def test_budget_follows_the_vendor_table(self):
         for effort, expected in fsm._EFFORT_BUDGETS.items():
             with self.subTest(effort=effort):
@@ -247,7 +246,6 @@ class TestEffortBudget(_FsmCase):
 
 
 class TestLeadingNewline(_FsmCase):
-
     def test_first_token_after_the_prompt_think_start_cannot_be_a_newline(self):
         self.assertEqual(_masked(_apply(_req())), set(fsm.CFG.reasoning_open_forbidden))
 
@@ -344,7 +342,6 @@ class TestLeadingNewline(_FsmCase):
 
 
 class TestContentMask(_FsmCase):
-
     def test_fresh_content_cannot_end_the_turn(self):
         req = _req([7, THINK_END])
         self.assertEqual(_masked(_apply(req)), set(fsm.CFG.content_fresh_forbidden))
@@ -989,8 +986,9 @@ class _VendorTranscript:
 
     def __init__(self, prompt):
         ts, te = IDS["think_start"], IDS["think_end"]
-        last_start, last_end = fsm._rindex(prompt, needle=ts), fsm._rindex(
-            prompt, needle=te
+        last_start, last_end = (
+            fsm._rindex(prompt, needle=ts),
+            fsm._rindex(prompt, needle=te),
         )
         self.state = (
             fsm.CONTENT

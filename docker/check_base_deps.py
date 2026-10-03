@@ -190,12 +190,12 @@ def main() -> int:
             "from the base image. Rebuild the base from this commit "
             "(--target framework) and repoint FRAMEWORK_BASE_IMAGE at it."
         )
-        log("CHECK " "FAILED")
+        log("CHECK FAILED")
         return 1
 
     # Split the last word so the sentinel exists only in this program's output,
     # never in a build log's echo of the command that starts it.
-    log("CHECK " "OK")
+    log("CHECK OK")
     return 0
 
 
