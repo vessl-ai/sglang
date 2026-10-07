@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -214,6 +215,7 @@ from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
+    apply_repetition_detection_gate,
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
@@ -2056,9 +2058,13 @@ class Scheduler(
         bitmask sees the previous batch's committed tokens. Invoked mid-worker
         (before generate_token_bitmask) so the CPU advance overlaps the target
         verify forward. Idempotent; no-op when the queue is empty or has no grammar.
+        Also advances the Solar reasoning FSM over the same committed run, so its
+        verify plan and the grammar bitmask are built from the same state.
         """
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
+            # --- solar-open2 FSM commit advance ---
+            _solar_fsm.advance_committed(prev_result, prev_batch)
 
     def ingest_requests(self) -> List:
         """Receive, broadcast and dispatch this iteration's external input.
@@ -2752,6 +2758,12 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        # Strip repetition_detection when the feature is off, once here at
+        # intake, before it reaches any Req construction below (normal
+        # request, session request, or session-not-found abort all read
+        # sampling_params off this same recv_req).
+        apply_repetition_detection_gate(self.server_args, recv_req.sampling_params)
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None

@@ -203,6 +203,10 @@ class Schedule(msgspec.Struct):
         bool,
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
     ] = False
+    enable_repetition_detection: A[
+        bool,
+        "Enable the repetition_detection request field (vLLM-parity N-gram loop early termination). When off, the field is accepted but has no effect.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

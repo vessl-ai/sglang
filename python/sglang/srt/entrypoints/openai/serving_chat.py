@@ -46,6 +46,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
+from sglang.srt.entrypoints.openai import solar_open2_serving as solar
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -109,6 +110,7 @@ from sglang.srt.parser.jinja_template_utils import (
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
+    solar_open2_force_reasoning,
 )
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -124,6 +126,9 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+# Safety cap for the stream-end drain of a required/named JSON array (see
+# _drain_json_array); the loop stops earlier as soon as a step yields nothing.
+_JSON_ARRAY_DRAIN_MAX_STEPS = 512
 
 
 def normalize_tool_content(role: str, content):
@@ -231,6 +236,32 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+def _drain_json_array(parser: JsonArrayParser, tools: List[Tool]):
+    """Stream-end drain of a required/named JSON array.
+
+    The base JSON detector advances one call one step (its name, or its
+    arguments) per increment. When the last delta carries the rest of the
+    array -- a short call under the grammar, or the close of one call plus
+    the whole of the next -- there is no next increment, so feed empty steps
+    until one yields no call and no real text. Whitespace the drain releases
+    from the array's tail is not content. Returns (text, calls)."""
+    text, calls = "", []
+    for _ in range(_JSON_ARRAY_DRAIN_MAX_STEPS):
+        step = parser.parse_streaming_increment("", tools)
+        step_text = step.normal_text or ""
+        if not step.calls and not step_text.strip():
+            return text, calls
+        if step_text.strip():
+            text += step_text
+        calls.extend(step.calls)
+    logger.warning(
+        "Tool-call array drain stopped at %d steps with output still buffered; "
+        "the client receives a truncated call list",
+        _JSON_ARRAY_DRAIN_MAX_STEPS,
+    )
+    return text, calls
 
 
 def _extract_video_question(request: ChatCompletionRequest) -> str | None:
@@ -793,10 +824,9 @@ class OpenAIServingChat(OpenAIServingBase):
     def _continuous_usage_cached_details(
         self, content: dict[str, Any]
     ) -> PromptTokensDetails | None:
-        if not get_serving().enable_cache_report:
-            return None
-        return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
+        return UsageProcessor.cached_details(
+            count=content["meta_info"].get("cached_tokens", 0),
+            enable_cache_report=get_serving().enable_cache_report,
         )
 
     def _reported_prompt_tokens(self, meta_info: dict[str, Any]) -> int:
@@ -929,6 +959,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle tool calls
         if self._tool_call_parsing_active(request):
+            finishing = finish_reason_type is not None and finish_reason_type != "abort"
+            glue_terminator = self._solar_single_call_stop_matched(
+                request,
+                effective_tools=self._effective_tools(request),
+                finish_reason=content["meta_info"].get("finish_reason"),
+            )
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -937,10 +973,30 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
-                flush=finish_reason_type is not None and finish_reason_type != "abort",
+                # The stream-end flush runs after the glue below: the detector
+                # is still holding the trimmed call, and the terminator must
+                # reach it before finish() releases held text as content.
+                flush=finishing and not glue_terminator,
             ):
                 if chunk:
                     yield chunk
+
+            if glue_terminator and index in parser_dict:
+                # solar_open2_serving rule 4: feed the trimmed terminator back
+                # (only onto an open call) as one more increment, then flush,
+                # before the finish_reason chunk goes out.
+                async for chunk in self._process_tool_call_stream(
+                    index,
+                    solar.glue_for_stream(parser_dict[index]),
+                    parser_dict,
+                    content,
+                    request,
+                    has_tool_calls,
+                    continuous_usage_stats,
+                    flush=finishing,
+                ):
+                    if chunk:
+                        yield chunk
 
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
@@ -1047,6 +1103,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and not effective_tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+
+        if solar.is_solar_cell(self.reasoning_parser, self.tool_call_parser):
+            solar_error = solar.validate_request(request)
+            if solar_error:
+                return solar_error
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
             if not effective_tools:
@@ -1294,6 +1355,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
+    def _solar_single_call_stop_matched(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        effective_tools: List[Tool],
+        finish_reason: Optional[Dict[str, Any]],
+    ) -> bool:
+        """solar_open2_serving rule 4 (the injected terminator halted
+        generation and was trimmed)."""
+        return solar.single_call_stop_matched(
+            self.tool_call_parser,
+            request=request,
+            effective_tools=effective_tools,
+            finish_reason=finish_reason,
+        )
+
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
@@ -1307,6 +1384,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
+        if solar.is_solar_cell(self.reasoning_parser, self.tool_call_parser):
+            solar.normalize_reasoning_effort(
+                request, tools_available=self._tool_call_parsing_active(request)
+            )
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config
         )
@@ -1382,6 +1463,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                 required_parsed_natively = parser.detector.parses_required_natively()
                 if self.chat_encoding_spec == "kimi_k3":
+                    tool_call_stop = parser.detector.eot_token
+                elif solar.injects_single_call_stop(
+                    self.tool_call_parser,
+                    request=request,
+                    effective_tools=effective_tools,
+                ):
+                    # solar_open2_serving rule 3. Unlike kimi_k3's stop (a
+                    # section-envelope closer outside each call, harmless to
+                    # trim), this terminator is required inside every call, so
+                    # the response paths glue it back before parsing (rule 4).
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
@@ -2079,10 +2170,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
+                matched_stop = finish_reason_data.get("matched")
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
+                    # As on the non-streaming path: a stop that was rewritten
+                    # to tool_calls does not expose the (internal) stop string
+                    # -- for Solar Open2 that is the call terminator itself.
+                    matched_stop = None
+                elif self._solar_single_call_stop_matched(
+                    request,
+                    effective_tools=self._effective_tools(request),
+                    finish_reason=finish_reason_data,
+                ):
+                    # The injected terminator halted generation but nothing
+                    # parsed as a call: still not a client-visible stop string.
+                    matched_stop = None
 
-                matched_stop = finish_reason_data.get("matched")
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -2337,10 +2440,20 @@ class OpenAIServingChat(OpenAIServingBase):
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
+            effective_tools = self._effective_tools(request)
 
             text = self._decode_response(ret_item)
             if isinstance(text, ErrorResponse):
                 return ORJSONResponse(content=text.model_dump(), status_code=text.code)
+
+            if self._solar_single_call_stop_matched(
+                request, effective_tools=effective_tools, finish_reason=finish_reason
+            ):
+                # solar_open2_serving rule 4: the internal stop is never
+                # reported as matched_stop; the terminator is glued back only
+                # onto an open call.
+                finish_reason["matched"] = None
+                text += solar.glue_for_text(text)
 
             # Handle reasoning content
             reasoning_text = None
@@ -2398,6 +2511,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_text, tool_calls
             )
 
+            finish_reason_type = finish_reason["type"] if finish_reason else None
+            matched_stop = (
+                finish_reason["matched"]
+                if finish_reason and "matched" in finish_reason
+                else None
+            )
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
@@ -2407,12 +2526,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
                 logprobs=choice_logprobs,
-                finish_reason=finish_reason["type"] if finish_reason else None,
-                matched_stop=(
-                    finish_reason["matched"]
-                    if finish_reason and "matched" in finish_reason
-                    else None
-                ),
+                finish_reason=finish_reason_type,
+                matched_stop=matched_stop,
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
                 response_token_ids=choice_token_ids,
@@ -2576,17 +2691,21 @@ class OpenAIServingChat(OpenAIServingBase):
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
+                    raw_text = text
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
                         logger.warning(
                             "Tool call marker present but no complete call parsed "
-                            "from %s output; dropping the incomplete call",
+                            "from %s output; the parser's content (%d of %d chars) "
+                            "is returned",
                             self.tool_call_parser,
+                            len(text),
+                            len(raw_text),
                         )
                         logger.debug(
                             "Unparsed tool call output (%d chars): %r",
-                            len(text),
-                            text[:2000],
+                            len(raw_text),
+                            raw_text[:2000],
                         )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
@@ -2913,6 +3032,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser == "solar_open2":
+            # The solar_open2 template pre-closes the think block for every
+            # reasoning_effort other than medium/high, so ``<|think:end|>``
+            # never appears in the output. With require_reasoning=True the
+            # scheduler's usage counter (Req.update_reasoning_tokens) would
+            # then label every completion token as reasoning. Same rule as
+            # the reasoning parser (solar_open2_force_reasoning).
+            return solar_open2_force_reasoning(request)
         if self.reasoning_parser == "iquest_q1":
             return IQuestQ1ReasoningDetector.thinking_enabled(
                 request.chat_template_kwargs or {}
@@ -3043,7 +3170,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, effective_tools)
-            normal_text, calls = result.normal_text, result.calls
+            # Under the array constraint the output is the array; whitespace
+            # around it is not content.
+            normal_text = (
+                result.normal_text if (result.normal_text or "").strip() else ""
+            )
+            calls = result.calls
+            if flush:
+                tail_text, tail_calls = _drain_json_array(parser, effective_tools)
+                normal_text = (normal_text or "") + tail_text
+                calls = list(calls) + tail_calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
             if flush:

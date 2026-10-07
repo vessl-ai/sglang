@@ -7,6 +7,9 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
+_SOLAR_KDA_BETA_SCALE = float(
+    __import__("os").environ.get("SOLAR_KDA_BETA_SCALE", "1.0")
+)
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 
@@ -96,6 +99,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_beta_slot: tl.constexpr = 0,
     MAX_CACHE_LEN: tl.constexpr = 0,
     CACHE_RING: tl.constexpr = False,
+    BETA_SCALE: tl.constexpr = 1.0,
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
 ):
@@ -243,7 +247,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_g = -tl.exp(b_A_log) * softplus_x
 
         # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+        b_beta = BETA_SCALE / (1.0 + tl.exp(-b_b))
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -497,6 +501,7 @@ def fused_sigmoid_gating_delta_rule_update(
         dt_bias=dt_bias,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        BETA_SCALE=_SOLAR_KDA_BETA_SCALE,
         lower_bound=lower_bound if lower_bound is not None else 0.0,
         q=q,
         k=k,

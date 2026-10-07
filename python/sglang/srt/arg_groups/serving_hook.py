@@ -468,16 +468,22 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and not (
-            (
-                cfg.hicache_storage_backend is None
-                and cfg.hicache_write_policy in ("write_back", "write_through")
+        elif (
+            cfg.enable_hierarchical_cache
+            and not (
+                (
+                    cfg.hicache_storage_backend is None
+                    and cfg.hicache_write_policy in ("write_back", "write_through")
+                )
+                or (
+                    cfg.hicache_storage_backend is not None
+                    and cfg.hicache_host_memory_mode == "buffer_only"
+                    and cfg.hicache_write_policy == "write_through"
+                )
             )
-            or (
-                cfg.hicache_storage_backend is not None
-                and cfg.hicache_host_memory_mode == "buffer_only"
-                and cfg.hicache_write_policy == "write_through"
-            )
+            # Opt-in escape hatch for the hierarchical-cache configurations
+            # refused here.
+            and not envs.SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE.get()
         ):
             logger.warning(
                 "Optimistic prefill supports L2 write-back/write-through or "

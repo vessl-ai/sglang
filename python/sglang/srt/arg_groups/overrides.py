@@ -401,6 +401,9 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Solar-Open2 runs on KDAAttnBackend and performs the same
+        # track-snapshot writes as KimiLinearForCausalLM above.
+        "SolarOpen2ForCausalLM",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -420,7 +423,19 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        # The h[] snapshots the extra_buffer index math reads are written by the
+        # prefill kernel, so the prefill backend is what is checked: flashkda's
+        # chunk layout is not the one that math assumes. The decode backend is
+        # deliberately not consulted. Partial views built in tests and during
+        # resolution may omit the per-phase field.
+        prefill = (
+            getattr(view, "linear_attn_prefill_backend", None)
+            or view.linear_attn_backend
+        )
+        return view.linear_attn_backend == "triton" and prefill in (
+            "triton",
+            "flashinfer",
+        )
     return False
 
 

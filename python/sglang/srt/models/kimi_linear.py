@@ -51,6 +51,10 @@ from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_xpu, make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
 
+_SOLAR_KDA_BETA_SCALE = float(
+    __import__("os").environ.get("SOLAR_KDA_BETA_SCALE", "1.0")
+)
+
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
     if num_heads % tp_size != 0:
@@ -250,7 +254,18 @@ class KimiDeltaAttention(nn.Module):
         self.no_kda_lora = no_kda_lora
 
         # TODO: support fusion with quant
-        self.do_fuse_qkvbfg = self.no_kda_lora or quant_config is None
+        #
+        # A caller may assert that these projections are unquantized even when a
+        # global quant_config exists -- Solar-Open2 keeps its KDA attention in the
+        # compressed-tensors ignore list, so the fused path is valid there. The
+        # fused Linears are then built with quant_config=None: their prefixes
+        # (fused_qkvbfg_a_proj / fused_fg_b_proj) do not match the ignore regexes,
+        # so passing the real config would send them down a quantized path.
+        self._force_fuse_qkvbfg = bool(kwargs.get("force_fuse_qkvbfg", False))
+        self.do_fuse_qkvbfg = (
+            self.no_kda_lora or quant_config is None or self._force_fuse_qkvbfg
+        )
+        _fuse_quant_config = None if self._force_fuse_qkvbfg else quant_config
         # Beta joins the fused GEMM only when nothing is quantized.
         self.fuse_no_lora_beta = self.no_kda_lora and quant_config is None
 
@@ -306,7 +321,7 @@ class KimiDeltaAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                quant_config=_fuse_quant_config,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
                 tp_rank=self.shard_tp_rank,
                 tp_size=self.shard_tp_size,
@@ -525,7 +540,12 @@ class KimiDeltaAttention(nn.Module):
             if not forward_batch.forward_mode.is_target_verify():
                 # Only chunk_kda (extend) wants pre-activated beta; the verify
                 # kernel sigmoids it in-kernel like decode.
-                beta = beta.float().sigmoid()
+                #
+                # The Solar scale rides along here for the same reason it is a
+                # kernel parameter on the decode paths: it has to be applied
+                # wherever the sigmoid is. The verify path therefore has to get
+                # it through the kernel's BETA_SCALE argument, not from here.
+                beta = beta.float().sigmoid() * _SOLAR_KDA_BETA_SCALE
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 

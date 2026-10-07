@@ -29,6 +29,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -824,15 +825,54 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
-        # Must stay ahead of the target verify launch below.
+        # --- solar-open2 FSM fold gate ---
+        # Decided before the target launch: the folded epilogue accepts inside
+        # the cuda graph, where the FSM mask below would never land.
+        _solar_fsm_gate = _solar_fsm.plan_gate(batch.reqs, verify_ids_2d.shape[1])
+        # The reasoning mask does not force the eager path -- it is staged here
+        # and applied inside the verify graph, so a thinking batch keeps the
+        # folded accept. The gate above is only the escape for what
+        # only plan_verify can do (`_reasoning_needs_eager` /
+        # `_content_needs_eager`).
+        # Read once: the staging condition below and the mask block further down
+        # must agree, and is_active() resolves lazily, so a second call could
+        # answer differently and leave the mask block without a chain.
+        _solar_fsm_on = _solar_fsm.is_active()
+        epilogue = self._verify_executor.verify_epilogue
+        if epilogue is not None:
+            epilogue.set_fsm_rows(
+                _solar_fsm.folded_mask_flags(batch.reqs, verify_ids_2d.shape[1])
+            )
+            epilogue.set_fsm_content_rows(
+                _solar_fsm.folded_content_mask_flags(batch.reqs, verify_ids_2d.shape[1])
+            )
+            epilogue.set_fsm_content_notools_rows(
+                _solar_fsm.folded_content_notools_mask_flags(
+                    batch.reqs, verify_ids_2d.shape[1]
+                )
+            )
+
+        # Must stay ahead of the target verify launch below. The Solar FSM plans
+        # off the same host copy of the chain.
+        #
+        # Staged whenever the FSM is on, not only when the gate fires: the mask
+        # block below also runs as the fallback for a step whose verify graph
+        # did not carry the in-graph mask, and whether that happens is not known
+        # until the target returns -- by which time it is too late to stage a
+        # host copy. Staging is the cheap half; ``resolve()`` is the wait, and
+        # only the block that uses the chain calls it.
         grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+            GrammarTree.from_linear_chain(verify_ids_2d)
+            if (batch.has_grammar or _solar_fsm_gate or _solar_fsm_on)
+            else None
         )
 
         # A live grammar forces the eager path: the folded epilogue accepts inside
         # the cuda graph off its own buffers, where the mask below never lands.
+        # The Solar FSM forces it for the same reason, so the two gates are
+        # independent and both have to hold for the folded path to be taken.
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
             and proposal.folded
             # The epilogue's in-graph accept is greedy (accept_greedy_triton);
             # sampling batches must take the eager accept path even when the
@@ -841,6 +881,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
             and not batch.has_grammar
+            # --- solar-open2 FSM fold gate ---
+            and not _solar_fsm_gate
         )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
@@ -884,7 +926,47 @@ class DSparkWorkerV2(BaseSpecWorker):
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
 
-        epilogue = self._verify_executor.verify_epilogue
+        # --- solar-open2 FSM verify mask ---
+        # Planned after the grammar barrier has fed the previous step's
+        # committed run to the FSMs, so the row states here and the grammar
+        # bitmask above describe the same committed prefix. Applied after the
+        # grammar mask: both write -inf into the same tensor, and the FSM's job
+        # is to close the illegal exits from the reasoning block.
+        #
+        # Runs on two kinds of step. The gate names what only plan_verify can
+        # do (`_reasoning_needs_eager` / `_content_needs_eager`).
+        # The second condition is the reasoning mask's fallback: the in-graph
+        # mask is baked into the verify cuda graph, so a step that does not
+        # replay that graph never executes it, and this is the only carrier
+        # left. Both are known here because the target verify has returned.
+        # Same replay condition the folded accept uses below.
+        _solar_fsm_in_graph = (
+            epilogue is not None
+            and can_run_cuda_graph
+            and (run_compact or self._verify_planner.mode_value == "static")
+        )
+        # `_solar_fsm_on` is the same read the chain was staged on, so a step
+        # that reaches here always has one. Guarding on `grammar_tree` instead
+        # would turn a wiring mistake into a silently unmasked step.
+        if _solar_fsm_on and (_solar_fsm_gate or not _solar_fsm_in_graph):
+            if not batch.has_grammar and grammar_barrier is not None:
+                # The grammar path runs the barrier inside build_grammar_vocab_mask;
+                # without a grammar in the batch it still has to run here, and it
+                # is idempotent.
+                grammar_barrier()
+            _solar_fsm_plan = _solar_fsm.plan_verify(
+                batch.reqs,
+                grammar_tree.resolve()[2],
+                verify_ids_2d.shape[1],
+            )
+            if _solar_fsm_plan is not None:
+                # Same tensor and row order the grammar mask uses: rows are
+                # (request-major, chain-minor), stride = chain length.
+                _solar_fsm_plan.apply(
+                    logits_output.next_token_logits,
+                    verify_lens=getattr(layout, "verify_lens", None),
+                )
+
         folded_accept = (
             fold_eligible
             and can_run_cuda_graph

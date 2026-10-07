@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
+from sglang.srt.sampling import solar_open2_fsm as _solar_fsm
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -357,9 +358,9 @@ class SchedulerBatchResultProcessor:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
-
                         req.update_finish_state()
+                        # Order matters; see the decode path's note below.
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
@@ -785,6 +786,9 @@ class SchedulerBatchResultProcessor:
         # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
 
+        # --- solar-open2 FSM commit advance ---
+        _solar_fsm.advance_committed(result, batch)
+
         predict_tokens = []
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -1014,8 +1018,12 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
-                self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
+            # Order matters: the counter reads finished_len, which the line
+            # above is what sets. Swapping these silently counts tokens past
+            # the stop trim as reasoning while completion tokens exclude them.
+            if sampling_mask_finish_reason is None:
+                self._maybe_update_reasoning_tokens(req, next_token_id)
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)
@@ -1360,6 +1368,14 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
+        """Count reasoning usage for the newly accepted run.
+
+        Runs after ``update_finish_state``: reported completion tokens are the
+        stop-trimmed ``output_ids_through_stop``, so tokens past
+        ``finished_len`` (a stop mid-verify-run, or the max_new_tokens cap)
+        must not count as reasoning either — both usage numbers share one
+        basis.
+        """
         if not req.require_reasoning:
             return
         think_end_ids = self.model_config.think_end_ids
@@ -1376,7 +1392,14 @@ class SchedulerBatchResultProcessor:
                 think_end_ids = request_think_end_ids
             if not think_end_ids:
                 return
-        req.update_reasoning_tokens(next_token_id, think_end_ids)
+        run = next_token_id if isinstance(next_token_id, list) else [next_token_id]
+        if req.finished_len is not None:
+            kept = req.finished_len - (len(req.output_ids) - len(run))
+            if kept <= 0:
+                return
+            if kept < len(run):
+                run = run[:kept]
+        req.update_reasoning_tokens(run, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,

@@ -1,4 +1,23 @@
 ARG CUDA_VERSION=13.0.3
+
+# By parameterizing the base of the stages that sit above the whole dependency
+# set, a build can start from a published image of an earlier build's stage
+# instead of rebuilding it. The defaults are the in-Dockerfile stage names, so
+# the default build graph is exactly the one described below; passing an image
+# ref makes BuildKit skip every stage that only that ref depended on.
+#
+# Example:
+# docker build --target framework_final \
+#   --build-arg FRAMEWORK_BASE_IMAGE=registry.acme.org/sglang-framework@sha256:... \
+#   --build-arg GATEWAY_BUILDER_BASE_IMAGE=registry.acme.org/sglang-framework@sha256:...
+#
+# framework_final installs the sglang source with --no-deps, so an external
+# FRAMEWORK_BASE_IMAGE freezes the dependency set at the commit that base was
+# built from. docker/check_base_deps.py runs as the last step of framework_final
+# and fails the build when that set no longer satisfies python/pyproject.toml.
+ARG FRAMEWORK_BASE_IMAGE=framework
+ARG GATEWAY_BUILDER_BASE_IMAGE=base
+
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -345,7 +364,7 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
 ########################################################
 # Builds sgl-model-gateway in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
+FROM ${GATEWAY_BUILDER_BASE_IMAGE} AS gateway_builder
 
 ARG GITHUB_ARTIFACTORY
 ARG BRANCH_TYPE
@@ -357,9 +376,23 @@ WORKDIR /build
 # Copy ONLY the gateway source (not the full repo)
 COPY sgl-model-gateway /build/sgl-model-gateway
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
+# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain.
+#
+# The leading rm is what makes this stage work when GATEWAY_BUILDER_BASE_IMAGE
+# is a prebuilt framework image rather than the default `base` stage. That
+# image already carries a stable toolchain under /root/.rustup, and rustup-init
+# starts by moving the existing one aside -- a rename of a directory that
+# exists only in a lower overlayfs layer, which returns EXDEV on any node
+# whose overlay module has redirect_dir off (the default):
+#   error: could not rename 'component' file from
+#   '/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/share/doc/cargo'
+#   ...: Invalid cross-device link (os error 18)
+# Deleting the directory first is a whiteout in the upper layer, which
+# overlayfs does handle, and it costs nothing: this stage installs a fresh
+# stable toolchain either way and deletes it again on the last line.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    rm -rf /root/.cargo /root/.rustup \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -555,7 +588,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 FROM scratch AS local_src
 COPY . /src
 
-FROM framework AS framework_final
+FROM ${FRAMEWORK_BASE_IMAGE} AS framework_final
 
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
@@ -618,6 +651,16 @@ COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
+
+# The editable install above is --no-deps: every dependency comes from the stage
+# underneath. When that stage is an external FRAMEWORK_BASE_IMAGE built from an
+# older commit, a dependency added or bumped since then is simply absent and the
+# build still succeeds, failing as an ImportError only once the server starts.
+# Assert the environment against the source's own dependency list instead.
+COPY docker/check_base_deps.py /usr/local/bin/sglang-check-base-deps
+RUN python3 /usr/local/bin/sglang-check-base-deps \
+    --pyproject /sgl-workspace/sglang/python/pyproject.toml \
+    --extras "${BUILD_TYPE}"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

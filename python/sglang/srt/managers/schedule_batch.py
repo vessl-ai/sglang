@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -300,6 +301,18 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
         return {
             "type": "stop",  # to match OpenAI API's return value
             "matched": self.matched,
+        }
+
+
+class FINISH_REPETITION(BaseFinishReason):
+    def __init__(self, pattern_len: int):
+        super().__init__()
+        self.pattern_len = pattern_len
+
+    def to_json(self):
+        return {
+            "type": "repetition",
+            "matched": self.pattern_len,
         }
 
 
@@ -994,6 +1007,37 @@ class ReqKvInfo:
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.component_evicted_seqlens.clear()
+
+
+def _has_repeating_pattern(
+    token_ids: array, pattern_len: int, repetition_min_count: int
+) -> bool:
+    """Check whether the last ``repetition_min_count`` blocks of ``pattern_len``
+    tokens at the tail of ``token_ids`` are identical. Ported verbatim from
+    vLLM's ``_has_repeating_pattern`` (``SamplingParams.repetition_detection``).
+    """
+    for n in range(1, pattern_len + 1):
+        target_token = token_ids[-n]
+        for m in range(1, repetition_min_count):
+            if token_ids[-(pattern_len * m + n)] != target_token:
+                return False
+    return True
+
+
+def apply_repetition_detection_gate(
+    server_args: ServerArgs, sampling_params: SamplingParams
+) -> None:
+    """Strip ``repetition_detection`` from *sampling_params* in place unless
+    the server was started with ``--enable-repetition-detection``.
+
+    Called once at request intake, before a :class:`Req` is built from the
+    (possibly shared) ``SamplingParams``. With the field nulled here,
+    ``Req._check_repetition_finish`` sees the same ``is None`` gate it sees
+    when a request simply never set the field, so the disabled path costs
+    exactly what it costs today.
+    """
+    if not server_args.enable_repetition_detection:
+        sampling_params.repetition_detection = None
 
 
 class Req(ReqDllmMixin):
@@ -1904,6 +1948,40 @@ class Req(ReqDllmMixin):
 
         return False
 
+    def _check_repetition_finish(self) -> bool:
+        """N-gram loop detector (vLLM parity: ``SamplingParams.repetition_detection``).
+
+        Two deliberate design decisions:
+        (a) This is evaluated once per driver call, at the final accepted
+            position only. Under multi-token acceptance (speculative decoding
+            / grammar jump-forward) a persistent loop is caught with at most
+            acceptance-length overshoot; a loop the model exits again within
+            the same batch is intentionally not flagged.
+        (b) Stateless by design: it re-scans the tail of ``output_ids`` on
+            every call, so retraction/resume needs no state migration.
+        """
+        repetition_detection = self.sampling_params.repetition_detection
+        if repetition_detection is None:
+            return False
+
+        if len(self.output_ids) < self.sampling_params.min_new_tokens:
+            return False
+
+        max_pattern_size = repetition_detection["max_pattern_size"]
+        min_pattern_size = repetition_detection["min_pattern_size"]
+        min_count = repetition_detection["min_count"]
+
+        for pattern_len in range(min_pattern_size, max_pattern_size + 1):
+            if pattern_len * min_count > len(self.output_ids):
+                return False
+            if _has_repeating_pattern(self.output_ids, pattern_len, min_count):
+                # Repetition keeps all generated output untrimmed (vLLM
+                # parity): do NOT set self.finished_len.
+                self.finished_reason = FINISH_REPETITION(pattern_len)
+                return True
+
+        return False
+
     def _cap_finished_len_at_max_new_tokens(self) -> None:
         """Demote a stop matched beyond the length budget to a length finish.
 
@@ -1956,6 +2034,11 @@ class Req(ReqDllmMixin):
 
         if self.grammar is not None and self.grammar.is_terminated():
             self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+            return
+
+        # Repetition has the lowest priority of all stops: length/EOS/stop-str
+        # on the same step must win over it.
+        if self._check_repetition_finish():
             return
 
     def reset_for_retract(self):

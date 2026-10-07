@@ -204,11 +204,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual", "least_load"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -251,6 +251,20 @@ struct CliArgs {
     /// Label selector for decode server pods in PD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
+
+    /// Interval (seconds) of the periodic full-LIST reconcile that repairs the
+    /// discovered worker set independently of watch health. Keep it below the
+    /// pod termination-drain budget so draining pods stop receiving traffic
+    /// early enough for in-flight requests to complete. Removing a model's
+    /// last healthy worker can be held a few seconds longer while a
+    /// replacement activates, so leave headroom rather than sizing this to the
+    /// drain budget exactly.
+    #[arg(
+        long,
+        default_value_t = 30,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    service_discovery_resync_secs: u64,
 
     // ==================== Logging ====================
     /// Directory to store log files
@@ -759,6 +773,7 @@ impl CliArgs {
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
             "random" => PolicyConfig::Random,
+            "least_load" => PolicyConfig::LeastLoad,
             "round_robin" => PolicyConfig::RoundRobin,
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
@@ -1095,6 +1110,7 @@ impl CliArgs {
                 enabled: true,
                 selector,
                 check_interval: std::time::Duration::from_secs(60),
+                resync_interval: std::time::Duration::from_secs(self.service_discovery_resync_secs),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,

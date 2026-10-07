@@ -396,6 +396,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
+                        cached_tokens=UsageProcessor.cached_details(
+                            count=cached_tokens.get(index, 0),
+                            enable_cache_report=get_serving().enable_cache_report,
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
