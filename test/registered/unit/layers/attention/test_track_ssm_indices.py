@@ -4,7 +4,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import types
 import unittest
-from unittest import mock
 
 import torch
 
@@ -42,14 +41,35 @@ def _forward_batch(extend_seq_lens, prefix_lens, track_seqlens, track_mask):
     )
 
 
+def _with_mode(forward_batch, *, host_plan):
+    """The same batch, routed to the device-tensor path or the host-list plan."""
+    return types.SimpleNamespace(
+        **vars(forward_batch),
+        forward_mode=types.SimpleNamespace(
+            is_extend=lambda: host_plan, is_target_verify=lambda: False
+        ),
+        batch_size=len(forward_batch.extend_seq_lens),
+        mamba_prefill_track_mask_cpu=forward_batch.mamba_track_mask.tolist(),
+        mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens.tolist(),
+        extend_seq_lens_cpu=forward_batch.extend_seq_lens.tolist(),
+        extend_prefix_lens_cpu=forward_batch.extend_prefix_lens.tolist(),
+    )
+
+
 def _call(backend, forward_batch, chunk_size=CHUNK_SIZE):
+    """(h_src, h_dst, final_src, final_dst), required to agree between the
+    device-tensor path and the host-list plan that prefill takes."""
+    backend._mamba_chunk_size = chunk_size
     cache_indices = torch.arange(len(forward_batch.extend_seq_lens), dtype=torch.int64)
-    server_args = types.SimpleNamespace(mamba_cache_chunk_size=chunk_size)
-    with mock.patch(
-        "sglang.srt.layers.attention.hybrid_linear_attn_backend.get_server_args",
-        return_value=server_args,
-    ):
-        return backend._init_track_ssm_indices(cache_indices, forward_batch)
+    results = []
+    for host_plan in (False, True):
+        out = backend._init_track_ssm_indices(
+            cache_indices, _with_mode(forward_batch, host_plan=host_plan)
+        )
+        results.append((out[1], out[2], out[4], out[5]))
+    for device_t, host_t in zip(*results):
+        assert torch.equal(device_t, host_t), (device_t.tolist(), host_t.tolist())
+    return results[0]
 
 
 class TestTrackSsmIndices(unittest.TestCase):

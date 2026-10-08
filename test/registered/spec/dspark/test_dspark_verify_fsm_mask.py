@@ -21,11 +21,11 @@ import torch
 
 from sglang.srt.sampling import solar_open2_fsm as fsm
 from sglang.srt.speculative.dspark_components import dspark_worker_v2
-from sglang.srt.speculative.dspark_components.dspark_tp import DsparkTpSync
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     _fsm_content_forbidden_ids,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -121,7 +121,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
             max_bs=self.max_bs,
             verify_num_draft_tokens=self.stride,
             device="cpu",
-            tp_sync=DsparkTpSync(SimpleNamespace(world_size=1)),
+            tp_sync=SpecTpSync(SimpleNamespace(world_size=1)),
         )
 
     def setUp(self):
@@ -201,7 +201,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         # rows 0..3 = request 0 (REASONING), rows 4..7 = request 1 (CONTENT).
         self.ep.set_fsm_rows([True] * self.stride + [False] * self.stride)
         self.ep.set_fsm_content_rows([False] * self.stride + [True] * self.stride)
-        self.ep._apply_fsm_mask(bs=self.max_bs)
+        self.ep._apply_fsm_mask(logits, bs=self.max_bs)
 
         content = logits[self.stride :]
         reasoning = logits[: self.stride]
@@ -231,7 +231,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         before = logits.clone()
         self.ep.set_fsm_rows(None)
         self.ep.set_fsm_content_rows(None)
-        self.ep._apply_fsm_mask(bs=self.max_bs)
+        self.ep._apply_fsm_mask(logits, bs=self.max_bs)
         self.assertTrue(torch.equal(logits, before))
 
     def test_a_smaller_batch_does_not_reach_stale_rows(self):
@@ -239,7 +239,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         shrinking batch from masking the previous step's rows."""
         logits = self._logits()
         self.ep.set_fsm_content_rows([True] * (self.max_bs * self.stride))
-        self.ep._apply_fsm_mask(bs=1)
+        self.ep._apply_fsm_mask(logits, bs=1)
         self.assertTrue(torch.isinf(logits[: self.stride, THINK_START]).all())
         self.assertTrue(torch.isfinite(logits[self.stride :, THINK_START]).all())
 
@@ -251,7 +251,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         n = self.max_bs * self.stride
         self.ep.set_fsm_rows([True] * n)
         self.ep.set_fsm_content_rows([True] * n)
-        self.ep._apply_fsm_mask(bs=self.max_bs)
+        self.ep._apply_fsm_mask(logits, bs=self.max_bs)
         self.assertTrue(torch.isinf(logits[:, EOS]).all())
         self.assertTrue(torch.isinf(logits[:, THINK_START]).all())
 
@@ -271,7 +271,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 max_bs=self.max_bs,
                 verify_num_draft_tokens=self.stride,
                 device="cpu",
-                tp_sync=DsparkTpSync(SimpleNamespace(world_size=1)),
+                tp_sync=SpecTpSync(SimpleNamespace(world_size=1)),
             )
             self.assertEqual(ep.fsm_content_forbid_buf.tolist(), [0])
         finally:
@@ -357,7 +357,8 @@ class TestEpilogueFsmMasks(CustomTestCase):
                 self.fail("the greedy test is negated or compared, not required")
 
     def test_the_in_graph_mask_is_not_gated(self):
-        """It fires on every compact step, and `VerifyPlan.apply` may write over
+        """It fires on every replayed verify step, ragged or static, and
+        `VerifyPlan.apply` may write over
         the same tensor on the same one -- `plan_gate` decides whether the eager
         plan is built, not whether these kernels run. Both only write -inf, so
         the applied mask is the union.
@@ -380,7 +381,9 @@ class TestEpilogueFsmMasks(CustomTestCase):
             and isinstance(n.func, ast.Attribute)
             and n.func.attr == "_apply_fsm_mask"
         ]
-        self.assertEqual(len(calls), 1, "_apply_fsm_mask is called once")
+        self.assertEqual(
+            len(calls), 2, "_apply_fsm_mask is called once per epilogue path"
+        )
         guarded = [
             n
             for n in ast.walk(epilogue)
@@ -550,7 +553,7 @@ class TestEpilogueFsmMasks(CustomTestCase):
         self.ep.set_fsm_content_notools_rows(
             [True] * self.stride + [False] * self.stride
         )
-        self.ep._apply_fsm_mask(self.max_bs)
+        self.ep._apply_fsm_mask(logits, bs=self.max_bs)
         self.assertTrue(torch.isneginf(logits[0, THINK_START]))
         self.assertTrue(torch.isneginf(logits[0, TOOL_START]))
         # And the tool-call internals, which the shared buffer drops for the
