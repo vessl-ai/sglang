@@ -288,6 +288,32 @@ def _run_triton_sparse_decode(
     return out.unsqueeze(1), lse.unsqueeze(1)
 
 
+# SM80 tensor-core path (env-gated, default off): head-tile tl.dot + kv-split, see sm80_sparse_mla.py
+# SGLANG_SM80_SPARSE_MLA=1 enables both paths; _PREFILL / _DECODE override per path (prefill = tokens > 64).
+import os as _os
+
+
+def _sm80_flag(name: str) -> bool:
+    return _os.environ.get(name, _os.environ.get("SGLANG_SM80_SPARSE_MLA", "0")) == "1"
+
+
+_SM80_PREFILL = _sm80_flag("SGLANG_SM80_SPARSE_MLA_PREFILL")
+_SM80_DECODE = _sm80_flag("SGLANG_SM80_SPARSE_MLA_DECODE")
+
+if _SM80_PREFILL or _SM80_DECODE:
+    from sglang.kernels.ops.attention.sm80_sparse_mla import run_sparse_mla_sm80
+
+    _run_triton_sparse_decode_orig = _run_triton_sparse_decode
+
+    def _run_triton_sparse_decode(q, k_cache, indices, topk_length, softmax_scale):  # noqa: F811
+        if q.shape[0] > 64:  # SM120_DECODE_MAX_TOKENS
+            use = _SM80_PREFILL
+        else:
+            use = _SM80_DECODE
+        fn = run_sparse_mla_sm80 if use else _run_triton_sparse_decode_orig
+        return fn(q, k_cache, indices, topk_length, softmax_scale)
+
+
 def _merge_partial_attn(
     out1: torch.Tensor,
     lse1: torch.Tensor,
