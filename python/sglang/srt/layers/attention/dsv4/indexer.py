@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.attention.dsv4.sm80_compat import is_sm80_dsv4
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
@@ -831,7 +832,7 @@ class C4IndexerBackendMixin:
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if get_platform().is_sm120:
+            if get_platform().is_sm120 or is_sm80_dsv4():
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch

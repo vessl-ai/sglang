@@ -139,11 +139,20 @@ def _tiled_sparse_decode_kernel(
         # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
         nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
         nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
-        kv_nope_fp8 = tl.load(
-            cache_fp8_ptr + nope_addrs,
+        # SM80: Triton 은 fp8e4nv 를 거부 → uint8 로 읽어 e4m3fn 수동 디코드.
+        _b = tl.load(
+            cache_uint8_ptr + nope_addrs,
             mask=nope_2d_mask,
-            other=0.0,
+            other=0,
+        ).to(tl.int32)
+        _e = (_b >> 3) & 15
+        _m = (_b & 7).to(tl.float32)
+        _v = tl.where(
+            _e == 0,
+            _m * (1.0 / 512.0),
+            (1.0 + _m / 8.0) * tl.math.exp2(_e.to(tl.float32) - 7.0),
         )
+        kv_nope_fp8 = tl.where(((_b >> 7) & 1) == 1, -_v, _v)
 
         # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
         scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
@@ -154,7 +163,7 @@ def _tiled_sparse_decode_kernel(
             other=127,
         )
         scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
-        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0)
+        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8 * scale_f32, 0.0)
 
         # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
         rope_byte_bases = token_data_bases + 448
@@ -246,7 +255,7 @@ def _run_triton_sparse_decode(
     grid = (B, H)
     _tiled_sparse_decode_kernel[grid](
         q3,
-        raw_fp8,
+        raw_uint8,  # SM80: fp8e4nv 포인터 금지 → uint8 별칭
         raw_uint8,
         raw_bf16,
         flat_indices,

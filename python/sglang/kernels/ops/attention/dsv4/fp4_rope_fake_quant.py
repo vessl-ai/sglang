@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+from sglang.kernels.ops.quantization.fp8_e4m3_sw import SW_FP8, e4m3fn_to_f32, f32_to_e4m3fn
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
 
@@ -54,7 +55,10 @@ def rope_tail_fake_quant_fp4_row(
     amax = tl.max(tl.abs(vb), axis=1)
     if COMPRESSED_KV:
         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
-        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        if SW_FP8:
+            scale = e4m3fn_to_f32(f32_to_e4m3fn(scale))
+        else:
+            scale = scale.to(tl.float8e4nv).to(tl.float32)
         s = tl.div_rn(vb, scale[:, None])
     else:
         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
