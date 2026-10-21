@@ -42,6 +42,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.attention.dsv4.sm80_compat import is_sm80_dsv4
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1069,7 +1070,7 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
-        if get_platform().is_sm120:
+        if get_platform().is_sm120 or is_sm80_dsv4():
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:
                 return self.n_local_heads

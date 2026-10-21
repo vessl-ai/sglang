@@ -9,6 +9,7 @@ the arithmetic of the torch lookup it replaces.
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.ops.quantization.fp8_e4m3_sw import SW_FP8, e4m3fn_to_f32
 
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
@@ -32,10 +33,14 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    if SW_FP8:
+        wb = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        vals = e4m3fn_to_f32(tl.load(wb + local * DIM + offs, mask=owned, other=0))
+    else:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
     exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
         tl.int32
     )

@@ -99,6 +99,43 @@ def apply_fp8_marlin_linear(
     return output.reshape(out_shape)
 
 
+def _regroup_fp8_block32_to_128(layer: torch.nn.Module) -> bool:
+    """[32,32] ue8m0 블록 스케일 → [32,128] 그룹 (SM80 Marlin FP8 은 group 32 커널이 없다)."""
+    wbs = getattr(layer, "weight_block_size", None)
+    if wbs is None or wbs[1] != 32:
+        return False
+    sname = "weight_scale" if "weight_scale" in dir(layer) else "weight_scale_inv"
+    w = layer.weight.data
+    n, k = w.shape
+    sf = getattr(layer, sname).data.to(torch.float32)
+    nb, kb = sf.shape
+    assert n == nb * wbs[0] and k == kb * 32, (w.shape, sf.shape, wbs)
+    import os
+    mode = os.environ.get("SGLANG_SM80_FP8_DENSE", "regroup")  # regroup | g32 | bf16
+    if mode == "g32" and k % 64 == 0 and n % 64 == 0:
+        return False  # [32,32] 그대로: gptq_marlin.cuh 에 kFE4M3fn group32 인스턴스 추가(아래 CUH 패치)
+    if mode in ("g32", "bf16") or kb % 4 != 0 or n % 64 != 0:
+        # Marlin 불가 형상(예: shared expert w2 K=288) 또는 bf16 arm: bf16 로 dequant(2의 거듭제곱 스케일이라 정확) 후 F.linear.
+        wf = w.to(torch.float32).view(nb, wbs[0], kb, 32) * sf[:, None, :, None]
+        layer.weight.data = wf.reshape(n, k).to(torch.bfloat16)
+        layer._sm80_bf16_dequant = True
+        return True
+    s4 = sf.view(nb, kb // 4, 4)
+    smax = s4.max(dim=-1, keepdim=True).values
+    ratio = s4 / smax
+    out = torch.empty_like(w)
+    step = max(1, (1 << 24) // max(1, wbs[0] * k))
+    for r in range(0, nb, step):
+        e = min(nb, r + step)
+        wf = w[r * wbs[0] : e * wbs[0]].to(torch.float32).view(e - r, wbs[0], kb // 4, 4, 32)
+        wf = wf * ratio[r:e, None, :, :, None]
+        out[r * wbs[0] : e * wbs[0]] = wf.reshape(-1, k).to(w.dtype)
+    layer.weight.data = out
+    setattr(layer, sname, torch.nn.Parameter(smax.squeeze(-1).contiguous(), requires_grad=False))
+    layer.weight_block_size = [wbs[0], 128]
+    return False
+
+
 def prepare_fp8_layer_for_marlin(
     layer: torch.nn.Module, size_k_first: bool = True
 ) -> None:
@@ -109,6 +146,8 @@ def prepare_fp8_layer_for_marlin(
         "performance for compute-heavy workloads."
     )
 
+    if _regroup_fp8_block32_to_128(layer):
+        return
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
     weight_block_size = getattr(layer, "weight_block_size", None)
