@@ -122,6 +122,18 @@ def _regroup_fp8_block32_to_128(layer: torch.nn.Module) -> bool:
         layer.weight.data = wf.reshape(n, k).to(torch.bfloat16)
         layer._sm80_bf16_dequant = True
         return True
+    # [C1 hybrid] keep an exact bf16 copy (dequantised with the ORIGINAL [32,32] scales, 2^k so lossless in bf16) next to the
+    # Marlin-regrouped weight; Fp8LinearMethod.apply uses it for rows >= SGLANG_R2_DENSE_BF16_MIN_TOKENS (prefill chunks).
+    # Cost: +2 B/param of every Marlin-served dense layer. Round-1 arm-BF measured fp8->bf16 replacement = +1.2 GB/GPU
+    # (50.11 -> 51.33), so keeping BOTH copies is about +2.4 GB/GPU; at ~1.6 KB KV per token per GPU (7.16M tokens in
+    # 11.5 GB, sm80-triage.md:71) the KV pool shrinks by roughly 2.4 GB / 1.6 KB = 1.5M tokens (-14% of 10.8M).
+    # Lossless vs the checkpoint: the current regroup path is already within 1e-7 rel. (c/c1_regroup_stats.py), so this is a speed lever.
+    _min_tok = int(os.environ.get("SGLANG_R2_DENSE_BF16_MIN_TOKENS", "0"))
+    if _min_tok > 0:
+        layer._r2_w_bf16 = (
+            (w.to(torch.float32).view(nb, wbs[0], kb, 32) * sf[:, None, :, None]).reshape(n, k).to(torch.bfloat16)
+        )
+        layer._r2_bf16_min_tokens = _min_tok
     s4 = sf.view(nb, kb // 4, 4)
     smax = s4.max(dim=-1, keepdim=True).values
     ratio = s4 / smax
