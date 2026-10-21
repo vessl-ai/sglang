@@ -1254,6 +1254,10 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if getattr(layer, "_sm80_bf16_dequant", False):
             return torch.nn.functional.linear(x, layer.weight, bias)
+        _w16 = getattr(layer, "_r2_w_bf16", None)
+        if _w16 is not None and x.numel() // x.shape[-1] >= layer._r2_bf16_min_tokens:
+            # [C1 hybrid] prefill-sized chunks: cuBLAS bf16 GEMM on the exact dequantised copy; decode keeps Marlin W8A16.
+            return torch.nn.functional.linear(x, _w16, bias)
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
