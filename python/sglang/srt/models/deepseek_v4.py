@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -3066,18 +3067,20 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        # [C2] SM80: the bf16x3 compensated projection is plain tl.dot (no DeepGEMM), opt-in via SGLANG_R2_MHC_STATS_BF16X3.
+        _r2_mhc_sm80 = is_sm80_dsv4() and os.environ.get("SGLANG_R2_MHC_STATS_BF16X3", "0").lower() in ("1", "true")
         if (
             self.hc_pre_from_prev_sublayer
-            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and (get_platform().is_sm100 or get_platform().is_sm90 or _r2_mhc_sm80)
             and self.hc_attn_fn.shape == (24, 20480)
-            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and (envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() or _r2_mhc_sm80)
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
-            if get_platform().is_sm90:
-                # Hopper's compensated projection does not require DeepGEMM.
+            if get_platform().is_sm90 or _r2_mhc_sm80:
+                # Hopper's (and, opt-in, SM80's) compensated projection does not require DeepGEMM.
                 self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
             else:
