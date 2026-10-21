@@ -824,6 +824,15 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 )
 
 
+def _sm80_decode_real_heads() -> bool:
+    import os as _os_r3
+
+    return (
+        _os_r3.environ.get("SGLANG_SM80_DECODE_REAL_HEADS", "0").lower() in ("1", "true")
+        and envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "triton"
+    )
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -1038,6 +1047,9 @@ class MqaAttentionBase(nn.Module):
             return self.n_local_heads
 
         if get_platform().is_sm120 or is_sm80_dsv4():
+            # [0015] SM80 Triton decode takes any head count; the 64-head zero pad only serves FlashMLA's h_q specialization.
+            if is_sm80_dsv4() and _sm80_decode_real_heads():
+                return self.n_local_heads
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:
                 return self.n_local_heads
