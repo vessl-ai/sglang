@@ -5,6 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
+import os
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
 import msgspec
@@ -250,6 +251,43 @@ def dense_prefill_topk(
 # ---------- torch ----------
 
 
+def _row_shard_topology():
+    """(attn_tp_rank, attn_tp_size, group) when the torch prefill indexer shards
+    query rows across the attention TP ranks, else (0, 1, None).
+
+    The indexer weights are replicated across TP, so every rank otherwise scores the
+    same rows against the same index K (an 8x-redundant [rows, heads, lc] chain).
+    Sharding assumes every rank sees identical (req, pos) rows: attn DP and attn CP
+    must both be off. Default OFF; SGLANG_DSV41_INDEXER_ROW_SHARD=1 turns it on.
+    Read via os.environ so the patch needs no environ.py change.
+    """
+    if os.environ.get("SGLANG_DSV41_INDEXER_ROW_SHARD", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return 0, 1, None
+    from sglang.srt.runtime_context import get_parallel
+
+    par = get_parallel()
+    if par.attn_dp_size != 1 or par.attn_cp_size != 1 or par.attn_tp_size <= 1:
+        return 0, 1, None
+    return par.attn_tp_rank, par.attn_tp_size, par.attn_tp_group.device_group
+
+
+def _merge_row_shards(inputs: PrefillInputs, group) -> None:
+    """Every rank wrote only its own rows of the selection (-1 elsewhere); max-merge
+    so each rank holds all rows. Selections are >= 0 or -1, so max is the union."""
+    n = inputs.positions.shape[0]
+    for out in (inputs.out_raw_indices, inputs.out_page_indices):
+        if out is None:
+            continue
+        view = out[:n]
+        buf = view if view.is_contiguous() else view.contiguous()
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.MAX, group=group)
+        if buf is not view:
+            view.copy_(buf)
+
+
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
@@ -296,12 +334,22 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
+    shard_rank, shard_size, shard_group = _row_shard_topology()
+    sharded = False
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
         lc = int(lens.max().item())
         if lc == 0:
             continue
+        if shard_size > 1 and tok.numel() >= shard_size:
+            # lc / k / slots stay request-wide, so each row's top-k is bit-identical to
+            # the unsharded path. Fewer rows than ranks: every rank scores them all.
+            keep = torch.tensor_split(
+                torch.arange(tok.numel(), device=tok.device), shard_size
+            )[shard_rank]
+            tok, lens = tok[keep], lens[keep]
+            sharded = True
         j = torch.arange(lc, device=pos.device)
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
@@ -315,6 +363,10 @@ def prefill_requests(
                 indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
             ),
         )
+    # Reached only once the caller has consumed every request. `sharded` is the same on
+    # all ranks (it depends on shared row counts), so the collective is uniform.
+    if sharded:
+        _merge_row_shards(inputs, shard_group)
 
 
 def _score_chunks(
