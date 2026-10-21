@@ -114,7 +114,9 @@ def _regroup_fp8_block32_to_128(layer: torch.nn.Module) -> bool:
     mode = os.environ.get("SGLANG_SM80_FP8_DENSE", "regroup")  # regroup | g32 | bf16
     if mode == "g32" and k % 64 == 0 and n % 64 == 0:
         return False  # [32,32] 그대로: gptq_marlin.cuh 에 kFE4M3fn group32 인스턴스 추가(아래 CUH 패치)
-    if mode in ("g32", "bf16") or kb % 4 != 0 or n % 64 != 0:
+    # DSpark draft main_proj: FP8(재그룹 포함)이면 accept≈1 (yaleyoou 선례) → bf16 dequant 강제. 토글 SGLANG_SM80_DSPARK_MAIN_PROJ_BF16(기본 0)
+    force_bf16 = getattr(layer, "_sm80_force_bf16", False) and os.environ.get("SGLANG_SM80_DSPARK_MAIN_PROJ_BF16", "0") == "1"
+    if mode in ("g32", "bf16") or force_bf16 or kb % 4 != 0 or n % 64 != 0:
         # Marlin 불가 형상(예: shared expert w2 K=288) 또는 bf16 arm: bf16 로 dequant(2의 거듭제곱 스케일이라 정확) 후 F.linear.
         wf = w.to(torch.float32).view(nb, wbs[0], kb, 32) * sf[:, None, :, None]
         layer.weight.data = wf.reshape(n, k).to(torch.bfloat16)
