@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_CATEGORIES,
@@ -1951,6 +1952,13 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 **self.labels, reason=reason
             )
 
+        # Prefetch outcome counters, keyed by the cache's
+        # _prefetch_outcome_stats names. Children are bound once here so the
+        # scheduler-thread path is a dict lookup plus one inc().
+        self._prefetch_outcome_children: Dict[str, Any] = {}
+        if envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.get():
+            self._init_prefetch_outcome_metrics(Counter)
+
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
             documentation="Buffer-mode backup tokens that never reached L3 "
@@ -2019,6 +2027,115 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
+
+    # Outcome key -> (counter attribute, reason label or None).
+    PREFETCH_OUTCOME_KEYS = {
+        "issued": ("storage_prefetch_issued_total", None),
+        "declined_too_short": ("storage_prefetch_declined_total", "too_short"),
+        "declined_rate_limited": ("storage_prefetch_declined_total", "rate_limited"),
+        "declined_anchor_lost": ("storage_prefetch_declined_total", "anchor_lost"),
+        "declined_device_covered": (
+            "storage_prefetch_declined_total",
+            "device_covered",
+        ),
+        "revoked_insufficient": ("storage_prefetch_revoked_total", "insufficient"),
+        "revoked_full_miss": ("storage_prefetch_revoked_total", "full_miss"),
+        "revoked_deadline": ("storage_prefetch_revoked_total", "deadline"),
+        "revoked_stop_policy": ("storage_prefetch_revoked_total", "stop_policy"),
+        "revoked_all_or_nothing": (
+            "storage_prefetch_revoked_total",
+            "all_or_nothing",
+        ),
+        "l1l2_miss_tokens": ("storage_prefetch_requested_tokens_total", None),
+        "l3_miss_tokens": ("storage_prefetch_miss_tokens_total", None),
+        "deadline_tokens": ("storage_prefetch_deadline_tokens_total", None),
+        "all_or_nothing_tokens": (
+            "storage_prefetch_all_or_nothing_tokens_total",
+            None,
+        ),
+        "redundant_tokens": ("storage_prefetch_redundant_tokens_total", None),
+    }
+
+    def _init_prefetch_outcome_metrics(self, Counter) -> None:
+        labelnames = list(self.labels.keys())
+        reason_labelnames = labelnames + ["reason"]
+        self.storage_prefetch_issued_total = Counter(
+            name="sglang:storage_prefetch_issued_total",
+            documentation="L3 lookups issued for the tokens beyond the "
+            "device and host match.",
+            labelnames=labelnames,
+        )
+        self.storage_prefetch_declined_total = Counter(
+            name="sglang:storage_prefetch_declined_total",
+            documentation="Prefetches not started or not staged, by reason. "
+            "too_short: the span beyond the L1/L2 match was below "
+            "prefetch_threshold, so no lookup was sent; rate_limited: host "
+            "prefetch occupancy was at its cap (buffer mode also counts a "
+            "parked hit once); anchor_lost and device_covered: buffer mode "
+            "only.",
+            labelnames=reason_labelnames,
+        )
+        self.storage_prefetch_revoked_total = Counter(
+            name="sglang:storage_prefetch_revoked_total",
+            documentation="Issued prefetches that ended without a usable "
+            "result, by reason. insufficient: L3 hit was positive but below "
+            "prefetch_threshold; full_miss: L3 had none of the span; "
+            "deadline: the timeout policy's deadline (base + per-1K-token "
+            "allowance, from enqueue) cut the lookup or the transfer; "
+            "stop_policy: the best_effort policy stopped it the same way; "
+            "all_or_nothing: a hybrid (SWA/Mamba) result fell short and the "
+            "whole fetched span was released.",
+            labelnames=reason_labelnames,
+        )
+        self.storage_prefetch_requested_tokens_total = Counter(
+            name="sglang:storage_prefetch_requested_tokens_total",
+            documentation="Tokens beyond the L1/L2 match that an L3 lookup "
+            "answered for (the L1/L2-miss span sent to L3).",
+            labelnames=labelnames,
+        )
+        self.storage_prefetch_miss_tokens_total = Counter(
+            name="sglang:storage_prefetch_miss_tokens_total",
+            documentation="Of storage_prefetch_requested_tokens_total, the "
+            "tokens L3 did not hold (requested minus the L3 hit).",
+            labelnames=labelnames,
+        )
+        self.storage_prefetch_deadline_tokens_total = Counter(
+            name="sglang:storage_prefetch_deadline_tokens_total",
+            documentation="Tokens lost to a deadline or stop-policy cut: the "
+            "requested span when the lookup had not answered, the whole hit "
+            "span on an all-or-nothing (hybrid) model, otherwise the "
+            "untransferred tail.",
+            labelnames=labelnames,
+        )
+        self.storage_prefetch_all_or_nothing_tokens_total = Counter(
+            name="sglang:storage_prefetch_all_or_nothing_tokens_total",
+            documentation="L3 hit tokens released because a hybrid "
+            "(SWA/Mamba) prefetch fell short of the full span for a reason "
+            "other than a deadline cut.",
+            labelnames=labelnames,
+        )
+        self.storage_prefetch_redundant_tokens_total = Counter(
+            name="sglang:storage_prefetch_redundant_tokens_total",
+            documentation="Tokens transferred from L3 that were already in "
+            "host memory (L2) when the result was inserted, because another "
+            "request's prefetch or write-through landed first. They count in "
+            "prefetched_tokens_total but are credited as host_hit, not "
+            "storage_hit, at admission.",
+            labelnames=labelnames,
+        )
+        for key, (attr, reason) in self.PREFETCH_OUTCOME_KEYS.items():
+            counter = getattr(self, attr)
+            if reason is None:
+                child = counter.labels(**self.labels)
+            else:
+                child = counter.labels(**self.labels, reason=reason)
+            self._prefetch_outcome_children[key] = child
+
+    def log_prefetch_outcome(self, key: str, num: int = 1) -> None:
+        """Increment one prefetch outcome counter; unknown keys are ignored."""
+        child = self._prefetch_outcome_children.get(key)
+        if child is not None and num > 0:
+            child.inc(num)
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:

@@ -235,6 +235,9 @@ class StorageOperation:
         self.all_hash_values: Optional[List[str]] = None
         # Prefetch-outcome accounting, set at enqueue by the tree cache.
         self.stats_requested_tokens = 0
+        # Set by the tree cache when its stop policy cuts a prefetch that
+        # was still transferring ("deadline" or "stop_policy").
+        self.stats_cut_reason: Optional[str] = None
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
 

@@ -223,6 +223,96 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_storage_prefetch_outcome_metrics(self):
+        labels = {"model_name": "test", "tp_rank": 0}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+
+        for key in StorageMetricsCollector.PREFETCH_OUTCOME_KEYS:
+            collector.log_prefetch_outcome(key, 3)
+        collector.log_prefetch_outcome("redundant_tokens", 0)
+        collector.log_prefetch_outcome("attempts", 5)  # internal only
+
+        def incs(attr):
+            return getattr(collector, attr).increments
+
+        self.assertEqual(incs("storage_prefetch_issued_total"), [(labels, 3)])
+        self.assertEqual(
+            {m["reason"]: v for m, v in incs("storage_prefetch_declined_total")},
+            {
+                "too_short": 3,
+                "rate_limited": 3,
+                "anchor_lost": 3,
+                "device_covered": 3,
+            },
+        )
+        self.assertEqual(
+            {m["reason"]: v for m, v in incs("storage_prefetch_revoked_total")},
+            {
+                "insufficient": 3,
+                "full_miss": 3,
+                "deadline": 3,
+                "stop_policy": 3,
+                "all_or_nothing": 3,
+            },
+        )
+        for attr in (
+            "storage_prefetch_requested_tokens_total",
+            "storage_prefetch_miss_tokens_total",
+            "storage_prefetch_deadline_tokens_total",
+            "storage_prefetch_all_or_nothing_tokens_total",
+            "storage_prefetch_redundant_tokens_total",
+        ):
+            self.assertEqual(incs(attr), [(labels, 3)], attr)
+        # Only the collector's own labels plus a closed reason set.
+        for attr in (
+            "storage_prefetch_declined_total",
+            "storage_prefetch_revoked_total",
+        ):
+            self.assertEqual(
+                getattr(collector, attr).labelnames, ("model_name", "tp_rank", "reason")
+            )
+
+    def test_storage_prefetch_outcome_metrics_can_be_disabled(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.override(False):
+            collector = _RecordingStorageMetricsCollector(labels={"model_name": "t"})
+        self.assertFalse(hasattr(collector, "storage_prefetch_revoked_total"))
+        self.assertFalse(hasattr(collector, "storage_prefetch_redundant_tokens_total"))
+        collector.log_prefetch_outcome("revoked_deadline", 1)  # no-op
+        # The pre-existing series are untouched.
+        self.assertTrue(hasattr(collector, "storage_prefetch_hit_tokens_total"))
+
+    def test_storage_prefetch_outcome_metric_names(self):
+        registry = prometheus_client.CollectorRegistry()
+
+        def counter(*args, **kwargs):
+            return prometheus_client.Counter(*args, registry=registry, **kwargs)
+
+        def histogram(*args, **kwargs):
+            return prometheus_client.Histogram(*args, registry=registry, **kwargs)
+
+        class _RegistryCollector(StorageMetricsCollector):
+            _counter_cls = staticmethod(counter)
+            _histogram_cls = staticmethod(histogram)
+
+        collector = _RegistryCollector(labels={"tp_rank": "0"})
+        collector.log_prefetch_outcome("revoked_deadline", 2)
+        collector.log_prefetch_outcome("redundant_tokens", 640)
+        text = prometheus_client.generate_latest(registry).decode()
+        self.assertIn(
+            'sglang:storage_prefetch_revoked_total{reason="deadline",tp_rank="0"} 2.0',
+            text,
+        )
+        self.assertIn(
+            'sglang:storage_prefetch_redundant_tokens_total{tp_rank="0"} 640.0', text
+        )
+        # Every reason series exists from the start, at zero.
+        self.assertIn(
+            'sglang:storage_prefetch_declined_total{reason="too_short",tp_rank="0"} 0.0',
+            text,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
