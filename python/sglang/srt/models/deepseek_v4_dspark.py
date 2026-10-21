@@ -614,6 +614,7 @@ class DSparkV4StageMixin:
                 quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
+            self.main_proj._sm80_force_bf16 = True  # SM80: marlin_utils_fp8._regroup_fp8_block32_to_128 가 소비
             self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         if stage_id == num_stages - 1:

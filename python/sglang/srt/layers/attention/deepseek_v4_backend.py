@@ -51,6 +51,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
     swa_ring_rows,
 )
+from sglang.srt.layers.attention.dsv4.sm80_compat import (
+    is_sm80_dsv4,
+    sm80_sparse_prefill_union_g,
+    sm80_sparse_prefill_ws,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -194,7 +199,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or is_sm80_dsv4() or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -2705,6 +2710,7 @@ class DeepseekV4AttnBackend(
             forward_batch.forward_mode.is_extend_without_speculative()
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
+            and (not is_sm80_dsv4() or sm80_sparse_prefill_ws())  # [0013]
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -3949,6 +3955,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     cos_sin_cache=cos_sin_cache,
+                    real_heads=layer.tp_q_head_num,
                 )
 
             if cos_sin_cache is not None:
@@ -3999,7 +4006,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            if get_platform().is_sm120 or is_sm80_dsv4():
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
@@ -4073,13 +4080,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
         cos_sin_cache: Optional[torch.Tensor] = None,
+        real_heads: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
-        if _is_xpu:
-            from sgl_kernel import flash_mla_sparse_fwd
+        use_sm80_ws = sm80_sparse_prefill_ws()  # [0013]
+        if use_sm80_ws:
+            from sglang.kernels.ops.attention.sm80_sparse_prefill_ws import (
+                dequantize_k_cache_paged_sm80 as _dequant_paged,
+                sparse_mla_prefill_sm80,
+            )
         else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+            _dequant_paged = dequantize_k_cache_paged
+            if _is_xpu:
+                from sgl_kernel import flash_mla_sparse_fwd
+            else:
+                from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
@@ -4116,14 +4132,14 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            _dequant_paged(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-        dequantize_k_cache_paged(
+        _dequant_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4142,6 +4158,22 @@ class DeepseekV4AttnBackend(
                 attn_sink=attn_sink,
                 topk_length=combined_lens,
             )
+
+        if use_sm80_ws:
+            # [0013] 헤드 패딩(64)은 SM90 커널 전용 — 실제 헤드만 계산. N<=64 는 sm120 분기와 같이 패딩 폭으로 복원.
+            rh = real_heads or q_flat.shape[1]
+            o, _ = sparse_mla_prefill_sm80(
+                q_flat[:, :rh],
+                kv,
+                combined_indices,
+                self.softmax_scale,
+                attn_sink.reshape(-1)[:rh],
+                combined_lens,
+                union_g=sm80_sparse_prefill_union_g(),
+            )
+            if q_flat.shape[1] > rh and q_flat.shape[0] <= 64:
+                o = F.pad(o, (0, 0, 0, q_flat.shape[1] - rh))
+            return o
 
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,

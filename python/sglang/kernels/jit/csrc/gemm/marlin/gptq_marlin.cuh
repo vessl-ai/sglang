@@ -415,7 +415,7 @@ MarlinFuncPtr get_marlin_kernel(
 
   FP4_GET_IF(host::kFE2M1f)
 
-  BIGGROUP_GET_IF(host::kFE4M3fn)
+  COMMON_GET_IF(host::kFE4M3fn)  // SM80 오버레이: group32(group_blocks=2) 포함 (BIGGROUP 은 {-1,8} 만)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -42,6 +43,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.layers.attention.dsv4.sm80_compat import is_sm80_dsv4
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -855,6 +857,15 @@ bcg_deepseek_v4_exit_late_layer_tail = eager_on_graph(True)(
 )
 
 
+def _sm80_decode_real_heads() -> bool:
+    import os as _os_r3
+
+    return (
+        _os_r3.environ.get("SGLANG_SM80_DECODE_REAL_HEADS", "0").lower() in ("1", "true")
+        and envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "triton"
+    )
+
+
 class MqaAttentionBase(nn.Module):
     # Class-level default for subclasses that read it without running __init__.
     wo_a_fp8: bool = False
@@ -1069,7 +1080,10 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
-        if get_platform().is_sm120:
+        if get_platform().is_sm120 or is_sm80_dsv4():
+            # [0015] SM80 Triton decode takes any head count; the 64-head zero pad only serves FlashMLA's h_q specialization.
+            if is_sm80_dsv4() and _sm80_decode_real_heads():
+                return self.n_local_heads
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:
                 return self.n_local_heads
@@ -3065,18 +3079,20 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
+        # [C2] SM80: the bf16x3 compensated projection is plain tl.dot (no DeepGEMM), opt-in via SGLANG_R2_MHC_STATS_BF16X3.
+        _r2_mhc_sm80 = is_sm80_dsv4() and os.environ.get("SGLANG_R2_MHC_STATS_BF16X3", "0").lower() in ("1", "true")
         if (
             self.hc_pre_from_prev_sublayer
-            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and (get_platform().is_sm100 or get_platform().is_sm90 or _r2_mhc_sm80)
             and self.hc_attn_fn.shape == (24, 20480)
-            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and (envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() or _r2_mhc_sm80)
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
-            if get_platform().is_sm90:
-                # Hopper's compensated projection does not require DeepGEMM.
+            if get_platform().is_sm90 or _r2_mhc_sm80:
+                # Hopper's (and, opt-in, SM80's) compensated projection does not require DeepGEMM.
                 self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
             else:
