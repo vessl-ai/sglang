@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple, Optional, Tuple, TypeAlias, Union
 
+import os
+
 import msgspec
 import torch
 import torch.nn.functional as F
@@ -31,6 +33,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.sm80_compat import is_sm80_dsv4
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -272,13 +275,15 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     )
 
     parts = bf16_parts = None
+    # [C2] SM80 opt-in (SGLANG_R2_MHC_STATS_BF16X3): bf16x3 compensated projection for prefill-sized M only.
+    r2_sm80 = is_sm80_dsv4() and os.environ.get("SGLANG_R2_MHC_STATS_BF16X3", "0").lower() in ("1", "true")
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
     if (
         x.is_cuda
         and (x_flat.shape[0] >= 128 or hopper_medium)
         and x_flat.is_contiguous()
-        and (get_platform().is_sm100 or get_platform().is_sm90)
-        and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+        and (get_platform().is_sm100 or get_platform().is_sm90 or r2_sm80)
+        and (envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() or r2_sm80)
         and not is_batch_invariant_mode_enabled()
     ):
         parts, bf16_parts = hc.tf32_parts, hc.bf16_parts
@@ -292,7 +297,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     # gfx950 uses the fused Triton port at every row count (MI350X).
     use_fused_stats = _is_gfx95_supported or (
         torch.version.cuda is not None
-        and (get_platform().is_blackwell or hopper_fused_stats)
+        and (get_platform().is_blackwell or hopper_fused_stats or (r2_sm80 and use_bf16_projection))
     )
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
