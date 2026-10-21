@@ -224,8 +224,11 @@ class TestHiCacheMetrics(unittest.TestCase):
         )
 
     def test_storage_prefetch_outcome_metrics(self):
+        from sglang.srt.environ import envs
+
         labels = {"model_name": "test", "tp_rank": 0}
-        collector = _RecordingStorageMetricsCollector(labels=labels)
+        with envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.override(True):
+            collector = _RecordingStorageMetricsCollector(labels=labels)
 
         for key in StorageMetricsCollector.PREFETCH_OUTCOME_KEYS:
             collector.log_prefetch_outcome(key, 3)
@@ -272,11 +275,8 @@ class TestHiCacheMetrics(unittest.TestCase):
                 getattr(collector, attr).labelnames, ("model_name", "tp_rank", "reason")
             )
 
-    def test_storage_prefetch_outcome_metrics_can_be_disabled(self):
-        from sglang.srt.environ import envs
-
-        with envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.override(False):
-            collector = _RecordingStorageMetricsCollector(labels={"model_name": "t"})
+    def test_storage_prefetch_outcome_metrics_are_off_by_default(self):
+        collector = _RecordingStorageMetricsCollector(labels={"model_name": "t"})
         self.assertFalse(hasattr(collector, "storage_prefetch_revoked_total"))
         self.assertFalse(hasattr(collector, "storage_prefetch_redundant_tokens_total"))
         collector.log_prefetch_outcome("revoked_deadline", 1)  # no-op
@@ -296,7 +296,10 @@ class TestHiCacheMetrics(unittest.TestCase):
             _counter_cls = staticmethod(counter)
             _histogram_cls = staticmethod(histogram)
 
-        collector = _RegistryCollector(labels={"tp_rank": "0"})
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.override(True):
+            collector = _RegistryCollector(labels={"tp_rank": "0"})
         collector.log_prefetch_outcome("revoked_deadline", 2)
         collector.log_prefetch_outcome("redundant_tokens", 640)
         text = prometheus_client.generate_latest(registry).decode()

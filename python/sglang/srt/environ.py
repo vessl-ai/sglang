@@ -768,8 +768,8 @@ class Envs:
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Export the L3 prefetch outcome counters (issued, declined and revoked
     # by reason, requested/miss/redundant tokens) under --enable-metrics.
-    # Set to 0 to keep /metrics exactly as before.
-    SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS = EnvBool(True)
+    # Off by default so /metrics stays exactly as before; set to 1 to export.
+    SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
