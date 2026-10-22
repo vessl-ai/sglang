@@ -417,6 +417,41 @@ class TestMooncakePlacementKey(CustomTestCase):
             ],
         )
 
+    def test_controller_chain_groups_give_kv_and_mamba_the_same_key(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            _trailing_chain_groups,
+        )
+
+        store, fake = _make_store(anchor_pages=4)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store.register_mem_host_pool_v2(FakeMambaPool(), PoolName.MAMBA)
+        chain = _chain(7)
+        prefix, span = chain[:3], chain[3:7]
+        mamba = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=span[-1:],
+            host_indices=torch.tensor([0]),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+        for extra_info, transfers in _trailing_chain_groups(prefix, span, [mamba]):
+            store.batch_set_v2(transfers, extra_info=extra_info)
+        store.batch_set_v1(
+            span,
+            torch.tensor([0, 1, 2, 3]),
+            HiCacheStorageExtraInfo(prefix_keys=prefix),
+        )
+
+        preferred = {
+            key: call["preferred"][0]
+            for call in fake.batch_put_calls
+            for key in call["keys"]
+        }
+        self.assertEqual(preferred["h6_0_temporal"], "placement-key:h4")
+        self.assertEqual(preferred["h6_0_k"], preferred["h6_0_temporal"])
+        self.assertEqual(preferred["h3_0_k"], "placement-key:h0")
+
     def test_v2_multi_buffer_put_passes_the_key(self):
         store, fake = _make_store(is_mla_model=True)
         store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
