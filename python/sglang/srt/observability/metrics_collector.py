@@ -1953,9 +1953,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             )
 
         # Prefetch outcome counters, keyed by the cache's
-        # _prefetch_outcome_stats names. Children are bound once here so the
-        # scheduler-thread path is a dict lookup plus one inc().
-        self._prefetch_outcome_children: Dict[str, Any] = {}
+        # _prefetch_outcome_stats names. Each key maps to (counter, reason);
+        # labels are resolved per call, like the other log_* methods, so a
+        # reattached backend's new labels are followed.
+        self._prefetch_outcome_counters: Dict[str, Any] = {}
         if envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.get():
             self._init_prefetch_outcome_metrics(Counter)
 
@@ -2102,9 +2103,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.storage_prefetch_deadline_tokens_total = Counter(
             name="sglang:storage_prefetch_deadline_tokens_total",
             documentation="Tokens lost to a deadline or stop-policy cut: the "
-            "requested span when the lookup had not answered, the whole hit "
-            "span on an all-or-nothing (hybrid) model, otherwise the "
-            "untransferred tail.",
+            "requested span when the lookup had not answered, the L3 hit span "
+            "when an answered hit was still waiting for staging (buffer mode), "
+            "the whole hit span on an all-or-nothing (hybrid) model, otherwise "
+            "the untransferred tail. A cut that lands before the scheduler "
+            "reads an answered lookup is counted here but not in "
+            "storage_prefetch_requested_tokens_total.",
             labelnames=labelnames,
         )
         self.storage_prefetch_all_or_nothing_tokens_total = Counter(
@@ -2125,17 +2129,23 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         )
         for key, (attr, reason) in self.PREFETCH_OUTCOME_KEYS.items():
             counter = getattr(self, attr)
+            self._prefetch_outcome_counters[key] = (counter, reason)
+            # Create every series at 0 so rate() has a start point.
             if reason is None:
-                child = counter.labels(**self.labels)
+                counter.labels(**self.labels)
             else:
-                child = counter.labels(**self.labels, reason=reason)
-            self._prefetch_outcome_children[key] = child
+                counter.labels(**self.labels, reason=reason)
 
     def log_prefetch_outcome(self, key: str, num: int = 1) -> None:
         """Increment one prefetch outcome counter; unknown keys are ignored."""
-        child = self._prefetch_outcome_children.get(key)
-        if child is not None and num > 0:
-            child.inc(num)
+        entry = self._prefetch_outcome_counters.get(key)
+        if entry is None or num <= 0:
+            return
+        counter, reason = entry
+        if reason is None:
+            counter.labels(**self.labels).inc(num)
+        else:
+            counter.labels(**self.labels, reason=reason).inc(num)
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:

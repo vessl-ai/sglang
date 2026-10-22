@@ -2272,12 +2272,22 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             if cut_reason is not None:
-                # Cut before the lookup answered (or before staging): the
-                # whole requested span is lost to this attempt.
+                # Cut before staging. If the lookup had not answered, the
+                # whole requested span is lost to this attempt. If it had
+                # (a buffer-mode hit parked for staging), its miss is already
+                # in l3_miss_tokens, so only the known hit is lost here.
+                if operation.stats_query_accounted:
+                    lost_tokens = max(
+                        0,
+                        min(
+                            operation.storage_hit_count,
+                            operation.stats_requested_tokens,
+                        ),
+                    )
+                else:
+                    lost_tokens = operation.stats_requested_tokens
                 self._count_prefetch_outcome(f"revoked_{cut_reason}")
-                self._count_prefetch_outcome(
-                    "deadline_tokens", operation.stats_requested_tokens
-                )
+                self._count_prefetch_outcome("deadline_tokens", lost_tokens)
             self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
@@ -2710,6 +2720,7 @@ class UnifiedRadixCache(BasePrefixCache):
         requested = operation.stats_requested_tokens
         if requested <= 0:
             return
+        operation.stats_query_accounted = True
         hit = max(0, min(operation.storage_hit_count, requested))
         if revoked:
             if hit > 0:

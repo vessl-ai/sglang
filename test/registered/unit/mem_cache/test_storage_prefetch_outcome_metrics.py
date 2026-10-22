@@ -141,6 +141,24 @@ class TestPrefetchDeadline(unittest.TestCase):
         cache._can_terminate_prefetch.assert_not_called()
         cache.revoke_pending_prefetch.assert_called_once_with(_REQ)
 
+    def test_cut_of_a_parked_hit_loses_only_the_known_hit(self):
+        # Buffer mode: the lookup answered (requested and miss already
+        # counted) but the hit was parked for staging when the cut came.
+        cache = _cache()
+        op = _operation(requested=10 * _PAGE)
+        op.storage_hit_count = 6 * _PAGE
+        cache._account_prefetch_outcome(op, revoked=False)
+        _track(cache, op)
+
+        cache.check_prefetch_progress(_REQ)
+
+        stats = cache._prefetch_outcome_stats
+        self.assertEqual(stats["l1l2_miss_tokens"], 10 * _PAGE)
+        self.assertEqual(stats["l3_miss_tokens"], 4 * _PAGE)
+        self.assertEqual(stats["revoked_deadline"], 1)
+        self.assertEqual(stats["deadline_tokens"], 6 * _PAGE)
+        cache.revoke_pending_prefetch.assert_called_once_with(_REQ)
+
     def test_cut_mid_transfer_is_handed_to_the_result_handler(self):
         cache = _cache()
         op = _operation()

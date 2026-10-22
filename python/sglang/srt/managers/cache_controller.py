@@ -238,6 +238,9 @@ class StorageOperation:
         # Set by the tree cache when its stop policy cuts a prefetch that
         # was still transferring ("deadline" or "stop_policy").
         self.stats_cut_reason: Optional[str] = None
+        # Set once the tree cache has counted this operation's L3 lookup
+        # result (requested and miss tokens).
+        self.stats_query_accounted = False
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
 

@@ -275,6 +275,28 @@ class TestHiCacheMetrics(unittest.TestCase):
                 getattr(collector, attr).labelnames, ("model_name", "tp_rank", "reason")
             )
 
+    def test_storage_prefetch_outcome_metrics_follow_relabel(self):
+        # A reattached storage backend reuses the collector with new labels.
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS.override(True):
+            collector = _RecordingStorageMetricsCollector(
+                labels={"storage_backend": "a"}
+            )
+        collector.log_prefetch_outcome("issued", 1)
+        collector.labels = {"storage_backend": "b"}
+        collector.log_prefetch_outcome("issued", 2)
+        collector.log_prefetch_outcome("revoked_deadline", 3)
+
+        self.assertEqual(
+            collector.storage_prefetch_issued_total.increments,
+            [({"storage_backend": "a"}, 1), ({"storage_backend": "b"}, 2)],
+        )
+        self.assertEqual(
+            collector.storage_prefetch_revoked_total.increments,
+            [({"storage_backend": "b", "reason": "deadline"}, 3)],
+        )
+
     def test_storage_prefetch_outcome_metrics_are_off_by_default(self):
         collector = _RecordingStorageMetricsCollector(labels={"model_name": "t"})
         self.assertFalse(hasattr(collector, "storage_prefetch_revoked_total"))
