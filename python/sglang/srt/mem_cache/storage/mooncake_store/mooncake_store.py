@@ -28,8 +28,39 @@ from sglang.srt.observability.metrics_collector import StorageMetrics
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
+# A preferred_segments entry with this prefix names a placement key instead of
+# a segment. A Mooncake master started with --placement_key_hrw (vessl-ai
+# fork) ranks the serving segments by HRW hash of the key, so puts that share
+# a key share a segment. Other masters see a segment name that does not exist
+# and place the put as before.
+PLACEMENT_KEY_PREFIX = "placement-key:"
 
 logger = logging.getLogger(__name__)
+
+
+def chain_anchor_keys(
+    prefix_keys: List[str], keys: List[str], anchor_pages: int
+) -> List[str]:
+    """Anchor page hash of every page in `keys`; prefix_keys + keys is one chain.
+
+    Pages before chain position `anchor_pages` are anchored at the chain root
+    (shared by every chain with the same first page, e.g. a system prompt);
+    later pages at the chain's page `anchor_pages`, whose chained hash is in
+    practice unique to one conversation. A chain then touches at most two
+    segments. anchor_pages <= 0 anchors every page at the root.
+    """
+    chain_len = len(prefix_keys)
+    root = prefix_keys[0] if prefix_keys else keys[0]
+    anchors = []
+    for i in range(len(keys)):
+        pos = chain_len + i
+        if anchor_pages <= 0 or pos < anchor_pages:
+            anchors.append(root)
+        elif anchor_pages < chain_len:
+            anchors.append(prefix_keys[anchor_pages])
+        else:
+            anchors.append(keys[anchor_pages - chain_len])
+    return anchors
 
 
 class MooncakeHostTensorAllocator(HostTensorAllocator):
@@ -437,6 +468,28 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
 
+            self.placement_key_enabled = (
+                envs.SGLANG_HICACHE_MOONCAKE_PLACEMENT_KEY.get()
+            )
+            self.placement_anchor_pages = (
+                envs.SGLANG_HICACHE_MOONCAKE_PLACEMENT_ANCHOR_PAGES.get()
+            )
+            self._warned_placement_without_prefix_keys = False
+            if self.placement_key_enabled:
+                if self._replicate_config_cls is None:
+                    logger.warning(
+                        "SGLANG_HICACHE_MOONCAKE_PLACEMENT_KEY is set, but "
+                        "mooncake.store.ReplicateConfig is not available. "
+                        "Puts keep the default placement."
+                    )
+                    self.placement_key_enabled = False
+                else:
+                    logger.info(
+                        "Mooncake placement keys enabled: anchor_pages=%d. "
+                        "Takes effect only on a master with --placement_key_hrw.",
+                        self.placement_anchor_pages,
+                    )
+
             # Check server status
             if self.config.check_server:
                 self.check_server()
@@ -761,6 +814,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return None
         return [group_ids[i] for i in indices]
 
+    def _placement_keys(
+        self,
+        logical_keys: List[str],
+        key_multiplier: int,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> Optional[List[str]]:
+        """Placement key of every object of the pages `logical_keys`, or None.
+
+        `logical_keys` are untagged page hashes. All objects of one page (K/V,
+        every TP rank's shard, Mamba and draft sidecars) get the page's key,
+        so they land on the same segment. Needs the chain prefix
+        (hicache_storage_pass_prefix_keys); without it the position of the
+        pages in their chain is unknown and the put keeps the default
+        placement.
+        """
+        if not getattr(self, "placement_key_enabled", False):
+            return None
+        prefix_keys = extra_info.prefix_keys if extra_info is not None else None
+        if prefix_keys is None:
+            if not self._warned_placement_without_prefix_keys:
+                logger.warning(
+                    "Mooncake placement keys need the chain prefix: set "
+                    "hicache_storage_pass_prefix_keys=true in the storage "
+                    "extra config. Puts without it keep the default placement."
+                )
+                self._warned_placement_without_prefix_keys = True
+            return None
+        anchors = self._tag_keys(
+            chain_anchor_keys(prefix_keys, logical_keys, self.placement_anchor_pages)
+        )
+        placement_keys = []
+        for anchor in anchors:
+            placement_keys.extend([PLACEMENT_KEY_PREFIX + anchor] * key_multiplier)
+        return placement_keys
+
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
@@ -922,7 +1010,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         final_pages = restorable[-1] if restorable else 0
         return PoolTransferResult(final_pages, hit_count, restorable)
 
-    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+    def _batch_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
         # storage objects per logical page, but API still reports page-level result.
         results: dict = {}
@@ -951,6 +1044,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if self._can_use_group_semantics()
                     else None
                 )
+                placement_keys = self._placement_keys(keys, key_multiplier, extra_info)
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
@@ -960,6 +1054,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
                         self._filter_group_ids(group_ids, missing_idx),
+                        placement_keys=(
+                            [placement_keys[i] for i in missing_idx]
+                            if placement_keys is not None
+                            else None
+                        ),
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
@@ -984,7 +1083,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        return self._batch_io_v2(transfers, is_set=True, extra_info=extra_info)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1128,6 +1227,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
+        logical_keys = keys
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
@@ -1138,6 +1238,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if self._can_use_group_semantics()
             else None
         )
+        placement_keys = self._placement_keys(logical_keys, key_multiplier, extra_info)
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
@@ -1162,6 +1263,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_buffer_ptrs,
                 set_buffer_sizes,
                 self._filter_group_ids(group_ids, set_indices),
+                placement_keys=(
+                    [placement_keys[i] for i in set_indices]
+                    if placement_keys is not None
+                    else None
+                ),
             )
             end_time = time.perf_counter()
 
@@ -1342,7 +1448,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
+        placement_keys: Optional[List[str]] = None,
     ) -> List[int]:
+        if placement_keys is not None:
+            return self._put_batch_by_placement_key(
+                key_strs, buffer_ptrs, buffer_sizes, group_ids, placement_keys
+            )
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
@@ -1364,6 +1475,52 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         else:
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+
+    def _put_batch_by_placement_key(
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        group_ids: Optional[List[str]],
+        placement_keys: List[str],
+    ) -> List[int]:
+        """One put call per placement key (a ReplicateConfig applies to the
+        whole batch). A backup batch has at most two keys: the chain root and
+        the anchor page. Results come back in the order of key_strs."""
+        if len(placement_keys) != len(key_strs):
+            raise ValueError(
+                "Mooncake placement_keys length must match key_strs length: "
+                f"{len(placement_keys)} != {len(key_strs)}"
+            )
+        use_group_ids = self._can_use_group_semantics() and group_ids is not None
+        if use_group_ids and len(group_ids) != len(key_strs):
+            raise ValueError(
+                "Mooncake group_ids length must match key_strs length: "
+                f"{len(group_ids)} != {len(key_strs)}"
+            )
+        indices_by_key = {}
+        for i, placement_key in enumerate(placement_keys):
+            indices_by_key.setdefault(placement_key, []).append(i)
+
+        # A short or missing result list leaves the rest failed (-1).
+        results = [-1] * len(key_strs)
+        for placement_key, indices in indices_by_key.items():
+            config = self._replicate_config_cls()
+            config.preferred_segments = [placement_key]
+            if use_group_ids:
+                config.group_ids = [group_ids[i] for i in indices]
+            keys = [key_strs[i] for i in indices]
+            ptrs = [buffer_ptrs[i] for i in indices]
+            sizes = [buffer_sizes[i] for i in indices]
+            if self._uses_multi_buffer(buffer_ptrs):
+                put_results = self.store.batch_put_from_multi_buffers(
+                    keys, ptrs, sizes, config
+                )
+            else:
+                put_results = self.store.batch_put_from(keys, ptrs, sizes, config)
+            for i, res in zip(indices, put_results or []):
+                results[i] = res
+        return results
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
