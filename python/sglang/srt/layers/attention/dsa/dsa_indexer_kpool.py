@@ -1451,8 +1451,10 @@ class IndexerKPool(MultiPlatformOp):
                             token_page_table, kpool
                         )[:pool_pages].contiguous()
                     seq_len_t = torch.tensor(
-                        [pool_seq_len], dtype=torch.int32, device=q_fp8.device
-                    )
+                        [pool_seq_len],
+                        dtype=torch.int32,
+                        pin_memory=True,  # pinned, avoids a stream sync; eager only
+                    ).to(q_fp8.device, non_blocking=True)
                     k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                         layer_id,
                         seq_len_t,

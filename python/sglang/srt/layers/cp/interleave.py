@@ -149,8 +149,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             metadata.moe_local_token_count = torch.tensor(
                 lengths[self.cp_rank],
                 dtype=torch.int32,
-                device=forward_batch.input_ids.device,
-            )
+                pin_memory=True,  # pinned, avoids a stream sync; eager only
+            ).to(forward_batch.input_ids.device, non_blocking=True)
         return metadata.moe_local_token_count
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
