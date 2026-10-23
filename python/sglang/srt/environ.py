@@ -85,6 +85,17 @@ class EnvField:
             )
             return default
 
+    def get_strict(self) -> Any:
+        """Like get(), but a malformed value raises a ValueError naming the variable
+        instead of warning and falling back to the default."""
+        value = os.getenv(self.name)
+        if value is None or not value.strip():
+            return self._resolve_default()
+        try:
+            return self.parse(value.strip())
+        except ValueError as e:
+            raise ValueError(f"{self.name}: {e}") from None
+
     def is_set(self):
         return self.name in os.environ
 
@@ -1744,6 +1755,11 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # SM8x (A100) TileLang sparse MLA: split-K for decode / verify steps with few query
+    # rows, and the "block_I,num_stages,threads" tile of the V1 prefill kernel. Empty
+    # keeps the kernel defaults, and 32,1,128 on the fp8 KV path.
+    SGLANG_SM80_SPARSE_MLA_DECODE_SPLIT = EnvBool(False)
+    SGLANG_SM80_SPARSE_MLA_V1_CFG = EnvStr("")
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.

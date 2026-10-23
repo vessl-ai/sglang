@@ -208,6 +208,17 @@ def _trim_trtllm_decode_dp_padding(
     )
 
 
+def _decode_split_allowed(forward_mode) -> bool:
+    # Split-K sparse MLA only for decode / verify / draft extend. Prefill and extend
+    # keep the V1 kernel: under the breakable prefill graph their attention runs as an
+    # eager break on bucket-padded q.
+    return (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend_v2()
+    )
+
+
 def _restore_trtllm_decode_dp_padding(
     output: torch.Tensor, num_padding_rows: int
 ) -> torch.Tensor:
@@ -2309,6 +2320,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                allow_decode_split=_decode_split_allowed(forward_batch.forward_mode),
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2637,6 +2649,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                allow_decode_split=_decode_split_allowed(forward_batch.forward_mode),
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3392,6 +3405,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        allow_decode_split: bool = False,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -3414,6 +3428,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            allow_decode_split=allow_decode_split,
         )
 
     def _forward_triton_decode(

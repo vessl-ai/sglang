@@ -6,6 +6,11 @@ import tilelang
 import tilelang.language as T
 import torch
 
+from sglang.kernels.ops.attention.dsa.sm80 import (
+    decode_split_enabled,
+    is_sm80_family,
+    sm80_v1_cfg,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
 
@@ -46,6 +51,14 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+
+def _sm80_v1_kwargs(device_index, tail_dim) -> dict:
+    cfg = sm80_v1_cfg()
+    if cfg is None or tail_dim != 0 or not is_sm80_family(device_index):
+        return {}
+    return dict(zip(("block_I", "num_stages", "threads"), cfg))
+
 
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
@@ -1357,12 +1370,60 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+# On SM8x, decode / target-verify / draft-extend steps with few query rows split the
+# top-k over blocks (the partial kernel writes into a reusable workspace) and merge
+# with the combine kernel, so that the work still fills the SMs. Above the gate the
+# single V1 kernel is faster (A100: 1.19x at 48 token-heads, 1.02x at 56, 0.91x at 64).
+_DECODE_SPLIT_MAX_TOKEN_HEADS = 768
+_decode_split_workspace: dict = {}
+
+
+@functools.cache
+def _decode_split_partial_jit():
+    # The in-tree partial kernel without out_idx: its outputs are workspace views.
+    return tilelang.jit(pass_configs=sparse_mla_fwd_decode_partial.pass_configs)(
+        sparse_mla_fwd_decode_partial.func.orig_func
+    )
+
+
+def _use_decode_split(
+    num_tokens: int, num_heads: int, allow: bool, device_index
+) -> bool:
+    if not allow or _is_hip or num_heads % 4 or not is_sm80_family(device_index):
+        return False
+    if not decode_split_enabled():
+        return False
+    padded_heads = max(1 << (num_heads - 1).bit_length(), 16)
+    return 0 < num_tokens * padded_heads <= _DECODE_SPLIT_MAX_TOKEN_HEADS
+
+
+def _decode_split_partials(tokens: int, groups: int, heads: int, d_v: int, device):
+    """Grow-only partial buffers per (device, stream); older ones stay alive for the
+    CUDA graphs that captured them."""
+    key = (device.index, torch.cuda.current_stream(device).cuda_stream)
+    bufs = _decode_split_workspace.setdefault(key, [])
+    need_lse = tokens * groups * heads
+    for o_buf, lse_buf in reversed(bufs):
+        if lse_buf.numel() >= need_lse:
+            break
+    else:
+        cap = 1 << max(need_lse - 1, 1).bit_length()
+        o_buf = torch.empty(cap * d_v, dtype=torch.bfloat16, device=device)
+        lse_buf = torch.empty(cap, dtype=torch.float32, device=device)
+        bufs.append((o_buf, lse_buf))
+    return (
+        o_buf[: need_lse * d_v].view(1, tokens, groups, heads, d_v),
+        lse_buf[:need_lse].view(1, tokens, groups, heads),
+    )
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    allow_decode_split: bool = False,  # set by the caller from the forward mode
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1372,6 +1433,26 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if not is_fp8_kv and _use_decode_split(
+        q.shape[0], num_heads, allow_decode_split, q.device.index
+    ):
+        ni = topk // 64
+        partial_o, partial_lse = _decode_split_partials(
+            q.shape[0], ni, num_heads, d_v, q.device
+        )
+        _decode_split_partial_jit()(
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            block_I=64,
+            inner_iter=1,
+            threads=256,
+        )(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), partial_o, partial_lse)
+        return sparse_mla_fwd_decode_combine(
+            num_heads, d_v, ni * 64, head_per_block=4, block_I=64, threads=256
+        )(partial_o, partial_lse)
     if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
@@ -1431,7 +1512,14 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        kernel = kernel_factory(
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            **_sm80_v1_kwargs(q.device.index, tail_dim),
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
