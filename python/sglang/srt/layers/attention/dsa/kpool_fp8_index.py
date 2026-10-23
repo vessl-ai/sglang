@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.fp8_e4m3_sw import (
+    fp8_store_value,
+)
+from sglang.kernels.ops.attention.dsa.sm80 import is_sm80_family
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
@@ -746,7 +750,8 @@ def kpool_softmax_rotate_write_cache(
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    sw_fp8 = is_sm80_family(buf.device.index)
+    buf_fp8 = buf if sw_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     if return_compressed:
         compressed_k = torch.empty(
@@ -768,7 +773,7 @@ def kpool_softmax_rotate_write_cache(
         ape,
         loc,
         write_mask,
-        compressed_k,
+        compressed_k.view(torch.uint8) if sw_fp8 else compressed_k,
         compressed_scale,
         slot_k.stride(0),
         slot_k.stride(1),
@@ -786,6 +791,7 @@ def kpool_softmax_rotate_write_cache(
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
         BLOCK_D=triton.next_power_of_2(slot_k.shape[2]),
+        SW_FP8=sw_fp8,
     )
     if return_compressed:
         return compressed_k, compressed_scale
@@ -844,7 +850,8 @@ def kpool_decode_update_and_maybe_write_cache(
     assert block_tables.ndim == 2
     assert block_tables.shape[0] >= batch
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    sw_fp8 = is_sm80_family(buf.device.index)
+    buf_fp8 = buf if sw_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
         buf_fp8,
@@ -880,6 +887,7 @@ def kpool_decode_update_and_maybe_write_cache(
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         INDEX_PAGE_SIZE=pool.index_page_size,
+        SW_FP8=sw_fp8,
     )
 
 
@@ -932,6 +940,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SW_FP8: tl.constexpr = False,  # SM80 family: store e4m3fn bytes into a uint8 view
 ):
     row = tl.program_id(0)
     do_write = True
@@ -1016,12 +1025,14 @@ def _kpool_softmax_rotate_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+        tl.store(
+            buf_fp8_ptr + out_k_offsets, fp8_store_value(quantized, SW_FP8), mask=mask
+        )
         tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
-            quantized,
+            fp8_store_value(quantized, SW_FP8),
             mask=offs < HEAD_DIM,
         )
         tl.store(compressed_scale_ptr + row, scale)
@@ -1062,6 +1073,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
+    SW_FP8: tl.constexpr = False,  # SM80 family: store e4m3fn bytes into a uint8 view
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -1185,7 +1197,11 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             + loc_token_offset_in_page
         )
 
-        tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+        tl.store(
+            buf_fp8_ptr + out_k_offsets,
+            fp8_store_value(quantized, SW_FP8),
+            mask=dim_mask,
+        )
         tl.store(buf_fp32_ptr + out_s_offset, scale)
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
@@ -1242,6 +1258,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
+    SW_FP8: tl.constexpr = False,  # SM80 family: store e4m3fn bytes into a uint8 view
 ):
     row = tl.program_id(0)
     if HAS_WRITE_MASK:
@@ -1299,7 +1316,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         + loc_token_offset_in_page
     )
 
-    tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
+    tl.store(buf_fp8_ptr + out_k_offsets, fp8_store_value(quantized, SW_FP8), mask=mask)
     tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1335,7 +1352,8 @@ def kpool_assemble_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    sw_fp8 = is_sm80_family(buf.device.index)
+    buf_fp8 = buf if sw_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     index_page_size = pool.index_page_size
 
@@ -1367,6 +1385,7 @@ def kpool_assemble_softmax_rotate_write_cache(
         HAS_WRITE_MASK=has_write_mask,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
         INDEX_PAGE_SIZE=index_page_size,
+        SW_FP8=sw_fp8,
     )
 
 
@@ -1610,6 +1629,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
+    SW_FP8: tl.constexpr = False,  # SM80 family: store e4m3fn bytes into a uint8 view
 ):
     b = tl.program_id(0)
     cache_loc_0 = tl.load(out_cache_loc_ptr + b * N)
@@ -1684,7 +1704,11 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 + S_OFFSET_NBYTES_IN_PAGE // 4
                 + loc_token_offset_in_page
             )
-            tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
+            tl.store(
+                buf_fp8_ptr + out_k_offsets,
+                fp8_store_value(quantized, SW_FP8),
+                mask=dim_mask,
+            )
             tl.store(buf_fp32_ptr + out_s_offset, scale)
 
 
@@ -1738,7 +1762,8 @@ def kpool_write_tail_and_maybe_compress(
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
     index_page_size = pool.index_page_size
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    sw_fp8 = is_sm80_family(buf.device.index)
+    buf_fp8 = buf if sw_fp8 else buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
         key,
@@ -1772,4 +1797,5 @@ def kpool_write_tail_and_maybe_compress(
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
+        SW_FP8=sw_fp8,
     )
