@@ -486,6 +486,21 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+@functools.lru_cache(maxsize=1)
+def cp_min_extend_tokens() -> int:
+    """Smallest number of new tokens (summed over an extend batch) that interleave
+    prefill CP splits across the CP ranks. Smaller extends run without CP and can
+    replay the prefill CUDA graph. 0, the default, applies CP to every extend.
+    Cached; tests that change the variable call cp_min_extend_tokens.cache_clear()."""
+    from sglang.srt.environ import envs
+
+    field = envs.SGLANG_CP_MIN_EXTEND_TOKENS
+    value = field.get_strict()
+    if value < 0:
+        raise ValueError(f"{field.name} must be >= 0, got {value}")
+    return value
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 

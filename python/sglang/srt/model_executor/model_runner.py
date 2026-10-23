@@ -184,6 +184,7 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
+    cp_min_extend_tokens,
     get_context,
     get_device,
     get_exec,
@@ -275,10 +276,16 @@ class SamplingPrewarmResult:
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
-    """Allow CP only through a runner that captured the validated CP body."""
-    return get_cp_strategy() is None or (
-        bool(getattr(prefill_runner, "enable_cp_bcg_capture", False))
-        and is_cp_active(forward_batch)
+    """Allow CP only through a runner that captured the validated CP body. With a CP
+    token threshold, an extend below it runs without CP and may replay the plain graph."""
+    if get_cp_strategy() is None:
+        return True
+    if bool(getattr(prefill_runner, "enable_cp_bcg_capture", False)):
+        return is_cp_active(forward_batch)
+    return (
+        cp_min_extend_tokens() > 0
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and not is_cp_active(forward_batch)
     )
 
 

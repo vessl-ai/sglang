@@ -28,6 +28,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
+    cp_min_extend_tokens,
     derive_attn_tp_size,
     get_platform,
 )
@@ -145,6 +146,19 @@ def handle_context_parallelism(server_args: Any):
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
+        )
+    if cp_min_extend_tokens() > 0 and not cfg.enable_prefill_cp:
+        logger.info(
+            "SGLANG_CP_MIN_EXTEND_TOKENS=%d has no effect without --enable-prefill-cp.",
+            cp_min_extend_tokens(),
+        )
+    if (
+        cp_min_extend_tokens() > 0
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy != "interleave"
+    ):
+        raise ValueError(
+            "SGLANG_CP_MIN_EXTEND_TOKENS is only implemented for --cp-strategy interleave."
         )
 
     view = resolved_view(server_args)

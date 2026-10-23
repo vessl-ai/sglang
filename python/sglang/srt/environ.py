@@ -1743,6 +1743,13 @@ class Envs:
     SGLANG_INKLING_RS_MM_PREPROCESS = EnvBool(True)
 
     # ===================================================================
+    # Prefill context parallelism
+    # ===================================================================
+    # Interleave prefill CP: minimum new tokens of an extend batch to split across the CP
+    # ranks; smaller extends run without CP (and can use the prefill CUDA graph). 0 = off.
+    SGLANG_CP_MIN_EXTEND_TOKENS = EnvInt(0)
+
+    # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
     SGLANG_DSA_FUSE_TOPK = EnvBool(True)

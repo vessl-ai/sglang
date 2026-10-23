@@ -19,6 +19,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
+    cp_min_extend_tokens,
     get_disagg,
     get_memory,
     get_parallel,
@@ -240,6 +241,7 @@ def can_dsa_prefill_cp_interleave(forward_batch: "ForwardBatch"):
         and seq_len > 0
         and seq_len >= cp_size
         and cp_size > 1
+        and seq_len >= cp_min_extend_tokens()
     )
 
 

@@ -47,7 +47,7 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     is_allocation_symmetric,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import cp_min_extend_tokens, get_parallel
 
 
 def attn_cp_interleave_gather(hidden_states: torch.Tensor):
@@ -158,7 +158,12 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
-        return seq_len > 0 and seq_len >= cp_size and cp_size > 1
+        return (
+            seq_len > 0
+            and seq_len >= cp_size
+            and cp_size > 1
+            and seq_len >= cp_min_extend_tokens()
+        )
 
     def build_metadata(
         self,

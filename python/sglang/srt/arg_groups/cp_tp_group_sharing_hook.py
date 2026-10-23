@@ -11,6 +11,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import cp_min_extend_tokens
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -79,12 +80,11 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
-    declare_resolution(
-        server_args,
-        "resolve_cp_tp_group_sharing",
-        enable_cp_tp_group_sharing=True,
-        # The sequence collectives have batch-dependent sizes.
-        cuda_graph_config=with_phase(
+    updates: dict[str, Any] = {"enable_cp_tp_group_sharing": True}
+    if cp_min_extend_tokens() <= 0:
+        # The sequence collectives have batch-dependent sizes. With a CP token
+        # threshold only the batches below it replay the graph, and they run without CP.
+        updates["cuda_graph_config"] = with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        ),
-    )
+        )
+    declare_resolution(server_args, "resolve_cp_tp_group_sharing", **updates)

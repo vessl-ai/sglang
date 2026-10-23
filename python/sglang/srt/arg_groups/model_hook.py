@@ -39,6 +39,7 @@ from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import (
     attn_dp_enabled_of,
+    cp_min_extend_tokens,
     derive_attn_tp_size,
     get_platform,
 )
@@ -305,15 +306,18 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        cuda_graph_config=with_phase(
-                            cfg.cuda_graph_config,
-                            Phase.PREFILL,
-                            backend=Backend.DISABLED,
-                        ),
-                    )
+                    # With a CP token threshold the prefill graph stays on for the
+                    # batches below it, which run without CP.
+                    if cp_min_extend_tokens() <= 0:
+                        declare_resolution(
+                            server_args,
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     attn_tp_size = derive_attn_tp_size(

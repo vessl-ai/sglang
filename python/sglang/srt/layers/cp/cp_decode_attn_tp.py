@@ -15,7 +15,13 @@ import torch
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
+from sglang.srt.runtime_context import cp_min_extend_tokens, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -73,10 +79,19 @@ class CpDecodeAttnTpContext:
             self.use_decode_attn_tp = False
             return
         # Skip during prefill context parallel (needs all heads); apply on every
-        # other forward, which includes decode.
-        self.use_decode_attn_tp = not is_cp_active(
-            forward_batch
-        ) and not dsa_use_prefill_cp(forward_batch)
+        # other forward, which includes decode and target-verify. A prefill graph kept
+        # alive by SGLANG_CP_MIN_EXTEND_TOKENS replays attention from "break" functions
+        # that see the unsliced head count, so it keeps all heads too.
+        in_prefill_graph = (
+            cp_min_extend_tokens() > 0
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and (is_in_breakable_cuda_graph() or is_in_tc_piecewise_cuda_graph())
+        )
+        self.use_decode_attn_tp = (
+            not is_cp_active(forward_batch)
+            and not dsa_use_prefill_cp(forward_batch)
+            and not in_prefill_graph
+        )
 
     def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
         assert dim in (0, 1)

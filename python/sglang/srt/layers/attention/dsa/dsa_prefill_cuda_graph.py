@@ -62,7 +62,7 @@ def pcg_dsa_indexer_prefill_split(
     return_indices = topk_result.numel() != 0
     k_only = not return_indices or (
         indexer._should_skip_logits_computation(forward_batch)
-        and not indexer.dsa_enable_prefill_cp
+        and not indexer._runs_with_prefill_cp(forward_batch)
     )
     if k_only:
         indexer._forward_cuda_k_only(
