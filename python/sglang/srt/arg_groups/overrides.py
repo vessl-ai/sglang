@@ -569,8 +569,14 @@ def _check_dsa_backend_constraints(
     import torch
 
     major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (8, 0):
+        raise ValueError("CUDA TileLang FP8 KV requires SM80 or newer.")
     if (major, minor) < (8, 9):
-        raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
+        # SM80 family: the KV pool stays fp8 and the TileLang kernels convert it to
+        # bf16 in-kernel. Validate the tile settings at boot instead of at first use.
+        from sglang.kernels.ops.attention.dsa.sm80 import validate_sm80_fp8kv
+
+        validate_sm80_fp8kv()
 
 
 def _check_tilelang_dsa_fp8_kv(

@@ -7,9 +7,11 @@ import tilelang.language as T
 import torch
 
 from sglang.kernels.ops.attention.dsa.sm80 import (
+    FP8KV_DEFAULT_V1_CFG,
     decode_split_enabled,
     is_sm80_family,
     sm80_v1_cfg,
+    validate_sm80_fp8kv,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -53,19 +55,57 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
-def _sm80_v1_kwargs(device_index, tail_dim) -> dict:
-    cfg = sm80_v1_cfg()
-    if cfg is None or tail_dim != 0 or not is_sm80_family(device_index):
-        return {}
-    return dict(zip(("block_I", "num_stages", "threads"), cfg))
-
-
 BF16 = "bfloat16"
 FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
 FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
 UINT8 = "uint8"
+_FP8X8_SRC = r"""
+#include <cuda_bf16.h>
+__device__ __forceinline__ void tl_fp8x8_to_bf16x8(const void* src, void* dst) {
+  const uint2 q = *reinterpret_cast<const uint2*>(src);
+  const __nv_bfloat162 bias = __float2bfloat162_rn(0x1p120f);
+  unsigned int w[2] = {q.x, q.y};
+  uint4 o;
+  unsigned int* op = reinterpret_cast<unsigned int*>(&o);
+#pragma unroll
+  for (int k = 0; k < 2; ++k) {
+    const unsigned int x = w[k];
+    const unsigned int y = x << 8;
+    const unsigned int a = (x & 0x80008000u) | ((x & 0x7F007F00u) >> 4);
+    const unsigned int c = (y & 0x80008000u) | ((y & 0x7F007F00u) >> 4);
+    unsigned int lo = __byte_perm(c, a, 0x5410), hi = __byte_perm(c, a, 0x7632);
+    __nv_bfloat162 l = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&lo), bias);
+    __nv_bfloat162 h = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&hi), bias);
+    op[2 * k] = *reinterpret_cast<unsigned int*>(&l);
+    op[2 * k + 1] = *reinterpret_cast<unsigned int*>(&h);
+  }
+  *reinterpret_cast<uint4*>(dst) = o;
+}
+"""
+
+
+def _sm80_v1_kwargs(device_index, tail_dim, fp8_kv=False) -> dict:
+    if tail_dim != 0 or not is_sm80_family(device_index):
+        return {}
+    cfg = sm80_v1_cfg()
+    if cfg is None and fp8_kv:
+        cfg = FP8KV_DEFAULT_V1_CFG
+    kwargs = dict(zip(("block_I", "num_stages", "threads"), cfg)) if cfg else {}
+    if fp8_kv:
+        kwargs["fp8_kv"] = True
+    return kwargs
+
+
+def _check_fp8kv_factory(fp8_kv: bool, dim: int, num_stages: int) -> None:
+    """Backstop for the settings validate_sm80_fp8kv checks at boot."""
+    if not fp8_kv:
+        return
+    if num_stages != 1:
+        raise ValueError("the packed fp8 KV converter requires num_stages == 1")
+    if dim % 8:
+        raise ValueError(f"the packed fp8 KV converter needs dim % 8 == 0, got {dim}")
 
 
 def fast_log2_ceil(x):
@@ -284,7 +324,9 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    fp8_kv=False,
 ):
+    _check_fp8kv_factory(fp8_kv, dim, num_stages)
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
     )
@@ -334,7 +376,7 @@ def sparse_attention_fwd_kernel_v1(
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
-        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, UINT8 if fp8_kv else dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
@@ -347,6 +389,8 @@ def sparse_attention_fwd_kernel_v1(
             if has_tail:
                 Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
             KV_shared = T.alloc_shared([BI, D], dtype)
+            if fp8_kv:
+                KV_raw = T.alloc_shared([BI, D], UINT8)
             if has_tail:
                 K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             O_shared = T.alloc_shared([H_per_block, D], dtype)
@@ -381,10 +425,26 @@ def sparse_attention_fwd_kernel_v1(
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
-                for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
-                    ]
+                if fp8_kv:
+                    # Raw byte gather (vectorizable), then a packed shared-to-shared convert.
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        KV_raw[bi_i, d_i] = KV[
+                            b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        ]
+                    T.import_source(_FP8X8_SRC)
+                    for bi_i, j_i in T.Parallel(BI, D // 8):
+                        T.call_extern(
+                            "handle",
+                            "tl_fp8x8_to_bf16x8",
+                            T.address_of(KV_raw[bi_i, j_i * 8]),
+                            T.address_of(KV_shared[bi_i, j_i * 8]),
+                        )
+                    T.sync_threads()
+                else:
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        KV_shared[bi_i, d_i] = KV[
+                            b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
+                        ]
                 if has_tail:
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         K_tail_shared[bi_i, d_i] = KV[
@@ -842,12 +902,14 @@ def sparse_mla_fwd_decode_partial(
     inner_iter=1,
     num_stages=1,
     threads=256,
+    fp8_kv=False,
 ):
     """
     grid: (seq_len * REPLICATE_H, top_k / block_I / inner_iter)
     Each GPU block processes `inner_iter` consecutive KV tiles and writes one (partial_o, partial_lse) entry.
     """
 
+    _check_fp8kv_factory(fp8_kv, dim, num_stages)
     assert is_causal == True, "non-causal is not supported"
     assert kv_group == 1
     assert topk % block_I == 0
@@ -890,7 +952,7 @@ def sparse_mla_fwd_decode_partial(
     @T.prim_func
     def main(
         Q: T.Tensor(q_shape, dtype),
-        KV: T.Tensor(kv_shape, dtype),
+        KV: T.Tensor(kv_shape, UINT8 if fp8_kv else dtype),
         Indices: T.Tensor(indices_shape, indices_dtype),
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
@@ -906,6 +968,8 @@ def sparse_mla_fwd_decode_partial(
                     Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
 
             KV_shared = T.alloc_shared([BI, D], dtype)
+            if fp8_kv:
+                KV_raw = T.alloc_shared([BI, D], UINT8)
             if has_tail:
                 K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
             S_shared = T.alloc_shared([H_per_block, BI], dtype)
@@ -938,11 +1002,27 @@ def sparse_mla_fwd_decode_partial(
 
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
-                for bi_i, d_i in T.Parallel(BI, D):
-                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
-                    ]
+                if fp8_kv:
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                        KV_raw[bi_i, d_i] = KV[
+                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
+                        ]
+                    T.import_source(_FP8X8_SRC)
+                    for bi_i, j_i in T.Parallel(BI, D // 8):
+                        T.call_extern(
+                            "handle",
+                            "tl_fp8x8_to_bf16x8",
+                            T.address_of(KV_raw[bi_i, j_i * 8]),
+                            T.address_of(KV_shared[bi_i, j_i * 8]),
+                        )
+                    T.sync_threads()
+                else:
+                    for bi_i, d_i in T.Parallel(BI, D):
+                        idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                        KV_shared[bi_i, d_i] = KV[
+                            b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
+                        ]
                 if has_tail:
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
@@ -1433,6 +1513,14 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    fp8_kv_sm80 = False  # fp8 KV decoded to bf16 inside the kernels below
+    if is_fp8_kv and is_sm80_family(q.device.index):
+        if tail_dim != 0 or q.dtype != torch.bfloat16:
+            raise ValueError(
+                "fp8 KV (--kv-cache-dtype fp8_e4m3) on SM8x supports NoPE bf16 queries only"
+            )
+        validate_sm80_fp8kv()
+        kv, fp8_kv_sm80, is_fp8_kv = kv.view(torch.uint8), True, False
     if not is_fp8_kv and _use_decode_split(
         q.shape[0], num_heads, allow_decode_split, q.device.index
     ):
@@ -1449,6 +1537,7 @@ def tilelang_sparse_fwd(
             block_I=64,
             inner_iter=1,
             threads=256,
+            fp8_kv=fp8_kv_sm80,
         )(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), partial_o, partial_lse)
         return sparse_mla_fwd_decode_combine(
             num_heads, d_v, ni * 64, head_per_block=4, block_I=64, threads=256
@@ -1518,7 +1607,7 @@ def tilelang_sparse_fwd(
             tail_dim,
             topk,
             sm_scale=sm_scale,
-            **_sm80_v1_kwargs(q.device.index, tail_dim),
+            **_sm80_v1_kwargs(q.device.index, tail_dim, fp8_kv_sm80),
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out

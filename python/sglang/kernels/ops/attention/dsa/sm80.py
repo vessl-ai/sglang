@@ -60,3 +60,29 @@ def validate_sm80_settings() -> None:
     """Boot-time check of the SM8x sparse MLA settings."""
     sm80_v1_cfg()
     decode_split_enabled()
+
+
+# The V1 tile used for fp8 KV when SGLANG_SM80_SPARSE_MLA_V1_CFG is unset.
+FP8KV_DEFAULT_V1_CFG = (32, 1, 128)
+
+
+@functools.cache
+def validate_sm80_fp8kv() -> None:
+    """Boot-time check of the SM8x fp8 KV settings (the kernel factories check again).
+
+    The packed converter writes shared memory outside the pipeline's sync, so its V1
+    tile must not be pipelined.
+    """
+    configured = sm80_v1_cfg()
+    cfg = configured or FP8KV_DEFAULT_V1_CFG
+    if cfg[1] != 1:
+        raise ValueError(
+            f"fp8 KV on SM8x needs num_stages == 1 in "
+            f"{envs.SGLANG_SM80_SPARSE_MLA_V1_CFG.name}, got {cfg}"
+        )
+    logger.info(
+        "SM8x fp8 KV is decoded to bf16 in-kernel; V1 tile (block_I, num_stages, "
+        "threads) = %s (%s)",
+        cfg,
+        envs.SGLANG_SM80_SPARSE_MLA_V1_CFG.name if configured else "fp8 KV default",
+    )
