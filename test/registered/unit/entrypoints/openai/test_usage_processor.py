@@ -1,5 +1,3 @@
-"""Unit tests for UsageProcessor -- no server, no model loading."""
-
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails
@@ -20,18 +18,40 @@ def _resp(cached_tokens: int, completion_tokens: int = 1) -> dict:
     }
 
 
-class TestCalculateResponseUsage(CustomTestCase):
-    def test_cache_report_on_zero_cached(self):
-        """A cache miss must still report {"cached_tokens": 0}, not omit the field."""
-        responses = [_resp(0, completion_tokens=2)]
-        usage = UsageProcessor.calculate_response_usage(
-            responses, n_choices=1, enable_cache_report=True
-        )
-        self.assertEqual(
-            usage.model_dump()["prompt_tokens_details"], {"cached_tokens": 0}
-        )
+class TestUsageProcessor(CustomTestCase):
+    def test_cache_details_follow_reporting_flag(self):
+        for enable_cache_report, cached_tokens in (
+            (False, 7),
+            (True, 0),
+            (True, 7),
+        ):
+            with self.subTest(
+                enable_cache_report=enable_cache_report,
+                cached_tokens=cached_tokens,
+            ):
+                usages = (
+                    UsageProcessor.calculate_response_usage(
+                        [{"meta_info": {"cached_tokens": cached_tokens}}],
+                        enable_cache_report=enable_cache_report,
+                    ),
+                    UsageProcessor.calculate_streaming_usage(
+                        prompt_tokens={0: 0},
+                        reasoning_tokens={0: 0},
+                        completion_tokens={0: 0},
+                        cached_tokens={0: cached_tokens},
+                        n_choices=1,
+                        enable_cache_report=enable_cache_report,
+                    ),
+                )
+                for usage in usages:
+                    details = usage.prompt_tokens_details
+                    if enable_cache_report:
+                        self.assertIsNotNone(details)
+                        self.assertEqual(details.cached_tokens, cached_tokens)
+                    else:
+                        self.assertIsNone(details)
 
-    def test_cache_report_on_n_choices_sums_first_choice_only(self):
+    def test_response_usage_sums_cached_over_first_choice_only(self):
         """With n_choices>1, cached tokens are only summed over the first choice of
         each prompt (choices of the same prompt share the same prompt-side cache
         state, so counting every choice would double-count)."""
@@ -48,32 +68,7 @@ class TestCalculateResponseUsage(CustomTestCase):
             usage.prompt_tokens_details.model_dump(), {"cached_tokens": 12}
         )
 
-    def test_cache_report_off(self):
-        """With cache reporting disabled, prompt_tokens_details stays None even
-        though cached_tokens is nonzero in the raw meta_info."""
-        responses = [_resp(5, completion_tokens=2)]
-        usage = UsageProcessor.calculate_response_usage(
-            responses, n_choices=1, enable_cache_report=False
-        )
-        self.assertIsNone(usage.prompt_tokens_details)
-
-
-class TestCalculateStreamingUsage(CustomTestCase):
-    def test_cache_report_on_zero_cached(self):
-        """A cache miss must still report {"cached_tokens": 0}, not omit the field."""
-        usage = UsageProcessor.calculate_streaming_usage(
-            prompt_tokens={0: 10, 1: 10},
-            reasoning_tokens={0: 0, 1: 0},
-            completion_tokens={0: 2, 1: 2},
-            cached_tokens={0: 0, 1: 0},
-            n_choices=2,
-            enable_cache_report=True,
-        )
-        self.assertEqual(
-            usage.model_dump()["prompt_tokens_details"], {"cached_tokens": 0}
-        )
-
-    def test_cache_report_on_n_choices_sums_first_choice_only(self):
+    def test_streaming_usage_sums_cached_over_first_choice_only(self):
         usage = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 10, 1: 10, 2: 10, 3: 10},
             reasoning_tokens={0: 0, 1: 0, 2: 0, 3: 0},
@@ -85,17 +80,6 @@ class TestCalculateStreamingUsage(CustomTestCase):
         self.assertEqual(
             usage.prompt_tokens_details.model_dump(), {"cached_tokens": 12}
         )
-
-    def test_cache_report_off(self):
-        usage = UsageProcessor.calculate_streaming_usage(
-            prompt_tokens={0: 10, 1: 10},
-            reasoning_tokens={0: 0, 1: 0},
-            completion_tokens={0: 2, 1: 2},
-            cached_tokens={0: 5, 1: 5},
-            n_choices=2,
-            enable_cache_report=False,
-        )
-        self.assertIsNone(usage.prompt_tokens_details)
 
 
 class TestCalculateTokenUsage(CustomTestCase):

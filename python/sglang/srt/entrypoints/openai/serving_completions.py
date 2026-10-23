@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    PromptTokensDetails,
     SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -170,6 +171,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "watermark": request.watermark,
         }
 
         # Handle response_format constraints
@@ -396,9 +398,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
-                        cached_tokens=UsageProcessor.cached_details(
-                            count=cached_tokens.get(index, 0),
-                            enable_cache_report=get_serving().enable_cache_report,
+                        cached_tokens=(
+                            PromptTokensDetails(cached_tokens=cached_tokens.get(index, 0))
+                            if get_serving().enable_cache_report
+                            else None
                         ),
                     )
 
