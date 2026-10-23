@@ -499,6 +499,12 @@ class DeepseekSparseAttnBackend(
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
+    @property
+    def needs_paged_mqa_schedule(self) -> bool:
+        # IndexerKPool reads only the pooled schedule (as in upstream #44378), so the
+        # per-token schedule is only built for models without a k-pool.
+        return self.dsa_index_kpool <= 1
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -951,6 +957,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if not self.needs_paged_mqa_schedule:
+            return
         new_schedule = resolve_paged_mqa_logits_metadata_fn()(
             seqlens_32_2d, 64, resolve_num_sms()
         )
@@ -1300,10 +1308,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.needs_paged_mqa_schedule
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1695,10 +1707,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.needs_paged_mqa_schedule
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
