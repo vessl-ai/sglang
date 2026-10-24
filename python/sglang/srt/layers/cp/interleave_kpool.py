@@ -21,8 +21,8 @@ def local_query_inputs(forward_batch, metadata):
     indices = torch.tensor(
         [i for i, count in enumerate(counts) if count],
         dtype=torch.long,
-        device=forward_batch.req_pool_indices.device,
-    )
+        pin_memory=True,  # pinned, avoids a stream sync; eager only
+    ).to(forward_batch.req_pool_indices.device, non_blocking=True)
     return dict(
         local_real_page_table=metadata.real_page_table,
         local_seqlens_expanded=metadata.dsa_seqlens_expanded,

@@ -208,6 +208,17 @@ def _trim_trtllm_decode_dp_padding(
     )
 
 
+def _decode_split_allowed(forward_mode) -> bool:
+    # Split-K sparse MLA only for decode / verify / draft extend. Prefill and extend
+    # keep the V1 kernel: under the breakable prefill graph their attention runs as an
+    # eager break on bucket-padded q.
+    return (
+        forward_mode.is_decode()
+        or forward_mode.is_target_verify()
+        or forward_mode.is_draft_extend_v2()
+    )
+
+
 def _restore_trtllm_decode_dp_padding(
     output: torch.Tensor, num_padding_rows: int
 ) -> torch.Tensor:
@@ -498,6 +509,12 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+
+    @property
+    def needs_paged_mqa_schedule(self) -> bool:
+        # IndexerKPool reads only the pooled schedule (as in upstream #44378), so the
+        # per-token schedule is only built for models without a k-pool.
+        return self.dsa_index_kpool <= 1
 
     def __init__(
         self,
@@ -951,6 +968,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if not self.needs_paged_mqa_schedule:
+            return
         new_schedule = resolve_paged_mqa_logits_metadata_fn()(
             seqlens_32_2d, 64, resolve_num_sms()
         )
@@ -1127,7 +1146,10 @@ class DeepseekSparseAttnBackend(
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                # Pinned to avoid a stream sync; this site is eager only.
+                torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, pin_memory=True
+                ).to(device, non_blocking=True),
                 cache_seqlens_int32,
                 self.speculative_num_draft_tokens * batch_size,
                 self.speculative_num_draft_tokens,
@@ -1300,10 +1322,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.needs_paged_mqa_schedule
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1695,10 +1721,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            is_cuda()
+            and self.needs_paged_mqa_schedule
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -2293,6 +2323,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                allow_decode_split=_decode_split_allowed(forward_batch.forward_mode),
             )
         elif dsa_impl == "triton":
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
@@ -2621,6 +2652,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                allow_decode_split=_decode_split_allowed(forward_batch.forward_mode),
             )
         elif dsa_impl == "triton":
             return self._forward_triton_decode(
@@ -3376,6 +3408,7 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        allow_decode_split: bool = False,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
@@ -3398,6 +3431,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+            allow_decode_split=allow_decode_split,
         )
 
     def _forward_triton_decode(

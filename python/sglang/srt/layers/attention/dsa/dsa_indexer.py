@@ -63,6 +63,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
+    cp_min_extend_tokens,
     get_device,
     get_exec,
     get_parallel,
@@ -820,6 +821,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             row_ends_int32=seqlens,
             page_table_64=page_table_64,
             rows=rows,
+        )
+
+    def _runs_with_prefill_cp(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch is split across the CP ranks. With a CP token threshold an
+        extend below it runs without CP (no attn_cp_metadata) on a CP server."""
+        return self.dsa_enable_prefill_cp and (
+            cp_min_extend_tokens() <= 0 or forward_batch.attn_cp_metadata is not None
         )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
@@ -1942,7 +1950,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+        if skip_logits_computation and not self._runs_with_prefill_cp(forward_batch):
             topk_result = self._forward_cuda_k_only(
                 x,
                 positions,
@@ -1998,10 +2006,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        ):
+        elif is_graph_dsa_split_op_surface(
+            forward_batch
+        ) and not self._runs_with_prefill_cp(forward_batch):
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is
