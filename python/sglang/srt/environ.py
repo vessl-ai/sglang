@@ -820,6 +820,13 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Pass a placement key with every put so the master (fork flag
+    # --placement_key_hrw) keeps a prefix chain on few store segments. Needs
+    # hicache_storage_pass_prefix_keys=true in the storage extra config.
+    SGLANG_HICACHE_MOONCAKE_PLACEMENT_KEY = EnvBool(False)
+    # Pages anchored at the chain root; later pages are anchored at this
+    # page's hash. 0 anchors the whole chain at its root.
+    SGLANG_HICACHE_MOONCAKE_PLACEMENT_ANCHOR_PAGES = EnvInt(64)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
