@@ -217,7 +217,6 @@ class RequestWindow:
             layout = window_layout(
                 zeros,
                 zeros,
-                zero_row=self.zero_row,
                 capacity=self.capacity,
                 num_groups=1,
             )
