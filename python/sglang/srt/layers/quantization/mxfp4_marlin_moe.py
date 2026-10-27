@@ -256,6 +256,9 @@ class Mxfp4MarlinMoEMethod:
         self._tk_intermediate_size = layer.w2_weight.shape[-1] * 2
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+        # The swizzle's scratch stays reserved otherwise, and KV-cache sizing
+        # counts reserved memory as used.
+        torch.cuda.empty_cache()
         layer._dsv4_mxfp4_backend = "triton_kernels"
 
     def _apply_triton_kernels(self, hidden_states, topk_output) -> torch.Tensor:
