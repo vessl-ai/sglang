@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_logits_prefill,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -847,6 +848,64 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
             expected_raw = torch.where(chosen, selected - starts[:, None], -1)
             torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+
+
+# Row counts and visible lengths straddle the prefill kernels' row and key tiles;
+# under ratio 2 the first request has no visible position yet.
+_PREFILL_REQUESTS = [(0, 1), (0, 70), (130, 7), (1000, 129)]
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fused_prefill_indexer_scores_match_torch(heads, ratio):
+    from sglang.test.kernels.deepseek_v4.v41_prefill_indexer import (
+        make_prefill_indexer_case,
+        prefill_scores,
+    )
+
+    torch.manual_seed(heads + ratio)
+    inputs, pool, req_to_token = make_prefill_indexer_case(
+        heads=heads, ratio=ratio, requests=_PREFILL_REQUESTS, topk=64
+    )
+    common = dict(inputs=inputs, token_to_kv_pool=pool, req_to_token=req_to_token)
+    reference = prefill_scores(**common, fused=False)
+    fused = prefill_scores(**common, fused=True)
+    assert len(fused) == len(reference) == (4 if ratio == 1 else 3)
+    for (tok, expected), (fused_tok, actual) in zip(reference, fused):
+        torch.testing.assert_close(fused_tok, tok, rtol=0, atol=0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("kernel", ["triton", "keys_major"])
+def test_prefill_index_logits_kernel_matches_torch(heads, ratio, kernel):
+    from sglang.test.kernels.deepseek_v4.v41_prefill_indexer import (
+        make_prefill_indexer_case,
+        prefill_kernel_args,
+        prefill_scores,
+    )
+
+    if kernel == "keys_major":
+        if torch.cuda.get_device_capability()[0] != 9:
+            pytest.skip("SM90 wgmma kernel")
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_keys_major import (
+            fp4_index_logits_prefill_keys_major as fn,
+        )
+    else:
+        fn = fp4_index_logits_prefill
+
+    torch.manual_seed(heads + ratio)
+    inputs, pool, req_to_token = make_prefill_indexer_case(
+        heads=heads, ratio=ratio, requests=_PREFILL_REQUESTS, topk=64
+    )
+    common = dict(inputs=inputs, token_to_kv_pool=pool, req_to_token=req_to_token)
+    reference = prefill_scores(**common, fused=False)
+    visible = [r for r in range(len(_PREFILL_REQUESTS)) if r > 0 or ratio == 1]
+    assert len(visible) == len(reference)
+    for r, (_, expected) in zip(visible, reference):
+        actual = fn(**prefill_kernel_args(**common, request=r))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

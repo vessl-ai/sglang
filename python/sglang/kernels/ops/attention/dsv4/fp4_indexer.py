@@ -656,22 +656,14 @@ def _e2m1_decode(code):
 
 
 @triton.jit
-def _fp4_index_logits_tile(
-    q_ptr,
-    w_ptr,
+def _fp4_index_k_tile(
     table_ptr,
-    b,
     slot,
     valid,
     page_size,
     row_stride,
-    stride_qb,
-    stride_qh,
-    stride_wb,
-    H: tl.constexpr,
     HALF_D: tl.constexpr,
 ):
-    offs_h = tl.arange(0, H)
     offs_i = tl.arange(0, HALF_D)
     page = slot // page_size
     off = slot % page_size
@@ -701,6 +693,30 @@ def _fp4_index_logits_tile(
     scale = tl.exp2(exps.to(tl.float32) - 127.0)
     k_low = (low * scale).to(tl.bfloat16)  # [BLOCK_L, HALF_D] elements 2i
     k_high = (high * scale).to(tl.bfloat16)  # elements 2i+1
+    return k_low, k_high
+
+
+@triton.jit
+def _fp4_index_logits_tile(
+    q_ptr,
+    w_ptr,
+    table_ptr,
+    b,
+    slot,
+    valid,
+    page_size,
+    row_stride,
+    stride_qb,
+    stride_qh,
+    stride_wb,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+):
+    offs_h = tl.arange(0, H)
+    offs_i = tl.arange(0, HALF_D)
+    k_low, k_high = _fp4_index_k_tile(
+        table_ptr, slot, valid, page_size, row_stride, HALF_D
+    )
 
     # queries: even / odd elements, [H, HALF_D] bf16
     q_even = tl.load(
@@ -944,3 +960,99 @@ def fp4_index_logits_paged(
         num_warps=4,
     )
     return out[:, :max_len]
+
+
+@triton.jit
+def _fp4_index_logits_prefill_kernel(
+    q_ptr,  # [M, H, 2, HALF_D] bf16 contiguous: each head's even elements, then odd
+    w_ptr,  # [M, H] bf16, contiguous
+    lens_ptr,  # [M] visible compressed positions per row
+    slots_ptr,  # [L] int64 pool slots of the request's compressed positions
+    table_ptr,
+    out_ptr,  # [M, L] fp32
+    M,
+    L,
+    page_size,
+    row_stride,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    STAGES: tl.constexpr,
+):
+    offs_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_ok = offs_m < M
+    col_ok = offs_n < L
+    lens = tl.load(lens_ptr + offs_m, mask=row_ok, other=0)
+    out = out_ptr + offs_m[:, None].to(tl.int64) * L + offs_n[None, :]
+    out_mask = row_ok[:, None] & col_ok[None, :]
+    if tl.program_id(0) * BLOCK_N >= tl.max(lens, axis=0):
+        tl.store(out, float("-inf"), mask=out_mask)
+    else:
+        slot = tl.load(slots_ptr + offs_n, mask=col_ok, other=0)
+        k_low, k_high = _fp4_index_k_tile(
+            table_ptr, slot, col_ok, page_size, row_stride, HALF_D
+        )
+        k_low_t = tl.trans(k_low)
+        k_high_t = tl.trans(k_high)
+        offs_i = tl.arange(0, HALF_D)
+        q_rows = q_ptr + offs_m[:, None].to(tl.int64) * (H * 2 * HALF_D)
+        total = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for h in tl.range(H, num_stages=STAGES):
+            q_head = q_rows + h * (2 * HALF_D) + offs_i[None, :]
+            q_even = tl.load(q_head, mask=row_ok[:, None], other=0.0)
+            q_odd = tl.load(q_head + HALF_D, mask=row_ok[:, None], other=0.0)
+            acc = tl.dot(q_even, k_low_t)
+            acc += tl.dot(q_odd, k_high_t)
+            # Same rounding points as _fp4_index_logits_tile.
+            s = tl.maximum(acc.to(tl.bfloat16).to(tl.float32), 0.0)
+            w = tl.load(w_ptr + offs_m * H + h, mask=row_ok, other=0.0).to(tl.float32)
+            total += (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
+        logit = total.to(tl.bfloat16).to(tl.float32)
+        logit = tl.where(offs_n[None, :] < lens[:, None], logit, float("-inf"))
+        tl.store(out, logit, mask=out_mask)
+
+
+def fp4_index_logits_prefill(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    slots: torch.Tensor,
+    lens: torch.Tensor,
+    table: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """Prefill index logits of one request's query rows from the fp4 index-K pool.
+    q [M, H, 128] bf16, weights [M, H], slots [L] int64 pool slots of the request's
+    compressed positions, lens [M] visible positions per row, table = the layer's
+    index-K page buffer (uint8, 2D). Returns [M, L] fp32 logits, -inf at positions
+    >= lens, rounded as the torch reference does."""
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
+    assert table.dtype == torch.uint8 and table.dim() == 2
+    M, H, _ = q.shape
+    L = slots.shape[0]
+    out = torch.empty((M, L), dtype=torch.float32, device=q.device)
+    # Picked by timing on H200; re-time when the kernel changes.
+    BLOCK_M, BLOCK_N, STAGES = 64, 128, 3
+    grid = (triton.cdiv(L, BLOCK_N), triton.cdiv(M, BLOCK_M))
+    _fp4_index_logits_prefill_kernel[grid](
+        # Split each head into contiguous even and odd halves so the kernel's
+        # q loads vectorize; interleaved halves load one element at a time.
+        q.reshape(M, H, INDEX_HEAD_DIM // 2, 2).transpose(-1, -2).contiguous(),
+        weights.to(torch.bfloat16).contiguous(),
+        lens.contiguous(),
+        slots.to(torch.int64).contiguous(),
+        table,
+        out,
+        M,
+        L,
+        page_size,
+        table.stride(0),
+        H=H,
+        HALF_D=INDEX_HEAD_DIM // 2,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        STAGES=STAGES,
+        num_warps=4,
+    )
+    return out
