@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Module
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_platform
@@ -50,6 +51,9 @@ class Mxfp4MarlinMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self._use_triton_kernels = (
+            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get() and get_platform().is_sm90
+        )
 
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
@@ -163,6 +167,10 @@ class Mxfp4MarlinMoEMethod:
         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
 
+        if self._use_triton_kernels:
+            self._prepare_triton_kernels_weights(layer)
+            return
+
         log_info_on_rank0(
             logger,
             f"Preparing MXFP4 experts for Marlin backend (layer: {self.prefix})...",
@@ -184,6 +192,10 @@ class Mxfp4MarlinMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
+        if self._use_triton_kernels:
+            return StandardCombineInput(
+                hidden_states=self._apply_triton_kernels(hidden_states, topk_output)
+            )
         target_hidden_size = layer.w13_weight.shape[1] * 16
         if hidden_states.shape[-1] == target_hidden_size:
             hidden_states_padded = hidden_states
@@ -202,3 +214,94 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+    def _prepare_triton_kernels_weights(self, layer: Module) -> None:
+        from triton_kernels.matmul import FlexCtx, PrecisionConfig
+
+        from sglang.srt.layers.quantization.mxfp4 import (
+            _mx_block_kwargs,
+            _swizzle_mxfp4,
+        )
+
+        config = self.runner.config
+        if not (
+            config.activation == "silu"
+            and config.is_gated
+            and config.gemm1_alpha is None
+            and config.swiglu_limit is not None
+            and self.hidden_pad == 0
+        ):
+            raise ValueError(
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE supports only the DeepSeek-V4 "
+                "clamped SwiGLU experts with an unpadded hidden size."
+            )
+        log_info_on_rank0(
+            logger,
+            f"Preparing MXFP4 experts for triton_kernels (layer: {self.prefix})...",
+        )
+        mx_block = _mx_block_kwargs()
+        self._tk_num_experts = layer.w13_weight.shape[0]
+        self._tk_weights = []
+        for weight, scale in (
+            (layer.w13_weight, layer.w13_weight_scale_inv),
+            (layer.w2_weight, layer.w2_weight_scale_inv),
+        ):
+            tk_weight, flex, tk_scale = _swizzle_mxfp4(
+                weight.data.view(torch.uint8), scale.data.view(torch.uint8), 8
+            )
+            precision = PrecisionConfig(
+                b_mx_scale=tk_scale, flex_ctx=FlexCtx(rhs_data=flex), **mx_block
+            )
+            self._tk_weights.append((tk_weight, precision))
+        self._tk_intermediate_size = layer.w2_weight.shape[-1] * 2
+        del layer.w13_weight, layer.w2_weight
+        del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+        layer._dsv4_mxfp4_backend = "triton_kernels"
+
+    def _apply_triton_kernels(self, hidden_states, topk_output) -> torch.Tensor:
+        from triton_kernels.matmul import matmul
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+
+        from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            swiglu_limit_func,
+        )
+
+        num_tokens, top_k = topk_output.topk_ids.shape
+        output = torch.empty_like(hidden_states)
+        if num_tokens == 0:
+            return output
+        # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
+        valid = topk_output.topk_ids >= 0
+        expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
+        weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
+        # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
+        combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+        ragged_metadata = make_ragged_tensor_metadata(
+            torch.bincount(expert_ids, minlength=self._tk_num_experts).to(torch.int32),
+            expert_ids.numel(),
+        )
+        (w13, w13_precision), (w2, w2_precision) = self._tk_weights
+        gate_up = matmul(
+            hidden_states,
+            w13,
+            None,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=combine_indx // top_k,
+            precision_config=w13_precision,
+        )
+        activated = gate_up.new_empty(gate_up.shape[0], self._tk_intermediate_size)
+        swiglu_limit_func(
+            activated, gate_up, swiglu_limit=self.runner.config.swiglu_limit
+        )
+        down = matmul(
+            activated,
+            w2,
+            None,
+            a_ragged_metadata=ragged_metadata,
+            scatter_indx=combine_indx,
+            precision_config=w2_precision,
+            gammas=weights[combine_indx.long()],
+        )
+        moe_topk_sum(down.view(num_tokens, top_k, -1), output)
+        return output
