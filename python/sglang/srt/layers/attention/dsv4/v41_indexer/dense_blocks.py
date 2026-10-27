@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
+    _row_shard_topology,
     decode_scores,
     get_deep_gemm_prefill_data,
     prefill_requests,
@@ -212,6 +213,14 @@ class DenseBlocksBackend:
         )
         for rows, ids in picked:
             blocks[rows, : ids.shape[1]] = ids
+        # Row-sharded ranks hold only their own rows; merge so any later consumer
+        # (whatever rows it shards) reads complete block ids. width is request-wide,
+        # so it matches across ranks.
+        _, shard_size, shard_group = _row_shard_topology()
+        if shard_size > 1 and blocks.numel() > 0:
+            torch.distributed.all_reduce(
+                blocks, op=torch.distributed.ReduceOp.MAX, group=shard_group
+            )
         return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
 
     def _torch_consume_prefill(
