@@ -216,6 +216,7 @@ class Mxfp4MarlinMoEMethod:
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
+        import triton_kernels.matmul_details.opt_flags as opt_flags
         from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
         from sglang.srt.layers.quantization.mxfp4 import (
@@ -240,6 +241,9 @@ class Mxfp4MarlinMoEMethod:
             f"Preparing MXFP4 experts for triton_kernels (layer: {self.prefix})...",
         )
         mx_block = _mx_block_kwargs()
+        # Measured on H200 at the DSV4-Flash TP4 expert shapes: 3 stages beat
+        # the default by ~16% at 16k-32k rows with bit-identical output.
+        opt_flags.update_opt_flags_constraints({"num_stages": 3})
         self._tk_num_experts = layer.w13_weight.shape[0]
         self._tk_weights = []
         for weight, scale in (
