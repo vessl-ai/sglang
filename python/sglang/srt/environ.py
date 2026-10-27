@@ -1638,6 +1638,9 @@ class Envs:
     # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
     # TP ranks instead of scoring every row on every rank.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # Score the DeepSeek-V4.1 torch prefill indexer with one fused Triton kernel
+    # instead of separate torch einsum, relu, head-weight and head-sum ops.
+    SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

@@ -849,5 +849,31 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
 
 
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fused_prefill_indexer_scores_match_torch(heads, ratio):
+    from sglang.test.kernels.deepseek_v4.v41_prefill_indexer import (
+        make_prefill_indexer_case,
+        prefill_scores,
+    )
+
+    torch.manual_seed(heads + ratio)
+    # Row counts and visible lengths straddle the kernel's 64-row and 64-position
+    # tiles; under ratio 2 the first request has no visible position yet.
+    inputs, pool, req_to_token = make_prefill_indexer_case(
+        heads=heads,
+        ratio=ratio,
+        requests=[(0, 1), (0, 70), (130, 7), (1000, 129)],
+        topk=64,
+    )
+    common = dict(inputs=inputs, token_to_kv_pool=pool, req_to_token=req_to_token)
+    reference = prefill_scores(**common, fused=False)
+    fused = prefill_scores(**common, fused=True)
+    assert len(fused) == len(reference) == (4 if ratio == 1 else 3)
+    for (tok, expected), (fused_tok, actual) in zip(reference, fused):
+        torch.testing.assert_close(fused_tok, tok, rtol=0, atol=0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
