@@ -1642,6 +1642,9 @@ class Envs:
     # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
     # and head-sum ops.
     SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
+    # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
+    SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
