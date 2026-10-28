@@ -81,6 +81,8 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: torch.Tensor  # [rows] req_to_token row of each query row
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
+    # Consecutive rows of one request: the draft tokens under verify, else 1.
+    rows_per_request: int
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor
