@@ -769,6 +769,70 @@ def test_fp4_paged_logits_grouped_rows_replay(requests, ratio, width, masked):
         )
 
 
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "requests,group,ratio,width,masked",
+    [
+        (3, 6, 1, 193, False),
+        (5, 6, 2, 8193, True),
+        (7, 4, 1, 16385, True),
+        (9, 2, 2, 4097, False),
+        (13, 6, 1, 32769, True),
+    ],
+)
+def test_fp4_paged_logits_tensor_core_matches_per_row(
+    requests, group, ratio, width, masked
+):
+    """The tensor-core verify kernel scores bit for bit like the per-row kernel,
+    under graph replay with changing lengths, requests and masks."""
+    from sglang.srt.environ import envs
+
+    batch = requests * group
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::group] * ratio).int()
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def run():
+        return fp4_index_logits_paged(
+            *args, candidate_mask, rows_per_request=group
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, 129, width]):
+        lengths.copy_((visible - torch.arange(batch, device=q.device) % group).clamp_min(0))
+        req_table[:, : width * ratio : ratio] = (
+            slots[::group].roll(step, 1) * ratio
+        ).int()
+        q.neg_()
+        if masked:
+            candidate_mask.copy_(candidate_mask.roll(1, dims=1))
+        graph.replay()
+        with envs.SGLANG_DSV41_PAGED_INDEXER_NO_TC.override(True):
+            expected = run()
+        visible_mask = (
+            torch.arange(width, device=q.device)[None, :] < lengths[:, None]
+        )
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask],
+            expected[:, :width][visible_mask],
+            atol=0,
+            rtol=0,
+        )
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",

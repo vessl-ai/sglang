@@ -1641,6 +1641,9 @@ class Envs:
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
+    # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
+    # per-row kernel instead of the tensor-core one (A/B and fallback).
+    SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
