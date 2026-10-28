@@ -725,6 +725,19 @@ class DeepSeekV4IndexerPool(KVCache):
         scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
         return payload, scales
 
+    def get_index_k_fp8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The fp4 rows at `slots` widened to e4m3: (fp8 [n, index_head_dim], fp32
+        row scales [n]), the key operand of DeepGEMM's fp8 MQA logits."""
+        assert self.use_fp4_indexer, "fp8 widening only applies to the fp4 layout"
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            gather_fp4_index_k_fp8,
+        )
+
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return gather_fp4_index_k_fp8(buf, slots, page_size=self.page_size)
+
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -1932,6 +1945,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_fp4(
+            compress_layer_id, slots
+        )
+
+    def get_low_ratio_index_k_fp8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Index-K rows at `slots` as e4m3 [n, index_head_dim] with fp32 row scales
+        [n], for DeepGEMM's fp8 MQA logits on SM90."""
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).get_index_k_fp8(
             compress_layer_id, slots
         )
 

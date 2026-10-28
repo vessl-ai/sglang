@@ -20,6 +20,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_rows_to_fp8,
+    gather_fp4_index_k,
+    gather_fp4_index_k_fp8,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -224,6 +227,120 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
     expected = _ref_store_fp4_index_cache(ref_fp4, ref_sf, loc, num_pages)
     torch.testing.assert_close(cache, expected)
+
+
+def _ref_dequant_fp4_rows(payload: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """fp32 values of packed fp4 rows: e2m1 code times its block's ue8m0 scale."""
+    table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=payload.device
+    )
+    u = payload.view(torch.uint8).to(torch.int64)
+    codes = torch.stack([u & 0x0F, u >> 4], dim=-1).flatten(-2)
+    values = table[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
+    exps = torch.stack([(sf >> (8 * b)) & 0xFF for b in range(SCALE_GROUPS)], -1)
+    return values * torch.exp2(exps.float() - 127).repeat_interleave(GROUP_SIZE, -1)
+
+
+def _fp4_rows_with_block_spread(num_rows: int, spread: int, seed: int):
+    """Random packed fp4 rows whose block exponents span exactly ``spread``."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    payload = torch.randint(
+        0, 256, (num_rows, FP4_DIM), device="cuda", dtype=torch.uint8, generator=g
+    )
+    base = torch.randint(
+        100, 140, (num_rows, 1), device="cuda", dtype=torch.int32, generator=g
+    )
+    exps = base + torch.randint(
+        0, spread + 1, (num_rows, SCALE_GROUPS), device="cuda", generator=g
+    ).to(torch.int32)
+    exps[:, 0], exps[:, 1] = base[:, 0], base[:, 0] + spread
+    sf = sum(exps[:, b] << (8 * b) for b in range(SCALE_GROUPS))
+    return payload.view(torch.int8), sf.to(torch.int32)
+
+
+_needs_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="e4m3 conversion needs SM89+",
+)
+
+
+@_needs_fp8
+@pytest.mark.parametrize("num_rows", [1, 33, 4097])
+def test_fp4_index_k_fp8_gather_is_exact(num_rows: int) -> None:
+    """Quantized keys, gathered from the pool at shuffled slots, widen exactly."""
+    torch.manual_seed(num_rows)
+    num_pages = (num_rows + PAGE_SIZE - 1) // PAGE_SIZE + 2
+    x = torch.randn(num_rows, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    x[0, :GROUP_SIZE] *= 1e-6  # a block at the quantizer's scale floor
+    x[-1, GROUP_SIZE : 2 * GROUP_SIZE] = 0
+    cache = torch.zeros(
+        num_pages, PAGE_SIZE * (FP4_DIM + SCALE_BYTES), device="cuda", dtype=torch.uint8
+    )
+    loc = torch.randperm(num_pages * PAGE_SIZE, device="cuda")[:num_rows]
+    store_fp4_index_k_cache(x, cache, loc, page_size=PAGE_SIZE, rne=True)
+    slots = loc[torch.randperm(num_rows, device="cuda")]
+
+    k_fp8, k_scale = gather_fp4_index_k_fp8(cache, slots, page_size=PAGE_SIZE)
+
+    assert k_fp8.dtype == torch.float8_e4m3fn and k_fp8.shape == (num_rows, HEAD_DIM)
+    expected = _ref_dequant_fp4_rows(
+        *gather_fp4_index_k(cache, slots, page_size=PAGE_SIZE)
+    )
+    torch.testing.assert_close(
+        k_fp8.float() * k_scale[:, None], expected, rtol=0, atol=0
+    )
+    assert torch.equal(k_scale, torch.exp2(torch.log2(k_scale).round()))
+
+
+@_needs_fp8
+@pytest.mark.parametrize("spread", [0, 14, 15, 30])
+def test_fp4_index_rows_to_fp8_block_spread(spread: int) -> None:
+    """Exact while a row's block exponents are within 14 of each other; beyond, a
+    value rounds to the e4m3 grid, at most 2**-16 of the row's largest block scale."""
+    payload, sf = _fp4_rows_with_block_spread(512, spread, seed=spread)
+    rows = payload.shape[0]
+
+    values, scale = fp4_index_rows_to_fp8(
+        payload.view(2, rows // 2, FP4_DIM), sf.view(2, -1)
+    )
+
+    assert values.shape == (2, rows // 2, HEAD_DIM) and scale.shape == (2, rows // 2)
+    actual = values.float().view(rows, HEAD_DIM) * scale.view(rows, 1)
+    expected = _ref_dequant_fp4_rows(payload, sf)
+    largest_scale = torch.exp2(((sf >> 8) & 0xFF).float() - 127)  # block 1 is the max
+    error = (actual - expected).abs().amax(-1) / largest_scale
+    if spread <= 14:
+        assert error.max().item() == 0
+    else:
+        assert error.max().item() > 0
+        assert error.max().item() <= 2.0**-16
+
+
+@_needs_fp8
+def test_fp4_index_rows_to_fp8_scaled_logits_match() -> None:
+    """The q scale folded into the head weight reproduces the fp4 logits."""
+    torch.manual_seed(3)
+    rows, heads, keys = 64, 32, 300
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(
+        torch.randn(rows * heads, HEAD_DIM, device="cuda"), rne=True
+    )
+    k_fp4, k_sf = quantize_fp4_indexer_tensor(
+        torch.randn(keys, HEAD_DIM, device="cuda"), rne=True
+    )
+    weights = torch.rand(rows, heads, device="cuda")
+
+    q8, q_scale = fp4_index_rows_to_fp8(
+        q_fp4.view(rows, heads, FP4_DIM), q_sf.view(rows, heads)
+    )
+    k8, k_scale = fp4_index_rows_to_fp8(k_fp4, k_sf)
+
+    def logits(q, k, w):
+        return (torch.einsum("rhd,nd->rhn", q, k).relu() * w[..., None]).sum(1)
+
+    q_ref = _ref_dequant_fp4_rows(q_fp4, q_sf).view(rows, heads, HEAD_DIM)
+    expected = logits(q_ref, _ref_dequant_fp4_rows(k_fp4, k_sf), weights)
+    actual = logits(q8.float(), k8.float(), weights * q_scale) * k_scale
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])

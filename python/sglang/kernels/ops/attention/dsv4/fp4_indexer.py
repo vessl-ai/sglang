@@ -524,6 +524,164 @@ def gather_fp4_index_k(
     return payload.view(torch.int8), scales
 
 
+# Exponent bias of an fp8 row: its largest block maps to 2**_FP8_ROW_EXP_BIAS, so
+# that block's e2m1 maximum 6 becomes 384 <= 448, the e4m3fn maximum.
+_FP8_ROW_EXP_BIAS = tl.constexpr(6)
+
+
+@triton.jit
+def _fp4_rows_to_fp8(payload, sf):
+    """Widen packed fp4 index rows to e4m3 with one power-of-two scale per row.
+
+    ``payload`` is ``[R, 64]`` uint8 (element ``2i`` in the low nibble of byte
+    ``i``), ``sf`` ``[R]`` int32, the four ue8m0 block exponents little-endian.
+    Returns (``[R, 128]`` e4m3 values, ``[R]`` fp32 scales) whose product is the
+    fp4 row; exact while each block exponent is within 14 of the row's largest.
+    """
+    shifts = (tl.arange(0, 64) // 16) * 8
+    exps = (sf[:, None] >> shifts[None, :]) & 0xFF  # [R, 64]: the block of byte i
+    row_exp = tl.max(exps, axis=1)  # [R]
+    factor = tl.exp2((exps - row_exp[:, None] + _FP8_ROW_EXP_BIAS).to(tl.float32))
+    low = _e2m1_decode(payload & 0x0F) * factor
+    high = _e2m1_decode((payload >> 4) & 0x0F) * factor
+    values = tl.reshape(tl.join(low, high), (low.shape[0], 128))
+    scale = tl.exp2((row_exp - 127 - _FP8_ROW_EXP_BIAS).to(tl.float32))
+    return values.to(tl.float8e4nv), scale
+
+
+@triton.jit
+def _gather_fp4_index_k_fp8_kernel(
+    cache,
+    words,
+    cache_stride,
+    slots,
+    out,
+    out_scale,
+    n,
+    page_size: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    # Page layout: page_size * 64 payload bytes, then page_size scale words.
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    valid = rows < n
+    slot = tl.load(slots + rows, valid, 0).to(tl.int64)
+    page = slot // page_size
+    offset = slot - page * page_size
+    nbytes = tl.arange(0, 64)
+    payload = tl.load(
+        cache + page[:, None] * cache_stride + offset[:, None] * 64 + nbytes[None, :],
+        valid[:, None],
+        0,
+    )
+    sf = tl.load(words + page * (cache_stride // 4) + page_size * 16 + offset, valid, 0)
+    values, scale = _fp4_rows_to_fp8(payload, sf)
+    columns = tl.arange(0, 128)
+    tl.store(
+        out + rows[:, None].to(tl.int64) * 128 + columns[None, :],
+        values,
+        valid[:, None],
+    )
+    tl.store(out_scale + rows, scale, valid)
+
+
+def gather_fp4_index_k_fp8(
+    cache: torch.Tensor, slots: torch.Tensor, *, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The fp4 index-K rows at ``slots`` of ``cache`` (``store_fp4_index_k_cache``'s
+    layout), widened for DeepGEMM's fp8 x fp8 MQA logits: (e4m3fn ``[n, 128]``,
+    fp32 scales ``[n]``), the ``kv`` pair of ``deep_gemm.fp8_mqa_logits``.
+
+    Each row gets one power-of-two scale, its largest block exponent less 6. An
+    e2m1 value times its ue8m0 block scale is then an e4m3fn value times that
+    scale, exactly, while every block exponent of the row is within 14 of the
+    largest (e2m1 holds at most two significant bits and e4m3fn reaches 2**-9 in
+    subnormals). A block further below rounds to the e4m3fn grid, an error of at
+    most 2**-16 of the row's largest block scale; the quantizer's 1e-4 scale floor
+    makes that rare.
+    """
+    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES and cache.stride(1) == 1
+    assert slots.is_contiguous()
+    n = slots.shape[0]
+    out = torch.empty(
+        (n, INDEX_HEAD_DIM), device=cache.device, dtype=torch.float8_e4m3fn
+    )
+    out_scale = torch.empty((n,), device=cache.device, dtype=torch.float32)
+    if n > 0:
+        block_rows = 32
+        _gather_fp4_index_k_fp8_kernel[(triton.cdiv(n, block_rows),)](
+            cache.view(torch.uint8),
+            cache.view(torch.int32),
+            cache.stride(0),
+            slots,
+            out,
+            out_scale,
+            n,
+            page_size,
+            BLOCK_ROWS=block_rows,
+            num_warps=4,
+        )
+    return out, out_scale
+
+
+@triton.jit
+def _fp4_index_rows_to_fp8_kernel(
+    payload,
+    sf,
+    out,
+    out_scale,
+    n,
+    BLOCK_ROWS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    valid = rows < n
+    nbytes = tl.arange(0, 64)
+    packed = tl.load(
+        payload + rows[:, None].to(tl.int64) * 64 + nbytes[None, :],
+        valid[:, None],
+        0,
+    )
+    values, scale = _fp4_rows_to_fp8(packed, tl.load(sf + rows, valid, 0))
+    columns = tl.arange(0, 128)
+    tl.store(
+        out + rows[:, None].to(tl.int64) * 128 + columns[None, :],
+        values,
+        valid[:, None],
+    )
+    tl.store(out_scale + rows, scale, valid)
+
+
+def fp4_index_rows_to_fp8(
+    payload: torch.Tensor, sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed fp4 index rows (``[..., 64]`` int8 with ``[...]`` int32 packed ue8m0,
+    ``quantize_fp4_indexer_tensor``'s layout) widened to (e4m3fn ``[..., 128]``,
+    fp32 row scales ``[...]``), exact under ``gather_fp4_index_k_fp8``'s condition.
+
+    DeepGEMM's fp8 MQA logits take the index queries without a scale; since the
+    scale is positive it commutes with the ReLU, so a caller multiplies it into the
+    query's head weight instead.
+    """
+    assert payload.shape == (*sf.shape, INDEX_HEAD_DIM // 2)
+    payload, sf = payload.contiguous(), sf.contiguous()
+    out = torch.empty(
+        (*sf.shape, INDEX_HEAD_DIM), device=sf.device, dtype=torch.float8_e4m3fn
+    )
+    out_scale = torch.empty(sf.shape, device=sf.device, dtype=torch.float32)
+    n = sf.numel()
+    if n > 0:
+        block_rows = 32
+        _fp4_index_rows_to_fp8_kernel[(triton.cdiv(n, block_rows),)](
+            payload.view(torch.uint8),
+            sf,
+            out,
+            out_scale,
+            n,
+            BLOCK_ROWS=block_rows,
+            num_warps=4,
+        )
+    return out, out_scale
+
+
 @triton.jit
 def _index_k_rope_pack_kernel(
     X,
