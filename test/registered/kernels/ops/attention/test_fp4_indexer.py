@@ -590,6 +590,68 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "requests,ratio,width,masked",
+    [(2, 1, 193, False), (2, 2, 8193, True), (11, 1, 32769, True)],
+)
+def test_fp4_paged_logits_grouped_rows_replay(requests, ratio, width, masked):
+    batch = requests * 6
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+
+    def run():
+        return fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            candidate_mask,
+            rows_per_request=6,
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
+        # Rows of a request differ by one position, as verify draft tokens do.
+        row_lens = visible - torch.arange(batch, device=q.device) % 6
+        lens.copy_(
+            (row_lens - 3 * (torch.arange(batch, device=q.device) // 6)).clamp_min(0)
+        )
+        lengths.copy_(lens)
+        req.copy_(req.roll(6))
+        group_slots = slots[::6].roll(step, dims=1)
+        req_table[req[::6].long(), : width * ratio : ratio] = (group_slots * ratio).to(
+            torch.int32
+        )
+        q.neg_()
+        graph.replay()
+        row_slots = req_table[req.long(), : width * ratio : ratio].long() // ratio
+        expected = _reference_logits(q, weights, row_slots, lens, table)
+        if masked:
+            expected.masked_fill_(~candidate_mask[:, :width], -torch.inf)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
@@ -628,6 +690,7 @@ def test_hopper_indexer_backends_replay(ratio):
         req_rows=req,
         paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
         is_verify=True,
+        rows_per_request=1,
     )
     kwargs = dict(
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False

@@ -3424,7 +3424,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, forward_batch
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3472,8 +3472,21 @@ class DeepseekV4AttnBackend(
         )
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ):
         ratio = layer.compress_ratio
+        mode = forward_batch.forward_mode
+        # Static verify is request-major with draft_len rows per request; any
+        # other layout scores row by row.
+        static_verify = (
+            mode.is_target_verify()
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and self.speculative_num_draft_tokens is not None
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+        )
+        rows_per_request = self.speculative_num_draft_tokens if static_verify else 1
         metadata = (
             self.forward_metadata.c1_indexer_metadata
             if ratio == 1
@@ -3491,6 +3504,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
+            rows_per_request=rows_per_request,
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
