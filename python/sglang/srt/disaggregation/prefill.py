@@ -24,6 +24,8 @@ import logging
 import time
 from array import array
 from collections import deque
+from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
@@ -65,6 +67,10 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -72,6 +78,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components import midforward_hook
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -110,6 +117,25 @@ logger = logging.getLogger(__name__)
 PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
+
+
+@dataclass
+class _MidForwardState:
+    # Set by the first mid-forward hook that fires in a forward (SGLANG_OPT_PREFILL_
+    # MIDFORWARD_LAYERS); that hook processed the previous batch's result if any.
+    processed_previous: bool = False
+
+
+def _is_plain_generate_req(recv_req) -> bool:
+    """A text generate request whose intake touches no GPU state."""
+    if isinstance(recv_req, BatchTokenizedGenerateReqInput):
+        return all(_is_plain_generate_req(sub_req) for sub_req in recv_req)
+    return (
+        isinstance(recv_req, TokenizedGenerateReqInput)
+        and recv_req.mm_inputs is None
+        and recv_req.positional_embed_overrides is None
+        and recv_req.input_embeds is None
+    )
 
 
 def should_force_retry(req: Req) -> bool:
@@ -746,6 +772,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        midforward_layers = self._midforward_hook_layers()
 
         while True:
             if self.gracefully_exit:
@@ -792,13 +819,27 @@ class SchedulerDisaggregationPrefillMixin:
                 if batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
-                    batch_result = self.run_batch(batch)
+                    midforward = self._arm_midforward_hooks(midforward_layers, batch)
+                    try:
+                        batch_result = self.run_batch(batch)
+                    finally:
+                        midforward_fired = midforward_hook.disarm() if midforward else []
                     self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
+                    midforward = None
+                    midforward_fired = []
+            else:
+                midforward = None
+                midforward_fired = []
 
-            if self.last_batch:
+            if midforward_fired:
+                # The first hook that fired inside this forward already processed
+                # the previous batch's result (the one popped below otherwise) and
+                # polled the transfers.
+                assert midforward.processed_previous or not self.last_batch
+            elif self.last_batch:
                 if self.enable_continuous_input_polling:
                     # Resume intake until the oldest result is ready on all TP ranks.
                     oldest_batch_result = self.result_queue[0][1]
@@ -818,7 +859,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            if not midforward_fired:
+                self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -828,6 +870,80 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+
+    def _midforward_hook_layers(self: Scheduler) -> List[int]:
+        """Layers for SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS, or [] when it cannot apply."""
+        layers = midforward_hook.parse_layers(
+            envs.SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS.get()
+        )
+        if not layers:
+            return []
+        parallel = get_parallel()
+        if (
+            self.enable_continuous_input_polling
+            or parallel.pp_size > 1
+            or parallel.attn_dp_size > 1
+        ):
+            logger.warning(
+                "SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS needs the regular overlap loop, "
+                "PP=1 and attention DP=1; running the bookkeeping after the forward "
+                "as before."
+            )
+            return []
+        logger.info("Prefill mid-forward bookkeeping at layers %s", layers)
+        return layers
+
+    def _arm_midforward_hooks(
+        self: Scheduler, layers: List[int], batch: ScheduleBatch
+    ) -> Optional[_MidForwardState]:
+        """Arm the hooks for this batch's forward; the same decision on every rank."""
+        if not layers or not batch.forward_mode.is_extend():
+            return None
+        if (
+            batch.extend_num_tokens or 0
+        ) < envs.SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS.get():
+            return None
+        state = _MidForwardState()
+
+        def run(layer_id: int) -> None:
+            with torch.profiler.record_function(
+                f"scheduler.midforward[L{layer_id}]"
+            ), self.device_module.stream(self.schedule_stream):
+                # Off the forward stream: nothing here may queue behind this forward.
+                if not state.processed_previous:
+                    state.processed_previous = True
+                    if self.last_batch and self.result_queue:
+                        # Same pop as the loop's: the previous batch's result. Its
+                        # forward finished before this one started on the GPU.
+                        oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                        self.process_batch_result(oldest_batch, oldest_batch_result)
+                self.process_disagg_prefill_inflight_queue()
+                self._ingest_generate_requests_midforward()
+
+        midforward_hook.arm({layer: partial(run, layer) for layer in layers})
+        return state
+
+    def _ingest_generate_requests_midforward(self: Scheduler) -> None:
+        """Receive input and dispatch only its leading run of plain generate requests.
+
+        Everything from the first other message on (aborts, pause, control, flush,
+        multimodal input) stays queued in order for the loop's own intake after the
+        forward. The broadcast inside recv_requests is collective; every rank calls
+        this at the same layer, and all ranks keep the same suffix.
+        """
+        self._deferred_input_requests.extend(
+            self.request_receiver.recv_requests(local_reqs=None)
+        )
+        num_plain = 0
+        for recv_req in self._deferred_input_requests:
+            if not _is_plain_generate_req(recv_req):
+                break
+            num_plain += 1
+        if num_plain:
+            recv_reqs = self._deferred_input_requests[:num_plain]
+            del self._deferred_input_requests[:num_plain]
+            self.process_input_requests(recv_reqs)
+        self.waiting_queue.extend(self.disagg_prefill_bootstrap_queue.pop_bootstrapped())
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,

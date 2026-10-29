@@ -1952,6 +1952,16 @@ class Envs:
     # Debug: after each replay also run the same block eagerly (twice) and the unpadded
     # late layers eagerly, log the differences, and serve the unpadded eager result.
     SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_VERIFY = EnvBool(False)
+    # INF-681 k-gap. PD prefill overlap loop: run the scheduler's between-step work
+    # from inside the next forward, at the top of these layers (comma-separated, empty =
+    # off), while the host thread would otherwise sit blocked on the full launch queue.
+    # The first listed layer processes the previous batch's result (last KV chunk, first
+    # token), then polls the KV transfers and takes in new generate requests; the later
+    # ones poll and take in requests only. Whatever did not fire runs after the forward
+    # as before. Needs a model that calls midforward_hook.maybe_fire (DeepSeek V4).
+    SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS = EnvStr("")
+    # Only arm the hooks for extend batches with at least this many new tokens.
+    SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS = EnvInt(0)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
