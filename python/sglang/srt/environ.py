@@ -1658,10 +1658,12 @@ class Envs:
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
-    # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs.
+    # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
+    # the MoE raises under capture, so never set it on a decoder.
     SGLANG_OPT_DSV4_W4A8_PREFILL_MOE = EnvBool(False)
-    # With the above: convert the next layer's FP8 expert weights on a side stream while
-    # the current layer's attention runs (0 = convert in line, before each layer's GEMMs).
+    # With the above: right after a layer's experts, convert the next layer's FP8 expert
+    # weights on a side stream, overlapping the rest of the layer and the next layer's
+    # attention (0 = convert in line, before each layer's GEMMs).
     SGLANG_DSV4_W4A8_PREFETCH = EnvBool(True)
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).

@@ -55,9 +55,8 @@ class _Scratch:
         self.device = device
         self.w13 = torch.empty(0, dtype=torch.float8_e4m3fn, device=device)
         self.w2 = torch.empty(0, dtype=torch.float8_e4m3fn, device=device)
-        self.holder = (
-            None  # experts whose FP8 weights are (being) written into the buffers
-        )
+        # The experts whose FP8 weights are (being) written into the buffers.
+        self.holder = None
         self.stream = None
         self.ready = None  # recorded after the last conversion into the buffers
         self.free = None  # recorded after the last GEMM that read the buffers
@@ -287,26 +286,36 @@ class Mxfp4W4A8PrefillExperts:
         from triton_kernels.tensor import make_ragged_tensor_metadata
 
         from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            route_slots_by_expert,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
 
+        # The Python state of the shared scratch (which layer it holds, the prefetch
+        # events) is not replayed by a CUDA graph: a captured call would freeze it and
+        # could read another layer's FP8 weights, or fail capture on the events.
+        if torch.cuda.is_current_stream_capturing() or get_is_capture_mode():
+            raise RuntimeError(
+                "SGLANG_OPT_DSV4_W4A8_PREFILL_MOE does not support CUDA graphs; enable "
+                "it only on a PD prefill server whose MoE runs eagerly."
+            )
         num_tokens, top_k = topk_ids.shape
         output = torch.empty_like(hidden_states)
         if num_tokens == 0:
             return output
-        # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
-        valid = topk_ids >= 0
-        expert_ids = torch.where(valid, topk_ids, 0).flatten().long()
-        weights = torch.where(valid, topk_weights, 0).flatten()
-        combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
-        # scatter_add instead of bincount: bincount synchronizes with the host.
-        counts = torch.zeros(
-            self.num_experts, dtype=torch.int32, device=expert_ids.device
-        ).scatter_add_(0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32))
-        ragged_metadata = make_ragged_tensor_metadata(counts, expert_ids.numel())
+        routing = route_slots_by_expert(topk_ids, topk_weights, self.num_experts)
+        ragged_metadata = make_ragged_tensor_metadata(
+            routing.expert_counts, num_tokens * top_k
+        )
 
         x_fp8, x_scale = _row_quant(hidden_states.contiguous())
         self._acquire()
-        # Use triton_kernels' own tile heuristics: the W4A16 path pins num_stages for its
-        # BF16 x MXFP4 kernels process-wide, which does not fit these FP8 kernels.
+        # Use triton_kernels' own tile heuristics with no constraint at all: constraints
+        # set by others (the W4A16 path's num_stages pin, the MXFP4 swizzle's split_k=1)
+        # are tuned for BF16 x MXFP4 kernels. scoped_opt_flags_constraints merges into
+        # them, so replace the ContextVar directly (triton_kernels 3.8 internals).
         token = opt_flags._opt_flags_constraints.set({})
         try:
             gate_up = matmul(
@@ -314,7 +323,7 @@ class Mxfp4W4A8PrefillExperts:
                 self._fp8_view(self.w13, self.scratch.w13),
                 None,
                 a_ragged_metadata=ragged_metadata,
-                gather_indx=combine_indx // top_k,
+                gather_indx=routing.gather_indx,
                 precision_config=PrecisionConfig(
                     a_mx_tensor_scale=x_scale,
                     b_mx_tensor_scale=self.w13_channel_scale,
@@ -328,13 +337,13 @@ class Mxfp4W4A8PrefillExperts:
                 self._fp8_view(self.w2, self.scratch.w2),
                 None,
                 a_ragged_metadata=ragged_metadata,
-                scatter_indx=combine_indx,
+                scatter_indx=routing.combine_indx,
                 precision_config=PrecisionConfig(
                     a_mx_tensor_scale=a_scale,
                     b_mx_tensor_scale=self.w2_channel_scale,
                     out_dtype=torch.bfloat16,
                 ),
-                gammas=weights[combine_indx.long()],
+                gammas=routing.sorted_weights,
             )
         finally:
             opt_flags._opt_flags_constraints.reset(token)

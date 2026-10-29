@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -41,6 +42,11 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         expert_map=expert_map,
         global_num_experts=global_num_experts,
     )
+
+
+@functools.cache
+def _warn_w4a8_ignored() -> None:
+    logger.warning("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE is set but needs SM90; ignored.")
 
 
 class ExpertRouting(NamedTuple):
@@ -93,6 +99,8 @@ class Mxfp4MarlinMoEMethod:
         self._use_w4a8 = (
             envs.SGLANG_OPT_DSV4_W4A8_PREFILL_MOE.get() and get_platform().is_sm90
         )
+        if envs.SGLANG_OPT_DSV4_W4A8_PREFILL_MOE.get() and not self._use_w4a8:
+            _warn_w4a8_ignored()
         self._triton_kernels_decode = (
             envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE.get()
             and get_platform().is_sm90
