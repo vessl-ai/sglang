@@ -2293,7 +2293,6 @@ class MQALayer(MqaAttentionBase):
         k_nope, k_rope = None, None
         if (
             self.is_dsv41
-            and not self.q_head_norm
             and get_token_to_kv_pool().uniform_fp8
             and self.n_local_heads in (8, 16, 32, 64, 128)
         ):
