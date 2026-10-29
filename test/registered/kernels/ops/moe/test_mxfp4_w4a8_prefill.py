@@ -1,19 +1,26 @@
 """SM90 W4A8 MXFP4 experts (SGLANG_OPT_DSV4_W4A8_PREFILL_MOE): exact FP8 weights, output
-against fp32 references, and the side-stream prefetch against in-line conversion."""
+against fp32 references, the side-stream prefetch against in-line conversion (also with
+either stream delayed, so a missing event wait would corrupt the output), the refusal
+under CUDA graph capture, and the switch precedence in Mxfp4MarlinMoEMethod."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
     reason="SM90 only",
 )
+pytest.importorskip("triton_kernels")
+
+# ~25 ms on H200: far longer than one layer's conversion or GEMMs at these shapes.
+_DELAY_CYCLES = 50_000_000
 
 E, H, I, TOPK = 16, 1024, 192, 6
 LIMIT = 10.0
@@ -135,6 +142,109 @@ def test_prefetch_matches_inline_conversion():
         out = fetched[i](x, ids, wts)
         assert torch.equal(out, expected[i]), f"layer {i}"
     assert hits >= 4
+
+
+def _run_prefetch_sequence(fetched, inline, x, ids, wts):
+    expected = [inline[i](x, ids, wts) for i in range(len(inline))]
+    order = [0, 1, 2, 0, 1, 2, 2, 0, 0, 1]
+    for i in order:
+        out = fetched[i](x, ids, wts)
+        assert torch.equal(out, expected[i]), f"layer {i}"
+
+
+@pytest.mark.parametrize("delayed", ["side_stream", "current_stream"])
+def test_prefetch_orders_streams_under_delay(delayed, monkeypatch):
+    """side_stream: every side-stream conversion starts late, so a GEMM that did not
+    wait on `ready` would read the previous layer's weights. current_stream: every
+    layer's GEMMs start late, so a prefetch that did not wait on `free` would overwrite
+    the buffers they are about to read."""
+    from sglang.srt.layers.quantization import mxfp4_w4a8_prefill as mod
+
+    layers = [_weights(20 + i) for i in range(3)]
+    inline = [mod.Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False) for w in layers]
+    fetched = [mod.Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=True) for w in layers]
+    x, ids, wts = _inputs(512, 4)
+    if delayed == "side_stream":
+        convert = mod.Mxfp4W4A8PrefillExperts._convert_into_scratch
+
+        def slow_convert(self):
+            if torch.cuda.current_stream() == self.scratch.stream:
+                torch.cuda._sleep(_DELAY_CYCLES)
+            convert(self)
+
+        monkeypatch.setattr(
+            mod.Mxfp4W4A8PrefillExperts, "_convert_into_scratch", slow_convert
+        )
+    else:
+        row_quant = mod._row_quant
+
+        def slow_row_quant(x):
+            out = row_quant(x)
+            torch.cuda._sleep(_DELAY_CYCLES)
+            return out
+
+        monkeypatch.setattr(mod, "_row_quant", slow_row_quant)
+    _run_prefetch_sequence(fetched, inline, x, ids, wts)
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_refuses_cuda_graph_capture(prefetch):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    experts = Mxfp4W4A8PrefillExperts(*_weights(30), LIMIT, prefetch=prefetch)
+    x, ids, wts = _inputs(64, 5)
+    experts(x, ids, wts)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
+        with torch.cuda.graph(graph):
+            experts(x, ids, wts)
+
+
+@pytest.mark.parametrize(
+    "w4a8,triton,decode,expected",
+    [
+        ("1", "1", "1", (True, False, False)),
+        ("1", "0", "0", (True, False, False)),
+        ("0", "1", "0", (False, True, False)),
+        ("0", "0", "1", (False, True, True)),
+        ("0", "0", "0", (False, False, False)),
+    ],
+)
+def test_switch_precedence(w4a8, triton, decode, expected, monkeypatch):
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE", w4a8)
+    monkeypatch.setenv("SGLANG_OPT_DSV4_TRITON_KERNELS_MOE", triton)
+    monkeypatch.setenv("SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE", decode)
+    method = Mxfp4MarlinMoEMethod(
+        SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
+    )
+    got = (
+        method._use_w4a8,
+        method._use_triton_kernels,
+        method._triton_kernels_decode,
+    )
+    assert got == expected
+
+
+def test_rejects_non_dsv4_experts(monkeypatch):
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE", "1")
+    method = Mxfp4MarlinMoEMethod(
+        SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
+    )
+    method.hidden_pad = 0
+    method.runner = SimpleNamespace(
+        config=SimpleNamespace(
+            activation="silu", is_gated=True, gemm1_alpha=None, swiglu_limit=None
+        )
+    )
+    with pytest.raises(ValueError, match="clamped SwiGLU"):
+        method._prepare_w4a8_weights(torch.nn.Module())
 
 
 if __name__ == "__main__":
