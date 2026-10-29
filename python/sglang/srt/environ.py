@@ -1632,11 +1632,16 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
-    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path (test
+    # oracle / fallback) instead of DeepGEMM: fp8_fp4_mqa_logits on SM100+, and on
+    # SM90 fp8_mqa_logits over e4m3-widened operands, which is the SM90 default.
+    # SM100 ignores it under attention CP (only DeepGEMM serves CP rows there);
+    # SM90 always runs CP on the torch path, so the env changes nothing there.
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
-    # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
-    # TP ranks instead of scoring every row on every rank.
+    # Split the DeepSeek-V4.1 prefill indexer's query rows across the attention TP
+    # ranks instead of scoring every row on every rank, and max-merge the per-rank
+    # selections. Applies to the torch and the DeepGEMM prefill paths on any arch;
+    # off under attention DP or CP.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
