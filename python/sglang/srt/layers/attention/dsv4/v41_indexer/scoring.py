@@ -279,7 +279,9 @@ def _merge_row_shards(inputs: PrefillInputs, group) -> None:
             continue
         view = out[:n]
         buf = view if view.is_contiguous() else view.contiguous()
-        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.MAX, group=group)
+        torch.distributed.all_reduce(
+            buf, op=torch.distributed.ReduceOp.MAX, group=group
+        )
         if buf is not view:
             view.copy_(buf)
 
