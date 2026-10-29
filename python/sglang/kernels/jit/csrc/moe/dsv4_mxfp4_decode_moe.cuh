@@ -42,7 +42,7 @@ namespace dsv4_decode_moe {
 struct Params {
   const __nv_bfloat16* __restrict__ x;  // gate/up: [tokens, K] ; down: [slots, K] in sorted order
   const uint4* __restrict__ wq;         // repacked e2m1 [E][NB][W][K/64][T][32]
-  const uint4* __restrict__ ws;         // repacked e8m0+126 [E][NB][W][K/64][32]
+  const uint8_t* __restrict__ ws;       // repacked e8m0+126 [E][NB][W][K/64][8 groups][16]
   const int32_t* __restrict__ counts;   // [E] slots per expert
   const int32_t* __restrict__ gather;   // gate/up: token of each sorted slot
   const int32_t* __restrict__ combine;  // down: original slot of each sorted slot
@@ -65,6 +65,9 @@ SGL_DEVICE uint4 ldg_stream(const uint4* p) {
 
 SGL_DEVICE void cp_async16(uint32_t smem_addr, const void* gmem) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_addr), "l"(gmem));
+}
+SGL_DEVICE void cp_async4(uint32_t smem_addr, const void* gmem) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_addr), "l"(gmem));
 }
 SGL_DEVICE void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N>
@@ -133,9 +136,12 @@ struct Config {
   static constexpr int kStageElems = kRows * kKC;
   // A single-chunk K (down) needs one X buffer whatever kStages is.
   static constexpr int kSmemStages = kStages < kChunks ? kStages : kChunks;
-  static constexpr int kFrags = kTiles + 1;  // per k64 step: one uint4 per tile + one of scales
+  static constexpr int kFrags = kTiles;  // per k64 step and thread: one uint4 per tile
   static constexpr size_t kXBytes = static_cast<size_t>(kKSplit) * kSmemStages * kStageElems * 2;
-  static constexpr size_t kRingBytes = static_cast<size_t>(kRing) * kFrags * kThreads * 16;
+  // Weights: [slot][tile][thread] 16 B. Scales: [slot][warp][8 groups x 16 B]; the 4 lanes of a
+  // fragment group need the same 16 scale bytes, so each lane copies 4 of them and reads all 16.
+  static constexpr size_t kRingWBytes = static_cast<size_t>(kRing) * kFrags * kThreads * 16;
+  static constexpr size_t kRingBytes = kRingWBytes + static_cast<size_t>(kRing) * kWarpsTotal * 128;
   static constexpr size_t kSmemBytes = kXBytes + kRingBytes;
   static constexpr size_t kReduceBytes = static_cast<size_t>(kWarps) * 32 * kTiles * kMaxCh * 4 * sizeof(float);
   static_assert(kK % (kKC * kKSplit) == 0 && kKC % 64 == 0, "K chunking");
@@ -191,11 +197,14 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
 
   const size_t wblock = (static_cast<size_t>(expert) * gridDim.y + block) * kWarps + warp;
   const uint4* wq = p.wq + (wblock * kKSplit + kgroup) * (kSteps * kTiles * 32) + lane;
-  const uint4* ws = p.ws + (wblock * kKSplit + kgroup) * (kSteps * 32) + lane;
+  const uint8_t* ws = p.ws + (wblock * kKSplit + kgroup) * (kSteps * 128) + lane * 4;
   const uint32_t xs_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem_raw));
   // This thread's private weight ring: slot-major, then fragment, then thread (conflict-free v4).
   const uint32_t ring_base = xs_base + static_cast<uint32_t>(C::kXBytes) + tid * 16;
   const uint4* ring_ptr = reinterpret_cast<const uint4*>(smem_raw + C::kXBytes) + tid;
+  const uint32_t sring_base = xs_base + static_cast<uint32_t>(C::kXBytes + C::kRingWBytes) + warp_all * 128 + lane * 4;
+  const uint4* sring_ptr =
+      reinterpret_cast<const uint4*>(smem_raw + C::kXBytes + C::kRingWBytes + warp_all * 128) + lane / 4;
 
   for (int r0 = 0; r0 < count; r0 += kRows) {
     const int nrows = min(count - r0, kRows);
@@ -229,7 +238,7 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
   #pragma unroll
         for (int f = 0; f < kTiles; ++f)
           cp_async16(ring_base + ((slot * kFrags + f) * kThreads) * 16, wq + (step * kTiles + f) * 32);
-        cp_async16(ring_base + ((slot * kFrags + kTiles) * kThreads) * 16, ws + step * 32);
+        cp_async4(sring_base + slot * (C::kWarpsTotal * 128), ws + step * 128);
       };
 
       // Prologue: X chunks 0..kStages-2 in the first group, then one group per weight step.
@@ -264,7 +273,7 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
         const int stage = kgroup * kSmemStages + (s / kStepsPerChunk) % kSmemStages;
         const int kin = (s % kStepsPerChunk) * 64;  // k offset inside the staged chunk
         const int slot = s % kRing;
-        const uint4 scur = ring_ptr[(slot * kFrags + kTiles) * kThreads];
+        const uint4 scur = sring_ptr[slot * (C::kWarpsTotal * 8)];  // this lane's group record (broadcast)
         const uint32_t sw[4] = {scur.x, scur.y, scur.z, scur.w};
 
   #pragma unroll
@@ -420,7 +429,7 @@ inline void gate_up(
   Params prm{};
   prm.x = static_cast<const __nv_bfloat16*>(x.data_ptr());
   prm.wq = static_cast<const uint4*>(wq.data_ptr());
-  prm.ws = static_cast<const uint4*>(ws.data_ptr());
+  prm.ws = static_cast<const uint8_t*>(ws.data_ptr());
   prm.counts = static_cast<const int32_t*>(counts.data_ptr());
   prm.gather = static_cast<const int32_t*>(gather.data_ptr());
   prm.out = static_cast<__nv_bfloat16*>(out.data_ptr());
@@ -445,7 +454,7 @@ inline void down(
   Params prm{};
   prm.x = static_cast<const __nv_bfloat16*>(h.data_ptr());
   prm.wq = static_cast<const uint4*>(wq.data_ptr());
-  prm.ws = static_cast<const uint4*>(ws.data_ptr());
+  prm.ws = static_cast<const uint8_t*>(ws.data_ptr());
   prm.counts = static_cast<const int32_t*>(counts.data_ptr());
   prm.combine = static_cast<const int32_t*>(combine.data_ptr());
   prm.gammas = static_cast<const float*>(gammas.data_ptr());

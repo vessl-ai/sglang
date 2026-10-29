@@ -36,9 +36,9 @@ MAX_E8M0 = 128
 
 class PackedExperts(NamedTuple):
     w13_q: torch.Tensor  # uint8, [E, 3, 6, 80, 4, 32, 16]
-    w13_s: torch.Tensor  # uint8, [E, 3, 6, 80, 32, 16]
+    w13_s: torch.Tensor  # uint8, [E, 3, 6, 80, 8, 16]
     w2_q: torch.Tensor  # uint8, [E, 20, 4, 9, 4, 32, 16]
-    w2_s: torch.Tensor  # uint8, [E, 20, 4, 9, 32, 16]
+    w2_s: torch.Tensor  # uint8, [E, 20, 4, 9, 8, 16]
 
 
 def supports(hidden: int, inter_per_rank: int) -> bool:
@@ -77,10 +77,11 @@ def _place(nib: torch.Tensor, bits) -> torch.Tensor:
 
 def _repack(weight, scale, layout, chan_base, expert_chunk=16):
     """weight [E, N, K/2] (low nibble = even k), scale [E, N, K/32] e8m0 bytes ->
-    (q [E, NB, W, K/64, T, 32, 16] uint8, s [E, NB, W, K/64, 32, 16] uint8).
+    (q [E, NB, W, K/64, T, 32, 16] uint8, s [E, NB, W, K/64, 8, 16] uint8).
 
-    Word j of a lane's 16 bytes = k16 step j of the k64 step, bits per _PLACE; scale byte q of a
-    lane = tile q // 4, k32 block (q // 2) % 2, channel g + 8 * (q % 2), stored as e8m0 + 126."""
+    Word j of a lane's 16 bytes = k16 step j of the k64 step, bits per _PLACE; scale byte q of
+    fragment group g (lanes 4g..4g+3) = tile q // 4, k32 block (q // 2) % 2, channel g + 8 * (q % 2),
+    stored as e8m0 + 126 (exactly the raw scale bytes, no replication)."""
     nb, nw, nt = layout
     E, N, Kb = weight.shape
     K = 2 * Kb
@@ -105,18 +106,18 @@ def _repack(weight, scale, layout, chan_base, expert_chunk=16):
     kbyte = (64 * st + 16 * j + 2 * c + 8 * (i // 2)) // 2
     flat = (chan * Kb + kbyte).reshape(-1)
 
-    # scale bytes: [nb, nw, steps, 32, 16], byte q = t*4 + jb*2 + h
+    # scale bytes: [nb, nw, steps, 8 groups, 16], byte q = t*4 + jb*2 + h (one copy per fragment group)
     q = ar(16).view(1, 1, 1, 1, 16)
     ts, jb, h = q // 4, (q // 2) % 2, q % 2
     sb = b.view(nb, 1, 1, 1, 1)
     sw = w.view(1, nw, 1, 1, 1)
     sst = st.view(1, 1, steps, 1, 1)
-    sg = (lane // 4).view(1, 1, 1, 32, 1)
+    sg = ar(8).view(1, 1, 1, 8, 1)
     schan = chan_base(sb, sw, ts) + sg + 8 * h
     sflat = (schan * (K // 32) + 2 * sst + jb).reshape(-1)
 
     out_q = torch.empty((E, nb, nw, steps, nt, 32, 16), dtype=torch.uint8, device=dev)
-    out_s = torch.empty((E, nb, nw, steps, 32, 16), dtype=torch.uint8, device=dev)
+    out_s = torch.empty((E, nb, nw, steps, 8, 16), dtype=torch.uint8, device=dev)
     for e0 in range(0, E, expert_chunk):
         e1 = min(E, e0 + expert_chunk)
         ne = e1 - e0
@@ -129,7 +130,7 @@ def _repack(weight, scale, layout, chan_base, expert_chunk=16):
         word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
         out_q[e0:e1] = word.contiguous().view(torch.uint8).view(ne, nb, nw, steps, nt, 32, 16)
         sv = scale[e0:e1].reshape(ne, -1)[:, sflat].to(torch.int32) + SCALE_BIAS
-        out_s[e0:e1] = sv.to(torch.uint8).view(ne, nb, nw, steps, 32, 16)
+        out_s[e0:e1] = sv.to(torch.uint8).view(ne, nb, nw, steps, 8, 16)
     return out_q, out_s
 
 
