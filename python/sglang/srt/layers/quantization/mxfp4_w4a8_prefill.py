@@ -35,6 +35,8 @@ computed eagerly). Enabled by SGLANG_OPT_DSV4_W4A8_PREFILL_MOE=1 on SM90.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -309,8 +311,19 @@ def _gather_topk_sum_kernel(
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for k in tl.static_range(TOPK):
         r = tl.load(POS + t * TOPK + k).to(tl.int64)
-        acc += tl.load(Y + r * H + o, mask=m, other=0.0).to(tl.float32)
+        # r < 0: a masked slot the direct routing dropped (contributes nothing).
+        acc += tl.load(Y + r * H + o, mask=m & (r >= 0), other=0.0).to(tl.float32)
     tl.store(OUT + t * H + o, acc.to(tl.bfloat16), mask=m)
+
+
+def _topk_sum_by_pos(down_sorted, pos, out, top_k: int):
+    """out[t] = sum_k down_sorted[pos[t * top_k + k]], skipping pos < 0."""
+    num_tokens, hidden = out.shape
+    block_h = 1024
+    _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
+    )
+    return out
 
 
 def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
@@ -325,6 +338,440 @@ def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
     block_h = 1024
     _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
         down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
+    )
+    return out
+
+
+# --- Small steps: W4A8 GEMMs that read the MXFP4 weights directly (no FP8 copy) ---------
+#
+# A converted FP8 copy of a layer's experts costs ~1.3 ms per layer whatever the row count
+# (5.2 GB of HBM traffic). At a few thousand rows per layer that is about as much as the two
+# GEMMs, so for small steps these kernels expand the e2m1 nibbles to e4m3 in registers (the
+# same exact shift as the conversion) and feed them to the FP8 tensor cores as the A operand
+# (weights x activations^T, so a block of up to BR rows of one expert reads each weight byte
+# once). The activations are quantized like the W4A8 path (power-of-2 scale per row) but
+# written with each BK-wide chunk of columns permuted (even k first, then odd k), so the low
+# and high nibbles of a weight byte meet two contiguous activation half-chunks.
+# Everything is computed on the device from the routing (no host sync, fixed grid for a
+# fixed row count), so these calls can be captured in a CUDA graph.
+
+# (d = 0) e4m3 byte of the e2m1 magnitudes; same table as _PRMT_LUT_LO/_HI.
+_DQ_LO_ASM = tl.constexpr(
+    """
+{
+.reg .b32 v, t, sel, mag, nz, a, lo, hi;
+mov.b32 lo, 0x3C383000;
+mov.b32 hi, 0x4C484440;
+and.b32 v, $1, 0x07070707;
+shr.b32 t, v, 4;
+or.b32 v, v, t;
+prmt.b32 sel, v, 0, 0x4420;
+prmt.b32 mag, lo, hi, sel;
+add.u32 nz, mag, 0x7F7F7F7F;
+shr.b32 nz, nz, 7;
+and.b32 nz, nz, 0x01010101;
+mul.lo.u32 a, nz, 255;
+and.b32 a, a, $2;
+add.u32 v, mag, a;
+shl.b32 t, nz, 7;
+xor.b32 v, v, t;
+shl.b32 t, $1, 4;
+and.b32 t, t, 0x80808080;
+or.b32 $0, v, t;
+}
+"""
+)
+_DQ_HI_ASM = tl.constexpr(
+    """
+{
+.reg .b32 v, t, sel, mag, nz, a, lo, hi;
+mov.b32 lo, 0x3C383000;
+mov.b32 hi, 0x4C484440;
+shr.b32 v, $1, 4;
+and.b32 v, v, 0x07070707;
+shr.b32 t, v, 4;
+or.b32 v, v, t;
+prmt.b32 sel, v, 0, 0x4420;
+prmt.b32 mag, lo, hi, sel;
+add.u32 nz, mag, 0x7F7F7F7F;
+shr.b32 nz, nz, 7;
+and.b32 nz, nz, 0x01010101;
+mul.lo.u32 a, nz, 255;
+and.b32 a, a, $2;
+add.u32 v, mag, a;
+shl.b32 t, nz, 7;
+xor.b32 v, v, t;
+and.b32 t, $1, 0x80808080;
+or.b32 $0, v, t;
+}
+"""
+)
+
+
+@triton.jit
+def _dequant_nibbles(wb, dd, HIGH: tl.constexpr):
+    """Packed e2m1 bytes -> e4m3 of their low (HIGH=False) or high nibbles, scaled by 2^d.
+    dd = 8 d + 128 per byte (uint8), with d in [-5, 6]: exact, as in _nibbles_to_fp8."""
+    if HIGH:
+        return tl.inline_asm_elementwise(
+            _DQ_HI_ASM,
+            "=r,r,r",
+            [wb, dd],
+            dtype=tl.float8e4nv,
+            is_pure=True,
+            pack=4,
+        )
+    return tl.inline_asm_elementwise(
+        _DQ_LO_ASM, "=r,r,r", [wb, dd], dtype=tl.float8e4nv, is_pure=True, pack=4
+    )
+
+
+@triton.jit
+def _perm_col(o, BK: tl.constexpr):
+    # Column of k in the activation layout: inside each BK chunk, even k first.
+    return (o // BK) * BK + (o % 2) * (BK // 2) + (o % BK) // 2
+
+
+@triton.jit
+def _row_quant_perm_kernel(
+    X, Y, S, N: tl.constexpr, BK: tl.constexpr, BLOCK: tl.constexpr
+):
+    r = tl.program_id(0).to(tl.int64)
+    o = tl.arange(0, BLOCK)
+    m = o < N
+    x = tl.load(X + r * N + o, mask=m, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    tl.store(Y + r * N + _perm_col(o, BK), (x / s).to(tl.float8e4nv), mask=m)
+    tl.store(S + r, s)
+
+
+def _row_quant_perm(x: torch.Tensor, bk: int):
+    """_row_quant with each bk-wide chunk of columns stored even-k first."""
+    M, N = x.shape
+    y = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty(M, device=x.device, dtype=torch.float32)
+    _row_quant_perm_kernel[(M,)](
+        x, y, s, N, bk, triton.next_power_of_2(N), num_warps=8
+    )
+    return y, s
+
+
+@triton.jit
+def _swiglu_quant_perm_kernel(
+    GU, Y, S, I: tl.constexpr, LIMIT: tl.constexpr, BK: tl.constexpr, BLOCK: tl.constexpr
+):
+    r = tl.program_id(0).to(tl.int64)
+    o = tl.arange(0, BLOCK)
+    m = o < I
+    g = tl.load(GU + r * (2 * I) + o, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(GU + r * (2 * I) + I + o, mask=m, other=0.0).to(tl.float32)
+    g = tl.minimum(g, LIMIT)
+    u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+    a = (g / (1.0 + tl.exp(-g)) * u).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(a)), 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    tl.store(Y + r * I + _perm_col(o, BK), (a / s).to(tl.float8e4nv), mask=m)
+    tl.store(S + r, s)
+
+
+def _swiglu_quant_perm(gate_up: torch.Tensor, limit: float, bk: int):
+    """_swiglu_quant with each bk-wide chunk of columns stored even-k first."""
+    R, N2 = gate_up.shape
+    inter = N2 // 2
+    y = torch.empty(R, inter, device=gate_up.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty(R, device=gate_up.device, dtype=torch.float32)
+    _swiglu_quant_perm_kernel[(R,)](
+        gate_up, y, s, inter, limit, bk, triton.next_power_of_2(inter), num_warps=4
+    )
+    return y, s
+
+
+@triton.jit
+def _direct_hist_kernel(IDS, COUNTS, n_slots, BLOCK: tl.constexpr):
+    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(IDS + o, mask=o < n_slots, other=-1)
+    tl.atomic_add(COUNTS + ids, 1, mask=ids >= 0, sem="relaxed")
+
+
+@triton.jit
+def _direct_items(SCHED, c, ex, em, e, max_items, BR: tl.constexpr, BLOCK_J: tl.constexpr):
+    # Expert e's row blocks of BR rows go to SCHED[first block of e + j] = e << 16 | j;
+    # program 0 also writes -1 from the last block to max_items.
+    blocks = (c + BR - 1) // BR
+    first = tl.sum(tl.where(em & (ex < e), blocks, 0), 0)
+    nb = tl.sum(tl.where(ex == e, blocks, 0), 0)
+    for j0 in range(0, nb, BLOCK_J):
+        j = j0 + tl.arange(0, BLOCK_J)
+        tl.store(SCHED + first + j, (e << 16) | j, mask=j < nb)
+    if e == 0:
+        total = tl.sum(tl.where(em, blocks, 0), 0)
+        for i0 in range(total, max_items, BLOCK_J):
+            i = i0 + tl.arange(0, BLOCK_J)
+            tl.store(SCHED + i, tl.full([BLOCK_J], -1, tl.int32), mask=i < max_items)
+
+
+@triton.jit
+def _direct_scan_kernel(
+    COUNTS,
+    OFFS,
+    CURSOR,
+    SCHED1,
+    SCHED2,
+    E,
+    max_items1,
+    max_items2,
+    BR1: tl.constexpr,
+    BR2: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+):
+    # One program per expert e: its first row (OFFS[e], also the scatter cursor) and its
+    # row-block items for both GEMMs (BR1 and BR2 rows per block). OFFS[E] = valid slots.
+    e = tl.program_id(0)
+    ex = tl.arange(0, BLOCK_E)
+    em = ex < E
+    c = tl.load(COUNTS + ex, mask=em, other=0)
+    first_row = tl.sum(tl.where(ex < e, c, 0), 0)
+    tl.store(OFFS + e, first_row)
+    tl.store(CURSOR + e, first_row)
+    if e == 0:
+        tl.store(OFFS + E, tl.sum(c, 0))
+    _direct_items(SCHED1, c, ex, em, e, max_items1, BR1, BLOCK_J)
+    _direct_items(SCHED2, c, ex, em, e, max_items2, BR2, BLOCK_J)
+
+
+@triton.jit
+def _direct_scatter_kernel(
+    IDS,
+    WTS,
+    CURSOR,
+    GATHER,
+    SORTED_W,
+    POS,
+    n_slots,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Counting-sort scatter: slot -> next free row of its expert. The order of rows within
+    # an expert is not deterministic, but every row is computed on its own and the top-k
+    # sum reads rows by position, so the output does not depend on it.
+    slot = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = slot < n_slots
+    ids = tl.load(IDS + slot, mask=m, other=-1)
+    valid = ids >= 0
+    p = tl.atomic_add(CURSOR + ids, 1, mask=valid, sem="relaxed")
+    tl.store(GATHER + p, slot // TOPK, mask=valid)
+    tl.store(SORTED_W + p, tl.load(WTS + slot, mask=valid, other=0.0), mask=valid)
+    tl.store(POS + slot, tl.where(valid, p, -1), mask=m)
+
+
+class _DirectRouting(NamedTuple):
+    offs: torch.Tensor  # [E + 1] int32 first row of each expert; offs[E] = valid slots
+    sched13: torch.Tensor  # int32 expert << 16 | row block for W13, -1 = no item
+    sched2: torch.Tensor  # the same for W2's row blocks
+    gather_indx: torch.Tensor  # [slots] int32 token of each sorted row
+    sorted_weights: torch.Tensor  # [slots] fp32 top-k weight of each sorted row
+    pos: torch.Tensor  # [slots] int32 sorted row of each slot, -1 for masked slots
+
+
+def _direct_route(topk_ids, topk_weights, num_experts: int, br13: int, br2: int):
+    """Sort the valid top-k slots by expert (counting sort, 4 launches, no host sync, sizes
+    fixed by the slot count) and list the row blocks of the two direct GEMMs."""
+    device = topk_ids.device
+    n_slots = topk_ids.numel()
+    ids = topk_ids.reshape(-1)
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    block = 1024
+    _direct_hist_kernel[(triton.cdiv(n_slots, block),)](
+        ids, counts, n_slots, block, num_warps=4
+    )
+    items13 = triton.cdiv(n_slots, br13) + num_experts
+    items2 = triton.cdiv(n_slots, br2) + num_experts
+    offs = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    cursor = torch.empty(num_experts, dtype=torch.int32, device=device)
+    sched13 = torch.empty(items13, dtype=torch.int32, device=device)
+    sched2 = torch.empty(items2, dtype=torch.int32, device=device)
+    _direct_scan_kernel[(num_experts,)](
+        counts,
+        offs,
+        cursor,
+        sched13,
+        sched2,
+        num_experts,
+        items13,
+        items2,
+        br13,
+        br2,
+        triton.next_power_of_2(num_experts),
+        128,
+        num_warps=4,
+    )
+    gather_indx = torch.empty(n_slots, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(n_slots, dtype=torch.float32, device=device)
+    pos = torch.empty(n_slots, dtype=torch.int32, device=device)
+    _direct_scatter_kernel[(triton.cdiv(n_slots, block),)](
+        ids,
+        topk_weights.reshape(-1).float(),
+        cursor,
+        gather_indx,
+        sorted_weights,
+        pos,
+        n_slots,
+        topk_ids.shape[1],
+        block,
+        num_warps=4,
+    )
+    return _DirectRouting(offs, sched13, sched2, gather_indx, sorted_weights, pos)
+
+
+@triton.jit
+def _w4a8_direct_kernel(
+    X,
+    XS,
+    GATHER,
+    W,
+    SC,
+    SMAX,
+    CS,
+    GAMMA,
+    OUT,
+    OFFS,
+    SCHED,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    BN: tl.constexpr,
+    BR: tl.constexpr,
+    HAS_GATHER: tl.constexpr,
+    HAS_GAMMA: tl.constexpr,
+    SWAP: tl.constexpr,
+    DD_PER_BLOCK: tl.constexpr = True,
+):
+    # OUT[r, n] = XS[src] * CS[e, n] * (GAMMA[r]) * sum_k X[src, k] * W[e, n, k] over the
+    # rows r of one expert e (sorted order), src = GATHER[r] or r.
+    # SWAP: acc is [BN, BR] (dequantized weights = A operand, activations = B operand);
+    # else acc is [BR, BN] (activations = A, dequantized weights = B in shared memory).
+    item = tl.load(SCHED + tl.program_id(1))
+    if item >= 0:
+        e = item >> 16
+        r0 = tl.load(OFFS + e) + (item & 0xFFFF) * BR
+        end = tl.load(OFFS + e + 1)
+        rows = r0 + tl.arange(0, BR)
+        rmask = rows < end
+        if HAS_GATHER:
+            src = tl.load(GATHER + rows, mask=rmask, other=0).to(tl.int64)
+        else:
+            src = rows.to(tl.int64)
+        n = tl.program_id(0) * BN + tl.arange(0, BN)
+        nmask = n < N
+        wrow = (e * N + n).to(tl.int64)
+        smax = tl.load(SMAX + wrow, mask=nmask, other=0)
+        jb = tl.arange(0, BK // 2)
+        if SWAP:
+            acc = tl.zeros([BN, BR], dtype=tl.float32)
+        else:
+            acc = tl.zeros([BR, BN], dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            wb = tl.load(
+                W + wrow[:, None] * (K // 2) + (k0 // 2 + jb)[None, :],
+                mask=nmask[:, None],
+                other=0,
+            )
+            if DD_PER_BLOCK:
+                # One shift per 32-element block, broadcast to its 16 packed bytes.
+                jblk = tl.arange(0, BK // 32)
+                s = tl.load(
+                    SC + wrow[:, None] * (K // 32) + (k0 // 32 + jblk)[None, :],
+                    mask=nmask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                dd = ((s - smax[:, None] + 6) * 8 + 128).to(tl.uint8)
+                dd = tl.reshape(
+                    tl.broadcast_to(dd[:, :, None], [BN, BK // 32, 16]), [BN, BK // 2]
+                )
+            else:
+                s = tl.load(
+                    SC + wrow[:, None] * (K // 32) + (k0 // 32 + jb // 16)[None, :],
+                    mask=nmask[:, None],
+                    other=0,
+                ).to(tl.int32)
+                dd = ((s - smax[:, None] + 6) * 8 + 128).to(tl.uint8)
+            x_lo = tl.load(
+                X + src[:, None] * K + (k0 + jb)[None, :], mask=rmask[:, None], other=0.0
+            )
+            x_hi = tl.load(
+                X + src[:, None] * K + (k0 + BK // 2 + jb)[None, :],
+                mask=rmask[:, None],
+                other=0.0,
+            )
+            w_lo = _dequant_nibbles(wb, dd, False)
+            w_hi = _dequant_nibbles(wb, dd, True)
+            if SWAP:
+                acc = tl.dot(w_lo, tl.trans(x_lo), acc)
+                acc = tl.dot(w_hi, tl.trans(x_hi), acc)
+            else:
+                acc = tl.dot(x_lo, tl.trans(w_lo), acc)
+                acc = tl.dot(x_hi, tl.trans(w_hi), acc)
+        cs = tl.load(CS + wrow, mask=nmask, other=0.0)
+        xs = tl.load(XS + src, mask=rmask, other=0.0)
+        if HAS_GAMMA:
+            xs = xs * tl.load(GAMMA + rows, mask=rmask, other=0.0)
+        if SWAP:
+            tl.store(
+                OUT + rows.to(tl.int64)[None, :] * N + n[:, None],
+                (acc * cs[:, None] * xs[None, :]).to(tl.bfloat16),
+                mask=nmask[:, None] & rmask[None, :],
+            )
+        else:
+            tl.store(
+                OUT + rows.to(tl.int64)[:, None] * N + n[None, :],
+                (acc * xs[:, None] * cs[None, :]).to(tl.bfloat16),
+                mask=rmask[:, None] & nmask[None, :],
+            )
+
+
+def _w4a8_direct_matmul(
+    x_perm,
+    x_scale,
+    w,
+    scale,
+    smax,
+    channel_scale,
+    routing: _DirectRouting,
+    sched: torch.Tensor,
+    bk: int,
+    tiles,
+    gather: bool,
+    gamma: bool,
+):
+    """[slots, N] bf16 in expert-sorted row order (see _w4a8_direct_kernel); rows past
+    routing.offs[E] (masked slots) are left unwritten."""
+    E, N, KH = w.shape
+    bn, br, warps, stages, swap = tiles
+    out = torch.empty(routing.pos.numel(), N, device=w.device, dtype=torch.bfloat16)
+    _w4a8_direct_kernel[(triton.cdiv(N, bn), sched.numel())](
+        x_perm,
+        x_scale,
+        routing.gather_indx,
+        w.view(torch.uint8),
+        scale.view(torch.uint8),
+        smax,
+        channel_scale,
+        routing.sorted_weights,
+        out,
+        routing.offs,
+        sched,
+        N,
+        KH * 2,
+        bk,
+        bn,
+        br,
+        gather,
+        gamma,
+        swap,
+        num_warps=warps,
+        num_stages=stages,
     )
     return out
 
@@ -344,6 +791,27 @@ def _fold(scale: torch.Tensor, name: str):
     return smax.to(torch.int32).contiguous(), channel_scale
 
 
+# Direct-kernel tiles (BN, BR, warps, stages, swap) for W13 (K 5120, BK 128) and W2 (K 576,
+# BK 64), by routed rows per expert on average. Best of a sweep on H200 at the TP4
+# DeepSeek-V4.1-Flash shapes, 6,912 / 13,824 / 27,648 rows; the W13 switch from 128- to
+# 256-row blocks measured between 7,680 and 8,192 rows (~123 rows per expert).
+_DIRECT_BK13, _DIRECT_BK2 = 128, 64
+# FP8 tensor-core accumulation is the hardware's reduced-precision one over the whole K loop,
+# like the triton_kernels path (promoting every 32 products: 1.28% -> 0.41% vs the fp32 W4A8
+# reference at 2,048 rows, but 1.4-2.6x slower).
+_DIRECT_TILES = (
+    # (max rows per expert, W13 tiles, W2 tiles)
+    (120, (128, 128, 8, 3, False), (128, 128, 4, 3, True)),
+    (None, (128, 256, 8, 3, True), (128, 128, 4, 3, True)),
+)
+
+
+def _direct_tiles(rows_per_expert: float):
+    for limit, t13, t2 in _DIRECT_TILES:
+        if limit is None or rows_per_expert <= limit:
+            return t13, t2
+
+
 class Mxfp4W4A8PrefillExperts:
     """Keeps the checkpoint's MXFP4 experts ([E, N, K/2] int8 + [E, N, K/32] e8m0) and runs
     them as FP8 x FP8 GEMMs."""
@@ -358,6 +826,7 @@ class Mxfp4W4A8PrefillExperts:
         prefetch: bool,
         prefetch_chunks: int = 0,
         sorted_sum: bool = False,
+        small_step_rows: int = 0,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -372,6 +841,9 @@ class Mxfp4W4A8PrefillExperts:
         # W2 writes its rows in expert order (no epilogue scatter) and the top-k sum
         # gathers them by position: same sums, bit for bit, ~12% less W2 time at 32k rows.
         self.sorted_sum = sorted_sum
+        # Calls with at most this many rows read the MXFP4 weights directly (no FP8 copy,
+        # see _w4a8_direct_kernel). 0 = never.
+        self.small_step_rows = small_step_rows
         self.successor = None  # the experts observed to run after these ones
         self.scratch = _scratch(w13.device)
         # Reserve the buffers now so KV-cache sizing sees them.
@@ -389,6 +861,46 @@ class Mxfp4W4A8PrefillExperts:
             _mxfp4_to_fp8(
                 w, scale, smax, buf[: E * N * KH * 2].view(E, N, KH * 2), num_launches
             )
+
+    def _direct(self, hidden_states, topk_ids, topk_weights) -> torch.Tensor:
+        """The experts with _w4a8_direct_kernel: same quantization as the FP8-copy path
+        (exact FP8 weights, FP8 activations with a power-of-2 row scale), weights read once
+        per block of BR rows of an expert instead of converted for the whole layer."""
+        num_tokens, top_k = topk_ids.shape
+        t13, t2 = _direct_tiles(num_tokens * top_k / self.num_experts)
+        routing = _direct_route(topk_ids, topk_weights, self.num_experts, t13[1], t2[1])
+        x_perm, x_scale = _row_quant_perm(hidden_states.contiguous(), _DIRECT_BK13)
+        gate_up = _w4a8_direct_matmul(
+            x_perm,
+            x_scale,
+            self.w13,
+            self.w13_scale,
+            self.w13_smax,
+            self.w13_channel_scale,
+            routing,
+            routing.sched13,
+            _DIRECT_BK13,
+            t13,
+            gather=True,
+            gamma=False,
+        )
+        a_perm, a_scale = _swiglu_quant_perm(gate_up, self.swiglu_limit, _DIRECT_BK2)
+        del gate_up
+        down = _w4a8_direct_matmul(
+            a_perm,
+            a_scale,
+            self.w2,
+            self.w2_scale,
+            self.w2_smax,
+            self.w2_channel_scale,
+            routing,
+            routing.sched2,
+            _DIRECT_BK2,
+            t2,
+            gather=False,
+            gamma=True,
+        )
+        return _topk_sum_by_pos(down, routing.pos, torch.empty_like(hidden_states), top_k)
 
     def _single_launch(self) -> int:
         """num_launches for a conversion that is not sliced: the word kernel when the
@@ -446,6 +958,10 @@ class Mxfp4W4A8PrefillExperts:
             get_is_capture_mode,
         )
 
+        num_tokens = topk_ids.shape[0]
+        if 0 < num_tokens <= self.small_step_rows:
+            # No scratch, no events, no host sync: safe inside a CUDA graph.
+            return self._direct(hidden_states, topk_ids, topk_weights)
         # The Python state of the shared scratch (which layer it holds, the prefetch
         # events) is not replayed by a CUDA graph: a captured call would freeze it and
         # could read another layer's FP8 weights, or fail capture on the events.
