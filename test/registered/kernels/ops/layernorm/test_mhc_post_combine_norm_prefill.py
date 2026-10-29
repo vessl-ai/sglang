@@ -4,6 +4,7 @@ normed output within 1 bf16 ulp. On SM90 this is the opt-in
 SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE path; its dispatch gate keeps the unfused
 path in batch-invariant mode."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -81,3 +82,7 @@ def test_sm90_gate_respects_switch_and_batch_invariant_mode(monkeypatch):
             envs.SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE.override(switch),
         ):
             assert deepseek_v4_mhc._sm90_fused_post_combine() is expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

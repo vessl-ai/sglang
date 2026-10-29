@@ -1,4 +1,5 @@
 import itertools
+import sys
 
 import pytest
 import torch
@@ -48,3 +49,7 @@ def test_matches_cuda_v2_group_sizes_and_strided_rows(group, k):
     q, s = ue8m0_group_quant_fp8(x, group)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert torch.equal(s, s_ref)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
