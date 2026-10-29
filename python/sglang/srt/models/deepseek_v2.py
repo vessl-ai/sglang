@@ -1271,10 +1271,22 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
+                shared_pre_quant = pre_quant_input
+                if (
+                    shared_pre_quant is None
+                    and envs.SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT.get()
+                ):
+                    # INF-681 k-qcp: one pass quantizes the input for both the shared
+                    # expert (returned) and the W4A8 routed experts (handed to them).
+                    from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+                    shared_pre_quant = dsv4_prefill_qcp.offer_dual_quant(
+                        self, hidden_states
+                    )
                 shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    pre_quant_input=pre_quant_input,
+                    pre_quant_input=shared_pre_quant,
                 )
             # router_logits: (num_tokens, n_experts)
             if _is_hip:
@@ -1370,6 +1382,10 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
+        if envs.SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT.get():
+            from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+            dsv4_prefill_qcp.withdraw_row_quant(self)  # an offer the experts did not take
         if qcp_armed and dsv4_prefill_qcp.disarm_shared_add(self.experts):
             if self.reduce_results:
                 return post_experts_all_reduce(shared_output)

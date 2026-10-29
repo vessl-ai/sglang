@@ -10,9 +10,12 @@ arithmetic, same rounding points), only with fewer passes over HBM:
 * `gather_topk_sum_add` (SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM): the W4A8 prefill
   experts' top-k sum adds the shared expert's output in its epilogue instead of a separate
   ``shared.add_(routed, alpha)`` pass over [T, hidden] (three bf16 reads/writes).
+* `dual_quant_fp8` + `offer_dual_quant` (SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT): the MoE
+  input's 1x128 quant (GRAN128 shared expert) and per-row quant (W4A8 routed experts) in one
+  pass over [T, hidden].
 """
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -237,3 +240,153 @@ def take_shared_add(runner, num_tokens: int, hidden: int):
         return None
     runner.qcp_shared_add_taken = True
     return shared, alpha
+
+
+# --- SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT: one pass for both quants of the MoE input -----
+#
+# The [T, hidden] MoE input is quantized twice: per 1x128 group (UE8M0, MN-major scales) for
+# the GRAN128 shared expert's gate_up GEMM, and per row (power-of-two scale) for the W4A8
+# routed experts. One kernel reads the row once and writes both, with the arithmetic of
+# fp8_block32_gran128._ue8m0_quant_mn_kernel and mxfp4_w4a8_prefill._row_quant_kernel.
+
+
+class Gran128Activation(NamedTuple):
+    """A pre-quantized activation for a GRAN128 linear (fp8_block32_gran128.apply):
+    q [M, K] e4m3 and s [M, K / 128] fp32 powers of two, MN-major (M stride aligned to 4)."""
+
+    q: torch.Tensor
+    s: torch.Tensor
+
+
+@triton.jit
+def _dual_quant_kernel(
+    X,
+    Q1,
+    S1,
+    Q2,
+    S2,
+    stride_s1,
+    N: tl.constexpr,
+    GROUP: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    # Pass 1 finds the row's amax chunk by chunk; pass 2 re-reads the row (from cache)
+    # and writes both quantizations. No masked lanes for N = 5 x 1024.
+    r = tl.program_id(0).to(tl.int64)
+    o = tl.arange(0, CHUNK)
+    amax = tl.zeros((), tl.float32)
+    for c in tl.static_range(N // CHUNK):
+        x = tl.load(X + r * N + c * CHUNK + o).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x)))
+    # per row (mxfp4_w4a8_prefill._row_quant_kernel)
+    amax = tl.maximum(amax, 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    tl.store(S2 + r, s)
+    g = tl.arange(0, CHUNK // GROUP)
+    for c in tl.static_range(N // CHUNK):
+        x = tl.load(X + r * N + c * CHUNK + o).to(tl.float32)
+        tl.store(Q2 + r * N + c * CHUNK + o, (x / s).to(tl.float8e4nv))
+        # per 1x128 group (fp8_block32_gran128._ue8m0_quant_mn_kernel)
+        xg = tl.reshape(x, (CHUNK // GROUP, GROUP))
+        gamax = tl.maximum(tl.max(tl.abs(xg), axis=1), 1e-10)
+        bits = (gamax * (1.0 / 448.0)).to(tl.uint32, bitcast=True)
+        exp = (
+            ((bits >> 23) & 0xFF).to(tl.int32)
+            - 127
+            + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        )
+        scale_inv = ((exp + 127) << 23).to(tl.float32, bitcast=True)
+        scale = ((127 - exp) << 23).to(tl.float32, bitcast=True)
+        q = xg * scale[:, None]
+        q = tl.minimum(tl.maximum(q, -448.0), 448.0)
+        q = tl.reshape(q, (CHUNK,)).to(Q1.dtype.element_ty)
+        tl.store(Q1 + r * N + c * CHUNK + o, q)
+        gi = c * (CHUNK // GROUP) + g
+        tl.store(S1 + gi.to(tl.int64) * stride_s1 + r, scale_inv)
+
+
+def dual_quant_fp8(x: torch.Tensor):
+    """(Gran128Activation(q1, s1), (q2, s2)): q1/s1 equal ue8m0_group_quant_fp8_mn(x, 128),
+    q2/s2 equal mxfp4_w4a8_prefill._row_quant(x), bit for bit."""
+    assert x.dim() == 2 and x.is_contiguous() and x.dtype == torch.bfloat16
+    m, n = x.shape
+    assert n % _GROUP == 0
+    num_groups = n // _GROUP
+    q1 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    m_al = (m + 3) // 4 * 4
+    s1_buf = torch.empty((num_groups, m_al), dtype=torch.float32, device=x.device)
+    q2 = torch.empty((m, n), dtype=torch.float8_e4m3fn, device=x.device)
+    s2 = torch.empty(m, dtype=torch.float32, device=x.device)
+    if m > 0:
+        chunk = 1024 if n % 1024 == 0 else _GROUP
+        _dual_quant_kernel[(m,)](
+            x, q1, s1_buf, q2, s2, m_al, N=n, GROUP=_GROUP, CHUNK=chunk, num_warps=4
+        )
+    return Gran128Activation(q1, s1_buf[:, :m].t()), (q2, s2)
+
+
+def gran128_linear_prequant(layer, x: Gran128Activation, bias) -> torch.Tensor:
+    """fp8_block32_gran128.block128_fp8_linear for an already quantized activation (the
+    producer checked the GRAN32 windows)."""
+    from sglang.kernels.ops.gemm.fp8_kernel import deep_gemm_fp8_fp8_bf16_nt
+
+    m, n = x.q.shape[0], layer.weight.shape[0]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.q.device)
+    if m > 0:
+        deep_gemm_fp8_fp8_bf16_nt(
+            x.q, x.s, layer.weight, layer.weight_scale_inv, out, _GROUP, _GROUP
+        )
+    if bias is not None:
+        out += bias
+    return out
+
+
+def offer_dual_quant(moe, hidden_states: torch.Tensor) -> Optional[Gran128Activation]:
+    """For DeepseekV2MoE.forward_normal: when the shared expert's gate_up is a GRAN128
+    linear and the routed experts are the W4A8 prefill experts on their row-quant path,
+    quantize the MoE input once, hand the row quant to the experts and return the shared
+    expert's pre-quantized gate_up input; None leaves both paths as they are."""
+    from sglang.srt.layers.quantization.fp8_block32_gran128 import prefer_gran32_kernel
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    shared = getattr(moe, "shared_experts", None)
+    gate_up = getattr(shared, "gate_up_proj", None)
+    method = getattr(getattr(moe, "experts", None), "quant_method", None)
+    runner = getattr(method, "_w4a8", None)
+    x = hidden_states
+    if not (
+        gate_up is not None
+        and getattr(gate_up, "dense_gran128", False)
+        and isinstance(method, Mxfp4MarlinMoEMethod)
+        and getattr(method, "_use_w4a8", False)
+        and runner is not None
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.shape[0] > max(0, runner.small_step_rows)  # the row-quant (copy) path
+        and x.shape[1] == gate_up.weight.shape[1]
+        and x.shape[1] % _GROUP == 0
+        and not prefer_gran32_kernel(x.shape[0], *gate_up.weight.shape)
+    ):
+        return None
+    g128, row = dual_quant_fp8(x)
+    runner.qcp_row_quant = (x.data_ptr(), tuple(x.shape), row)
+    return g128
+
+
+def take_row_quant(runner, hidden_states: torch.Tensor):
+    """For the W4A8 experts: the offered (q, s) row quant of exactly this input, once."""
+    offer = getattr(runner, "qcp_row_quant", None)
+    if offer is None:
+        return None
+    runner.qcp_row_quant = None
+    ptr, shape, row = offer
+    if ptr != hidden_states.data_ptr() or shape != tuple(hidden_states.shape):
+        return None
+    return row
+
+
+def withdraw_row_quant(moe) -> None:
+    runner = getattr(getattr(moe.experts, "quant_method", None), "_w4a8", None)
+    if runner is not None:
+        runner.qcp_row_quant = None

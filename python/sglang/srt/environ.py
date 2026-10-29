@@ -1684,6 +1684,11 @@ class Envs:
     #   epilogue instead of the separate shared.add_(routed, alpha) over [T, hidden].
     #   Bit-identical (the routed sum is rounded to bf16 before the add, as before).
     SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM = EnvBool(False)
+    # - MOE_INPUT_DUAL_QUANT: with GRAN128 shared experts and the W4A8 prefill experts,
+    #   quantize the MoE input once for both (per 1x128 group for the shared gate_up,
+    #   per row for the routed experts) instead of two passes over [T, hidden].
+    #   Bit-identical (same q and scales for both consumers).
+    SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT = EnvBool(False)
     # INF-681 k-fuse-p. Sparse prefill: copy each request's compressed length to the
     # device from pinned memory without blocking, instead of torch.tensor(list,
     # device=cuda), whose pageable copy waits for the whole stream to drain. Removes

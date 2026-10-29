@@ -8,7 +8,11 @@ bit for bit:
 * SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM: the top-k sum with the shared add folded in
   equals the top-k sum followed by shared.add_(routed, alpha) (alpha 1 and the model's 1.5,
   masked slots), standalone and through the W4A8 prefill experts' handshake (sorted-sum
-  and small-step paths).
+  and small-step paths);
+* SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT: one pass gives the MoE input's 1x128 quant (GRAN128
+  shared gate_up) and per-row quant (W4A8 routed experts), equal to the two quantizers;
+  a GRAN128 linear takes the pre-quantized activation; the experts take the row quant of
+  exactly their input, once.
 """
 
 import sys
@@ -174,6 +178,77 @@ def test_experts_fold_the_shared_add(small_step_rows, rows, prescaled):
     # Disarmed: the experts are back to the plain routed sum.
     assert torch.equal(shared.clone().add_(runner(x, ids, wts), alpha=alpha), ref)
     assert not qcp.disarm_shared_add(experts)
+
+
+@pytest.mark.parametrize("rows", [1, 300, 6912, 65208])
+def test_dual_quant_matches_both_quantizers(rows):
+    from sglang.srt.layers.quantization.dsv4_prefill_qcp import dual_quant_fp8
+    from sglang.srt.layers.quantization.fp8_block32_gran128 import (
+        ue8m0_group_quant_fp8_mn,
+    )
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import _row_quant
+
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    x = (torch.randn(rows, 5120, device="cuda", generator=g) * 4).bfloat16()
+    x[: rows // 5] *= 1e-4
+    g128, (q2, s2) = dual_quant_fp8(x)
+    q1_ref, s1_ref = ue8m0_group_quant_fp8_mn(x, 128)
+    q2_ref, s2_ref = _row_quant(x)
+    assert torch.equal(g128.q.view(torch.uint8), q1_ref.view(torch.uint8))
+    assert g128.s.stride() == s1_ref.stride() and torch.equal(g128.s, s1_ref)
+    assert torch.equal(q2.view(torch.uint8), q2_ref.view(torch.uint8))
+    assert torch.equal(s2, s2_ref)
+
+
+@pytest.mark.parametrize("rows", [1, 300, 6912])
+def test_gran128_linear_takes_prequantized_activation(rows):
+    from sglang.srt.layers.quantization import fp8_block32_gran128
+    from sglang.srt.layers.quantization.dsv4_prefill_qcp import dual_quant_fp8
+
+    g = torch.Generator(device="cuda").manual_seed(11)
+    n, k = 1152, 5120
+    weight = (torch.randn(n, k, device="cuda", generator=g) * 100).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.exp2(
+        torch.randint(-12, -6, (n // 128, k // 128), device="cuda", generator=g).float()
+    )
+    layer = SimpleNamespace(weight=weight, weight_scale_inv=scale)
+    x = torch.randn(rows, k, device="cuda", generator=g).bfloat16()
+    ref = fp8_block32_gran128.apply(layer, x, None)
+    got = fp8_block32_gran128.apply(layer, dual_quant_fp8(x)[0], None)
+    assert torch.equal(got, ref)
+    with pytest.raises(RuntimeError):
+        fp8_block32_gran128.apply(layer, (x, x), None)
+
+
+@pytest.mark.parametrize("small_step_rows,rows,offered", [(0, 300, True), (512, 300, False)])
+def test_experts_take_the_offered_row_quant(small_step_rows, rows, offered):
+    from sglang.srt.layers.quantization import dsv4_prefill_qcp as qcp
+
+    helpers, runner, method = _experts_and_method(small_step_rows)
+    x, ids, wts = helpers._inputs(rows, 4)
+    ref = runner(x, ids, wts)
+    moe = SimpleNamespace(
+        shared_experts=SimpleNamespace(
+            gate_up_proj=SimpleNamespace(
+                dense_gran128=True, weight=torch.empty(2 * 128, helpers.H, device="cuda")
+            )
+        ),
+        experts=SimpleNamespace(quant_method=method),
+    )
+    g128 = qcp.offer_dual_quant(moe, x)
+    assert (g128 is not None) == offered  # the small-step path quantizes its own layout
+    if not offered:
+        return
+    assert runner.qcp_row_quant is not None
+    assert torch.equal(runner(x, ids, wts), ref)
+    assert runner.qcp_row_quant is None  # taken once
+    # An offer for another tensor is not taken (and the output stays the same).
+    qcp.offer_dual_quant(moe, x.clone())
+    assert torch.equal(runner(x, ids, wts), ref)
+    qcp.withdraw_row_quant(moe)
+    assert runner.qcp_row_quant is None
 
 
 if __name__ == "__main__":

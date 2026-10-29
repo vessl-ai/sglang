@@ -321,6 +321,11 @@ def convert_layer(layer) -> None:
 
 def apply(layer, x, bias: Optional[torch.Tensor]) -> torch.Tensor:
     if isinstance(x, tuple):
+        # INF-681 k-qcp: an activation already quantized per 1x128 group (MN-major scales).
+        from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+        if isinstance(x, dsv4_prefill_qcp.Gran128Activation):
+            return dsv4_prefill_qcp.gran128_linear_prequant(layer, x, bias)
         raise RuntimeError(
             "SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128: this layer was requantized to 128x128 "
             "blocks and cannot take a pre-quantized 1x32 activation; turn the switch off."

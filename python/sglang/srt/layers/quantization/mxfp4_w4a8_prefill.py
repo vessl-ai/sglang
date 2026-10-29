@@ -991,7 +991,8 @@ class Mxfp4W4A8PrefillExperts:
             routing.expert_counts, num_tokens * top_k
         )
 
-        x_fp8, x_scale = _row_quant(hidden_states.contiguous())
+        row = _qcp.take_row_quant(self, hidden_states)  # INF-681 k-qcp dual quant
+        x_fp8, x_scale = row if row is not None else _row_quant(hidden_states.contiguous())
         self._acquire()
         # Use triton_kernels' own tile heuristics with no constraint at all: constraints
         # set by others (the W4A16 path's num_stages pin, the MXFP4 swizzle's split_k=1)
