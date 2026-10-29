@@ -1638,6 +1638,14 @@ class Envs:
     # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
     # TP ranks instead of scoring every row on every rank.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # Hopper prefill: run the mHC post together with the next hyper-connection's
+    # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
+    # rows), so the rebuilt residual is not read back a second time.
+    SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # Hopper DeepGEMM linears with UE8M0 activation scales: quantize prefill-sized
+    # activations (>= 256 rows) with a Triton kernel that is bit-identical to
+    # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows.
+    SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)

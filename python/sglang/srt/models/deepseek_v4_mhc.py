@@ -626,7 +626,13 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and get_platform().is_blackwell
+        and (
+            get_platform().is_blackwell
+            or (
+                get_platform().is_sm90
+                and envs.SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE.get()
+            )
+        )
         and 4096 <= y.shape[0] <= 65536
         and cfg.hidden == 5120
         and cfg.mult == 4
