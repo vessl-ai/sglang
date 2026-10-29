@@ -51,12 +51,19 @@ class Mxfp4MarlinMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        # W4A8 (prefill only) takes precedence over both triton_kernels switches.
+        self._use_w4a8 = (
+            envs.SGLANG_OPT_DSV4_W4A8_PREFILL_MOE.get() and get_platform().is_sm90
+        )
         self._triton_kernels_decode = (
             envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE.get()
             and get_platform().is_sm90
+            and not self._use_w4a8
         )
         self._use_triton_kernels = self._triton_kernels_decode or (
-            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get() and get_platform().is_sm90
+            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get()
+            and get_platform().is_sm90
+            and not self._use_w4a8
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -171,6 +178,9 @@ class Mxfp4MarlinMoEMethod:
         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
 
+        if self._use_w4a8:
+            self._prepare_w4a8_weights(layer)
+            return
         if self._use_triton_kernels:
             self._prepare_triton_kernels_weights(layer)
             return
@@ -196,6 +206,12 @@ class Mxfp4MarlinMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
+        if self._use_w4a8:
+            return StandardCombineInput(
+                hidden_states=self._w4a8(
+                    hidden_states, topk_output.topk_ids, topk_output.topk_weights
+                )
+            )
         if self._use_triton_kernels:
             return StandardCombineInput(
                 hidden_states=self._apply_triton_kernels(hidden_states, topk_output)
@@ -218,6 +234,36 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+    def _prepare_w4a8_weights(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+            Mxfp4W4A8PrefillExperts,
+        )
+
+        config = self.runner.config
+        if not (
+            config.activation == "silu"
+            and config.is_gated
+            and config.gemm1_alpha is None
+            and config.swiglu_limit is not None
+            and self.hidden_pad == 0
+        ):
+            raise ValueError(
+                "SGLANG_OPT_DSV4_W4A8_PREFILL_MOE supports only the DeepSeek-V4 "
+                "clamped SwiGLU experts with an unpadded hidden size."
+            )
+        log_info_on_rank0(
+            logger, f"Using W4A8 (FP8 tensor core) MXFP4 experts (layer: {self.prefix})"
+        )
+        self._w4a8 = Mxfp4W4A8PrefillExperts(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            config.swiglu_limit,
+            prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
+        )
+        layer._dsv4_mxfp4_backend = "w4a8_fp8"
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
         import triton_kernels.matmul_details.opt_flags as opt_flags
