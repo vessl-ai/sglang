@@ -126,6 +126,7 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.scheduler_components import midforward_hook
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -4282,6 +4283,7 @@ class DeepseekV4Model(nn.Module):
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
         for i in range(self.start_layer, self.end_layer):
+            midforward_hook.maybe_fire(i)
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
@@ -4610,6 +4612,7 @@ class DeepseekV4Model(nn.Module):
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
             for i in range(self.start_layer, self.end_layer):
+                midforward_hook.maybe_fire(i)
                 layer = self.layers[i]
                 last_layer = layer
                 ctx = (
