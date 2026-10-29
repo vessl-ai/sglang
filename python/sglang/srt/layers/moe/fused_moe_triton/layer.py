@@ -402,6 +402,8 @@ class FusedMoE(torch.nn.Module):
         self._mega_moe_nvfp4 = False
         # Read at construction: draft_model_build_scope applies the draft's own value.
         self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
+        # MegaMoE's MXFP4 path pads this when it repacks the experts.
+        self.mega_moe_intermediate_size = intermediate_size
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
