@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.distributed import get_attn_tp_group
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.kpool_plan import IndexerRowSplit
 from sglang.srt.layers.layernorm import LayerNorm
@@ -745,12 +746,17 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     @staticmethod
+    def _emits_kv_slots(metadata: DSAIndexerMetadata) -> bool:
+        # An unfused backend maps the indices through its own page table, so it needs positions.
+        return envs.SGLANG_DSA_FUSE_TOPK.get() and not metadata.force_unfused_topk
+
+    @staticmethod
     def _kpool_fused_topk_mapping(
         metadata: BaseIndexerMetadata,
         paged_page_table: Optional[torch.Tensor] = None,
         paged_page_table_row_index: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if not envs.SGLANG_DSA_FUSE_TOPK.get():
+        if not IndexerKPool._emits_kv_slots(metadata):
             return None, None, None
 
         topk_method = metadata.topk_transform_method
@@ -1122,7 +1128,7 @@ class IndexerKPool(MultiPlatformOp):
         page_table_all = None
         page_table_row_index_all = None
         topk_offsets_all = None
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        if self._emits_kv_slots(metadata):
             if topk_method == TopkTransformMethod.PAGED:
                 page_table_all = plan.ragged_paged_page_table
                 page_table_row_index_all = plan.ragged_paged_page_table_row_index
@@ -1244,7 +1250,7 @@ class IndexerKPool(MultiPlatformOp):
 
         page_table_local = None
         topk_method = metadata.topk_transform_method
-        if envs.SGLANG_DSA_FUSE_TOPK.get() and topk_method == TopkTransformMethod.PAGED:
+        if self._emits_kv_slots(metadata) and topk_method == TopkTransformMethod.PAGED:
             req_pool_idx = int(forward_batch.req_pool_indices[0].item())
             page_table_local = (
                 get_req_to_token_pool()
@@ -1492,7 +1498,7 @@ class IndexerKPool(MultiPlatformOp):
             page_table_local = None
             topk_offsets_local = None
             if (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                self._emits_kv_slots(metadata)
                 and topk_method == TopkTransformMethod.PAGED
             ):
                 page_table_local = (
@@ -1502,7 +1508,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
                 page_table_local = page_table_local.unsqueeze(0).expand(q_len, -1)
             elif (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                self._emits_kv_slots(metadata)
                 and topk_method == TopkTransformMethod.RAGGED
                 and topk_offsets is not None
             ):
