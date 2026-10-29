@@ -1023,6 +1023,10 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
+                # The dual-stream path always runs the shared expert; a caller that
+                # computed it elsewhere (SGLANG_DP_SHARED_EXPERT_LOCAL) would get it
+                # twice on the TP rank that adds the replicated output.
+                and not skip_shared_experts
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
