@@ -1653,6 +1653,13 @@ class Envs:
     # the two in-step host waits (first ratio-2 and first ratio-1 layer); the values
     # are the same.
     SGLANG_OPT_DSV4_SPARSE_PREFILL_ASYNC_LENGTHS = EnvBool(False)
+    # INF-681 k-fuse-p. Switch torch's CUDA caching allocator to expandable segments
+    # when the scheduler enters its event loop, after the weights, the KV pools (and
+    # their RDMA registration), communicator buffers and graphs are allocated. Only
+    # serving-time activations then come from expandable segments, which stops the
+    # reserved pool from growing with every new mix of step sizes (at prefill chunk
+    # 65280 the classic pool reserved ~30 GB of activations per GPU).
+    SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT = EnvBool(False)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
