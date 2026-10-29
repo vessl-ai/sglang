@@ -1616,6 +1616,17 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Extend steps of a TP-sharded engram table (device or per_rank host): start the
+    # row gathers of every engram layer before layer 0 on a side stream (the hash ids
+    # only depend on the input tokens), copy fp8 + scale bytes instead of bf16, and
+    # combine the shards with an integer reduce-scatter under prefill CP (all-reduce
+    # otherwise) at the first engram layer. Bit-identical to the in-layer lookup
+    # (INF-681 k-engram).
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH = EnvBool(False)
+    # Programs of the side-stream gather; 0 = one per SM. Few programs keep the
+    # gather from crowding the layers it overlaps (INF-681 k-engram: 16 programs
+    # finish a 65k-token step's lookup well inside layer 0).
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH_PROGRAMS = EnvInt(16)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1636,17 +1647,45 @@ class Envs:
     # oracle / fallback) instead of DeepGEMM: fp8_fp4_mqa_logits on SM100+, and on
     # SM90 fp8_mqa_logits over e4m3-widened operands, which is the SM90 default.
     # SM100 ignores it under attention CP (only DeepGEMM serves CP rows there);
-    # SM90 always runs CP on the torch path, so the env changes nothing there.
+    # SM90 runs CP on the torch path unless SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER.
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Hopper prefill CP: score each CP rank's own query rows with the DeepGEMM
+    # fp8_mqa_logits prefill indexer (the SM90 default without CP) instead of the
+    # torch path, which is ~17x slower per index layer at 75k context. The selection
+    # of a row does not depend on which other rows are scored with it.
+    SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER = EnvBool(False)
     # Split the DeepSeek-V4.1 prefill indexer's query rows across the attention TP
     # ranks instead of scoring every row on every rank, and max-merge the per-rank
     # selections. Applies to the torch and the DeepGEMM prefill paths on any arch;
     # off under attention DP or CP.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # DeepSeek-V4.1 prefill CP without an a2a backend: hand each CP rank its MoE
+    # output shard with one reduce-scatter over the TP group instead of an all-reduce
+    # of the whole gathered batch followed by a local split (half the bytes per GPU).
+    # Applies only when the attention-CP group is the TP group (attention TP 1);
+    # otherwise the all-reduce stays. Same sums, possibly a different summation order.
+    SGLANG_DSV41_CP_MOE_REDUCE_SCATTER = EnvBool(False)
     # Hopper prefill: run the mHC post together with the next hyper-connection's
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
     SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # INF-681 k-fuse-p. Sparse prefill: copy each request's compressed length to the
+    # device from pinned memory without blocking, instead of torch.tensor(list,
+    # device=cuda), whose pageable copy waits for the whole stream to drain. Removes
+    # the two in-step host waits (first ratio-2 and first ratio-1 layer); the values
+    # are the same.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_ASYNC_LENGTHS = EnvBool(False)
+    # INF-681 k-fuse-p. Switch torch's CUDA caching allocator to expandable segments
+    # when the scheduler enters its event loop, after the weights, the KV pools (and
+    # their RDMA registration), communicator buffers and graphs are allocated. Only
+    # serving-time activations then come from expandable segments, which stops the
+    # reserved pool from growing with every new mix of step sizes (at prefill chunk
+    # 65280 the classic pool reserved ~30 GB of activations per GPU).
+    SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT = EnvBool(False)
+    # INF-681 k-fuse-p, diagnostics: after every target forward of at least this many
+    # tokens, log the torch allocated peak and reserved memory of the step (then reset
+    # the peak). 0 = off. Reading the counters does not synchronize.
+    SGLANG_LOG_STEP_MEMORY_MIN_TOKENS = EnvInt(0)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
@@ -1655,6 +1694,13 @@ class Envs:
     # 43 requests at DSpark block size 5: gamma + 1 = 6 verify rows each), unmeasured
     # and inside CUDA graph capture.
     SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
+    # Hopper DeepGEMM linears of a 32x32 UE8M0 block-FP8 checkpoint (DeepSeek-V4.1):
+    # requantize each eligible weight once at load to 128x128 UE8M0 blocks and quantize
+    # its activations per 1x128 group, so DeepGEMM runs SF_GRAN 128 instead of 32
+    # (promotion every K=128 instead of every K=32). With power-of-two scales the
+    # quantized values only differ in the e4m3 subnormal range. No online weight
+    # updates while it is on. See layers/quantization/fp8_block32_gran128.py.
+    SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128 = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     # Prefill only: the MoE raises under CUDA graph capture, so set it only where
@@ -1668,6 +1714,21 @@ class Envs:
     # are ~8.8 GB per GPU larger than Marlin's at TP4 (intermediate 576 padded to
     # 640): raise --mem-fraction-static (the e3 decoder runs 0.75 instead of 0.70).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
+    # INF-681: with SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE, pick the row tile from the
+    # routed rows per expert (num_slots / local experts) instead of always 16: <= 10 -> 16,
+    # <= 36 -> 32, <= 160 -> 64, above -> triton_kernels' own choice. Every extra 16-row
+    # tile of an expert repeats the whole dequantize pass over its weights, so at decode
+    # bs 125-192 x 6 verify rows (DSpark) the 32-row tile is 7-21% faster per MoE layer,
+    # and prefill steps of 1.5k-8k rows (bounded replay late layers) 1.4-1.8x. Output is
+    # bit-identical (the k order of each output element does not change).
+    SGLANG_OPT_DSV4_DECODE_MOE_ROWS_AWARE_TILES = EnvBool(False)
+    # INF-681, SM90: run the DeepSeek-V4 TP4 MXFP4 experts (hidden 5120, 576 per rank) with
+    # the dsv4_mxfp4_decode_moe CUDA kernels: W4A16 with the same numerics as the
+    # triton_kernels decode path (bit-identical in tests), each expert's weights streamed
+    # once for up to 32 rows, raw MXFP4 bytes repacked in place (no padding: ~8.8 GB per GPU
+    # less than triton_kernels at TP4). CUDA-graph safe. Takes precedence over the triton
+    # switches (not over W4A8 prefill). Other shapes keep the configured path.
+    SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL = EnvBool(False)
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
@@ -1677,11 +1738,70 @@ class Envs:
     # weights on a side stream, overlapping the rest of the layer and the next layer's
     # attention (0 = convert in line, before each layer's GEMMs).
     SGLANG_DSV4_W4A8_PREFETCH = EnvBool(True)
+    # With the prefetch: after a layer of >= 8192 rows, issue the next layer's conversion
+    # after the layer's top-k sum in this many launches per weight, so the MoE all-reduce
+    # (24 SMs) waits for one slice instead of the whole conversion and the rest runs beside
+    # it. 0 = one launch before the top-k sum (INF-674 behavior, ~no overlap in-engine).
+    SGLANG_DSV4_W4A8_PREFETCH_CHUNKS = EnvInt(0)
+    # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE: the down-projection GEMM writes its rows in
+    # expert order instead of scattering them token-major in its epilogue, and the top-k
+    # sum gathers each token's rows by position. Same output bit for bit; on H200 at 32k
+    # rows W2 1.90 vs 2.16 ms and the sum 0.56 vs 0.53 ms.
+    SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM = EnvBool(False)
+    # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE and --enable-decoder-swa-bounded-replay: MoE
+    # layers with id >= this value skip the W4A8 path and run W4A16 experts that read
+    # the MXFP4 weights directly. Set it to the first layer past the last kv_source layer
+    # (21 for DeepSeek-V4.1-Flash): bounded replay runs those layers over at most 128 rows
+    # per request, where converting every expert to FP8 costs more than the GEMMs.
+    # -1 = off. Ignored without bounded replay.
+    SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER = EnvInt(-1)
+    # W4A16 backend of those layers. "marlin": ~0.16 GB more device memory per TP4 layer
+    # than the W4A8 path's raw MXFP4 (H200, 768 rows: 1.03 vs 2.55 ms per layer).
+    # "triton": triton_kernels with the decode tiles of
+    # SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE, ~0.5 GB more per layer (intermediate 576
+    # padded to 640), 0.78 ms per layer.
+    # "sm90": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL CUDA kernels (raw MXFP4 bytes, no
+    # extra memory; 0.705 ms at 768 rows, slower than triton from ~3k rows); shapes they do
+    # not cover fall back to Marlin. Unmeasured in an engine.
+    SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND = EnvStr("marlin")
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)
+    # Hopper decode / verify: split the DeepSeek-V4.1 low-ratio indexer's requests
+    # across the attention TP ranks instead of scoring every row on every rank (the
+    # indexer heads are replicated), then all-gather the selected pool slots. Each
+    # rank keeps its own rows' candidate blocks. Off under attention DP or CP, and
+    # where DeepGEMM serves the decode indexer (SM100).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_SHARD = EnvBool(False)
+    # Hopper decode / verify: hand the candidate consumers the source's kept blocks
+    # as one flag per block instead of materializing a per-position mask over the
+    # whole graph capacity (scores stay bit-identical).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK = EnvBool(False)
+    # With BLOCK_MASK: skip the consumer score tiles (128 positions) no row of a
+    # verify row pair keeps. Pays only when candidates cluster; costs ~10% of the
+    # consumer kernel when every tile is kept (synthetic data).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP = EnvBool(False)
+    # Hopper paged tensor-core decode indexer: dequantize the fp4 index K with
+    # byte-table (PRMT) lookups in inline PTX instead of per-element integer ops.
+    # Scores stay bit-identical; ~25-28% less kernel time at the verdict shape.
+    SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Decoder SWA bounded replay (prefill): capture the late layers (past the last
+    # kv_source layer, which run over each request's last 128 extend rows only) as a
+    # breakable CUDA graph per row bucket and replay it; the window-KV store, the
+    # low-ratio sources and the attention core stay eager breaks. The eager launch of
+    # those layers costs more CPU than their GPU work (INF-681 k-lgraph). Needs the late
+    # layers off the W4A8 prefill MoE (SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER), which
+    # refuses capture.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH = EnvBool(False)
+    # Comma-separated row buckets (this rank's tail rows, CP padding included); empty
+    # = every 32 rows to 2304, then every 128 to 8192. More rows than the largest
+    # bucket run eagerly.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_BUCKETS = EnvStr("")
+    # Debug: after each replay also run the same block eagerly (twice) and the unpadded
+    # late layers eagerly, log the differences, and serve the unpadded eager result.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_VERIFY = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)

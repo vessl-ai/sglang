@@ -24,7 +24,12 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
-from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+from sglang.kernels.ops.embeddings.engram_gather import (
+    engram_dequant_raw,
+    engram_gather,
+    engram_gather_raw,
+    engram_raw_chunk_bytes,
+)
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
@@ -903,6 +908,34 @@ class EngramEmbedding(nn.Module):
         )
         return out
 
+    def can_prefetch(self) -> bool:
+        """TP-sharded rows (device shard or per_rank host shard) that the in-layer
+        lookup reassembles with the bf16 all-reduce."""
+        return not self._shared and self.tp_size > 1 and FP8_BLOCK_SIZE % 4 == 0
+
+    def gather_raw(
+        self,
+        ids: torch.Tensor,
+        out: torch.Tensor,
+        rows_per_chunk: int,
+        num_programs: int = 0,
+        order: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """fp8 + scale bytes of the rows of ``ids`` this shard owns, zero bytes for
+        the rest (see engram_gather_raw for the chunked layout)."""
+        return engram_gather_raw(
+            *self._table_ptrs(),
+            ids,
+            out,
+            self.dim,
+            FP8_BLOCK_SIZE,
+            rows_per_chunk,
+            row_lo=self.row_start,
+            row_hi=self.row_start + self.rows,
+            num_programs=num_programs,
+            order=order,
+        )
+
     def _dp_sharded_lookup(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
     ) -> torch.Tensor:
@@ -1011,11 +1044,17 @@ class Engram(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         *,
         cp_all_tokens: bool = False,
+        prefetched: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
-        # The lookup runs first even for an idle DP-attention batch: under DP
-        # attention it is a collective every rank has to join.
-        emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer.
+        ``prefetched`` is this layer's lookup from EngramPrefetch, [T, n_hash_cols,
+        head_dim]."""
+        if prefetched is not None:
+            emb = prefetched
+        else:
+            # The lookup runs first even for an idle DP-attention batch: under DP
+            # attention it is a collective every rank has to join.
+            emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
@@ -1024,3 +1063,188 @@ class Engram(nn.Module):
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
+
+
+_prefetch_stream: Optional[torch.cuda.Stream] = None
+
+
+def _engram_prefetch_stream() -> torch.cuda.Stream:
+    global _prefetch_stream
+    if _prefetch_stream is None:
+        _prefetch_stream = torch.cuda.Stream()
+    return _prefetch_stream
+
+
+def cp_rank_major_rows(
+    rows: torch.Tensor, cp_size: int, local_rows: int
+) -> torch.Tensor:
+    """[cp_size, local_rows, ...] from the rows of the whole prompt: chunk k is CP
+    rank k's interleaved rows (k, k + cp_size, ...) zero-padded to local_rows,
+    i.e. what the all-gather of every rank's padded local rows builds."""
+    total = rows.shape[0]
+    assert total <= cp_size * local_rows, (total, cp_size, local_rows)
+    if total < cp_size * local_rows:
+        rows = torch.cat(
+            [rows, rows.new_zeros(cp_size * local_rows - total, *rows.shape[1:])]
+        )
+    return rows.view(local_rows, cp_size, *rows.shape[1:]).transpose(0, 1)
+
+
+class _PrefetchedLayer:
+    __slots__ = ("embed", "reduce_at", "ids", "buf", "event", "raw")
+
+    def __init__(self, embed: EngramEmbedding, reduce_at: int):
+        self.embed = embed
+        self.reduce_at = reduce_at
+        self.ids: Optional[torch.Tensor] = None
+        self.buf: Optional[torch.Tensor] = None
+        self.event: Optional[torch.cuda.Event] = None
+        self.raw: Optional[torch.Tensor] = None
+
+
+class EngramPrefetch:
+    """SGLANG_OPT_DSV4_ENGRAM_PREFETCH: the engram lookups of one extend step,
+    started before layer 0.
+
+    The hash ids only depend on the input tokens, so the row gathers of every
+    engram layer run on a side stream while the first layers compute. Each rank
+    copies the fp8 + scale bytes of the rows its shard owns (zero bytes for the
+    rest) into a buffer with one chunk per receiving rank. An integer sum over the
+    shards hands every rank the owner's bytes, and the dequant afterwards gives the
+    values of the in-layer lookup + bf16 all-reduce bit for bit. Bytes instead of
+    bf16 halve the collective, and under prefill CP the consumer (wkv + gate) only
+    reads this rank's rows, so a reduce-scatter replaces the all-reduce.
+
+    Modes:
+      "rs": prefill CP over the whole TP group; reduce-scatter on the CP group.
+      "ar_slice": prefill CP with attention TP; all-reduce, keep the CP chunk.
+      "ar": no CP; all-reduce, every rank keeps every row.
+    The collective runs on the forward stream: for "rs"/"ar_slice" every layer's at
+    the first engram layer's turn (layer + 1 for later layers, so their gathers
+    have the whole first layer to finish), after which a later layer holds only its
+    own chunk; for "ar" at each layer's own turn (its result is as large as its
+    input).
+    """
+
+    def __init__(self, mode: str, local_rows: int, n_chunks: int):
+        self.mode = mode
+        self.local_rows = local_rows
+        self.n_chunks = n_chunks
+        self.layers: dict[int, _PrefetchedLayer] = {}
+
+    @staticmethod
+    def maybe_start(
+        engrams: list[tuple[int, "Engram"]],
+        hash_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        *,
+        cp: bool,
+        local_rows: int,
+        late_layer_start: Optional[int],
+    ) -> Optional["EngramPrefetch"]:
+        """``hash_ids`` [rows, n_engram_layers, n_hash_cols]: under CP the hashes of
+        the whole prompt (rank-strided as in the interleave split, ``local_rows``
+        per CP rank after padding), else the rows of this forward."""
+        if not envs.SGLANG_OPT_DSV4_ENGRAM_PREFETCH.get() or not engrams:
+            return None
+        mode_fb = forward_batch.forward_mode
+        if (
+            hash_ids is None
+            or _is_hip
+            or not _cuda_kernels(hash_ids)
+            or not mode_fb.is_extend_without_speculative()
+            or torch.cuda.is_current_stream_capturing()
+            or local_rows == 0
+        ):
+            return None
+        parallel = get_parallel()
+        if parallel.attn_dp_size > 1 or parallel.tp_size == 1:
+            return None
+        if not all(e.embed.can_prefetch() for _, e in engrams):
+            return None
+        if late_layer_start is not None and engrams[-1][0] >= late_layer_start:
+            # The tail swap would change the rows under a pending lookup.
+            return None
+        if cp:
+            n_chunks = parallel.attn_cp_size
+            if parallel.attn_cp_size == parallel.tp_size:
+                assert parallel.attn_cp_group.rank_in_group == parallel.attn_cp_rank
+                mode = "rs"
+            else:
+                mode = "ar_slice"
+            if hash_ids.shape[0] > n_chunks * local_rows:
+                return None
+            hash_ids = cp_rank_major_rows(hash_ids, n_chunks, local_rows)
+        else:
+            n_chunks, mode = 1, "ar"
+            local_rows = hash_ids.shape[0]
+        prefetch = EngramPrefetch(mode, local_rows, n_chunks)
+        first = engrams[0][0]
+        n_cols = hash_ids.shape[-1]
+        dim = engrams[0][1].embed.dim
+        chunk_bytes = engram_raw_chunk_bytes(local_rows * n_cols, dim, FP8_BLOCK_SIZE)
+        for layer_id, engram in engrams:
+            reduce_at = layer_id if mode == "ar" else min(layer_id, first + 1)
+            entry = _PrefetchedLayer(engram.embed, reduce_at)
+            entry.ids = hash_ids[..., engram.layer_hash_index, :].contiguous().view(-1)
+            entry.buf = torch.empty(
+                n_chunks * chunk_bytes, dtype=torch.uint8, device=hash_ids.device
+            )
+            prefetch.layers[layer_id] = entry
+        main = torch.cuda.current_stream()
+        side = _engram_prefetch_stream()
+        side.wait_stream(main)
+        num_programs = envs.SGLANG_OPT_DSV4_ENGRAM_PREFETCH_PROGRAMS.get()
+        with torch.cuda.stream(side):
+            for entry in prefetch.layers.values():
+                # Visiting the rows in id order touches each table page in one
+                # burst; the gather is bound by the GPU's translation of host pages.
+                entry.embed.gather_raw(
+                    entry.ids,
+                    entry.buf,
+                    local_rows * n_cols,
+                    num_programs,
+                    order=torch.argsort(entry.ids),
+                )
+                entry.event = torch.cuda.Event()
+                entry.event.record(side)
+        return prefetch
+
+    def reduce_due(self, layer_id: int) -> None:
+        """Run the collectives due at this layer; every rank calls it at every layer,
+        so the collectives line up."""
+        for entry in self.layers.values():
+            if entry.reduce_at == layer_id and entry.raw is None:
+                self._reduce(entry)
+
+    def _reduce(self, entry: _PrefetchedLayer) -> None:
+        # On the forward stream, after the side stream's gather.
+        torch.cuda.current_stream().wait_event(entry.event)
+        parallel = get_parallel()
+        buf = entry.buf.view(torch.int32)
+        if self.mode == "rs":
+            raw = torch.empty(
+                buf.numel() // self.n_chunks, dtype=torch.int32, device=buf.device
+            )
+            parallel.attn_cp_group.reduce_scatter_tensor(raw, buf)
+        else:
+            inplace_all_reduce(buf, group_name=parallel.tp_group.unique_name)
+            raw = buf
+            if self.mode == "ar_slice":
+                raw = buf.view(self.n_chunks, -1)[parallel.attn_cp_rank].clone()
+        # The side stream is done with ids and buf once the forward stream waited.
+        entry.ids = entry.buf = entry.event = None
+        entry.raw = raw.view(torch.uint8)
+
+    def take(self, layer_id: int) -> Optional[torch.Tensor]:
+        """This layer's lookup, [local_rows, n_hash_cols, head_dim] bf16."""
+        entry = self.layers.pop(layer_id, None)
+        if entry is None:
+            return None
+        if entry.raw is None:
+            self._reduce(entry)
+        dim = entry.embed.dim
+        n = entry.raw.numel() // (dim + dim // FP8_BLOCK_SIZE)
+        out = torch.empty(n, dim, dtype=torch.bfloat16, device=entry.raw.device)
+        engram_dequant_raw(entry.raw, out, dim, FP8_BLOCK_SIZE)
+        return out.view(self.local_rows, -1, dim)
