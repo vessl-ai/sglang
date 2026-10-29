@@ -214,6 +214,52 @@ def test_decode_tiles_cuda_graph_replay(shape, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "shape,tokens,decode_tiles",
+    [
+        # 16 routed rows per expert on average is the last decode-tile batch.
+        ("target", 16 * 384 // 6, True),
+        ("target", 16 * 384 // 6 + 1, False),
+        ("draft", 16 * 128 // 3, True),
+        ("draft", 16 * 128 // 3 + 1, False),
+    ],
+)
+def test_decode_switch_large_batch_fallback_cuda_graph(
+    shape, tokens, decode_tiles, monkeypatch
+):
+    """Past 16 routed rows per expert the decode switch falls back to the argsort
+    routing and triton_kernels' own tiles (4 warps, fixed by the swizzle). Both
+    sides of the boundary capture and replay in a CUDA graph and match eager."""
+    num_experts, top_k, _ = SHAPES[shape]
+    cpu_weights = _weights(num_experts)
+    w13 = _dequant(cpu_weights["w13_weight"], cpu_weights["w13_weight_scale_inv"])
+    w2 = _dequant(cpu_weights["w2_weight"], cpu_weights["w2_weight_scale_inv"])
+    tk, layer = _layer(
+        cpu_weights, num_experts, top_k, "triton_kernels_decode", monkeypatch
+    )
+    assert tk._uses_decode_tiles(tokens * top_k) == decode_tiles
+    static = _dispatch(tokens, num_experts, top_k, seed=tokens)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        tk.apply(layer, static)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = tk.apply(layer, static).hidden_states
+    fresh = _dispatch(tokens, num_experts, top_k, seed=tokens + 1, masked_rows=3)
+    static.hidden_states.copy_(fresh.hidden_states)
+    static.topk_output.topk_ids.copy_(fresh.topk_output.topk_ids)
+    static.topk_output.topk_weights.copy_(fresh.topk_output.topk_weights)
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = tk.apply(layer, fresh).hidden_states
+    assert torch.equal(out, eager)
+    rel = _rel(out, _reference(fresh, w13, w2))
+    assert rel < 1e-2, rel
+    del graph
+
+
+@pytest.mark.parametrize(
     "num_slots,num_experts,top_k",
     [(6, 384, 6), (2304, 384, 6), (4608, 384, 6), (640, 128, 3), (3000, 128, 3)],
 )
