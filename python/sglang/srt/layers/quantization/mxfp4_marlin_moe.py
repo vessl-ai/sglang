@@ -284,10 +284,16 @@ class Mxfp4MarlinMoEMethod:
         weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
         # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
         combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
-        ragged_metadata = make_ragged_tensor_metadata(
-            torch.bincount(expert_ids, minlength=self._tk_num_experts).to(torch.int32),
-            expert_ids.numel(),
+        # bincount sizes its output from the max id, a device-to-host sync per
+        # layer that leaves the GPU idle while the host relaunches; the counts
+        # are the same from a fixed-size scatter_add.
+        counts = torch.zeros(
+            self._tk_num_experts, dtype=torch.int32, device=expert_ids.device
         )
+        counts.scatter_add_(
+            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+        )
+        ragged_metadata = make_ragged_tensor_metadata(counts, expert_ids.numel())
         (w13, w13_precision), (w2, w2_precision) = self._tk_weights
         gate_up = matmul(
             hidden_states,
