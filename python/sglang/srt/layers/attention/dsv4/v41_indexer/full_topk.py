@@ -17,6 +17,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
+from .decode_shard import get_decode_row_sharder
 from .scoring import (
     decode_scores,
     deep_gemm_row_shard,
@@ -57,6 +58,7 @@ class FullTopKIndexer:
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
         )
+        self.decode_sharder = get_decode_row_sharder(use_deep_gemm_decode)
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
         if self.use_deep_gemm_prefill:
@@ -70,6 +72,8 @@ class FullTopKIndexer:
     def topk_decode(self, inputs: DecodeInputs) -> None:
         if self.use_deep_gemm_decode:
             self._deep_gemm_decode(inputs)
+        elif self.decode_sharder is not None:
+            self.decode_sharder.run(inputs, self._torch_decode)
         else:
             self._torch_decode(inputs)
 
