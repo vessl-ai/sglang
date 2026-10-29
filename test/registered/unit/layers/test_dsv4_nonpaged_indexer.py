@@ -4,6 +4,7 @@ from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -904,6 +905,62 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
+class TestDeepSelectFullTopKDecode(CustomTestCase):
+    @staticmethod
+    def _decode_case():
+        from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+
+        scores = torch.tensor(
+            [[1.0, 4.0, 2.0, 3.0], [3.0, 2.0, -torch.inf, -torch.inf]],
+            dtype=torch.float32,
+        )
+        lens = torch.tensor([4, 2], dtype=torch.int64)
+        slots = torch.tensor([[40, 10, 30, 20], [80, 70, 0, 0]], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[10], [20]], dtype=torch.int32),
+            compressed_page_size=4,
+        )
+        page_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        inputs = DecodeInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(2),
+            paged_metadata=metadata,
+            is_verify=False,
+            rows_per_request=1,
+            out_page_indices=page_indices,
+        )
+        data = DecodeScores(bs=2, lmax=4, lens=lens, slots=slots, scores=scores)
+        return inputs, data
+
+    def test_decode_uses_select_decode_fallback(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        inputs, data = self._decode_case()
+        inputs.indexer.index_topk = 2
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = False
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "topk_page_transform") as page_transform,
+            patch.object(mod, "select_decode") as select_decode,
+        ):
+            indexer.topk_decode(inputs)
+
+        page_transform.assert_not_called()
+        select_decode.assert_called_once_with(inputs, data, 2)
+
+
 class TestChunkedPagedDecode(CustomTestCase):
     """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
     every DeepGEMM call must get its own chunk's schedule and every top-k its own
@@ -942,6 +999,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             req_rows=torch.arange(num_rows),
             paged_metadata=metadata,
             is_verify=True,
+            rows_per_request=1,
             out_page_indices=torch.full((num_rows, 4), -1, dtype=torch.int32),
         )
         data = DeepGEMMDecodeData(
@@ -1075,6 +1133,220 @@ class TestCandidateIndexerGating(CustomTestCase):
         with sm100(True), patch(flag, False):
             with self.assertRaises(RuntimeError):
                 make(2048, 8)
+
+
+class _ScoreIndexer:
+    """The torch prefill indexer's surface: queries are q_lora reshaped, head
+    weights are the first heads columns of x, scores are the real formula."""
+
+    def __init__(self, heads: int, dim: int, topk: int):
+        self.heads, self.dim, self.index_topk = heads, dim, topk
+        self.k_rows = []
+
+    def queries(self, q_lora, freqs):
+        return q_lora.view(q_lora.shape[0], self.heads, self.dim)
+
+    def head_weights(self, x):
+        return x[:, : self.heads]
+
+    def scores(self, q, k, weights):
+        self.k_rows.append(k.shape[0])
+        s = torch.einsum("bhd,nd->bhn", q, k)
+        return (s.relu() * weights.unsqueeze(-1)).sum(dim=1).float()
+
+
+class _IndexKPool:
+    def __init__(self, table: torch.Tensor):
+        self.table = table
+
+    def get_low_ratio_index_k_dequant(self, layer_id, slots):
+        return self.table[slots]
+
+
+def _dyadic(shape, generator, device, dtype, low=-8, high=9):
+    # k/8 values: every dot product and head sum is exact in any order.
+    values = torch.randint(low, high, shape, generator=generator) / 8
+    return values.to(device=device, dtype=dtype)
+
+
+class TestTorchPrefillRequests(CustomTestCase):
+    """prefill_requests: CP row reconstruction and the BF16 score-width padding
+    adapted from upstream #45794."""
+
+    HEADS, DIM, RATIO = 2, 8, 4
+
+    def _inputs(
+        self,
+        *,
+        rows_per_request,
+        req_pool_indices,
+        positions,
+        device,
+        dtype,
+        cp,
+        device_rows=False,
+        negative_weights=False,
+    ):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+
+        g = torch.Generator().manual_seed(0)
+        rows = len(positions)
+        h, d = self.HEADS, self.DIM
+        weights = _dyadic((rows, h), g, device, dtype, low=1, high=9)
+        if negative_weights:
+            weights = -weights
+        x = torch.cat([weights, torch.zeros(rows, 4, device=device, dtype=dtype)], 1)
+        req_rows = torch.repeat_interleave(
+            torch.tensor(req_pool_indices), torch.tensor(rows_per_request)
+        ).to(device)
+        return PrefillInputs(
+            indexer=None,  # set by the caller
+            layer_id=0,
+            compress_ratio=self.RATIO,
+            freqs_cis=torch.zeros(max(positions) + 1, 1, device=device),
+            x=x,
+            q_lora=_dyadic((rows, h * d), g, device, dtype),
+            positions=torch.tensor(positions, device=device),
+            req_rows=None if cp else req_rows,
+            req_pool_indices=torch.tensor(req_pool_indices, device=device),
+            kv_page_table=torch.zeros(rows, 1, dtype=torch.int32, device=device),
+            seq_lens_cpu=None,
+            rows_per_request=list(rows_per_request),
+            rows_per_request_device=(
+                torch.tensor(rows_per_request, dtype=torch.int32, device=device)
+                if device_rows
+                else None
+            ),
+            out_raw_indices=torch.empty(rows, 4, dtype=torch.int32, device=device),
+            out_page_indices=None,
+        )
+
+    def _run(self, inputs, *, table, req_to_token, topk=4):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            prefill_requests,
+        )
+
+        indexer = _ScoreIndexer(self.HEADS, self.DIM, topk)
+        inputs = msgspec.structs.replace(inputs, indexer=indexer)
+        out = []
+        for request, chunks in prefill_requests(
+            inputs=inputs,
+            token_to_kv_pool=_IndexKPool(table),
+            req_to_token=req_to_token,
+        ):
+            scores = torch.cat([c.scores for c in chunks])
+            out.append((request.lc, request.tok, request.lens, request.slots, scores))
+        return out, indexer.k_rows
+
+    def _table(self, slots, device, dtype, generator):
+        return _dyadic((slots, self.DIM), generator, device, dtype)
+
+    def test_cp_rows_rebuilt_from_rows_per_request(self):
+        # Rank-local rows stay grouped by request; request 2 has no row here.
+        g = torch.Generator().manual_seed(1)
+        rows_per_request = [3, 0, 2, 1]
+        req_pool_indices = [5, 2, 7, 0]
+        positions = [9, 14, 30, 3, 21, 40]
+        req_to_token = torch.randperm(8 * 48, generator=g).view(8, 48)
+        table = self._table(8 * 48, "cpu", torch.float32, g)
+        kwargs = dict(
+            rows_per_request=rows_per_request,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        expected, _ = self._run(
+            self._inputs(cp=False, **kwargs), table=table, req_to_token=req_to_token
+        )
+        self.assertEqual([lc for lc, *_ in expected], [7, 5, 10])
+        for device_rows in (False, True):
+            with self.subTest(device_rows=device_rows):
+                got, _ = self._run(
+                    self._inputs(cp=True, device_rows=device_rows, **kwargs),
+                    table=table,
+                    req_to_token=req_to_token,
+                )
+                self.assertEqual(len(got), len(expected))
+                for a, b in zip(got, expected):
+                    self.assertEqual(a[0], b[0])
+                    for x, y in zip(a[1:], b[1:]):
+                        self.assertTrue(torch.equal(x, y))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_bf16_score_width_padding_is_sliced_off(self):
+        # Negative head weights make every valid score <= 0, so a padded column
+        # (score 0) that leaked past the slice would win the top-k.
+        g = torch.Generator().manual_seed(2)
+        for lc in (1023, 1024, 1025, 1088):
+            with self.subTest(lc=lc):
+                positions = [lc * self.RATIO - 1, lc * self.RATIO // 2]
+                req_to_token = torch.arange(lc * self.RATIO + 1, device="cuda")[None]
+                table = self._table(lc + 1, "cuda", torch.bfloat16, g)
+                inputs = self._inputs(
+                    rows_per_request=[2],
+                    req_pool_indices=[0],
+                    positions=positions,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    cp=False,
+                    negative_weights=True,
+                )
+                got, k_rows = self._run(
+                    inputs, table=table, req_to_token=req_to_token, topk=16
+                )
+                padded = lc if lc < 1024 else (lc + 63) // 64 * 64
+                self.assertEqual(set(k_rows), {padded})
+                (glc, tok, lens, slots, scores) = got[0]
+                self.assertEqual(glc, lc)
+                self.assertEqual(tuple(scores.shape), (2, lc))
+                # The reference scores the unpadded K directly.
+                indexer = _ScoreIndexer(self.HEADS, self.DIM, 16)
+                q = inputs.q_lora.view(2, self.HEADS, self.DIM)
+                ref = indexer.scores(q, table[slots], inputs.x[:, : self.HEADS])
+                j = torch.arange(lc, device="cuda")
+                ref = ref.masked_fill(j[None, :] >= lens[:, None], -torch.inf)
+                self.assertTrue(torch.equal(scores, ref))
+                self.assertTrue(bool((scores <= 0).all()))
+                self.assertLess(int(scores.topk(16, dim=-1).indices.max()), lc)
+
+
+class TestDeepGemmPrefillChoice(CustomTestCase):
+    """_use_deep_gemm_prefill: arch x SGLANG_DSV41_TORCH_PREFILL_INDEXER x attention CP."""
+
+    def test_decision_matrix(self):
+        from sglang.srt.layers.attention.dsv4 import v41_indexer
+
+        choose = v41_indexer._use_deep_gemm_prefill.__wrapped__
+        # (sm100, sm90, torch env, cp size) -> DeepGEMM prefill
+        cases = {
+            (True, False, False, 1): True,
+            (True, False, True, 1): False,
+            # SM100 CP rows are served only by DeepGEMM: the env is ignored.
+            (True, False, False, 2): True,
+            (True, False, True, 2): True,
+            (False, True, False, 1): True,
+            (False, True, True, 1): False,
+            # SM90 CP stays on the torch path.
+            (False, True, False, 2): False,
+            (False, True, True, 2): False,
+            # Neither (e.g. SM8x or ROCm): torch.
+            (False, False, False, 1): False,
+        }
+        for (sm100, sm90, torch_env, cp), expected in cases.items():
+            with self.subTest(sm100=sm100, sm90=sm90, torch_env=torch_env, cp=cp):
+                with (
+                    patch.object(v41_indexer, "is_sm100_or_newer", lambda: sm100),
+                    patch.object(v41_indexer, "has_dense_fp4_indexer", lambda: True),
+                    patch.object(v41_indexer, "has_dense_fp8_indexer", lambda: True),
+                    patch.object(v41_indexer, "prefill_index_logits_fp8", lambda: sm90),
+                    patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_cp_size=cp),
+                    ),
+                    envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(torch_env),
+                ):
+                    self.assertEqual(choose(), expected)
 
 
 if __name__ == "__main__":

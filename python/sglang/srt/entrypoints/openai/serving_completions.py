@@ -399,7 +399,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         cached_tokens=(
-                            PromptTokensDetails(cached_tokens=cached_tokens.get(index, 0))
+                            PromptTokensDetails(
+                                cached_tokens=cached_tokens.get(index, 0)
+                            )
                             if get_serving().enable_cache_report
                             else None
                         ),

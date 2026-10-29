@@ -12,6 +12,7 @@ import torch
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
+from .scoring import prefill_index_logits_fp8
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -33,6 +34,7 @@ __all__ = [
     "PrefillCandidates",
     "PrefillInputs",
     "has_dense_fp4_indexer",
+    "has_dense_fp8_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
     "make_full_topk_indexer",
@@ -41,8 +43,9 @@ __all__ = [
 
 @functools.cache
 def is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
-    # take the torch indexer.
+    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+. Hopper's prefill uses
+    # fp8_mqa_logits on widened operands (_use_deep_gemm_prefill) and its decode the
+    # Triton paged kernel; non-CUDA devices take the torch indexer.
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -58,18 +61,36 @@ def has_dense_fp4_indexer() -> bool:
 
 
 @functools.cache
+def has_dense_fp8_indexer() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda is None:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, "fp8_mqa_logits")
+
+
+@functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
     from sglang.srt.environ import envs
     from sglang.srt.runtime_context import get_parallel
 
-    return (
-        is_sm100_or_newer()
-        and has_dense_fp4_indexer()
-        and (
-            get_parallel().attn_cp_size > 1
-            or not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+    torch_prefill = envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
+    if is_sm100_or_newer():
+        # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP
+        # ignores the env.
+        return has_dense_fp4_indexer() and (
+            get_parallel().attn_cp_size > 1 or not torch_prefill
         )
+    # SM90 widens the fp4 operands to e4m3 for DeepGEMM's fp8 logits. Attention CP
+    # stays on the torch path, which serves CP rows (#45794): the DeepGEMM CP path
+    # has not been validated end to end on SM90.
+    return (
+        prefill_index_logits_fp8()
+        and has_dense_fp8_indexer()
+        and not torch_prefill
+        and get_parallel().attn_cp_size == 1
     )
 
 

@@ -2999,6 +2999,12 @@ class DeepseekV4AttnBackend(
         meta = self.forward_metadata
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
+            # DP attention pads an eager extend past the rows extend_seq_lens cover.
+            num_real = hoisted_pos.shape[0]
+            x, positions = x[:num_real], positions[:num_real]
+            if q_lora is not None:
+                q_lora = q_lora[:num_real]
         if (
             hoisted_req is not None
             and hoisted_pos is not None
@@ -3424,7 +3430,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, forward_batch
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3472,8 +3478,21 @@ class DeepseekV4AttnBackend(
         )
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ):
         ratio = layer.compress_ratio
+        mode = forward_batch.forward_mode
+        # Static verify is request-major with draft_len rows per request; any
+        # other layout scores row by row.
+        static_verify = (
+            mode.is_target_verify()
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and self.speculative_num_draft_tokens is not None
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+        )
+        rows_per_request = self.speculative_num_draft_tokens if static_verify else 1
         metadata = (
             self.forward_metadata.c1_indexer_metadata
             if ratio == 1
@@ -3491,6 +3510,7 @@ class DeepseekV4AttnBackend(
             req_rows=req,
             paged_metadata=metadata,
             is_verify=mode.is_target_verify(),
+            rows_per_request=rows_per_request,
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
@@ -3567,25 +3587,29 @@ class DeepseekV4AttnBackend(
         )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Idle always re-translates at store time: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot."""
+        """Idle never trusts its metadata, which may be stale or unset: it writes
+        the request window's idle layout, or translates the zero-padded
+        out_cache_loc to the dummy slot."""
+        out_cache_loc = forward_batch.out_cache_loc
+        window = self.token_to_kv_pool.request_window
+        if forward_batch.forward_mode.is_idle():
+            if window is not None:
+                return window.activate_idle(out_cache_loc.shape[0])
+            return self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         metadata = self.forward_metadata
-        if self.token_to_kv_pool.request_window is not None:
+        if window is not None:
             layout = metadata.core_attn_metadata.request_window_layout
-            self.token_to_kv_pool.request_window.activate(layout)
+            window.activate(layout)
             return layout.write_loc
         if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # The tail's q rows are a subset of the extend, so the full
             # out_cache_loc below would be the wrong length; the tail owns its own.
             return metadata.late_layer_tail.swa_out_cache_loc
-        out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
-        if (
-            cached is not None
-            and not forward_batch.forward_mode.is_idle()
-            and cached.shape[0] == out_cache_loc.shape[0]
-        ):
+        if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
             return cached
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32

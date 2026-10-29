@@ -20,7 +20,10 @@ from .scoring import (
     PagedDecodeScores,
     _row_shard_topology,
     decode_scores,
+    deep_gemm_row_shard,
     get_deep_gemm_prefill_data,
+    get_deep_gemm_prefill_kv,
+    merge_row_shards,
     prefill_requests,
     score_tiles,
     select_decode,
@@ -148,15 +151,22 @@ class DenseBlocksBackend:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return None
+        kv = get_deep_gemm_prefill_kv(
+            data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
+        )
+        shard, group = deep_gemm_row_shard(data.num_rows)
         selected, blocks = _publish_prefill_blocks(
-            data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
+            data=data if shard is None else data.row_slice(shard),
+            kv=kv,
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
         )
+        if shard is not None:
+            # Block ids are request-relative and -1 padded, like the selection.
+            selected = _unshard_rows(selected, shard, data.num_rows)
+            blocks = _unshard_rows(blocks, shard, data.num_rows)
+            merge_row_shards(group, selected, blocks)
         data.write_selection(selected, inputs)
         return BlockIds(blocks=blocks, rows_per_request=data.rows_per_request)
 
@@ -170,15 +180,20 @@ class DenseBlocksBackend:
         if data is None:
             return
         assert published is not None
+        kv = get_deep_gemm_prefill_kv(
+            data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
+        )
+        shard, group = deep_gemm_row_shard(data.num_rows)
         selected = _consume_prefill_blocks(
-            data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
-            ),
+            data=data if shard is None else data.row_slice(shard),
+            kv=kv,
             topk=inputs.indexer.index_topk,
-            blocks=published.blocks,
+            blocks=published.blocks if shard is None else published.blocks[shard],
             block_size=self.block_size,
         )
+        if shard is not None:
+            selected = _unshard_rows(selected, shard, data.num_rows)
+            merge_row_shards(group, selected)
         data.write_selection(selected, inputs)
 
     # ---------- torch: per-request scores ----------
@@ -218,9 +233,7 @@ class DenseBlocksBackend:
         # so it matches across ranks.
         _, shard_size, shard_group = _row_shard_topology()
         if shard_size > 1 and blocks.numel() > 0:
-            torch.distributed.all_reduce(
-                blocks, op=torch.distributed.ReduceOp.MAX, group=shard_group
-            )
+            merge_row_shards(shard_group, blocks)
         return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
 
     def _torch_consume_prefill(
@@ -354,6 +367,13 @@ def _consume_tile_blocks(
         out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
             torch.int32
         )
+
+
+def _unshard_rows(part: torch.Tensor, rows: slice, num_rows: int) -> torch.Tensor:
+    """``part`` at ``rows`` of a ``num_rows``-row buffer, -1 elsewhere."""
+    full = part.new_full((num_rows, part.shape[1]), -1)
+    full[rows] = part
+    return full
 
 
 def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):

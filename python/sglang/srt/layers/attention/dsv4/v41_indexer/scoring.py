@@ -4,6 +4,7 @@ a selection back into pool slots."""
 
 from __future__ import annotations
 
+import functools
 import itertools
 from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 
@@ -14,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_rows_to_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
@@ -51,13 +53,36 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     lens_per_request: List[int]  # compressed positions at each request's newest token
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
-    q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
+    # [rows, heads, 64] int8 packed fp4 (SM100), or [rows, heads, 128] e4m3 (SM90)
+    q: torch.Tensor
+    # [rows, heads] int32 packed ue8m0; None for e4m3, whose scale is in weights
+    q_sf: Optional[torch.Tensor]
     weights: torch.Tensor  # [rows, heads] fp32 head weights
 
     @property
     def num_rows(self) -> int:
-        return self.q_fp4.shape[0]
+        return self.q.shape[0]
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.q_sf is None
+
+    def row_slice(self, rows: slice) -> DeepGEMMPrefillData:
+        """The query rows ``rows`` against the same flattened K and widths."""
+        counts, start = [], 0
+        for n in self.rows_per_request:
+            counts.append(max(0, min(start + n, rows.stop) - max(start, rows.start)))
+            start += n
+        return DeepGEMMPrefillData(
+            k_slots=self.k_slots,
+            request_starts=self.request_starts[rows],
+            lens_per_request=self.lens_per_request,
+            rows_per_request=counts,
+            compress_lens=self.compress_lens[rows],
+            q=self.q[rows],
+            q_sf=None if self.q_sf is None else self.q_sf[rows],
+            weights=self.weights[rows],
+        )
 
     def empty_selection(self, topk: int) -> torch.Tensor:
         return self.request_starts.new_full(
@@ -158,6 +183,13 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
+@functools.cache
+def prefill_index_logits_fp8() -> bool:
+    """Whether the DeepGEMM prefill logits widen the fp4 queries and index K to e4m3
+    for ``fp8_mqa_logits``: SM90 lacks SM100's ``fp8_fp4_mqa_logits``."""
+    return get_platform().is_sm90
+
+
 def get_deep_gemm_prefill_data(
     inputs: PrefillInputs, req_to_token: torch.Tensor
 ) -> Optional[DeepGEMMPrefillData]:
@@ -184,13 +216,17 @@ def get_deep_gemm_prefill_data(
     )
     position = torch.arange(columns, device=device) - starts_dev[request]
     pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
-    q_fp4, q_sf, weights = _index_q_and_weights(
+    q, q_sf, weights = _index_q_and_weights(
         indexer=inputs.indexer,
         x=inputs.x,
         q_lora=inputs.q_lora,
         freqs_cis=inputs.freqs_cis,
         positions=pos,
     )
+    if prefill_index_logits_fp8():
+        # fp8_mqa_logits takes an unscaled q; the scale commutes with its ReLU.
+        q, q_scale = fp4_index_rows_to_fp8(q, q_sf)
+        weights, q_sf = weights * q_scale, None
     return DeepGEMMPrefillData(
         k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
         request_starts=torch.repeat_interleave(
@@ -201,10 +237,23 @@ def get_deep_gemm_prefill_data(
         lens_per_request=lens_per_request,
         rows_per_request=inputs.rows_per_request,
         compress_lens=((pos + 1) // ratio).to(torch.int32),
-        q_fp4=q_fp4,
+        q=q,
         q_sf=q_sf,
         weights=weights,
     )
+
+
+def get_deep_gemm_prefill_kv(
+    data: DeepGEMMPrefillData,
+    *,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    layer_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The index K of ``data.k_slots`` in the form its queries are scored against:
+    packed fp4 rows, or e4m3 rows with fp32 scales."""
+    if data.is_fp8:
+        return token_to_kv_pool.get_low_ratio_index_k_fp8(layer_id, data.k_slots)
+    return token_to_kv_pool.get_low_ratio_index_k_fp4(layer_id, data.k_slots)
 
 
 def score_tiles(
@@ -214,7 +263,7 @@ def score_tiles(
     width_align: int,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     yield from flat_index_logits_tiles(
-        q=(data.q_fp4, data.q_sf),
+        q=(data.q, data.q_sf),
         kv=kv,
         weights=data.weights,
         starts=data.request_starts,
@@ -251,8 +300,8 @@ def dense_prefill_topk(
 
 
 def _row_shard_topology():
-    """(attn_tp_rank, attn_tp_size, group) when the torch prefill indexer shards
-    query rows across the attention TP ranks, else (0, 1, None).
+    """(attn_tp_rank, attn_tp_size, group) when the prefill indexer shards query
+    rows across the attention TP ranks, else (0, 1, None).
 
     The indexer weights are replicated across TP, so every rank otherwise scores the
     same rows against the same index K. Sharding assumes every rank sees identical
@@ -270,18 +319,35 @@ def _row_shard_topology():
     return par.attn_tp_rank, par.attn_tp_size, par.attn_tp_group.device_group
 
 
+def deep_gemm_row_shard(num_rows: int):
+    """(this rank's rows, group) when the DeepGEMM prefill indexer shards query rows
+    across the attention TP ranks (``_row_shard_topology``), else (None, None).
+    Every rank gathers the whole K; the per-rank selections are max-merged."""
+    rank, size, group = _row_shard_topology()
+    if size <= 1 or num_rows < size:
+        return None, None
+    return slice(num_rows * rank // size, num_rows * (rank + 1) // size), group
+
+
+def merge_row_shards(group, *selections: torch.Tensor) -> None:
+    """Max-merge selections that are -1 outside each rank's rows (a union, since
+    every entry is >= 0 or -1), in place. A non-contiguous view is merged through
+    a contiguous copy."""
+    for selection in selections:
+        buf = selection if selection.is_contiguous() else selection.contiguous()
+        torch.distributed.all_reduce(
+            buf, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        if buf is not selection:
+            selection.copy_(buf)
+
+
 def _merge_row_shards(inputs: PrefillInputs, group) -> None:
     """Every rank wrote only its own rows of the selection (-1 elsewhere); max-merge
-    so each rank holds all rows. Selections are >= 0 or -1, so max is the union."""
+    so each rank holds all rows."""
     n = inputs.positions.shape[0]
-    for out in (inputs.out_raw_indices, inputs.out_page_indices):
-        if out is None:
-            continue
-        view = out[:n]
-        buf = view if view.is_contiguous() else view.contiguous()
-        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.MAX, group=group)
-        if buf is not view:
-            view.copy_(buf)
+    outs = (inputs.out_raw_indices, inputs.out_page_indices)
+    merge_row_shards(group, *(out[:n] for out in outs if out is not None))
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
@@ -323,7 +389,17 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    if req is None:
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
+        )
     inputs.reset_outputs()
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
@@ -350,6 +426,12 @@ def prefill_requests(
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
         index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        # Keep BF16 GEMM output rows aligned for Hopper tensor-core kernels.
+        # Pad K once per request; padded positions never enter selection.
+        if index_k.is_cuda and index_k.dtype == torch.bfloat16 and lc >= 1024:
+            score_width = (lc + 63) // 64 * 64
+            if score_width != lc:
+                index_k = torch.nn.functional.pad(index_k, (0, 0, 0, score_width - lc))
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
@@ -375,11 +457,13 @@ def _score_chunks(
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    rows_per_chunk = max(
+        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+    )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+        s = indexer.scores(q[tok_c], index_k, weights[tok_c])[:, :lc]
         s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
@@ -415,7 +499,7 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     req: torch.Tensor
     req_to_token: torch.Tensor
     ratio: int
-    plan: torch.Tensor
+    plan: Optional[torch.Tensor]  # None when the caller skips the top-k v2 plan
     has_candidate_mask: bool
 
 
@@ -425,6 +509,7 @@ def decode_scores(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    compute_topk_plan: bool = True,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -453,7 +538,7 @@ def decode_scores(
     if paged:
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
-        plan = plan_topk_v2(lens)
+        plan = plan_topk_v2(lens) if compute_topk_plan else None
         scores = fp4_index_logits_paged(
             q,
             weights,
@@ -465,6 +550,7 @@ def decode_scores(
             lmax,
             ratio,
             candidate_mask,
+            rows_per_request=inputs.rows_per_request,
         )
         return PagedDecodeScores(
             bs=bs,
@@ -493,6 +579,7 @@ def select_decode(
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
+        assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
         topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
         finish_paged_indexer_topk(

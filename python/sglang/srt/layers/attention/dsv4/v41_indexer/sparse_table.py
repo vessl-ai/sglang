@@ -398,7 +398,7 @@ def publish_prefill_table(
     positions) and the chunk's table, from one pass over its dense scores;
     ``index_page_table`` is at ``index_page_size`` slots."""
     rows = data.num_rows
-    device = data.q_fp4.device
+    device = data.q.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
@@ -431,7 +431,7 @@ def publish_prefill_table(
         page_size=index_page_size,
         request_ids=_row_pair_ids(data.rows_per_request, device=device),
         rows_per_request=data.rows_per_request,
-        q_dtype=data.q_fp4.dtype,
+        q_dtype=data.q.dtype,
         valid_lens=valid_lens,
     )
 
@@ -445,7 +445,7 @@ def select_prefill_table(
 ) -> None:
     rows, heads = data.q_sf.shape
     logits = sparse_logits(
-        data.q_fp4.view(rows, 1, heads, 64),
+        data.q.view(rows, 1, heads, 64),
         data.q_sf.view(rows, 1, heads),
         k_cache,
         data.weights.to(torch.bfloat16),

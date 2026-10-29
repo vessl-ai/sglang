@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SM100 (prefill and decode) and SM90 (prefill), torch elsewhere."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.deep_select import (
+    is_deep_select_supported,
+    topk_page_transform,
+)
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
@@ -15,10 +19,13 @@ from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_m
 
 from .scoring import (
     decode_scores,
+    deep_gemm_row_shard,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_deep_gemm_prefill_kv,
     get_index_k_cache,
+    merge_row_shards,
     prefill_requests,
     quantize_index_q,
     select_decode,
@@ -47,6 +54,9 @@ class FullTopKIndexer:
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        self.use_deep_select_decode = (
+            not use_deep_gemm_decode and is_deep_select_supported()
+        )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
         if self.use_deep_gemm_prefill:
@@ -68,10 +78,16 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
+        kv = get_deep_gemm_prefill_kv(
+            data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        out = inputs.out_raw_indices[: data.num_rows]
+        shard, group = deep_gemm_row_shard(data.num_rows)
+        if shard is None:
+            dense_prefill_topk(data, kv, out=out)
+        else:
+            dense_prefill_topk(data.row_slice(shard), kv, out=out[shard])
+            merge_row_shards(group, out)
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
@@ -131,8 +147,21 @@ class FullTopKIndexer:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            compute_topk_plan=not self.use_deep_select_decode,
         )
         if d is None:
+            return
+        if self.use_deep_select_decode:
+            metadata = inputs.paged_metadata
+            topk_page_transform(
+                d.scores,
+                inputs.indexer.index_topk,
+                page_table=metadata.page_table[: d.bs],
+                page_size=metadata.compressed_page_size,
+                end=d.lens.to(torch.int32),
+                sorted_index=False,
+                output_idx=inputs.out_page_indices[: d.bs],
+            )
             return
         select_decode(inputs, d, inputs.indexer.index_topk)
 

@@ -3,12 +3,22 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    fp4_index_rows_to_fp8,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+# SM90 scores e4m3-widened operands with fp8_mqa_logits, SM100 packed fp4 ones
+# with fp8_fp4_mqa_logits; the selection logic under test is the same.
+_FP8 = _ARCH == 9
+_MQA_LOGITS = "fp8_mqa_logits" if _FP8 else "fp8_fp4_mqa_logits"
 
 
 def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
@@ -35,10 +45,15 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
             for position in range(context * ratio - queries, context * ratio)
         )
         start += context
+    q = (packed.view(rows, 32, 64), scales.view(rows, 32))
+    weights = torch.rand((rows, 32), dtype=torch.float32, device="cuda")
+    if _FP8:
+        q_fp8, q_scale = fp4_index_rows_to_fp8(*q)
+        q, weights, kv = (q_fp8, None), weights * q_scale, fp4_index_rows_to_fp8(*kv)
     return dict(
-        q=(packed.view(rows, 32, 64), scales.view(rows, 32)),
+        q=q,
         kv=kv,
-        weights=torch.rand((rows, 32), dtype=torch.float32, device="cuda"),
+        weights=weights,
         starts=torch.tensor(starts, dtype=torch.int32, device="cuda"),
         lengths=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
         request_lengths=request_lengths,
@@ -57,7 +72,7 @@ def run_dense(inputs, *, publish_candidates, candidates):
         lens_per_request=[n for _, n in inputs["request_lengths"]],
         rows_per_request=[q for q, _ in inputs["request_lengths"]],
         compress_lens=inputs["lengths"],
-        q_fp4=inputs["q"][0],
+        q=inputs["q"][0],
         q_sf=inputs["q"][1],
         weights=inputs["weights"],
     )
@@ -107,11 +122,11 @@ def request_blocks(inputs, candidates):
 
 
 def dense_scores(inputs):
-    from deep_gemm import fp8_fp4_mqa_logits
+    import deep_gemm
 
     width = (max(n for _, n in inputs["request_lengths"]) + 3) // 4 * 4
-    scores = fp8_fp4_mqa_logits(
-        inputs["q"],
+    scores = getattr(deep_gemm, _MQA_LOGITS)(
+        inputs["q"][0] if _FP8 else inputs["q"],
         inputs["kv"],
         inputs["weights"],
         inputs["starts"],
@@ -125,10 +140,7 @@ def dense_scores(inputs):
     )
 
 
-@unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "requires SM100",
-)
+@unittest.skipUnless(_ARCH in (9, 10), "requires SM90 or SM100")
 class TestDensePrefillIndexer(CustomTestCase):
     def assert_topk(self, inputs, selected, scores):
         columns = (selected - inputs["starts"][:, None]).long()
@@ -249,7 +261,10 @@ class TestDensePrefillIndexer(CustomTestCase):
                         rows = torch.tensor(rows, dtype=torch.int64, device="cuda")
                         tail_inputs = dict(
                             consumer_inputs,
-                            q=tuple(t[rows] for t in consumer_inputs["q"]),
+                            q=tuple(
+                                None if t is None else t[rows]
+                                for t in consumer_inputs["q"]
+                            ),
                             weights=consumer_inputs["weights"][rows],
                             starts=inputs["starts"][rows],
                             lengths=inputs["lengths"][rows],
@@ -266,6 +281,76 @@ class TestDensePrefillIndexer(CustomTestCase):
                             candidates=candidates.tail(tail_lengths),
                         )
                         self.assert_topk(tail_inputs, selected, consumer_scores[rows])
+
+    def test_row_shards_merge_to_the_whole(self):
+        # What row-sharded ranks compute (deep_gemm_row_shard): each scores its own
+        # row slice; the max-merge of the -1 padded parts is the unsharded result.
+        inputs = make_inputs([(5, 300), (40, 1031), (90, 4097)], ratio=2)
+        inputs["candidate_topk_blocks"] = 64
+        data = scoring.DeepGEMMPrefillData(
+            k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
+            request_starts=inputs["starts"],
+            lens_per_request=[n for _, n in inputs["request_lengths"]],
+            rows_per_request=[q for q, _ in inputs["request_lengths"]],
+            compress_lens=inputs["lengths"],
+            q=inputs["q"][0],
+            q_sf=inputs["q"][1],
+            weights=inputs["weights"],
+        )
+        rows, topk = data.num_rows, inputs["topk"]
+        whole = torch.full((rows, topk), -1, dtype=torch.int32, device="cuda")
+        scoring.dense_prefill_topk(data, inputs["kv"], out=whole)
+        whole_sel, whole_blocks = dense_blocks._publish_prefill_blocks(
+            data=data, kv=inputs["kv"], topk=topk, topk_blocks=64, block_size=8
+        )
+        # A candidate consumer layer reads the merged (whole) published blocks and,
+        # sharded, the block rows of its own row slice.
+        whole_consumed = dense_blocks._consume_prefill_blocks(
+            data=data, kv=inputs["kv"], topk=topk, blocks=whole_blocks, block_size=8
+        )
+        self.assertTrue(bool((whole_consumed >= 0).any()))
+        for size in (2, 3, 4):
+            merged = torch.full_like(whole, -1)
+            merged_sel, merged_blocks = (
+                torch.full_like(whole_sel, -1),
+                torch.full_like(whole_blocks, -1),
+            )
+            merged_consumed = torch.full_like(whole_consumed, -1)
+            for rank in range(size):
+                shard = slice(rows * rank // size, rows * (rank + 1) // size)
+                part = data.row_slice(shard)
+                self.assertEqual(sum(part.rows_per_request), shard.stop - shard.start)
+                out = torch.full_like(whole, -1)
+                scoring.dense_prefill_topk(part, inputs["kv"], out=out[shard])
+                merged = torch.maximum(merged, out)
+                sel, blocks = dense_blocks._publish_prefill_blocks(
+                    data=part, kv=inputs["kv"], topk=topk, topk_blocks=64, block_size=8
+                )
+                merged_sel = torch.maximum(
+                    merged_sel, dense_blocks._unshard_rows(sel, shard, rows)
+                )
+                merged_blocks = torch.maximum(
+                    merged_blocks, dense_blocks._unshard_rows(blocks, shard, rows)
+                )
+                consumed = dense_blocks._consume_prefill_blocks(
+                    data=part,
+                    kv=inputs["kv"],
+                    topk=topk,
+                    blocks=whole_blocks[shard],
+                    block_size=8,
+                )
+                merged_consumed = torch.maximum(
+                    merged_consumed, dense_blocks._unshard_rows(consumed, shard, rows)
+                )
+            for actual, expected in (
+                (merged, whole),
+                (merged_sel, whole_sel),
+                (merged_blocks, whole_blocks),
+                (merged_consumed, whole_consumed),
+            ):
+                torch.testing.assert_close(
+                    actual.sort(-1).values, expected.sort(-1).values, rtol=0, atol=0
+                )
 
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
@@ -301,8 +386,9 @@ class TestDensePrefillIndexer(CustomTestCase):
                 self.assertEqual(tuple(candidates.blocks.shape), block_shape)
 
     def test_score_budget_includes_allocation_padding(self):
-        from deep_gemm import fp8_fp4_mqa_logits
+        import deep_gemm
 
+        mqa_logits = getattr(deep_gemm, _MQA_LOGITS)
         inputs = make_inputs([(13, 257)])
         expected = dense_scores(inputs)
         for budget in (32 << 10, 28 << 10, 8 << 10):
@@ -311,13 +397,13 @@ class TestDensePrefillIndexer(CustomTestCase):
 
                 def checked_logits(*args, **kwargs):
                     before = torch.cuda.memory_allocated()
-                    logits = fp8_fp4_mqa_logits(*args, **kwargs)
+                    logits = mqa_logits(*args, **kwargs)
                     allocations.append(torch.cuda.memory_allocated() - before)
                     return logits
 
                 with (
                     patch.object(scoring, "_DEEP_GEMM_SCORE_BUDGET_BYTES", budget),
-                    patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
+                    patch(f"deep_gemm.{_MQA_LOGITS}", new=checked_logits),
                 ):
                     selected, _ = run_dense(
                         inputs, publish_candidates=True, candidates=None
