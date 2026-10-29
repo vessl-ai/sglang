@@ -568,9 +568,8 @@ class SparsePrefillChunkCache:
             # A pageable host->device copy synchronizes the stream; a pinned one
             # does not, and the caching host allocator keeps the buffer until the
             # copy has run.
-            lengths = torch.tensor(
-                lengths_cpu, dtype=torch.int32, pin_memory=True
-            ).to(device, non_blocking=True)
+            host_lengths = torch.tensor(lengths_cpu, dtype=torch.int32, pin_memory=True)
+            lengths = host_lengths.to(device, non_blocking=True)
         else:
             lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
