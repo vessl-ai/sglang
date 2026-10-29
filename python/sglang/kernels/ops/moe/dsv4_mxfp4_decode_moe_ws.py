@@ -52,6 +52,7 @@ def _module() -> Module:
             ("down", "dsv4_moe_ws::down"),
             ("combine", "dsv4_moe_ws::combine"),
             ("sort_slots", "dsv4_moe_ws::sort_slots"),
+            ("prepare_kernels", "dsv4_moe_ws::prepare_kernels"),
         ],
     )
 
@@ -159,6 +160,30 @@ def _row_quant(x: torch.Tensor):
 
 
 SORT_MAX_SLOTS = 16384  # one-CTA sort kernel limit
+
+
+@cache_once
+def prepare(device_index: int) -> None:
+    """Build and load everything ``decode_moe`` launches, once per process and device: the JIT module
+    (compiled under a lock shared by the node's ranks on a cold cache), its CUDA kernels (loaded lazily at
+    the first launch otherwise), and the Triton expert sort and row quantization specializations. Called at
+    weight-processing time, so that the first MoE call of CUDA graph capture compiles and loads nothing while
+    other ranks have collectives in flight."""
+    from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
+
+    with torch.cuda.device(device_index):
+        _module().prepare_kernels()
+        for num_tokens in (
+            4,
+            16,
+        ):  # num_slots not / divisible by 16: Triton specializes on it
+            ids = torch.zeros(num_tokens, 6, dtype=torch.int32, device="cuda")
+            expert_sort_small(
+                ids, torch.ones(ids.shape, device="cuda"), 384, drop_masked=True
+            )
+        for width in (HIDDEN, INTER):
+            _row_quant(torch.zeros(1, width, dtype=torch.bfloat16, device="cuda"))
+        torch.cuda.synchronize()
 
 
 def _sort_slots(topk_ids, topk_weights, num_experts):

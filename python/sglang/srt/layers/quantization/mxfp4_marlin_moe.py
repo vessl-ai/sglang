@@ -536,6 +536,9 @@ class Mxfp4MarlinMoEMethod:
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
         torch.cuda.empty_cache()
+        if w4a8:
+            # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
+            dk.prepare(self._sm90_packed.w13.device.index)
         layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
         return True
 
