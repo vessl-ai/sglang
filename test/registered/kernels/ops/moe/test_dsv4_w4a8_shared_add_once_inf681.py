@@ -72,7 +72,8 @@ def _arm_qcp(runner, shared, alpha=1.0):
 def test_qcp_fold_equals_one_separate_add(kw, rows):
     w = _weights(61)
     x, ids, wts, shared = _inputs(rows, 62)
-    want = shared.clone().add_(_experts(w)(x, ids, wts))
+    # reference: the same experts (the direct path has its own W4A8 numerics), add separately
+    want = shared.clone().add_(_experts(w, **kw)(x, ids, wts))
     ex = _experts(w, **kw)
     target = shared.clone()
     _arm_qcp(ex, target)
