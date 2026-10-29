@@ -1660,6 +1660,10 @@ class Envs:
     # reserved pool from growing with every new mix of step sizes (at prefill chunk
     # 65280 the classic pool reserved ~30 GB of activations per GPU).
     SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT = EnvBool(False)
+    # INF-681 k-fuse-p, diagnostics: after every target forward of at least this many
+    # tokens, log the torch allocated peak and reserved memory of the step (then reset
+    # the peak). 0 = off. Reading the counters does not synchronize.
+    SGLANG_LOG_STEP_MEMORY_MIN_TOKENS = EnvInt(0)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
