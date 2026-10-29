@@ -2716,9 +2716,19 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
+        # Under CP only with SGLANG_OPT_DSV4_CP_SPARSE_PREFILL: num_qo_tokens is then
+        # this rank's query rows (0 from the page-index gate, which errs to True).
         return (
             forward_batch.forward_mode.is_extend_without_speculative()
-            and not is_cp_active(forward_batch)
+            and (
+                not is_cp_active(forward_batch)
+                or (
+                    envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL.get()
+                    and num_qo_tokens > 0
+                    and num_qo_tokens
+                    >= envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL_MIN_ROWS.get()
+                )
+            )
             and not get_platform().is_sm120
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -2765,6 +2775,9 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT.get():
+            # A new forward: its tensors may reuse the last forward's addresses.
+            self.sparse_prefill_workspace.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -2775,11 +2788,23 @@ class DeepseekV4AttnBackend(
             extend_seq_lens = tail.extend_seq_lens
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
+        cp_active = is_cp_active(forward_batch)
+        if cp_active:
+            # SGLANG_OPT_DSV4_CP_SPARSE_PREFILL: the query rows are this rank's
+            # interleaved share of each request (padding rows follow them).
+            assert envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL.get()
+            cp_query_lens_cpu = interleave_rows_per_request(
+                _as_int_list(extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            num_needed_queries = sum(cp_query_lens_cpu)
+        else:
+            num_needed_queries = sum(extend_seq_lens_cpu)
+        assert num_qo_tokens >= num_needed_queries, (
+            "DSV4 sparse prefill requires the query rows of every request: "
+            f"allocated {num_qo_tokens}, but request offsets cover {num_needed_queries}. "
+            "CP-local queries use paged attention unless SGLANG_OPT_DSV4_CP_SPARSE_PREFILL is set."
         )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
@@ -2791,15 +2816,10 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+        if cp_active:
+            # Pinned: a pageable copy would wait for the stream to drain.
+            query_lens = async_h2d(
+                cp_query_lens_cpu, dtype=torch.int32, device=extend_seq_lens.device
             )
         else:
             query_lens = extend_seq_lens.to(torch.int32)
@@ -4072,10 +4092,26 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
-            )
-            compressed_slice = workspace[:n_compressed]
+            if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT.get():
+                # Layers sharing a kv_source reuse its dequant: no later layer
+                # writes that cache within the forward (upstream #45909).
+                workspace, compressed_filled = (
+                    self.sparse_prefill_workspace.get_with_head(
+                        n_compressed + cache.swa_token_ids.shape[0],
+                        head_source=(
+                            extra_k_cache.data_ptr(),
+                            flat_token_ids.data_ptr(),
+                            n_compressed,
+                        ),
+                    )
+                )
+            else:
+                workspace = self.sparse_prefill_workspace.get(
+                    n_compressed + cache.swa_token_ids.shape[0]
+                )
+                compressed_filled = False
+            if not compressed_filled:
+                compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
