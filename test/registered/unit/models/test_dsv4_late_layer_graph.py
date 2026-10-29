@@ -204,3 +204,114 @@ def test_buckets():
     assert lg.select_bucket((32, 64), 65) is None
     with pytest.raises(ValueError):
         lg.parse_buckets("0")
+
+
+# ---------------------------------------------------------------------------
+# Prefill CP on, but off for a batch of fewer extend tokens than CP ranks (a 1-token
+# /health_generate step, a fully cached prompt): that batch's late layers take the
+# non-CP code. A graph captured on a CP batch must not replay it (the CP window-KV
+# break asserted is_cp_active inside cp_materialize_global_token_order, INF-681 i3
+# PD cell 2026-10-29 16:50Z), and a non-CP capture must not serve CP batches.
+# ---------------------------------------------------------------------------
+
+from sglang.srt.layers.cp import utils as cp_utils  # noqa: E402
+
+CP_SIZE = 4
+
+
+class _FakeAttn:
+    """The two window-KV stores of MqaAttention, writing the toy pool."""
+
+    def _cp_store_window_kv(self, kv, forward_batch, attn_backend):
+        # The real gather: asserts the batch runs prefill CP.
+        kv = cp_utils.cp_materialize_global_token_order(kv.contiguous(), forward_batch)
+        _pool["kv"][forward_batch.write_loc[: kv.shape[0]]] = kv
+
+    def _compute_kv_to_cache(
+        self, x, positions, forward_batch, attn_backend, qkv_a=None, q_rope=None
+    ):
+        _pool["kv"][forward_batch.write_loc[: x.shape[0]]] = x
+
+
+class _ToyCPModel(_ToyModel):
+    def __init__(self):
+        super().__init__()
+        self.attn = _FakeAttn()
+
+    def _forward_late_layers(
+        self, *, state, positions, input_ids, input_ids_global, forward_batch,
+        capture_dspark,
+    ):  # fmt: skip
+        cp = cp_utils.is_cp_active(forward_batch)
+        r, pre = state.residual, state.pre
+        for layer in range(L):
+            h = (r.float() * pre[..., None]).sum(1).to(torch.bfloat16) * self.w[layer]
+            if cp:
+                h = h * 2  # stands for the CP-only ops of a layer (gathers)
+            if lg.active():
+                if cp:
+                    lg.cp_store_window_kv(self.attn, h)
+                else:
+                    lg.store_window_kv(self.attn, h, positions, None, None)
+            elif cp:
+                self.attn._cp_store_window_kv(h, forward_batch, None)
+            else:
+                self.attn._compute_kv_to_cache(h, positions, forward_batch, None)
+            out = torch.empty_like(h)
+            if lg.active():
+                _attend_break(h, out)
+            else:
+                _attend(h, out, forward_batch, h.shape[0])
+            r = r + out[:, None, :] * 0.25
+        return mhc.HcState(r, pre), []
+
+
+@pytest.fixture
+def _prefill_cp4(monkeypatch):
+    """A CP4 server: prefill CP is active iff the batch says so; the CP gather of
+    this single process is the identity."""
+    monkeypatch.setattr(cp_utils, "is_cp_active", lambda fb: fb.cp_active)
+    monkeypatch.setattr(
+        cp_utils,
+        "get_cp_strategy",
+        lambda: SimpleNamespace(gather_kv_cache=lambda x, fb, stream=None: x),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(attn_cp_size=CP_SIZE),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.model_executor.forward_context.get_attn_backend",
+        lambda: SimpleNamespace(forward_metadata=None),
+    )
+    monkeypatch.setenv("SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_BUCKETS", "32,64")
+
+
+def test_cp_inactive_batches_run_eagerly_between_cp_batches(_prefill_cp4):
+    _pool["kv"] = torch.randn((POOL_ROWS, H), device="cuda").to(torch.bfloat16)
+    model = _ToyCPModel()
+    with mock.patch(
+        "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+    ):
+        runner = lg.LateLayerGraphRunner(model)
+        # 4-token PD warm-up (CP on, 1 tail row per rank: captures bucket 32), a
+        # 1-token health_generate step (CP off), CP steps, a 2-token step, CP again.
+        steps = [(1, True), (1, False), (8, True), (2, False), (20, True), (3, False)]
+        for i, (rows, cp_active) in enumerate(steps):
+            fb, residual, pre, positions = _batch(rows, 100 + i)
+            fb.cp_active = cp_active
+            before = _pool["kv"].clone()
+            want = _eager(model, fb, residual, pre, positions, False)
+            want_pool = _pool["kv"].clone()
+            _pool["kv"].copy_(before)
+            got = _run(runner, fb, residual, pre, positions, False)
+            if not cp_active:
+                # The caller runs the late layers eagerly.
+                assert got is None, (rows, cp_active)
+                got = _eager(model, fb, residual, pre, positions, False)
+            assert torch.equal(got[0], want[0]), (rows, cp_active)
+            assert torch.equal(_pool["kv"], want_pool), (rows, cp_active)
+    # Every CP step after the first replays the one CP capture of bucket 32.
+    assert runner.stats["capture"] == 1
+    assert runner.stats["replay"] == 2
+    assert [k[1][-1] for k in runner._entries] == [True]
