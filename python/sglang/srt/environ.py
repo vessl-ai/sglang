@@ -1658,6 +1658,23 @@ class Envs:
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
     SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # INF-681 k-fuse-p. Sparse prefill: copy each request's compressed length to the
+    # device from pinned memory without blocking, instead of torch.tensor(list,
+    # device=cuda), whose pageable copy waits for the whole stream to drain. Removes
+    # the two in-step host waits (first ratio-2 and first ratio-1 layer); the values
+    # are the same.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_ASYNC_LENGTHS = EnvBool(False)
+    # INF-681 k-fuse-p. Switch torch's CUDA caching allocator to expandable segments
+    # when the scheduler enters its event loop, after the weights, the KV pools (and
+    # their RDMA registration), communicator buffers and graphs are allocated. Only
+    # serving-time activations then come from expandable segments, which stops the
+    # reserved pool from growing with every new mix of step sizes (at prefill chunk
+    # 65280 the classic pool reserved ~30 GB of activations per GPU).
+    SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT = EnvBool(False)
+    # INF-681 k-fuse-p, diagnostics: after every target forward of at least this many
+    # tokens, log the torch allocated peak and reserved memory of the step (then reset
+    # the peak). 0 = off. Reading the counters does not synchronize.
+    SGLANG_LOG_STEP_MEMORY_MIN_TOKENS = EnvInt(0)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and

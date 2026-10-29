@@ -40,6 +40,7 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_align
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
@@ -563,7 +564,14 @@ class SparsePrefillChunkCache:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
         total_compressed = sum(lengths_cpu)
-        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
+        if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_ASYNC_LENGTHS.get():
+            # A pageable host->device copy synchronizes the stream; a pinned one
+            # does not, and the caching host allocator keeps the buffer until the
+            # copy has run.
+            host_lengths = torch.tensor(lengths_cpu, dtype=torch.int32, pin_memory=True)
+            lengths = host_lengths.to(device, non_blocking=True)
+        else:
+            lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
         compressed_base = ends - lengths
         swa_base = total_compressed + self.swa_offsets[:-1]
