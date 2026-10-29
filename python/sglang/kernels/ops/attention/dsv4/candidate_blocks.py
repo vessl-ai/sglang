@@ -155,6 +155,21 @@ def candidate_block_mask(
     return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+def candidate_block_keep(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """A source's block IDs as one flag per block, ``[rows, ceil(width /
+    block_size) + 1]`` bool (the last column absorbs the ``-1`` padding):
+    ``candidate_block_mask`` without expanding each flag to ``block_size``
+    positions. The paged decode scorer reads it with ``mask_block=block_size``."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
@@ -176,6 +191,86 @@ def select_candidate_block_ids(
     )
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+
+
+@triton.jit
+def _max_like_torch(a, b):
+    # torch.amax's combine: (isnan(a) || a > b) ? a : b. Ties (-0.0 vs +0.0) go to b.
+    return tl.where((a != a) | (a > b), a, b)
+
+
+@triton.jit
+def _candidate_block_keys_kernel(
+    LOGITS,
+    LOGITS_STRIDE,
+    LENS,
+    KEYS,
+    KEYS_STRIDE,
+    NUM_BLOCKS,
+    BLOCK: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    length = tl.load(LENS + row).to(tl.int32)
+    # the block of position length - 1; -1 when nothing is visible (floor division)
+    last = tl.where(length > 0, (length - 1) // BLOCK, -1)
+    # Blocks before `last` lie entirely below the row's length, so they read only
+    # computed scores; `last` is +inf and every later block -inf without a read.
+    full = blocks < last
+    base = LOGITS + row * LOGITS_STRIDE + blocks * BLOCK
+    tl.static_assert(BLOCK == 8)
+    e0 = tl.load(base + 0, mask=full, other=0.0)
+    e1 = tl.load(base + 1, mask=full, other=0.0)
+    e2 = tl.load(base + 2, mask=full, other=0.0)
+    e3 = tl.load(base + 3, mask=full, other=0.0)
+    e4 = tl.load(base + 4, mask=full, other=0.0)
+    e5 = tl.load(base + 5, mask=full, other=0.0)
+    e6 = tl.load(base + 6, mask=full, other=0.0)
+    e7 = tl.load(base + 7, mask=full, other=0.0)
+    # torch.amax over an innermost dim of 8 reduces in this tree (checked bit for bit
+    # on H200, signed zeros and NaN included): ((0,4),(2,6)),((1,5),(3,7)).
+    key = _max_like_torch(
+        _max_like_torch(_max_like_torch(e0, e4), _max_like_torch(e2, e6)),
+        _max_like_torch(_max_like_torch(e1, e5), _max_like_torch(e3, e7)),
+    )
+    key = tl.where(full, key, tl.where(blocks == last, float("inf"), float("-inf")))
+    tl.store(KEYS + row * KEYS_STRIDE + blocks, key, mask=blocks < NUM_BLOCKS)
+
+
+def candidate_block_keys(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    num_blocks: int,
+    block_size: int = 8,
+) -> torch.Tensor:
+    """The block keys ``select_candidate_block_ids`` ranks, for every row of a score
+    tile at once: fp32 ``[rows, num_blocks]``, block ``b`` of row ``i`` the max of
+    ``logits[i, 8 b : 8 b + 8]`` for ``b < (compress_lens[i] - 1) // 8``, ``+inf`` for
+    the block of position ``compress_lens[i] - 1``, ``-inf`` after it. Bit for bit the
+    keys the per-request path computes (torch.amax's reduction order); columns at or
+    past a row's length are never read, so they may hold garbage. ``logits`` is fp32
+    with unit column stride and is not modified."""
+    assert block_size == 8, "the key tree is written for blocks of 8"
+    assert logits.dtype == torch.float32 and logits.stride(-1) == 1
+    assert compress_lens.dim() == 1 and compress_lens.shape[0] == logits.shape[0]
+    rows = logits.shape[0]
+    keys = torch.empty((rows, num_blocks), dtype=torch.float32, device=logits.device)
+    if rows == 0 or num_blocks == 0:
+        return keys
+    tile = 256
+    _candidate_block_keys_kernel[(rows, triton.cdiv(num_blocks, tile))](
+        logits,
+        logits.stride(0),
+        compress_lens,
+        keys,
+        keys.stride(0),
+        num_blocks,
+        block_size,
+        tile,
+        num_warps=4,
+    )
+    return keys
 
 
 def topk_among_blocks(

@@ -1055,6 +1055,7 @@ def _fp4_index_logits_paged_kernel(
     GROUP: tl.constexpr,
     BLOCK_L: tl.constexpr,
     CHUNK_TILES: tl.constexpr,
+    MASK_BLOCK: tl.constexpr = 1,
 ):
     # Programs stride over (row group, chunk) units of the whole batch, so one
     # long request spreads over many programs; chunk_end is the inclusive
@@ -1096,7 +1097,7 @@ def _fp4_index_logits_paged_kernel(
                 valid = offs_l < n_vis
                 if HAS_MASK:
                     valid = valid & tl.load(
-                        mask_ptr + b * mask_stride + offs_l,
+                        mask_ptr + b * mask_stride + offs_l // MASK_BLOCK,
                         mask=offs_l < n_vis,
                         other=False,
                     )
@@ -1148,6 +1149,65 @@ def _load_pair_q(
     return q_even, q_odd
 
 
+# e2m1 -> bf16 for four packed index-K bytes (eight codes) by byte-table lookups:
+# PRMT picks each code's bf16 high and low byte from 8-entry tables indexed by its
+# 3 magnitude bits, PRMT's msb-replicate mode turns each code's sign bit into the
+# bf16 sign, and mul.rn.bf16x2 applies the ue8m0 block scale (a power of two, so
+# exact). $4 = four payload bytes, $5 / $6 = the bf16 scales of bytes 0-1 / 2-3;
+# $0 / $1 = low-nibble values of bytes 0-1 / 2-3, $2 / $3 = high-nibble values.
+_E2M1_BF16_PRMT_ASM = tl.constexpr("""
+{
+.reg .b32 th0, th1, tl0, tl1, c01, c23, hb, lb, sg, v, t, z;
+mov.b32 th0, 0x3F3F3F00;
+mov.b32 th1, 0x40404040;
+mov.b32 tl0, 0xC0800000;
+mov.b32 tl1, 0xC0804000;
+mov.b32 z, 0;
+and.b32 c01, $4, 0x7777;
+shr.u32 t, $4, 16;
+and.b32 c23, t, 0x7777;
+shl.b32 v, $4, 4;
+prmt.b32 hb, th0, th1, c01;
+prmt.b32 lb, tl0, tl1, c01;
+prmt.b32 $0, lb, hb, 0x6240;
+prmt.b32 $2, lb, hb, 0x7351;
+prmt.b32 sg, v, z, 0x9484;
+lop3.b32 $0, $0, sg, 0x80008000, 0xF8;
+prmt.b32 sg, $4, z, 0x9484;
+lop3.b32 $2, $2, sg, 0x80008000, 0xF8;
+prmt.b32 hb, th0, th1, c23;
+prmt.b32 lb, tl0, tl1, c23;
+prmt.b32 $1, lb, hb, 0x6240;
+prmt.b32 $3, lb, hb, 0x7351;
+prmt.b32 sg, v, z, 0xB4A4;
+lop3.b32 $1, $1, sg, 0x80008000, 0xF8;
+prmt.b32 sg, $4, z, 0xB4A4;
+lop3.b32 $3, $3, sg, 0x80008000, 0xF8;
+mul.rn.bf16x2 $0, $0, $5;
+mul.rn.bf16x2 $2, $2, $5;
+mul.rn.bf16x2 $1, $1, $6;
+mul.rn.bf16x2 $3, $3, $6;
+}
+""")
+
+
+@triton.jit
+def _dequant_index_k_prmt(pay, word, offs_i):
+    """Bit-identical to the _e2m1_bits dequant of _tc_score_tile in about a fifth of
+    the integer instructions: pay [N, HALF_D] uint8, word [N] the packed ue8m0
+    exponents -> (even elements, odd elements) bf16 [N, HALF_D]."""
+    exps = (word[:, None] >> ((offs_i[None, :] // 16) * 8)) & 0xFF
+    scale = (exps << 7).to(tl.int16).to(tl.bfloat16, bitcast=True)
+    return tl.inline_asm_elementwise(
+        asm=_E2M1_BF16_PRMT_ASM,
+        constraints="=r,=r,=r,=r,r,r,r",
+        args=[pay, scale],
+        dtype=(tl.bfloat16, tl.bfloat16),
+        is_pure=True,
+        pack=4,
+    )
+
+
 @triton.jit
 def _fp4_index_logits_paged_tc_kernel(
     qs_ptr,  # [rows, H, 2, HALF_D] bf16: each head's even elements, then odd
@@ -1174,6 +1234,9 @@ def _fp4_index_logits_paged_tc_kernel(
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CHUNK_TILES: tl.constexpr,
+    MASK_BLOCK: tl.constexpr = 1,
+    PRMT_DEQUANT: tl.constexpr = False,
+    SKIP_TILES: tl.constexpr = False,
 ):
     # Same (row group, chunk) striding as _fp4_index_logits_paged_kernel. A K tile
     # of BLOCK_N positions is loaded and dequantized once, then multiplied on tensor
@@ -1182,6 +1245,9 @@ def _fp4_index_logits_paged_tc_kernel(
     PAIRS: tl.constexpr = GROUP // 2
     # The pair loads below hold at most three row pairs.
     tl.static_assert(GROUP % 2 == 0 and GROUP <= 6)
+    # Tile skipping needs per-block flags (SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK).
+    SKIP_EMPTY: tl.constexpr = HAS_MASK and MASK_BLOCK > 1 and SKIP_TILES
+    tl.static_assert(MASK_BLOCK == 1 or BLOCK_N % MASK_BLOCK == 0)
     M: tl.constexpr = 2 * H
     offs_i = tl.arange(0, HALF_D)
     offs_m = tl.arange(0, M)
@@ -1209,75 +1275,358 @@ def _fp4_index_logits_paged_tc_kernel(
         qe2, qo2 = _load_pair_q(qs_ptr, b0 + 4, offs_m, offs_i, H, HALF_D, PAIRS > 2)
         for tile in range(tile0, tile1):
             offs_n = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-            in_group = offs_n < n_group
-            slot = (
-                tl.load(
-                    req_table_ptr + req * req_stride + offs_n * RATIO,
-                    mask=in_group,
-                    other=0,
+            if SKIP_EMPTY:
+                # Per-block candidate flags: a row pair none of whose rows keeps a
+                # block of this tile gets -inf there, as its masked scores would.
+                kept0 = _pair_keeps_tile(
+                    mask_ptr, mask_stride, b0, tile, n_group, BLOCK_N, MASK_BLOCK
                 )
-                // RATIO
-            )
-            # An unmapped (-1) entry of a padded graph row reads slot 0, not out of bounds.
-            slot = tl.maximum(slot, 0)
-            page = (slot // PAGE_SIZE).to(tl.int64)
-            off = slot % PAGE_SIZE
-            base = page * row_stride
-            pay = tl.load(
-                table_ptr
-                + base[:, None]
-                + off[:, None] * INDEX_K_PAYLOAD_BYTES
-                + offs_i[None, :],
-                mask=in_group[:, None],
-                other=0,
-            ).to(tl.int32)
-            word_ptr = (
-                table_ptr + base + PAGE_SIZE * INDEX_K_PAYLOAD_BYTES + off * 4
-            ).to(tl.pointer_type(tl.int32))
-            # Masked positions decode to zero under a unit scale.
-            word = tl.load(word_ptr, mask=in_group, other=0x7F7F7F7F)
-            # e8m0 block scales: byte i (elements 2i, 2i+1) uses block i // 16.
-            exps = (word[:, None] >> ((offs_i[None, :] // 16) * 8)) & 0xFF
-            scale = (exps << 23).to(tl.float32, bitcast=True)
-            k_lo = (_e2m1_bits(pay & 0xF).to(tl.float32, bitcast=True) * scale).to(
-                tl.bfloat16
-            )
-            k_hi = (_e2m1_bits(pay >> 4).to(tl.float32, bitcast=True) * scale).to(
-                tl.bfloat16
-            )
-            for p in tl.static_range(PAIRS):
-                if p == 0:
-                    q_even, q_odd = qe0, qo0
-                elif p == 1:
-                    q_even, q_odd = qe1, qo1
-                else:
-                    q_even, q_odd = qe2, qo2
-                acc = tl.dot(k_lo, tl.trans(q_even))  # [BLOCK_N, 2H] fp32
-                acc = tl.dot(k_hi, tl.trans(q_odd), acc)
-                # reference rounding points: bf16 dot -> relu -> * bf16 weight
-                # -> bf16 -> sum -> bf16
-                s = tl.maximum(acc.to(tl.bfloat16).to(tl.float32), 0.0)
-                row0 = b0 + 2 * p
-                w = tl.load(w_ptr + row0 * H + offs_m).to(tl.float32)
-                s = (s * w[None, :]).to(tl.bfloat16).to(tl.float32)
-                logit = tl.sum(tl.reshape(s, (BLOCK_N, 2, H)), axis=2)
-                logit = logit.to(tl.bfloat16).to(tl.float32)  # [BLOCK_N, 2]
-                rows = row0 + offs_r
-                n_vis = tl.minimum(tl.load(lens_ptr + rows), L)
-                valid = offs_n[:, None] < n_vis[None, :]
-                if HAS_MASK:
-                    valid = valid & tl.load(
-                        mask_ptr
-                        + rows[None, :].to(tl.int64) * mask_stride
-                        + offs_n[:, None],
-                        mask=valid,
-                        other=False,
+                any_kept = kept0
+                if PAIRS > 1:
+                    kept1 = _pair_keeps_tile(
+                        mask_ptr,
+                        mask_stride,
+                        b0 + 2,
+                        tile,
+                        n_group,
+                        BLOCK_N,
+                        MASK_BLOCK,
                     )
-                tl.store(
-                    out_ptr + rows[None, :].to(tl.int64) * out_stride + offs_n[:, None],
-                    tl.where(valid, logit, float("-inf")),
-                    mask=(offs_n < L)[:, None],
+                    any_kept = any_kept | kept1
+                else:
+                    kept1 = kept0
+                if PAIRS > 2:
+                    kept2 = _pair_keeps_tile(
+                        mask_ptr,
+                        mask_stride,
+                        b0 + 4,
+                        tile,
+                        n_group,
+                        BLOCK_N,
+                        MASK_BLOCK,
+                    )
+                    any_kept = any_kept | kept2
+                else:
+                    kept2 = kept0
+                if any_kept:
+                    _tc_score_tile(
+                        qe0,
+                        qo0,
+                        qe1,
+                        qo1,
+                        qe2,
+                        qo2,
+                        kept0,
+                        kept1,
+                        kept2,
+                        w_ptr,
+                        req,
+                        req_table_ptr,
+                        req_stride,
+                        table_ptr,
+                        row_stride,
+                        lens_ptr,
+                        mask_ptr,
+                        mask_stride,
+                        out_ptr,
+                        out_stride,
+                        offs_n,
+                        offs_i,
+                        offs_m,
+                        offs_r,
+                        n_group,
+                        b0,
+                        L,
+                        PAGE_SIZE,
+                        H,
+                        HALF_D,
+                        RATIO,
+                        HAS_MASK,
+                        PAIRS,
+                        BLOCK_N,
+                        MASK_BLOCK,
+                        True,
+                        PRMT_DEQUANT,
+                    )
+                else:
+                    for p in tl.static_range(PAIRS):
+                        _tc_store_neg_inf(
+                            out_ptr, out_stride, b0 + 2 * p, offs_n, offs_r, L, BLOCK_N
+                        )
+            else:
+                _tc_score_tile(
+                    qe0,
+                    qo0,
+                    qe1,
+                    qo1,
+                    qe2,
+                    qo2,
+                    True,
+                    True,
+                    True,
+                    w_ptr,
+                    req,
+                    req_table_ptr,
+                    req_stride,
+                    table_ptr,
+                    row_stride,
+                    lens_ptr,
+                    mask_ptr,
+                    mask_stride,
+                    out_ptr,
+                    out_stride,
+                    offs_n,
+                    offs_i,
+                    offs_m,
+                    offs_r,
+                    n_group,
+                    b0,
+                    L,
+                    PAGE_SIZE,
+                    H,
+                    HALF_D,
+                    RATIO,
+                    HAS_MASK,
+                    PAIRS,
+                    BLOCK_N,
+                    MASK_BLOCK,
+                    False,
+                    PRMT_DEQUANT,
                 )
+
+
+@triton.jit
+def _tc_score_tile(
+    qe0,
+    qo0,
+    qe1,
+    qo1,
+    qe2,
+    qo2,
+    kept0,
+    kept1,
+    kept2,
+    w_ptr,
+    req,
+    req_table_ptr,
+    req_stride,
+    table_ptr,
+    row_stride,
+    lens_ptr,
+    mask_ptr,
+    mask_stride,
+    out_ptr,
+    out_stride,
+    offs_n,
+    offs_i,
+    offs_m,
+    offs_r,
+    n_group,
+    b0,
+    L,
+    PAGE_SIZE: tl.constexpr,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    RATIO: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    PAIRS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MASK_BLOCK: tl.constexpr,
+    CHECK_KEPT: tl.constexpr,
+    PRMT_DEQUANT: tl.constexpr,
+):
+    """One K tile of _fp4_index_logits_paged_tc_kernel: load and dequantize it,
+    then score each row pair (only the kept pairs when CHECK_KEPT)."""
+    in_group = offs_n < n_group
+    slot = (
+        tl.load(
+            req_table_ptr + req * req_stride + offs_n * RATIO,
+            mask=in_group,
+            other=0,
+        )
+        // RATIO
+    )
+    # An unmapped (-1) entry of a padded graph row reads slot 0, not out of bounds.
+    slot = tl.maximum(slot, 0)
+    page = (slot // PAGE_SIZE).to(tl.int64)
+    off = slot % PAGE_SIZE
+    base = page * row_stride
+    pay = tl.load(
+        table_ptr
+        + base[:, None]
+        + off[:, None] * INDEX_K_PAYLOAD_BYTES
+        + offs_i[None, :],
+        mask=in_group[:, None],
+        other=0,
+    )
+    word_ptr = (table_ptr + base + PAGE_SIZE * INDEX_K_PAYLOAD_BYTES + off * 4).to(
+        tl.pointer_type(tl.int32)
+    )
+    # Masked positions decode to zero under a unit scale.
+    word = tl.load(word_ptr, mask=in_group, other=0x7F7F7F7F)
+    if PRMT_DEQUANT:
+        k_lo, k_hi = _dequant_index_k_prmt(pay, word, offs_i)
+    else:
+        pay = pay.to(tl.int32)
+        # e8m0 block scales: byte i (elements 2i, 2i+1) uses block i // 16.
+        exps = (word[:, None] >> ((offs_i[None, :] // 16) * 8)) & 0xFF
+        scale = (exps << 23).to(tl.float32, bitcast=True)
+        k_lo = (_e2m1_bits(pay & 0xF).to(tl.float32, bitcast=True) * scale).to(
+            tl.bfloat16
+        )
+        k_hi = (_e2m1_bits(pay >> 4).to(tl.float32, bitcast=True) * scale).to(
+            tl.bfloat16
+        )
+    for p in tl.static_range(PAIRS):
+        if p == 0:
+            q_even, q_odd, kept = qe0, qo0, kept0
+        elif p == 1:
+            q_even, q_odd, kept = qe1, qo1, kept1
+        else:
+            q_even, q_odd, kept = qe2, qo2, kept2
+        row0 = b0 + 2 * p
+        if CHECK_KEPT:
+            if kept:
+                _tc_score_pair(
+                    k_lo,
+                    k_hi,
+                    q_even,
+                    q_odd,
+                    w_ptr,
+                    row0,
+                    lens_ptr,
+                    mask_ptr,
+                    mask_stride,
+                    out_ptr,
+                    out_stride,
+                    offs_n,
+                    offs_m,
+                    offs_r,
+                    L,
+                    H,
+                    BLOCK_N,
+                    HAS_MASK,
+                    MASK_BLOCK,
+                )
+            else:
+                _tc_store_neg_inf(out_ptr, out_stride, row0, offs_n, offs_r, L, BLOCK_N)
+        else:
+            _tc_score_pair(
+                k_lo,
+                k_hi,
+                q_even,
+                q_odd,
+                w_ptr,
+                row0,
+                lens_ptr,
+                mask_ptr,
+                mask_stride,
+                out_ptr,
+                out_stride,
+                offs_n,
+                offs_m,
+                offs_r,
+                L,
+                H,
+                BLOCK_N,
+                HAS_MASK,
+                MASK_BLOCK,
+            )
+
+
+@triton.jit
+def _tc_score_pair(
+    k_lo,
+    k_hi,
+    q_even,
+    q_odd,
+    w_ptr,
+    row0,
+    lens_ptr,
+    mask_ptr,
+    mask_stride,
+    out_ptr,
+    out_stride,
+    offs_n,
+    offs_m,
+    offs_r,
+    L,
+    H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    MASK_BLOCK: tl.constexpr,
+):
+    acc = tl.dot(k_lo, tl.trans(q_even))  # [BLOCK_N, 2H] fp32
+    acc = tl.dot(k_hi, tl.trans(q_odd), acc)
+    # reference rounding points: bf16 dot -> relu -> * bf16 weight
+    # -> bf16 -> sum -> bf16
+    s = tl.maximum(acc.to(tl.bfloat16).to(tl.float32), 0.0)
+    w = tl.load(w_ptr + row0 * H + offs_m).to(tl.float32)
+    s = (s * w[None, :]).to(tl.bfloat16).to(tl.float32)
+    logit = tl.sum(tl.reshape(s, (BLOCK_N, 2, H)), axis=2)
+    logit = logit.to(tl.bfloat16).to(tl.float32)  # [BLOCK_N, 2]
+    rows = row0 + offs_r
+    n_vis = tl.minimum(tl.load(lens_ptr + rows), L)
+    valid = offs_n[:, None] < n_vis[None, :]
+    if HAS_MASK:
+        valid = valid & tl.load(
+            mask_ptr
+            + rows[None, :].to(tl.int64) * mask_stride
+            + offs_n[:, None] // MASK_BLOCK,
+            mask=valid,
+            other=False,
+        )
+    tl.store(
+        out_ptr + rows[None, :].to(tl.int64) * out_stride + offs_n[:, None],
+        tl.where(valid, logit, float("-inf")),
+        mask=(offs_n < L)[:, None],
+    )
+
+
+@triton.jit
+def _tc_store_neg_inf(
+    out_ptr, out_stride, row0, offs_n, offs_r, L, BLOCK_N: tl.constexpr
+):
+    rows = row0 + offs_r
+    tl.store(
+        out_ptr + rows[None, :].to(tl.int64) * out_stride + offs_n[:, None],
+        tl.full((BLOCK_N, 2), float("-inf"), tl.float32),
+        mask=(offs_n < L)[:, None],
+    )
+
+
+@triton.jit
+def _pair_keeps_tile(
+    mask_ptr,
+    mask_stride,
+    row0,
+    tile,
+    n_group,
+    BLOCK_N: tl.constexpr,
+    MASK_BLOCK: tl.constexpr,
+):
+    """Whether row ``row0`` or ``row0 + 1`` keeps a block of the tile."""
+    NB: tl.constexpr = BLOCK_N // MASK_BLOCK
+    offs_b = tile * NB + tl.arange(0, NB)
+    rows = row0 + tl.arange(0, 2)
+    flags = tl.load(
+        mask_ptr + rows[:, None].to(tl.int64) * mask_stride + offs_b[None, :],
+        mask=(offs_b * MASK_BLOCK < n_group)[None, :],
+        other=0,
+    ).to(tl.int32)
+    return tl.max(tl.max(flags, axis=1), axis=0) > 0
+
+
+def _use_prmt_dequant() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT.get()
+
+
+def _use_tile_skip() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP.get()
 
 
 def _use_paged_tc_kernel(rows_per_request: int, heads: int, page_size: int) -> bool:
@@ -1303,6 +1652,7 @@ def fp4_index_logits_paged(
     ratio: int,
     candidate_mask: torch.Tensor | None = None,
     rows_per_request: int = 1,
+    mask_block: int = 1,
 ) -> torch.Tensor:
     """Score visible compressed positions directly from the request table.
 
@@ -1318,13 +1668,19 @@ def fp4_index_logits_paged(
     order inside the dot and the head sum is not specified: scores are identical
     on the measured H200 runs, not by construction, and may differ by bf16 ulps
     on other hardware or Triton versions (which can reorder top-k ties).
+
+    ``candidate_mask`` holds one flag per ``mask_block`` positions; with
+    ``mask_block > 1`` (per-block flags) and SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP
+    the tensor-core kernel also skips the tiles no row of a row pair keeps, writing
+    -inf there as the mask would.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
     assert ratio in (1, 2) and max_len <= req_table.shape[1] // ratio
     assert req_table.stride(1) == 1
     if candidate_mask is not None:
-        assert candidate_mask.shape[1] >= max_len and candidate_mask.stride(1) == 1
+        assert candidate_mask.shape[1] * mask_block >= max_len
+        assert candidate_mask.stride(1) == 1
     batch, heads, _ = q.shape
     assert batch % rows_per_request == 0
     q = q.contiguous()
@@ -1379,6 +1735,9 @@ def fp4_index_logits_paged(
             GROUP=rows_per_request,
             BLOCK_N=block_l,
             CHUNK_TILES=chunk_tiles,
+            MASK_BLOCK=mask_block,
+            PRMT_DEQUANT=_use_prmt_dequant(),
+            SKIP_TILES=_use_tile_skip(),
             num_warps=4,
             num_stages=3,
         )
@@ -1411,6 +1770,7 @@ def fp4_index_logits_paged(
         GROUP=rows_per_request,
         BLOCK_L=block_l,
         CHUNK_TILES=chunk_tiles,
+        MASK_BLOCK=mask_block,
         num_warps=4,
     )
     return out
