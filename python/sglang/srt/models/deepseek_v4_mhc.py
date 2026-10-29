@@ -602,6 +602,12 @@ def _sm90_fused_post_combine() -> bool:
     )
 
 
+def _fused_post_combine_min_rows() -> int:
+    """The fused post + combine + norm kernel's lower row bound: 4096, or what
+    SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS sets for small prefill steps."""
+    return max(1, min(4096, envs.SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS.get()))
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -642,17 +648,24 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and 4096 <= y.shape[0] <= 65536
+        and _fused_post_combine_min_rows() <= y.shape[0] <= 65536
         and (get_platform().is_blackwell or _sm90_fused_post_combine())
         and cfg.hidden == 5120
         and cfg.mult == 4
         and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
+        and (not cfg.cp_prefill or envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.get())
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
             mhc_post_combine_norm_prefill,
         )
 
+        if cfg.cp_prefill:
+            # The kernel indexes dense rows; mhc_post makes the same guarantee under CP.
+            from sglang.srt.layers.utils.common import strict_contiguous
+
+            y, residual = strict_contiguous(y), strict_contiguous(residual)
+            post_mix, comb = strict_contiguous(post_mix), strict_contiguous(comb)
+            pre = strict_contiguous(pre)
         updated, normalized = mhc_post_combine_norm_prefill(
             y,
             residual,
