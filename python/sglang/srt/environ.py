@@ -1814,6 +1814,29 @@ class Envs:
     # that keep the same block count) instead of once per request. The kernel count
     # stops growing with the request count; selections stay bit-identical.
     SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS = EnvBool(False)
+    # INF-681 k-attnp. Prefill CP (interleave): attend each CP rank's own query rows
+    # with the FlashMLA sparse PREFILL kernel over a bf16 dequant of the chunk's SWA
+    # and compressed history (the TP path's kernel), instead of the sparse DECODE
+    # kernel with one "request" per query row. Every CP rank already holds the whole
+    # KV, so the workspace is the same as without CP; only the query rows are this
+    # rank's. Numerics: same keys and softmax, different kernel accumulation order.
+    SGLANG_OPT_DSV4_CP_SPARSE_PREFILL = EnvBool(False)
+    # With SGLANG_OPT_DSV4_CP_SPARSE_PREFILL: CP ranks with fewer local query rows
+    # than this keep the decode kernel. 0 = every CP prefill forward.
+    SGLANG_OPT_DSV4_CP_SPARSE_PREFILL_MIN_ROWS = EnvInt(0)
+    # INF-681 k-attnp (backport of upstream sgl-project/sglang#45909). Sparse prefill:
+    # layers that share a ratio-1/2 kv_source reuse its bf16 dequant in the workspace
+    # head instead of dequantizing the same compressed cache again in every layer (no
+    # later layer writes that cache within a forward). Bit-identical.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT = EnvBool(False)
+    # INF-681 k-attnp. The in-place q / attention-output RoPE (fused_rope_inplace without
+    # k) runs one CTA per token with 16-byte accesses instead of one warp per (token,
+    # head) with 4-byte accesses. Same per-element arithmetic, same bits.
+    SGLANG_OPT_DSV4_ROPE_WIDE = EnvBool(False)
+    # INF-681 k-attnp. Sparse prefill's dequant of the V4 (584-byte) KV cache into the
+    # bf16 workspace: 8 tokens per Triton program and a whole row per block instead of
+    # one token per program and one 64-value tile at a time. Same arithmetic, same bits.
+    SGLANG_OPT_DSV4_SPARSE_PREFILL_FAST_DEQUANT = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last

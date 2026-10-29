@@ -34,7 +34,7 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import triton
@@ -88,12 +88,33 @@ class SparsePrefillWorkspace:
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        # SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT (backport of upstream
+        # #45909): what the head rows hold, or None when nothing reusable is there.
+        self._head_source: Optional[tuple] = None
 
     def get(
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
+        self._head_source = None
+        return self._reserve(num_tokens, dtype)
+
+    def get_with_head(
+        self, num_tokens: int, head_source: tuple
+    ) -> Tuple[torch.Tensor, bool]:
+        """The rows, and whether the head rows already hold ``head_source``'s
+        dequant (the caller then skips rewriting them)."""
+        buffer = self._reserve(num_tokens, torch.bfloat16)
+        head_filled = head_source == self._head_source
+        self._head_source = head_source
+        return buffer, head_filled
+
+    def forget_head(self) -> None:
+        """Per forward: the next forward's tensors may reuse freed addresses."""
+        self._head_source = None
+
+    def _reserve(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
@@ -103,6 +124,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self._head_source = None
         return self._buffer[:num_tokens]
 
 
