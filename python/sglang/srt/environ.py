@@ -1641,6 +1641,9 @@ class Envs:
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
+    # Same triton_kernels experts with tiles tuned for decode (a few routed rows per
+    # expert, CUDA graphs); implies SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.
+    SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)

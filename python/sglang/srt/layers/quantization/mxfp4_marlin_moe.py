@@ -51,7 +51,11 @@ class Mxfp4MarlinMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
-        self._use_triton_kernels = (
+        self._triton_kernels_decode = (
+            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE.get()
+            and get_platform().is_sm90
+        )
+        self._use_triton_kernels = self._triton_kernels_decode or (
             envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get() and get_platform().is_sm90
         )
 
@@ -241,9 +245,15 @@ class Mxfp4MarlinMoEMethod:
             f"Preparing MXFP4 experts for triton_kernels (layer: {self.prefix})...",
         )
         mx_block = _mx_block_kwargs()
-        # Measured on H200 at the DSV4-Flash TP4 expert shapes: 3 stages beat
-        # the default by ~16% at 16k-32k rows with bit-identical output.
-        opt_flags.update_opt_flags_constraints({"num_stages": 3})
+        if self._triton_kernels_decode:
+            # The swizzled scale layout fixes the warp count of every later
+            # matmul; 4 warps lets decode take 128-wide tiles (see _DECODE_TILES).
+            swizzle_num_warps = 4
+        else:
+            swizzle_num_warps = 8
+            # Measured on H200 at the DSV4-Flash TP4 expert shapes: 3 stages beat
+            # the default by ~16% at 16k-32k rows with bit-identical output.
+            opt_flags.update_opt_flags_constraints({"num_stages": 3})
         self._tk_num_experts = layer.w13_weight.shape[0]
         self._tk_weights = []
         for weight, scale in (
@@ -251,7 +261,9 @@ class Mxfp4MarlinMoEMethod:
             (layer.w2_weight, layer.w2_weight_scale_inv),
         ):
             tk_weight, flex, tk_scale = _swizzle_mxfp4(
-                weight.data.view(torch.uint8), scale.data.view(torch.uint8), 8
+                weight.data.view(torch.uint8),
+                scale.data.view(torch.uint8),
+                swizzle_num_warps,
             )
             precision = PrecisionConfig(
                 b_mx_scale=tk_scale, flex_ctx=FlexCtx(rhs_data=flex), **mx_block
@@ -265,8 +277,26 @@ class Mxfp4MarlinMoEMethod:
         torch.cuda.empty_cache()
         layer._dsv4_mxfp4_backend = "triton_kernels"
 
+    # H200, DSV4-Flash TP4 experts (hidden 5120, intermediate 576), 16 routed rows
+    # per tile: best of a block/stage sweep at 48-128 decode requests x 6 verify
+    # rows (target, 384 experts top 6) and x 5 draft rows (128 experts top 3).
+    _DECODE_TILES = (
+        dict(block_m=16, block_n=128, block_k=128, num_warps=4, num_stages=4),
+        dict(block_m=16, block_n=256, block_k=64, num_warps=4, num_stages=4),
+    )
+    # Above this many routed rows per expert on average, leave the tile choice to
+    # triton_kernels (only the warp count is fixed by the swizzled scales).
+    _DECODE_MAX_ROWS_PER_EXPERT = 16
+
+    def _decode_tiles(self, num_slots: int):
+        if not self._triton_kernels_decode:
+            return {}, {}
+        if num_slots > self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts:
+            return {"num_warps": 4}, {"num_warps": 4}
+        return self._DECODE_TILES
+
     def _apply_triton_kernels(self, hidden_states, topk_output) -> torch.Tensor:
-        from triton_kernels.matmul import matmul
+        from triton_kernels.matmul import matmul, scoped_opt_flags_constraints
         from triton_kernels.tensor import make_ragged_tensor_metadata
 
         from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
@@ -278,37 +308,63 @@ class Mxfp4MarlinMoEMethod:
         output = torch.empty_like(hidden_states)
         if num_tokens == 0:
             return output
-        # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
-        valid = topk_output.topk_ids >= 0
-        expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
-        weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
-        # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
-        combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
-        ragged_metadata = make_ragged_tensor_metadata(
-            torch.bincount(expert_ids, minlength=self._tk_num_experts).to(torch.int32),
-            expert_ids.numel(),
-        )
+        num_slots = num_tokens * top_k
+        if (
+            self._triton_kernels_decode
+            and num_slots <= self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts
+        ):
+            from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
+
+            # One launch instead of argsort + histogram + gathers (~45 us at decode).
+            expert_counts, combine_indx, gather_indx, sorted_weights = (
+                expert_sort_small(
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self._tk_num_experts,
+                )
+            )
+        else:
+            # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
+            valid = topk_output.topk_ids >= 0
+            expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
+            weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
+            # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
+            combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+            # torch.bincount reads its max on the host, which breaks CUDA graph
+            # capture; a fixed-size scatter-add histogram stays on the device.
+            expert_counts = torch.zeros(
+                self._tk_num_experts, dtype=torch.int32, device=expert_ids.device
+            )
+            expert_counts.scatter_add_(
+                0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+            )
+            gather_indx = combine_indx // top_k
+            sorted_weights = weights[combine_indx.long()]
+        ragged_metadata = make_ragged_tensor_metadata(expert_counts, num_slots)
         (w13, w13_precision), (w2, w2_precision) = self._tk_weights
-        gate_up = matmul(
-            hidden_states,
-            w13,
-            None,
-            a_ragged_metadata=ragged_metadata,
-            gather_indx=combine_indx // top_k,
-            precision_config=w13_precision,
-        )
+        w13_tiles, w2_tiles = self._decode_tiles(num_slots)
+        with scoped_opt_flags_constraints(w13_tiles):
+            gate_up = matmul(
+                hidden_states,
+                w13,
+                None,
+                a_ragged_metadata=ragged_metadata,
+                gather_indx=gather_indx,
+                precision_config=w13_precision,
+            )
         activated = gate_up.new_empty(gate_up.shape[0], self._tk_intermediate_size)
         swiglu_limit_func(
             activated, gate_up, swiglu_limit=self.runner.config.swiglu_limit
         )
-        down = matmul(
-            activated,
-            w2,
-            None,
-            a_ragged_metadata=ragged_metadata,
-            scatter_indx=combine_indx,
-            precision_config=w2_precision,
-            gammas=weights[combine_indx.long()],
-        )
+        with scoped_opt_flags_constraints(w2_tiles):
+            down = matmul(
+                activated,
+                w2,
+                None,
+                a_ragged_metadata=ragged_metadata,
+                scatter_indx=combine_indx,
+                precision_config=w2_precision,
+                gammas=sorted_weights,
+            )
         moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         return output
