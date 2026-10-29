@@ -2757,6 +2757,19 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
+        if (
+            envs.SGLANG_OPT_DSV4_WO_B_FUSED_ACT_QUANT.get()
+            and not defer_all_reduce
+            and self.attn_tp_size == 1
+        ):
+            # INF-681 k-qcp: quantize wo_a's grouped output in place of flatten(1)'s copy.
+            from sglang.srt.layers.quantization.dsv4_prefill_qcp import (
+                wo_b_from_grouped,
+            )
+
+            out = wo_b_from_grouped(o, self.wo_b)
+            if out is not None:
+                return out
         o, _ = self.wo_b(
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
