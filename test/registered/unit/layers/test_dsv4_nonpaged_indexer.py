@@ -949,6 +949,8 @@ class TestDeepSelectFullTopKDecode(CustomTestCase):
         indexer.req_to_token = None
         indexer.use_deep_gemm_decode = False
         indexer.use_deep_select_decode = False
+        # Built without __init__: set the request shard (SGLANG_OPT_DSV4_DECODE_INDEXER_SHARD) off.
+        indexer.decode_sharder = None
 
         with (
             patch.object(mod, "decode_scores", return_value=data),
