@@ -4,6 +4,7 @@ bincount and a stable argsort, accuracy against a BF16-dequantized reference (ne
 to Marlin's) with masked (-1) slots and empty batches, and the refusal under CUDA
 graph capture."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -244,3 +245,7 @@ def test_zero_tokens_and_cuda_graph_capture(monkeypatch):
     with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
         with torch.cuda.graph(graph):
             tk.apply(layer, static)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
