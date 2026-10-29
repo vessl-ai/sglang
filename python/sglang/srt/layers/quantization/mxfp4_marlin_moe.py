@@ -114,6 +114,27 @@ def route_slots_by_expert(
     )
 
 
+_warned_two_shared_adds = False
+
+
+def _w4a8_fused_shared_add() -> bool:
+    """INF-681 int4: SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD (k-pmoe, #112) and
+    SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM (k-qcp, #111) fuse the same shared-expert
+    add into the W4A8 top-k sum. With both set, k-qcp's runs and k-pmoe's stays off, so
+    the shared output is added exactly once."""
+    global _warned_two_shared_adds
+    on = envs.SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD.get()
+    if on and envs.SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM.get():
+        if not _warned_two_shared_adds:
+            _warned_two_shared_adds = True
+            logger.warning(
+                "SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD is ignored: "
+                "SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM fuses the same add."
+            )
+        return False
+    return on
+
+
 class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
 
@@ -299,12 +320,15 @@ class Mxfp4MarlinMoEMethod:
     def accepts_shared_add(self, experts) -> bool:
         """True when the next apply() can return shared + routed for this layer: the W4A8
         prefill experts with the fused add on, and the routed scaling factor already in
-        the top-k weights (so the add has no scale)."""
+        the top-k weights (so the add has no scale). Never while k-qcp's
+        SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM is on: that switch fuses the same add
+        (`_w4a8_fused_shared_add`), and only one of the two may hand the output over."""
         w4a8 = getattr(self, "_w4a8", None)
         return (
             self._use_w4a8
             and w4a8 is not None
             and w4a8.fused_shared_add
+            and not envs.SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM.get()
             and bool(
                 getattr(experts, "should_fuse_routed_scaling_factor_in_topk", False)
             )
@@ -442,7 +466,7 @@ class Mxfp4MarlinMoEMethod:
             logger,
             f"Using W4A8 (FP8 tensor core) MXFP4 experts (layer: {self.prefix}; k-pmoe "
             f"fused_swiglu={envs.SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU.get()} "
-            f"fused_shared_add={envs.SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD.get()} "
+            f"fused_shared_add={_w4a8_fused_shared_add()} "
             f"counting_route={envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get()} "
             f"w2_two_cta_min_rows={envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get()})",
         )
@@ -457,7 +481,7 @@ class Mxfp4MarlinMoEMethod:
             sorted_sum=envs.SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.get(),
             small_step_rows=envs.SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS.get(),
             fused_swiglu=envs.SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU.get(),
-            fused_shared_add=envs.SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD.get(),
+            fused_shared_add=_w4a8_fused_shared_add(),
             counting_route=envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get(),
             w2_two_cta_min_rows=envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get(),
         )
