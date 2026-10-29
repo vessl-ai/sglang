@@ -325,6 +325,7 @@ class Mxfp4MarlinMoEMethod:
     # H200, DSV4-Flash TP4 experts (hidden 5120, intermediate 576), 16 routed rows
     # per tile: best of a block/stage sweep at 48-128 decode requests x 6 verify
     # rows (target, 384 experts top 6) and x 5 draft rows (128 experts top 3).
+    # Measured at TP4 only; other TP shard widths use the same tiles unmeasured.
     _DECODE_TILES = (
         dict(block_m=16, block_n=128, block_k=128, num_warps=4, num_stages=4),
         dict(block_m=16, block_n=256, block_k=64, num_warps=4, num_stages=4),

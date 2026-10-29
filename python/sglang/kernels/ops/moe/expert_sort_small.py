@@ -62,6 +62,8 @@ def expert_sort_small(
     sorted_weights[S] float32) for ``topk_ids``/``topk_weights`` of shape [T, top_k].
 
     ``sorted_slots`` equals ``argsort(ids, stable=True)`` with ids -1 mapped to 0.
+    Ids must lie in [-1, num_experts): a larger id is counted for no expert and
+    leaves output entries unwritten, without an error.
     """
     num_tokens, top_k = topk_ids.shape
     num_slots = num_tokens * top_k

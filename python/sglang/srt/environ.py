@@ -1649,7 +1649,12 @@ class Envs:
     # the MoE runs eagerly (a PD prefill server without a prefill CUDA graph).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
     # Same triton_kernels experts with tiles tuned for decode (a few routed rows per
-    # expert, CUDA graphs); implies SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.
+    # expert) and CUDA graph capture allowed. Implies SGLANG_OPT_DSV4_TRITON_KERNELS_MOE
+    # and replaces its prefill tuning for the whole process: the weights are swizzled
+    # for 4 warps and num_stages=3 is not pinned, so prefill batches in the same
+    # process run slower than with the prefill switch alone. The swizzled weights
+    # are ~8.8 GB per GPU larger than Marlin's at TP4 (intermediate 576 padded to
+    # 640): raise --mem-fraction-static (the e3 decoder runs 0.75 instead of 0.70).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
