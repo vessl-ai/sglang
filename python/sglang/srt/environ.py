@@ -1656,6 +1656,14 @@ class Envs:
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs.
     SGLANG_OPT_DSV4_W4A8_PREFILL_MOE = EnvBool(False)
+    # DeepSeek-V4.1 DSpark PD: let a prefill with attention TP > 1 and CP 1 (e.g. TP4)
+    # serve a decode with attention TP 1 (DP attention). The V4 KV pool is MLA-style
+    # (one latent KV head, replicated across attention TP), so one prefill rank sends
+    # each request through the generic MLA dummy-rank path; the dsv41_spec_layout
+    # comparison still rejects any state whose per-rank layout differs. Upstream #40177
+    # allowed this pairing and #40323 dropped it without a stated reason, so it stays
+    # off until PD correctness is measured on this pairing. Set it on both servers.
+    SGLANG_OPT_DSV4_PD_TP_PREFILL_DP_DECODE = EnvBool(False)
     # With the above: convert the next layer's FP8 expert weights on a side stream while
     # the current layer's attention runs (0 = convert in line, before each layer's GEMMs).
     SGLANG_DSV4_W4A8_PREFETCH = EnvBool(True)
