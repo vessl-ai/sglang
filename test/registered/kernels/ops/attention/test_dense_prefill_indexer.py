@@ -303,12 +303,19 @@ class TestDensePrefillIndexer(CustomTestCase):
         whole_sel, whole_blocks = dense_blocks._publish_prefill_blocks(
             data=data, kv=inputs["kv"], topk=topk, topk_blocks=64, block_size=8
         )
+        # A candidate consumer layer reads the merged (whole) published blocks and,
+        # sharded, the block rows of its own row slice.
+        whole_consumed = dense_blocks._consume_prefill_blocks(
+            data=data, kv=inputs["kv"], topk=topk, blocks=whole_blocks, block_size=8
+        )
+        self.assertTrue(bool((whole_consumed >= 0).any()))
         for size in (2, 3, 4):
             merged = torch.full_like(whole, -1)
             merged_sel, merged_blocks = (
                 torch.full_like(whole_sel, -1),
                 torch.full_like(whole_blocks, -1),
             )
+            merged_consumed = torch.full_like(whole_consumed, -1)
             for rank in range(size):
                 shard = slice(rows * rank // size, rows * (rank + 1) // size)
                 part = data.row_slice(shard)
@@ -325,10 +332,21 @@ class TestDensePrefillIndexer(CustomTestCase):
                 merged_blocks = torch.maximum(
                     merged_blocks, dense_blocks._unshard_rows(blocks, shard, rows)
                 )
+                consumed = dense_blocks._consume_prefill_blocks(
+                    data=part,
+                    kv=inputs["kv"],
+                    topk=topk,
+                    blocks=whole_blocks[shard],
+                    block_size=8,
+                )
+                merged_consumed = torch.maximum(
+                    merged_consumed, dense_blocks._unshard_rows(consumed, shard, rows)
+                )
             for actual, expected in (
                 (merged, whole),
                 (merged_sel, whole_sel),
                 (merged_blocks, whole_blocks),
+                (merged_consumed, whole_consumed),
             ):
                 torch.testing.assert_close(
                     actual.sort(-1).values, expected.sort(-1).values, rtol=0, atol=0

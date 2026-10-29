@@ -1632,11 +1632,16 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
-    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
-    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path (test
+    # oracle / fallback) instead of DeepGEMM: fp8_fp4_mqa_logits on SM100+, and on
+    # SM90 fp8_mqa_logits over e4m3-widened operands, which is the SM90 default.
+    # SM100 ignores it under attention CP (only DeepGEMM serves CP rows there);
+    # SM90 always runs CP on the torch path, so the env changes nothing there.
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
-    # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
-    # TP ranks instead of scoring every row on every rank.
+    # Split the DeepSeek-V4.1 prefill indexer's query rows across the attention TP
+    # ranks instead of scoring every row on every rank, and max-merge the per-rank
+    # selections. Applies to the torch and the DeepGEMM prefill paths on any arch;
+    # off under attention DP or CP.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
     # Hopper prefill: run the mHC post together with the next hyper-connection's
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
@@ -1648,7 +1653,26 @@ class Envs:
     SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
+    # Prefill only: the MoE raises under CUDA graph capture, so set it only where
+    # the MoE runs eagerly (a PD prefill server without a prefill CUDA graph).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
+    # Same triton_kernels experts with tiles tuned for decode (a few routed rows per
+    # expert) and CUDA graph capture allowed. Implies SGLANG_OPT_DSV4_TRITON_KERNELS_MOE
+    # and replaces its prefill tuning for the whole process: the weights are swizzled
+    # for 4 warps and num_stages=3 is not pinned, so prefill batches in the same
+    # process run slower than with the prefill switch alone. The swizzled weights
+    # are ~8.8 GB per GPU larger than Marlin's at TP4 (intermediate 576 padded to
+    # 640): raise --mem-fraction-static (the e3 decoder runs 0.75 instead of 0.70).
+    SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
+    # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
+    # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
+    # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
+    # the MoE raises under capture, so never set it on a decoder.
+    SGLANG_OPT_DSV4_W4A8_PREFILL_MOE = EnvBool(False)
+    # With the above: right after a layer's experts, convert the next layer's FP8 expert
+    # weights on a side stream, overlapping the rest of the layer and the next layer's
+    # attention (0 = convert in line, before each layer's GEMMs).
+    SGLANG_DSV4_W4A8_PREFETCH = EnvBool(True)
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)

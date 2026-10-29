@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import functools
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch.nn import Module
@@ -43,6 +44,49 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
     )
 
 
+@functools.cache
+def _warn_w4a8_ignored() -> None:
+    logger.warning("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE is set but needs SM90; ignored.")
+
+
+class ExpertRouting(NamedTuple):
+    """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
+
+    expert_counts: torch.Tensor  # [num_experts] int32 slots routed to each expert
+    combine_indx: torch.Tensor  # [slots] int32 slot (token * top_k + k) in sorted order
+    gather_indx: torch.Tensor  # [slots] int32 token of each sorted slot
+    sorted_weights: torch.Tensor  # [slots] top-k weight of each sorted slot
+
+
+def route_slots_by_expert(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int
+) -> ExpertRouting:
+    """Sort the top-k slots by expert without a host sync.
+
+    Masked slots (id -1) contribute nothing: they are routed to expert 0 with weight 0.
+    The sort is stable, so slots of one expert keep token order. Expert ids must be in
+    [-1, num_experts). The per-expert counts use a fixed-size scatter-add histogram:
+    torch.bincount reads its max on the host, which stalls the CPU's kernel launches at
+    every MoE layer and cannot be captured in a CUDA graph.
+    """
+    top_k = topk_ids.shape[1]
+    valid = topk_ids >= 0
+    expert_ids = torch.where(valid, topk_ids, 0).flatten().long()
+    weights = torch.where(valid, topk_weights, 0).flatten()
+    # triton_kernels' own topk needs a power-of-2 top_k, so sort here.
+    combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+    expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    expert_counts.scatter_add_(
+        0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+    )
+    return ExpertRouting(
+        expert_counts=expert_counts,
+        combine_indx=combine_indx,
+        gather_indx=combine_indx // top_k,
+        sorted_weights=weights[combine_indx.long()],
+    )
+
+
 class Mxfp4MarlinMoEMethod:
     """MXFP4 (E8M0 scales) MoE quantization method using the Marlin backend."""
 
@@ -51,8 +95,21 @@ class Mxfp4MarlinMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
-        self._use_triton_kernels = (
-            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get() and get_platform().is_sm90
+        # W4A8 (prefill only) takes precedence over both triton_kernels switches.
+        self._use_w4a8 = (
+            envs.SGLANG_OPT_DSV4_W4A8_PREFILL_MOE.get() and get_platform().is_sm90
+        )
+        if envs.SGLANG_OPT_DSV4_W4A8_PREFILL_MOE.get() and not self._use_w4a8:
+            _warn_w4a8_ignored()
+        self._triton_kernels_decode = (
+            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE.get()
+            and get_platform().is_sm90
+            and not self._use_w4a8
+        )
+        self._use_triton_kernels = self._triton_kernels_decode or (
+            envs.SGLANG_OPT_DSV4_TRITON_KERNELS_MOE.get()
+            and get_platform().is_sm90
+            and not self._use_w4a8
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -167,6 +224,9 @@ class Mxfp4MarlinMoEMethod:
         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
 
+        if self._use_w4a8:
+            self._prepare_w4a8_weights(layer)
+            return
         if self._use_triton_kernels:
             self._prepare_triton_kernels_weights(layer)
             return
@@ -192,6 +252,12 @@ class Mxfp4MarlinMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
+        if self._use_w4a8:
+            return StandardCombineInput(
+                hidden_states=self._w4a8(
+                    hidden_states, topk_output.topk_ids, topk_output.topk_weights
+                )
+            )
         if self._use_triton_kernels:
             return StandardCombineInput(
                 hidden_states=self._apply_triton_kernels(hidden_states, topk_output)
@@ -214,6 +280,36 @@ class Mxfp4MarlinMoEMethod:
         )
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
+    def _prepare_w4a8_weights(self, layer: Module) -> None:
+        from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+            Mxfp4W4A8PrefillExperts,
+        )
+
+        config = self.runner.config
+        if not (
+            config.activation == "silu"
+            and config.is_gated
+            and config.gemm1_alpha is None
+            and config.swiglu_limit is not None
+            and self.hidden_pad == 0
+        ):
+            raise ValueError(
+                "SGLANG_OPT_DSV4_W4A8_PREFILL_MOE supports only the DeepSeek-V4 "
+                "clamped SwiGLU experts with an unpadded hidden size."
+            )
+        log_info_on_rank0(
+            logger, f"Using W4A8 (FP8 tensor core) MXFP4 experts (layer: {self.prefix})"
+        )
+        self._w4a8 = Mxfp4W4A8PrefillExperts(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            config.swiglu_limit,
+            prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
+        )
+        layer._dsv4_mxfp4_backend = "w4a8_fp8"
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
         import triton_kernels.matmul_details.opt_flags as opt_flags
@@ -241,18 +337,33 @@ class Mxfp4MarlinMoEMethod:
             f"Preparing MXFP4 experts for triton_kernels (layer: {self.prefix})...",
         )
         mx_block = _mx_block_kwargs()
-        # Measured on H200 at the DSV4-Flash TP4 expert shapes: 3 stages beat
-        # the default by ~16% at 16k-32k rows with bit-identical output.
-        opt_flags.update_opt_flags_constraints({"num_stages": 3})
+        if self._triton_kernels_decode:
+            # The swizzled scale layout fixes the warp count of every later
+            # matmul; 4 warps lets decode take 128-wide tiles (see _DECODE_TILES).
+            swizzle_num_warps = 4
+        else:
+            swizzle_num_warps = 8
+            # Measured on H200 at the DSV4-Flash TP4 expert shapes: 3 stages beat
+            # the default by ~16% at 16k-32k rows with bit-identical output.
+            opt_flags.update_opt_flags_constraints({"num_stages": 3})
         self._tk_num_experts = layer.w13_weight.shape[0]
         self._tk_weights = []
         for weight, scale in (
             (layer.w13_weight, layer.w13_weight_scale_inv),
             (layer.w2_weight, layer.w2_weight_scale_inv),
         ):
+            # Return the previous swizzle's cached scratch before the next swizzle, and
+            # this swizzle's scratch right after it. Otherwise a swizzle's output can be
+            # placed inside a cached scratch segment: the rest of that segment can then
+            # never be returned to the driver, and KV-cache sizing (which empties the
+            # cache and reads driver free memory) loses ~0.5 GB per TP4 layer on H200.
+            torch.cuda.empty_cache()
             tk_weight, flex, tk_scale = _swizzle_mxfp4(
-                weight.data.view(torch.uint8), scale.data.view(torch.uint8), 8
+                weight.data.view(torch.uint8),
+                scale.data.view(torch.uint8),
+                swizzle_num_warps,
             )
+            torch.cuda.empty_cache()
             precision = PrecisionConfig(
                 b_mx_scale=tk_scale, flex_ctx=FlexCtx(rhs_data=flex), **mx_block
             )
@@ -260,13 +371,40 @@ class Mxfp4MarlinMoEMethod:
         self._tk_intermediate_size = layer.w2_weight.shape[-1] * 2
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        # The swizzle's scratch stays reserved otherwise, and KV-cache sizing
-        # counts reserved memory as used.
+        # Return the original MXFP4 weights' segments too, so later allocations do not
+        # mix into them.
         torch.cuda.empty_cache()
         layer._dsv4_mxfp4_backend = "triton_kernels"
 
+    # H200, DSV4-Flash TP4 experts (hidden 5120, intermediate 576), 16 routed rows
+    # per tile: best of a block/stage sweep at 48-128 decode requests x 6 verify
+    # rows (target, 384 experts top 6) and x 5 draft rows (128 experts top 3).
+    # Measured at TP4 only; other TP shard widths use the same tiles unmeasured.
+    _DECODE_TILES = (
+        dict(block_m=16, block_n=128, block_k=128, num_warps=4, num_stages=4),
+        dict(block_m=16, block_n=256, block_k=64, num_warps=4, num_stages=4),
+    )
+    # Above this many routed rows per expert on average, leave the tile choice to
+    # triton_kernels (only the warp count is fixed by the swizzled scales).
+    _DECODE_MAX_ROWS_PER_EXPERT = 16
+
+    def _uses_decode_tiles(self, num_slots: int) -> bool:
+        """Whether this call takes the decode routing and tiles: the decode switch is
+        on and the routed rows per expert stay small on average."""
+        return (
+            self._triton_kernels_decode
+            and num_slots <= self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts
+        )
+
+    def _decode_tiles(self, decode_tiles: bool):
+        if not self._triton_kernels_decode:
+            return {}, {}
+        if not decode_tiles:
+            return {"num_warps": 4}, {"num_warps": 4}
+        return self._DECODE_TILES
+
     def _apply_triton_kernels(self, hidden_states, topk_output) -> torch.Tensor:
-        from triton_kernels.matmul import matmul
+        from triton_kernels.matmul import matmul, scoped_opt_flags_constraints
         from triton_kernels.tensor import make_ragged_tensor_metadata
 
         from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
@@ -274,47 +412,59 @@ class Mxfp4MarlinMoEMethod:
             swiglu_limit_func,
         )
 
+        if torch.cuda.is_current_stream_capturing() and not self._triton_kernels_decode:
+            raise RuntimeError(
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE is prefill-only and does not support "
+                "CUDA graphs; enable it only where the MoE runs eagerly (a PD prefill "
+                "server without a prefill CUDA graph), or use "
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE for CUDA-graph decode."
+            )
         num_tokens, top_k = topk_output.topk_ids.shape
         output = torch.empty_like(hidden_states)
         if num_tokens == 0:
             return output
-        # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
-        valid = topk_output.topk_ids >= 0
-        expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
-        weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
-        # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
-        combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
-        # bincount sizes its output from the max id, a device-to-host sync per
-        # layer that leaves the GPU idle while the host relaunches; the counts
-        # are the same from a fixed-size scatter_add.
-        counts = torch.zeros(
-            self._tk_num_experts, dtype=torch.int32, device=expert_ids.device
-        )
-        counts.scatter_add_(
-            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
-        )
-        ragged_metadata = make_ragged_tensor_metadata(counts, expert_ids.numel())
+        num_slots = num_tokens * top_k
+        decode_tiles = self._uses_decode_tiles(num_slots)
+        if decode_tiles:
+            from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
+
+            # One launch instead of argsort + histogram + gathers (~45 us at decode).
+            routing = ExpertRouting(
+                *expert_sort_small(
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self._tk_num_experts,
+                )
+            )
+        else:
+            routing = route_slots_by_expert(
+                topk_output.topk_ids, topk_output.topk_weights, self._tk_num_experts
+            )
+        ragged_metadata = make_ragged_tensor_metadata(routing.expert_counts, num_slots)
         (w13, w13_precision), (w2, w2_precision) = self._tk_weights
-        gate_up = matmul(
-            hidden_states,
-            w13,
-            None,
-            a_ragged_metadata=ragged_metadata,
-            gather_indx=combine_indx // top_k,
-            precision_config=w13_precision,
-        )
+        w13_tiles, w2_tiles = self._decode_tiles(decode_tiles)
+        with scoped_opt_flags_constraints(w13_tiles):
+            gate_up = matmul(
+                hidden_states,
+                w13,
+                None,
+                a_ragged_metadata=ragged_metadata,
+                gather_indx=routing.gather_indx,
+                precision_config=w13_precision,
+            )
         activated = gate_up.new_empty(gate_up.shape[0], self._tk_intermediate_size)
         swiglu_limit_func(
             activated, gate_up, swiglu_limit=self.runner.config.swiglu_limit
         )
-        down = matmul(
-            activated,
-            w2,
-            None,
-            a_ragged_metadata=ragged_metadata,
-            scatter_indx=combine_indx,
-            precision_config=w2_precision,
-            gammas=weights[combine_indx.long()],
-        )
+        with scoped_opt_flags_constraints(w2_tiles):
+            down = matmul(
+                activated,
+                w2,
+                None,
+                a_ragged_metadata=ragged_metadata,
+                scatter_indx=routing.combine_indx,
+                precision_config=w2_precision,
+                gammas=routing.sorted_weights,
+            )
         moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         return output
