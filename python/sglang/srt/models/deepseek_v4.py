@@ -2684,6 +2684,33 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+def _cp_moe_combine_reduce_scatters() -> bool:
+    """Whether the V4.1 prefill-CP MoE exit reduce-scatters its output.
+
+    The expert partial sums span the TP group. A reduce-scatter over the
+    attention-CP group completes them only when that group is the TP group
+    (attention TP 1); its rank-major chunk is then the same CP shard that the
+    all-reduce + split returns.
+    """
+    parallel = get_parallel()
+    return (
+        envs.SGLANG_DSV41_CP_MOE_REDUCE_SCATTER.get()
+        and parallel.attn_cp_size == parallel.tp_size
+    )
+
+
+def _cp_moe_return_shard(hidden_states: torch.Tensor, *, dsv41: bool) -> torch.Tensor:
+    """Sum the MoE partials of the rank-major gathered CP batch and keep this
+    rank's equal, padded interleave shard."""
+    if dsv41 and not _cp_moe_combine_reduce_scatters():
+        parallel = get_parallel()
+        hidden_states = parallel.tp_group.all_reduce(hidden_states)
+        return hidden_states.tensor_split(parallel.attn_cp_size)[
+            parallel.attn_cp_rank
+        ].contiguous()
+    return attn_cp_interleave_reduce_scatter(hidden_states)
+
+
 @contextmanager
 def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
     # Under CP the real rows are not a prefix, so every row must be routed.
@@ -3559,14 +3586,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            if self.config.model_type == "deepseek_v41":
-                parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
-            else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+            hidden_states = _cp_moe_return_shard(
+                hidden_states, dsv41=self.config.model_type == "deepseek_v41"
+            )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),

@@ -1643,6 +1643,12 @@ class Envs:
     # selections. Applies to the torch and the DeepGEMM prefill paths on any arch;
     # off under attention DP or CP.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # DeepSeek-V4.1 prefill CP without an a2a backend: hand each CP rank its MoE
+    # output shard with one reduce-scatter over the TP group instead of an all-reduce
+    # of the whole gathered batch followed by a local split (half the bytes per GPU).
+    # Applies only when the attention-CP group is the TP group (attention TP 1);
+    # otherwise the all-reduce stays. Same sums, possibly a different summation order.
+    SGLANG_DSV41_CP_MOE_REDUCE_SCATTER = EnvBool(False)
     # Hopper prefill: run the mHC post together with the next hyper-connection's
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
