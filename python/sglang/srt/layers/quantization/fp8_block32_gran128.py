@@ -257,6 +257,14 @@ def block128_fp8_linear(
     return out.view(*x.shape[:-1], n)
 
 
+def window_scale_32x(scale128: torch.Tensor, n: int, k: int) -> Optional[torch.Tensor]:
+    """The expanded 32-grid scale `block128_fp8_linear` needs inside a gran-32 window,
+    or None when (N, K) has no window."""
+    if (n, k) not in _GRAN32_WINDOWS:
+        return None
+    return expand_scale_128_to_32(scale128, n, k)
+
+
 def expand_scale_128_to_32(scale128: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """[ceil(N/128), ceil(K/128)] -> [ceil(N/32), ceil(K/32)] (each 128x128 scale repeated)."""
     s = scale128.repeat_interleave(4, 0).repeat_interleave(4, 1)
@@ -300,10 +308,9 @@ def convert_layer(layer) -> None:
     layer.weight.data = q
     layer.weight_scale_inv.data = s
     n, k = q.shape
-    if (n, k) in _GRAN32_WINDOWS:
-        layer.register_buffer(
-            "weight_scale_inv_32x", expand_scale_128_to_32(s, n, k), persistent=False
-        )
+    scale_32x = window_scale_32x(s, n, k)
+    if scale_32x is not None:
+        layer.register_buffer("weight_scale_inv_32x", scale_32x, persistent=False)
     layer.dense_gran128 = True
     layer._derived_weight_cache_error = (
         "Online weight updates are not supported while "
