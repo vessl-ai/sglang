@@ -169,6 +169,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     late_layer_dp_counts,
 )
+from sglang.srt.models.deepseek_common import late_layer_graph
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -1461,6 +1462,32 @@ class MQALayer(MqaAttentionBase):
             **({} if q_rope is None else {"q": q_rope}),
         )
 
+    def _cp_store_window_kv(
+        self, kv: torch.Tensor, forward_batch: ForwardBatch, attn_backend
+    ) -> None:
+        """Prefill CP (V4.1): gather every rank's window KV into the global token
+        order and write it with the fused fp32 norm + RoPE store."""
+        kv = cp_materialize_global_token_order(
+            kv.contiguous(),
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        tail = attn_backend.forward_metadata.late_layer_tail
+        global_positions = (
+            tail.pos_global
+            if tail is not None
+            else forward_batch.positions[: kv.shape[0]]
+        )
+        get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=global_positions,
+        )
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -2097,25 +2124,18 @@ class MQALayer(MqaAttentionBase):
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:
                     kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
-                get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
-                    layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
-                    kv=kv,
-                    kv_weight=self.kv_norm.weight.data,
-                    eps=self.eps,
-                    freqs_cis=self.freqs_cis,
-                    positions=global_positions,
+                if late_layer_graph.active():
+                    late_layer_graph.cp_store_window_kv(self, kv)
+                else:
+                    self._cp_store_window_kv(kv, forward_batch, attn_backend)
+                kv = None
+            elif late_layer_graph.active():
+                late_layer_graph.store_window_kv(
+                    self,
+                    None if qkv_a is not None else x_linear,
+                    positions,
+                    qkv_a,
+                    q if fuse_q_rope else None,
                 )
                 kv = None
             else:
@@ -2140,6 +2160,8 @@ class MQALayer(MqaAttentionBase):
                 and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
+            elif late_layer_graph.active():
+                late_layer_graph.low_ratio_sources(self, x, q_lora, positions)
             else:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
@@ -2472,6 +2494,19 @@ class MQALayer(MqaAttentionBase):
                     attn_k,
                     o,
                     self.attn_mqa.layer_id,
+                    self.compress_ratio,
+                    attn_sink,
+                    save_kv_cache,
+                )
+            elif late_layer_graph.active():
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                )
+                late_layer_graph.attention_core(
+                    self.attn_mqa,
+                    attn_q,
+                    attn_k,
+                    o,
                     self.compress_ratio,
                     attn_sink,
                     save_kv_cache,
@@ -4046,6 +4081,50 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
+        # SGLANG_OPT_DSV4_LATE_LAYER_GRAPH: built at the first late-layer entry.
+        self._late_layer_graph: Optional[late_layer_graph.LateLayerGraphRunner] = None
+        self._late_layer_graph_built = False
+
+    def _get_late_layer_graph(
+        self,
+    ) -> Optional[late_layer_graph.LateLayerGraphRunner]:
+        if not self._late_layer_graph_built:
+            self._late_layer_graph = late_layer_graph.make_runner(self)
+            self._late_layer_graph_built = True
+        return self._late_layer_graph
+
+    def _forward_late_layers(
+        self,
+        *,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
+        """Layers late_layer_start..end_layer on the tail rows: the late part of
+        _forward_layers_hc_pre_from_prev's loop, which the late-layer graph runs on
+        its row block (no Engram, no HIP fused boundary there)."""
+        aux: List[torch.Tensor] = []
+        for i in range(self.late_layer_start, self.end_layer):
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                aux.append(state.residual.mean(dim=1))
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                state = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    state=state,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                )
+        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        return state, aux
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4209,6 +4288,25 @@ class DeepseekV4Model(nn.Module):
                         if self.late_layer_vl_routing
                         else None
                     )
+            if (
+                i == self.late_layer_start
+                and tail is not None
+                and late_dp_counts is None
+                and not tail_in_graph
+                and self._get_late_layer_graph() is not None
+            ):
+                late_state = self._late_layer_graph.run(
+                    state=state,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
+                    capture_dspark=capture_dspark,
+                    aux_out=dspark_aux_hidden_states,
+                )
+                if late_state is not None:
+                    state = late_state
+                    break
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual

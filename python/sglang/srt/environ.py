@@ -1682,6 +1682,21 @@ class Envs:
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Decoder SWA bounded replay (prefill): capture the late layers (past the last
+    # kv_source layer, which run over each request's last 128 extend rows only) as a
+    # breakable CUDA graph per row bucket and replay it; the window-KV store, the
+    # low-ratio sources and the attention core stay eager breaks. The eager launch of
+    # those layers costs more CPU than their GPU work (INF-681 k-lgraph). Needs the late
+    # layers off the W4A8 prefill MoE (SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER), which
+    # refuses capture.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH = EnvBool(False)
+    # Comma-separated row buckets (this rank's tail rows, CP padding included); empty
+    # = every 32 rows to 2304, then every 128 to 8192. More rows than the largest
+    # bucket run eagerly.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_BUCKETS = EnvStr("")
+    # Debug: after each replay also run the same block eagerly (twice) and the unpadded
+    # late layers eagerly, log the differences, and serve the unpadded eager result.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_VERIFY = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
