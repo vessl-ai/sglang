@@ -871,10 +871,10 @@ def test_fp4_paged_logits_tensor_core_non_dyadic(heads, group, ratio):
     guaranteed. What is guaranteed: the same rounding points, so every score is
     within a few bf16 ulps of the per-row one, up to cancellation between signed
     head terms (bounded by the row's score scale).
-    Masking, -inf past each row's length and the capacity bound (here the
-    capacity equals the width, so the last tile is cut by the store mask) are
-    exact. On H200 with the image's Triton the scores have matched bit for bit;
-    that is measured, not asserted here."""
+    Only the visible scores are compared. The capacity bound is exercised (the
+    capacity equals the width, so the store mask cuts the last tile); candidate
+    masking is checked bit for bit by the dyadic test. On H200 with the image's
+    Triton the scores have matched bit for bit; that is measured, not asserted."""
     from sglang.srt.environ import envs
 
     requests, width = 7, 3000
