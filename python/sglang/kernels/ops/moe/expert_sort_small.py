@@ -55,7 +55,9 @@ def _expert_sort_small_kernel(
         tl.store(sorted_weights_ptr + pos, weights, mask=keep)
 
 
-def expert_sort_small(topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int):
+def expert_sort_small(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int
+):
     """Return (counts[E] int32, sorted_slots[S] int32, sorted_tokens[S] int32,
     sorted_weights[S] float32) for ``topk_ids``/``topk_weights`` of shape [T, top_k].
 

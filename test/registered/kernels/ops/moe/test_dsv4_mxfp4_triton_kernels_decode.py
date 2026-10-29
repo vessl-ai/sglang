@@ -156,15 +156,21 @@ def test_decode_tiles_accuracy_vs_marlin(shape, monkeypatch):
     tk, tk_layer = _layer(
         cpu_weights, num_experts, top_k, "triton_kernels_decode", monkeypatch
     )
-    marlin, marlin_layer = _layer(cpu_weights, num_experts, top_k, "marlin", monkeypatch)
+    marlin, marlin_layer = _layer(
+        cpu_weights, num_experts, top_k, "marlin", monkeypatch
+    )
     for bs in (1, 48, 64, 96, 128):
         # Raw Marlin does not take masked (-1) slots, so compare on full routing.
         d = _dispatch(bs * rows_per_req, num_experts, top_k, seed=bs)
         ref = _reference(d, w13, w2)
         rel_tk = _rel(tk.apply(tk_layer, d).hidden_states, ref)
         rel_marlin = _rel(marlin.apply(marlin_layer, d).hidden_states, ref)
-        masked = _dispatch(bs * rows_per_req, num_experts, top_k, seed=bs, masked_rows=1)
-        rel_masked = _rel(tk.apply(tk_layer, masked).hidden_states, _reference(masked, w13, w2))
+        masked = _dispatch(
+            bs * rows_per_req, num_experts, top_k, seed=bs, masked_rows=1
+        )
+        rel_masked = _rel(
+            tk.apply(tk_layer, masked).hidden_states, _reference(masked, w13, w2)
+        )
         print(
             f"{shape} bs={bs} rel_err triton_kernels={rel_tk:.5f} marlin={rel_marlin:.5f} "
             f"triton_kernels_masked={rel_masked:.5f}"
@@ -207,13 +213,18 @@ def test_decode_tiles_cuda_graph_replay(shape, monkeypatch):
         del graph
 
 
-@pytest.mark.parametrize("num_slots,num_experts,top_k", [(6, 384, 6), (2304, 384, 6), (4608, 384, 6), (640, 128, 3), (3000, 128, 3)])
+@pytest.mark.parametrize(
+    "num_slots,num_experts,top_k",
+    [(6, 384, 6), (2304, 384, 6), (4608, 384, 6), (640, 128, 3), (3000, 128, 3)],
+)
 def test_expert_sort_small_matches_stable_argsort(num_slots, num_experts, top_k):
     from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
 
     tokens = num_slots // top_k
     g = torch.Generator(device="cuda").manual_seed(num_slots)
-    ids = torch.randint(0, num_experts, (tokens, top_k), device="cuda", generator=g, dtype=torch.int32)
+    ids = torch.randint(
+        0, num_experts, (tokens, top_k), device="cuda", generator=g, dtype=torch.int32
+    )
     ids[::7, 0] = -1
     weights = torch.rand(tokens, top_k, device="cuda", generator=g)
     counts, slots, toks, sorted_w = expert_sort_small(ids, weights, num_experts)
