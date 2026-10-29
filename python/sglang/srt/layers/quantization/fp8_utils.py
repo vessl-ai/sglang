@@ -1349,7 +1349,18 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if get_platform().is_sm90 and act_scale_ue8m0:
+    if (
+        get_platform().is_sm90
+        and act_scale_ue8m0
+        and input_2d.shape[0] >= 256
+        and envs.SGLANG_SM90_TRITON_UE8M0_ACT_QUANT.get()
+    ):
+        from sglang.kernels.ops.quantization.ue8m0_group_quant_triton import (
+            ue8m0_group_quant_fp8,
+        )
+
+        q_input, x_scale = ue8m0_group_quant_fp8(input_2d, block_size[1])
+    elif get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
         # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
         q_input, x_scale = sglang_per_token_group_quant_fp8(
