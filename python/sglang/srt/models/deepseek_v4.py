@@ -485,74 +485,6 @@ def _cp_shared_expert_sm_cap():
         deep_gemm.set_num_sms(total)
 
 
-_CP_MOE_COMM_STREAM: Optional[torch.cuda.Stream] = None
-_CP_MOE_PIPELINE_LOGGED = False
-
-
-def _cp_moe_pipeline_rows(num_rows: int) -> int:
-    """INF-681 k-pcomm SGLANG_OPT_DSV4_CP_MOE_PIPELINE: the row split (rows of this
-    rank's shard in the first chunk) for a 2-chunk all-gather / MoE / reduce-scatter
-    pipeline, or 0 to run the MoE in one piece. Eager CUDA steps only (a graph would
-    freeze the fork/join), the reduce-scatter MoE exit only, shards of at least _MIN_ROWS."""
-    global _CP_MOE_PIPELINE_LOGGED
-    if not (_is_cuda and envs.SGLANG_OPT_DSV4_CP_MOE_PIPELINE.get()):
-        return 0
-    if num_rows < envs.SGLANG_OPT_DSV4_CP_MOE_PIPELINE_MIN_ROWS.get():
-        return 0
-    if torch.cuda.is_current_stream_capturing() or get_is_capture_mode():
-        return 0
-    if not _cp_moe_combine_reduce_scatters():
-        return 0
-    split = (num_rows // 2) // 64 * 64
-    if not 0 < split < num_rows:
-        return 0
-    if not _CP_MOE_PIPELINE_LOGGED:
-        _CP_MOE_PIPELINE_LOGGED = True
-        logger.info(
-            "k-pcomm CP MoE pipeline on: 2 chunks (first %d of %d shard rows), "
-            "triton idle_sms=%d during the overlapped chunks",
-            split,
-            num_rows,
-            envs.SGLANG_OPT_DSV4_CP_MOE_PIPELINE_IDLE_SMS.get(),
-        )
-    return split
-
-
-def _cp_pipeline_ids_ok(input_ids_global: Optional[torch.Tensor], rows: int) -> bool:
-    """Hash-routed layers route by the gathered token ids, which the pipeline chunks
-    rank-major like the rows: they must be the CP-interleaved [cp * rows] ids."""
-    if input_ids_global is None:
-        return True
-    return input_ids_global.numel() == get_parallel().attn_cp_size * rows
-
-
-def _cp_moe_comm_stream() -> torch.cuda.Stream:
-    """The stream all collectives of a pipelined CP MoE run on (one for all layers):
-    keeping every NCCL launch of the CP group on one stream preserves their order."""
-    global _CP_MOE_COMM_STREAM
-    if _CP_MOE_COMM_STREAM is None:
-        _CP_MOE_COMM_STREAM = torch.cuda.Stream()
-    return _CP_MOE_COMM_STREAM
-
-
-@contextmanager
-def _triton_idle_sms(num_idle: int):
-    """Leave SMs free for the collective that runs beside a chunk's MoE GEMMs: the
-    triton_kernels persistent matmuls (W4A8 prefill experts) size their grid to the SMs
-    minus this many. Same tiles, so the same bits; restored afterwards."""
-    if num_idle <= 0:
-        yield
-        return
-    from triton_kernels.matmul_details import opt_flags
-
-    previous = opt_flags._get_idle_sms()
-    opt_flags.set_idle_sms(num_idle)
-    try:
-        yield
-    finally:
-        opt_flags.set_idle_sms(previous)
-
-
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -3774,7 +3706,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         _cp_shared = None
         _cp_shared_stream = None
         _cp_shared_input = None
-        _cp_split = 0
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
@@ -3790,19 +3721,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                             _cp_shared = self.mlp._forward_shared_experts(hidden_states)
                     else:
                         _cp_shared = self.mlp._forward_shared_experts(hidden_states)
-                # INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_MOE_PIPELINE): gather, MoE and
-                # reduce-scatter in two row chunks instead (below), or 0.
-                _cp_split = (
-                    _cp_moe_pipeline_rows(hidden_states.shape[0])
-                    if self.config.model_type == "deepseek_v41"
-                    else 0
-                )
-                if _cp_split and not _cp_pipeline_ids_ok(
-                    input_ids_global, hidden_states.shape[0]
-                ):
-                    _cp_split = 0
-                if not _cp_split:
-                    hidden_states = attn_cp_interleave_gather(hidden_states)
+                hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3858,7 +3777,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # (else double-reduce).
         gathered_rows = (
             _every_row_routed(forward_batch, hidden_states.shape[0])
-            if _use_cp and get_moe_a2a_backend().is_none() and not _cp_split
+            if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
         with (
@@ -3871,38 +3790,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and not _use_tp_moe_gather
                 and not _use_tp_attn_a2a_scatter
             )
-            if _cp_split:
-                hidden_states = self._cp_moe_pipelined(
-                    hidden_states,
-                    _cp_split,
-                    forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                    skip_shared_experts=_cp_shared is not None,
-                )
-            else:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                    skip_shared_experts=_do_shared_local or _cp_shared is not None,
-                    return_moe_output=return_moe_output,
-                )
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=_do_shared_local or _cp_shared is not None,
+                return_moe_output=return_moe_output,
+            )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            if not _cp_split:  # the pipeline already returned this rank's reduced shard
-                hidden_states = _cp_moe_return_shard(
-                    hidden_states, dsv41=self.config.model_type == "deepseek_v41"
-                )
-            if envs.SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE.get():
-                # INF-681 k-pcomm: the next layer's W4A8 weight conversion, held back
-                # by the experts until the reduce-scatter above was launched.
-                from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
-                    fire_pending_prefetch,
-                )
-
-                fire_pending_prefetch()
+            hidden_states = _cp_moe_return_shard(
+                hidden_states, dsv41=self.config.model_type == "deepseek_v41"
+            )
             if _cp_shared is not None:
                 if _cp_shared_stream is not None:
                     torch.cuda.current_stream().wait_stream(_cp_shared_stream)
@@ -3956,84 +3856,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 attn_tp_all_gather(gathered, hidden_states.contiguous())
                 hidden_states = torch.cat(gathered)
         return hidden_states
-
-    def _cp_moe_pipelined(
-        self,
-        x: torch.Tensor,
-        split: int,
-        forward_batch: ForwardBatch,
-        *,
-        input_ids: Optional[torch.Tensor],
-        input_ids_global: Optional[torch.Tensor],
-        skip_shared_experts: bool,
-    ) -> torch.Tensor:
-        """INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_MOE_PIPELINE): the prefill-CP MoE of this
-        rank's shard x [rows, hidden] in two row chunks, rows [0, split) and [split, rows):
-        all-gather both, MoE chunk 0 beside the second all-gather, reduce-scatter chunk 0
-        beside MoE chunk 1, then reduce-scatter chunk 1. Returns this rank's reduced shard,
-        the same rows the one-piece all-gather / MoE / reduce-scatter returns (the MoE is
-        row-local; each chunk's gathered rows are rank-major like the one-piece gather).
-
-        All four collectives run on one comm stream, in the same order on every rank;
-        every buffer is allocated on the main stream and stays referenced until the main
-        stream has joined the comm stream (no record_stream)."""
-        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-            use_symmetric_memory,
-        )
-        from sglang.srt.layers.dp_attention import (
-            attn_cp_all_gather_into_tensor,
-            attn_cp_reduce_scatter_tensor,
-        )
-        from sglang.srt.layers.quantization import mxfp4_w4a8_prefill as w4a8
-
-        parallel = get_parallel()
-        cp = parallel.attn_cp_size
-        rows = x.shape[0]
-        x = x.contiguous()
-        bounds = ((0, split), (split, rows))
-        ids = (
-            input_ids_global.view(cp, rows) if input_ids_global is not None else None
-        )
-        cur = torch.cuda.current_stream()
-        comm = _cp_moe_comm_stream()
-        idle = envs.SGLANG_OPT_DSV4_CP_MOE_PIPELINE_IDLE_SMS.get()
-        out = torch.empty_like(x)
-        with use_symmetric_memory(
-            parallel.attn_cp_group, disabled=not is_allocation_symmetric()
-        ):
-            gathered = [x.new_empty((cp * (b - a), x.shape[1])) for a, b in bounds]
-        comm.wait_stream(cur)
-        gathered_ready = []
-        with torch.cuda.stream(comm):
-            for (a, b), g in zip(bounds, gathered):
-                attn_cp_all_gather_into_tensor(g, x[a:b])
-                ev = torch.cuda.Event()
-                ev.record(comm)
-                gathered_ready.append(ev)
-        partials = []
-        for i, ((a, b), g) in enumerate(zip(bounds, gathered)):
-            cur.wait_event(gathered_ready[i])
-            # Both chunks read this layer's FP8 expert weights: only the last one may
-            # prefetch the next layer's into the shared scratch.
-            w4a8.skip_next_prefetch(i == 0)
-            with _every_row_routed(forward_batch, g.shape[0]), _triton_idle_sms(idle):
-                y = self.mlp(
-                    g,
-                    forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=(
-                        ids[:, a:b].reshape(-1) if ids is not None else None
-                    ),
-                    skip_shared_experts=skip_shared_experts,
-                )
-            w4a8.skip_next_prefetch(False)
-            partials.append(y)
-            comm.wait_stream(cur)
-            with torch.cuda.stream(comm):
-                attn_cp_reduce_scatter_tensor(out[a:b], y)
-        cur.wait_stream(comm)
-        del gathered, partials
-        return out
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)

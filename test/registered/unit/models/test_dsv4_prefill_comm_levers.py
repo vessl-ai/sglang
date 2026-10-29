@@ -5,9 +5,6 @@
   it replaces (per-token MLP), so adding it after the reduce-scatter gives the same sum.
 - SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP: the side stream is used only for eager shards
   of at least _MIN_ROWS rows; inline otherwise; one stream for all layers.
-- SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE: a held-back prefetch is launched exactly
-  once, by fire_pending_prefetch (after the reduce-scatter) or, if nobody fired it, by the
-  next layer's _acquire before it reads the FP8 scratch.
 """
 
 from types import SimpleNamespace
@@ -85,38 +82,3 @@ def test_local_shared_sum_equals_gathered_rows():
     full = mlp(gathered)
     for r in range(cp):
         torch.testing.assert_close(mlp(shards[r]), full[r * rows:(r + 1) * rows], rtol=1e-5, atol=1e-5)
-
-
-class _Runner:
-    def __init__(self):
-        self.calls = []
-
-    def _prefetch_next(self, n):
-        self.calls.append(n)
-
-
-def test_held_back_prefetch_fires_once():
-    from sglang.srt.layers.quantization import mxfp4_w4a8_prefill as w
-
-    r = _Runner()
-    w._PENDING_PREFETCH[0] = (r, 16)
-    w.fire_pending_prefetch()
-    w.fire_pending_prefetch()
-    assert r.calls == [16] and w._PENDING_PREFETCH[0] is None
-
-
-def test_acquire_fires_a_prefetch_nobody_fired(monkeypatch):
-    from sglang.srt.layers.quantization import mxfp4_w4a8_prefill as w
-
-    order = []
-    r = _Runner()
-    r._prefetch_next = lambda n: order.append(("prefetch", n))
-    w._PENDING_PREFETCH[0] = (r, 16)
-    sc = SimpleNamespace(device=torch.device("cuda"), ready=None, holder=None, last_called=None)
-    layer = SimpleNamespace(scratch=sc, successor=None)
-    layer._single_launch = lambda: 1
-    layer._convert_into_scratch = lambda n: order.append(("convert", n))
-    w.Mxfp4W4A8PrefillExperts._acquire(layer)
-    # the held-back prefetch first, then this layer's own conversion (holder was None)
-    assert order == [("prefetch", 16), ("convert", 1)]
-    assert w._PENDING_PREFETCH[0] is None

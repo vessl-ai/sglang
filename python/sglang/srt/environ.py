@@ -1982,22 +1982,6 @@ class Envs:
     #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
     #   (NCCL's ring all-gather / reduce-scatter hold 24 SMs at the CP4 sizes); 0 = no cap.
     SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
-    # - W4A8_PREFETCH_AFTER_COMBINE: with the overlapped W4A8 weight prefetch
-    #   (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS > 0), launch the next layer's MXFP4 -> FP8
-    #   conversion right after the MoE-exit reduce-scatter instead of right after the
-    #   top-k sum, so the collective runs alone (the conversion's HBM traffic and SMs slow
-    #   it ~1.4-1.9x) and the conversion overlaps the next layer's attention side. Same
-    #   kernels and bits; only the launch point moves.
-    SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE = EnvBool(False)
-    # - CP_MOE_PIPELINE: run the prefill-CP MoE of a shard of at least _MIN_ROWS rows in
-    #   two row chunks: all-gather both, MoE chunk 0 beside the second all-gather,
-    #   reduce-scatter chunk 0 beside MoE chunk 1, reduce-scatter chunk 1 (DeepSeek-V4.1,
-    #   reduce-scatter MoE exit, eager steps). The triton_kernels persistent matmuls leave
-    #   _IDLE_SMS SMs to the collective beside them. The MoE is row-local, so only GEMM
-    #   tilings that depend on the row count can change the bits (router, W13 heuristics).
-    SGLANG_OPT_DSV4_CP_MOE_PIPELINE = EnvBool(False)
-    SGLANG_OPT_DSV4_CP_MOE_PIPELINE_MIN_ROWS = EnvInt(8192)
-    SGLANG_OPT_DSV4_CP_MOE_PIPELINE_IDLE_SMS = EnvInt(24)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)

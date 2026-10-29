@@ -42,7 +42,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import dsv4_prefill_qcp as _qcp
 
 _LUT: dict[torch.device, torch.Tensor] = {}
@@ -84,33 +83,6 @@ class _Scratch:
 _SCRATCH: dict[torch.device, _Scratch] = {}
 # Construction order of the experts; the first guess for "next layer".
 _INSTANCES: list = []
-# INF-681 k-pcomm (SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE): the overlapped prefetch
-# of the next layer's FP8 weights, held until the caller has launched the MoE-exit
-# collective (fire_pending_prefetch), so the collective does not share the GPU with the
-# conversion. (runner, num_launches) or None.
-_PENDING_PREFETCH: list = [None]
-
-
-# INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_MOE_PIPELINE): the next experts call is the first
-# of two row chunks of the same layer, so it must not prefetch the next layer's weights
-# over the FP8 scratch the second chunk still reads. Consumed by that call.
-_SKIP_PREFETCH: list = [False]
-
-
-def skip_next_prefetch(skip: bool = True) -> None:
-    """Make the next W4A8 prefill experts call leave the weight prefetch to a later call
-    (the second chunk of a pipelined CP MoE); skip_next_prefetch(False) withdraws it."""
-    _SKIP_PREFETCH[0] = skip
-
-
-def fire_pending_prefetch() -> None:
-    """Launch the overlapped weight prefetch that SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE
-    held back, if any (the MoE-exit reduce-scatter has just been launched)."""
-    pending = _PENDING_PREFETCH[0]
-    if pending is not None:
-        _PENDING_PREFETCH[0] = None
-        runner, num_launches = pending
-        runner._prefetch_next(num_launches)
 
 
 def _scratch(device: torch.device) -> _Scratch:
@@ -1136,9 +1108,6 @@ class Mxfp4W4A8PrefillExperts:
         """Make the scratch hold this layer's FP8 weights, in stream order."""
         sc = self.scratch
         current = torch.cuda.current_stream(sc.device)
-        # A held-back prefetch nobody fired (another MoE exit path ran): launch it now,
-        # in stream order before this layer reads the buffers.
-        fire_pending_prefetch()
         if sc.ready is not None:
             # A prefetch may still be writing the buffers.
             current.wait_event(sc.ready)
@@ -1221,8 +1190,6 @@ class Mxfp4W4A8PrefillExperts:
             routing.expert_counts, num_tokens * top_k
         )
 
-        skip_prefetch = _SKIP_PREFETCH[0]  # INF-681 k-pcomm: first chunk of a pipelined MoE
-        _SKIP_PREFETCH[0] = False
         row = _qcp.take_row_quant(self, hidden_states)  # INF-681 k-qcp dual quant
         x_fp8, x_scale = row if row is not None else _row_quant(hidden_states.contiguous())
         self._acquire()
@@ -1273,14 +1240,6 @@ class Mxfp4W4A8PrefillExperts:
                 and num_tokens * top_k >= 128 * self.num_experts
             ):
                 w2_flags = _w2_two_cta_flags()
-                if opt_flags._get_idle_sms() > 0:
-                    # INF-681 k-pcomm: a pipelined CP MoE leaves SMs to the collective
-                    # beside it; the fixed flags would otherwise take every SM.
-                    import dataclasses
-
-                    w2_flags = dataclasses.replace(
-                        w2_flags, idle_sms=opt_flags._get_idle_sms()
-                    )
             with (
                 opt_flags.scoped_opt_flags(w2_flags)
                 if w2_flags is not None
@@ -1302,7 +1261,7 @@ class Mxfp4W4A8PrefillExperts:
         finally:
             opt_flags._opt_flags_constraints.reset(token)
         overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
-        if self.prefetch and not overlapped and not skip_prefetch:
+        if self.prefetch and not overlapped:
             self._prefetch_next(self._single_launch())
         # counting_route implies sorted_sum, so pos is set only on sorted-sum calls.
         fold = _qcp_take_shared_add(self, hidden_states) if self.sorted_sum else None
@@ -1320,19 +1279,13 @@ class Mxfp4W4A8PrefillExperts:
             _gather_topk_sum(down, routing.combine_indx, output, top_k, fuse_add)
         else:
             moe_topk_sum(down.view(num_tokens, top_k, -1), output)
-        if self.prefetch and overlapped and not skip_prefetch:
+        if self.prefetch and overlapped:
             # Launched before the top-k sum in one piece, the conversion takes every SM
             # and the main stream's next kernels (shared add, all-reduce) queue behind it
             # (equal stream priority): p1 measured 0.8 of 57 ms overlapped. Issued after
             # the top-k sum in slices, the all-reduce gets its SMs after one slice and the
             # rest of the conversion runs beside it.
-            if envs.SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE.get():
-                # INF-681 k-pcomm: launched by the caller right after the MoE-exit
-                # reduce-scatter instead, so the conversion overlaps the next layer's
-                # attention side rather than the collective.
-                _PENDING_PREFETCH[0] = (self, self.prefetch_chunks)
-            else:
-                self._prefetch_next(self.prefetch_chunks)
+            self._prefetch_next(self.prefetch_chunks)
         if add_to is not None and not fuse_add:
             return add_to.add_(output)
         return output
