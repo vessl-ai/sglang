@@ -1651,8 +1651,9 @@ class Envs:
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
     # 32728 rows only). Meant for prefill servers: the gate looks only at the row
-    # count, so a decoder would also take it for verify batches of >= 256 rows (about
-    # 52 requests x 5 draft rows), unmeasured and inside CUDA graph capture.
+    # count, so a decoder would also take it for verify batches of >= 256 rows (from
+    # 43 requests at DSpark block size 5: gamma + 1 = 6 verify rows each), unmeasured
+    # and inside CUDA graph capture.
     SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
