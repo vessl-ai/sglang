@@ -312,6 +312,14 @@ class LateLayerGraphRunner:
         """
         if self._disabled is not None:
             return None
+        cp_size, cp_active = _prefill_cp_state(forward_batch)
+        if cp_size > 1 and not cp_active:
+            # Prefill CP turns itself off for an extend of fewer tokens than CP ranks
+            # (a 1-token /health_generate step, a fully cached prompt). Its late layers
+            # then take the non-CP code (no CP gathers, no CP window-KV store), which
+            # no graph captured on this server holds; such steps are a few rows.
+            self._note_unsupported("prefill CP inactive for this batch")
+            return None
         rows = int(state.residual.shape[0]) if state.streams is not None else 0
         bucket = select_bucket(self.buckets, rows)
         if rows == 0 or bucket is None:
@@ -332,6 +340,8 @@ class LateLayerGraphRunner:
             positions.dtype,
             tuple(None if t is None else t.dtype for t in ids),
             capture_dspark,
+            # The late layers' code path (CP gathers and window-KV store, or not).
+            cp_active,
         )
         inputs = self._input_buffers(key_sig, state_tensors, positions, ids)
         self._fill_inputs(inputs, [*state_tensors, positions, *ids], rows, bucket)
@@ -633,6 +643,18 @@ class _TailSnapshot:
         for buf, saved in self.buffers:
             buf.copy_(saved)
         self.meta.candidate_metadata = self.candidates
+
+
+def _prefill_cp_state(forward_batch) -> Tuple[int, bool]:
+    """(attention CP size, whether prefill CP runs this batch)."""
+    from sglang.srt.layers.cp import utils as cp_utils
+    from sglang.srt.runtime_context import get_parallel
+
+    try:
+        cp_size = int(get_parallel().attn_cp_size)
+    except Exception:  # noqa: BLE001 -- no parallel context (unit tests)
+        cp_size = 1
+    return cp_size, bool(cp_utils.is_cp_active(forward_batch))
 
 
 def _drop_lazy_metadata_buffers() -> None:
