@@ -1655,6 +1655,13 @@ class Envs:
     # 43 requests at DSpark block size 5: gamma + 1 = 6 verify rows each), unmeasured
     # and inside CUDA graph capture.
     SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
+    # Hopper DeepGEMM linears of a 32x32 UE8M0 block-FP8 checkpoint (DeepSeek-V4.1):
+    # requantize each eligible weight once at load to 128x128 UE8M0 blocks and quantize
+    # its activations per 1x128 group, so DeepGEMM runs SF_GRAN 128 instead of 32
+    # (promotion every K=128 instead of every K=32). With power-of-two scales the
+    # quantized values only differ in the e4m3 subnormal range. No online weight
+    # updates while it is on. See layers/quantization/fp8_block32_gran128.py.
+    SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128 = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     # Prefill only: the MoE raises under CUDA graph capture, so set it only where
