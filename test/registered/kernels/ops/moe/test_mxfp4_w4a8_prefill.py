@@ -1,7 +1,12 @@
 """SM90 W4A8 MXFP4 experts (SGLANG_OPT_DSV4_W4A8_PREFILL_MOE): exact FP8 weights, output
 against fp32 references, the side-stream prefetch against in-line conversion (also with
 either stream delayed, so a missing event wait would corrupt the output), the refusal
-under CUDA graph capture, and the switch precedence in Mxfp4MarlinMoEMethod."""
+under CUDA graph capture, and the switch precedence in Mxfp4MarlinMoEMethod.
+INF-681: the word conversion kernel (bit-identical to the byte kernel, also sliced), the
+sliced prefetch after the top-k sum (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS), the late-layer
+W4A16 selection (SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER), and the small-step path that
+reads the MXFP4 weights directly (SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS): its routing, output
+against the references, run-to-run identity and CUDA graph capture."""
 
 import sys
 from types import SimpleNamespace
@@ -11,7 +16,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -167,10 +172,10 @@ def test_prefetch_orders_streams_under_delay(delayed, monkeypatch):
     if delayed == "side_stream":
         convert = mod.Mxfp4W4A8PrefillExperts._convert_into_scratch
 
-        def slow_convert(self):
+        def slow_convert(self, *args):
             if torch.cuda.current_stream() == self.scratch.stream:
                 torch.cuda._sleep(_DELAY_CYCLES)
-            convert(self)
+            convert(self, *args)
 
         monkeypatch.setattr(
             mod.Mxfp4W4A8PrefillExperts, "_convert_into_scratch", slow_convert
@@ -245,6 +250,252 @@ def test_rejects_non_dsv4_experts(monkeypatch):
     )
     with pytest.raises(ValueError, match="clamped SwiGLU"):
         method._prepare_w4a8_weights(torch.nn.Module())
+
+
+@pytest.mark.parametrize("num_launches", [1, 3, 7])
+def test_word_kernel_matches_byte_kernel(num_launches):
+    """Every packed byte value, every exponent shift d in [-5, 6], odd tensor sizes."""
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import _fold, _mxfp4_to_fp8
+
+    g = torch.Generator().manual_seed(40 + num_launches)
+    for n, k, spread in ((2 * I, H, 11), (H, I, 4), (3, 64, 0), (5, 96, 11)):
+        e = 3
+        w = torch.randint(-128, 128, (e, n, k // 2), generator=g, dtype=torch.int8)
+        w.view(-1)[:256] = torch.arange(-128, 128, dtype=torch.int8)
+        s = torch.randint(
+            122 - spread, 123, (e, n, k // 32), generator=g, dtype=torch.uint8
+        )
+        w, s = w.cuda(), s.view(torch.float8_e8m0fnu).cuda()
+        smax, _ = _fold(s, "w")
+        ref = torch.empty(e, n, k, device="cuda", dtype=torch.float8_e4m3fn)
+        got = torch.full_like(ref.view(torch.uint8), 0x7F).view(torch.float8_e4m3fn)
+        _mxfp4_to_fp8(w, s, smax, ref, 0)
+        _mxfp4_to_fp8(w, s, smax, got, num_launches)
+        assert torch.equal(got.view(torch.uint8), ref.view(torch.uint8)), (n, k)
+
+
+@pytest.mark.parametrize("rows", [512, 8192])
+def test_sliced_prefetch_matches_inline_conversion(rows):
+    """rows 8192: the prefetch is sliced and issued after the top-k sum; rows 512: one
+    word-kernel launch before it. Both must give the in-line byte-kernel output."""
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        _OVERLAP_MIN_ROWS,
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    assert (rows >= _OVERLAP_MIN_ROWS) == (rows == 8192)
+    layers = [_weights(50 + i) for i in range(3)]
+    inline = [Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False) for w in layers]
+    fetched = [
+        Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=True, prefetch_chunks=4)
+        for w in layers
+    ]
+    x, ids, wts = _inputs(rows, 6)
+    expected = [inline[i](x, ids, wts) for i in range(3)]
+    hits = 0
+    for i in [0, 1, 2, 0, 1, 2, 2, 0, 0, 1]:
+        hits += fetched[i].scratch.holder is fetched[i]
+        assert torch.equal(fetched[i](x, ids, wts), expected[i]), f"layer {i}"
+    assert hits >= 4
+
+
+@pytest.mark.parametrize("delayed", ["side_stream", "current_stream"])
+def test_sliced_prefetch_orders_streams_under_delay(delayed, monkeypatch):
+    """As test_prefetch_orders_streams_under_delay, for the sliced prefetch issued after
+    the top-k sum (the `free` event is then recorded after it)."""
+    from sglang.srt.layers.quantization import mxfp4_w4a8_prefill as mod
+
+    layers = [_weights(60 + i) for i in range(3)]
+    inline = [mod.Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False) for w in layers]
+    fetched = [
+        mod.Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=True, prefetch_chunks=4)
+        for w in layers
+    ]
+    x, ids, wts = _inputs(8192, 7)
+    if delayed == "side_stream":
+        convert = mod.Mxfp4W4A8PrefillExperts._convert_into_scratch
+
+        def slow_convert(self, *args):
+            if torch.cuda.current_stream() == self.scratch.stream:
+                torch.cuda._sleep(_DELAY_CYCLES)
+            convert(self, *args)
+
+        monkeypatch.setattr(
+            mod.Mxfp4W4A8PrefillExperts, "_convert_into_scratch", slow_convert
+        )
+    else:
+        row_quant = mod._row_quant
+
+        def slow_row_quant(x):
+            out = row_quant(x)
+            torch.cuda._sleep(_DELAY_CYCLES)
+            return out
+
+        monkeypatch.setattr(mod, "_row_quant", slow_row_quant)
+    _run_prefetch_sequence(fetched, inline, x, ids, wts)
+
+
+@pytest.mark.parametrize("rows", [1, 37, 2048])
+def test_sorted_sum_matches_scattered_sum(rows):
+    """SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM: same output bit for bit, masked slots too."""
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w = _weights(70)
+    ref = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False)
+    got = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False, sorted_sum=True)
+    x, ids, wts = _inputs(rows, 8)
+    ids[0, -1] = -1
+    assert torch.equal(got(x, ids, wts), ref(x, ids, wts))
+
+
+@pytest.mark.parametrize("br", [64, 128])
+def test_direct_route(br):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import _direct_route
+
+    _, ids, wts = _inputs(777, 9)
+    ids[3, 2] = -1
+    ids[10, :] = -1
+    r = _direct_route(ids, wts, E, br, 2 * br)
+    flat = ids.flatten().long()
+    valid = flat >= 0
+    counts = torch.bincount(flat[valid], minlength=E)
+    offs = torch.zeros(E + 1, dtype=torch.long, device="cuda")
+    offs[1:] = counts.cumsum(0)
+    assert torch.equal(r.offs.long(), offs)
+    pos = r.pos.long()
+    assert torch.equal(pos[~valid], torch.full_like(pos[~valid], -1))
+    p = pos[valid]
+    # Every valid slot has its own row inside its expert's range.
+    assert torch.equal(torch.sort(p).values, torch.arange(int(valid.sum()), device="cuda"))
+    assert bool(((p >= offs[flat[valid]]) & (p < offs[flat[valid] + 1])).all())
+    slots = torch.nonzero(valid).flatten()
+    assert torch.equal(r.gather_indx[p].long(), slots // TOPK)
+    assert torch.equal(r.sorted_weights[p], wts.flatten()[slots])
+    for sched, rows in ((r.sched13, br), (r.sched2, 2 * br)):
+        items = sched[sched >= 0].long()
+        expect = torch.cat(
+            [
+                (e << 16) + torch.arange((int(c) + rows - 1) // rows, device="cuda")
+                for e, c in enumerate(counts.tolist())
+            ]
+        )
+        assert torch.equal(items, expect)
+        assert bool((sched[items.numel() :] == -1).all())
+
+
+def _direct_experts(seed, threshold=1 << 30):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w = _weights(seed)
+    return w, Mxfp4W4A8PrefillExperts(
+        *w, LIMIT, prefetch=False, small_step_rows=threshold
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 37, 768, 2048])
+def test_direct_matches_references(rows):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w, direct = _direct_experts(80)
+    copy_path = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False)
+    x, ids, wts = _inputs(rows, 10)
+    ids[0, -1] = -1
+    y = direct(x, ids, wts)
+    native = _reference(*w, x, ids, wts, native_fp8=True)
+    bf16 = _reference(*w, x, ids, wts, native_fp8=False)
+    assert torch.isfinite(y).all()
+    assert _rel(y, native) < 0.025
+    assert _rel(y, bf16) < 0.08
+    assert _rel(y, copy_path(x, ids, wts)) < 0.025
+    # The counting sort's row order inside an expert varies; the output must not.
+    assert torch.equal(direct(x, ids, wts), y)
+
+
+def test_direct_only_below_threshold():
+    _, experts = _direct_experts(81, threshold=100)
+    sc = experts.scratch
+    sc.holder = None
+    x, ids, wts = _inputs(100, 11)
+    experts(x, ids, wts)
+    assert sc.holder is None  # direct: the FP8 scratch is not touched
+    x, ids, wts = _inputs(101, 11)
+    experts(x, ids, wts)
+    assert sc.holder is experts  # copy path
+
+
+def test_direct_cuda_graph_replay():
+    """The direct path captures; replays on new activations and new routing match eager."""
+    _, experts = _direct_experts(82)
+    x, ids, wts = _inputs(512, 12)
+    sx, sids, swts = x.clone(), ids.clone(), wts.clone()
+    experts(sx, sids, swts)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = experts(sx, sids, swts)
+    for seed in (13, 14):
+        x2, ids2, wts2 = _inputs(512, seed)
+        ids2[5, 0] = -1
+        sx.copy_(x2)
+        sids.copy_(ids2)
+        swts.copy_(wts2)
+        graph.replay()
+        assert torch.equal(out, experts(x2, ids2, wts2))
+
+
+@pytest.mark.parametrize(
+    "start,prefix,bounded,expected",
+    [
+        (21, "model.layers.25.mlp.experts", True, True),
+        (21, "model.layers.21.mlp.experts", True, True),
+        (21, "model.layers.20.mlp.experts", True, False),
+        (21, "model.stages.0.mlp.experts", True, False),  # DSpark draft stage
+        (21, "model.layers.25.mlp.experts", False, False),  # no bounded replay
+        (-1, "model.layers.25.mlp.experts", True, False),  # switch off
+    ],
+)
+def test_late_layer_w4a16_selection(start, prefix, bounded, expected, monkeypatch):
+    import sglang.srt.runtime_context as runtime_context
+    from sglang.srt.layers.quantization import mxfp4_marlin_moe as mod
+
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER", str(start))
+    features = SimpleNamespace(enable_decoder_swa_bounded_replay=bounded)
+    monkeypatch.setattr(
+        runtime_context, "get_exec", lambda: SimpleNamespace(features=features)
+    )
+    assert mod._is_late_w4a16_layer(prefix) == expected
+
+
+@pytest.mark.parametrize(
+    "backend,expected",
+    [("triton", (False, True, True)), ("marlin", (False, False, False))],
+)
+def test_late_layer_w4a16_backend(backend, expected, monkeypatch):
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE", "1")
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND", backend)
+    method = Mxfp4MarlinMoEMethod(
+        SimpleNamespace(process_weights_after_loading=lambda layer: None),
+        "model.layers.25.mlp.experts",
+    )
+    assert method._use_w4a8
+    method._use_late_w4a16()
+    got = (
+        method._use_w4a8,
+        method._use_triton_kernels,
+        method._triton_kernels_decode,
+    )
+    assert got == expected
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND", "other")
+    with pytest.raises(ValueError, match="triton' or 'marlin"):
+        method._use_late_w4a16()
 
 
 if __name__ == "__main__":
