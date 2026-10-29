@@ -1673,6 +1673,13 @@ class Envs:
     #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes
     #   before wo_b. Bit-identical (same cuBLAS reduction, different output strides).
     SGLANG_OPT_DSV4_WO_A_STRIDED_BMM = EnvBool(False)
+    # - DP_SYMM_MOE_OUTPUT: with --enable-symm-mem, allocate the triton_kernels MoE
+    #   output (the reduce-scatter's send buffer under attention DP + MAX_LEN padding)
+    #   from the NCCL symmetric pool, as FusedMoE already does for its combine output.
+    #   The all-gather's receive buffer (the global DP buffer) is symmetric already.
+    #   4 ranks, 1.97 MB per rank on H200: all-gather 42.7 -> 28.5 us (recv symmetric),
+    #   reduce-scatter 38.5 -> 30.0 us (send symmetric).
+    SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT = EnvBool(False)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
