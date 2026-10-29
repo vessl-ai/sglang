@@ -35,6 +35,7 @@ computed eagerly). Enabled by SGLANG_OPT_DSV4_W4A8_PREFILL_MOE=1 on SM90.
 
 from __future__ import annotations
 
+import contextlib
 from typing import NamedTuple
 
 import torch
@@ -186,11 +187,14 @@ def _mxfp4_to_fp8_words_kernel(
     n_words,
     BLOCKS_PER_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
+    INTERLEAVE_HALF: tl.constexpr = 0,
 ):
     # Same result as _mxfp4_to_fp8_kernel, bit for bit, but on 32-bit words (8 nibbles,
     # 4 words per scale block) with the nibble table in registers (prmt) instead of a
     # per-byte table gather: HBM-bound (~4.1 TB/s on H200) instead of SM-bound (~3.9),
     # so it keeps its speed beside other kernels on fewer SMs.
+    # INTERLEAVE_HALF = h > 0: each expert has 2h rows [gate; up]; output row r goes to
+    # 2r (gate) or 2(r - h) + 1 (up), the layout of a fused SwiGLU epilogue.
     pid = tl.program_id(0).to(tl.int64)
     wi = first_word + pid * BLOCK + tl.arange(0, BLOCK)
     m = wi < n_words
@@ -203,11 +207,26 @@ def _mxfp4_to_fp8_words_kernel(
     lut_hi = tl.full([BLOCK], _PRMT_LUT_HI, tl.int32)
     lo = _nibbles_to_fp8(w & 0xFFFF, dd, lut_lo, lut_hi)
     hi = _nibbles_to_fp8((w >> 16) & 0xFFFF, dd, lut_lo, lut_hi)
-    tl.store(OUT + wi, (hi.to(tl.int64) << 32) | (lo.to(tl.int64) & 0xFFFFFFFF), mask=m)
+    if INTERLEAVE_HALF > 0:
+        # 4 words per scale block, BLOCKS_PER_ROW blocks per row.
+        words_per_row = BLOCKS_PER_ROW * 4
+        row = wi // words_per_row
+        e = row // (2 * INTERLEAVE_HALF)
+        r = row % (2 * INTERLEAVE_HALF)
+        r2 = tl.where(r < INTERLEAVE_HALF, 2 * r, 2 * (r - INTERLEAVE_HALF) + 1)
+        wo = (e * (2 * INTERLEAVE_HALF) + r2) * words_per_row + wi % words_per_row
+    else:
+        wo = wi
+    tl.store(OUT + wo, (hi.to(tl.int64) << 32) | (lo.to(tl.int64) & 0xFFFFFFFF), mask=m)
 
 
 def _mxfp4_to_fp8(
-    w: torch.Tensor, scale: torch.Tensor, smax: torch.Tensor, out, num_launches: int = 0
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    smax: torch.Tensor,
+    out,
+    num_launches: int = 0,
+    interleave_half: int = 0,
 ):
     """[E, N, K/2] packed e2m1 + [E, N, K/32] e8m0 -> [E, N, K] e4m3 (scaled by 2^(133 - smax)).
 
@@ -217,7 +236,11 @@ def _mxfp4_to_fp8(
     another stream launches meanwhile (e.g. an all-reduce) waits for the whole conversion.
     Between two launches the hardware can dispatch such a kernel, so it waits for at most
     one slice and then runs beside the remaining slices.
+    interleave_half = h > 0 (word kernel only): store the 2h rows of each expert as
+    gate/up pairs (row r -> 2r for r < h, 2(r - h) + 1 otherwise).
     """
+    if interleave_half > 0:
+        num_launches = max(num_launches, 1)
     if num_launches <= 0:
         n_blocks = w.numel() // 16
         _mxfp4_to_fp8_kernel[(triton.cdiv(n_blocks, _CONVERT_BLOCK),)](
@@ -246,6 +269,7 @@ def _mxfp4_to_fp8(
             n_words,
             scale.shape[-1],
             _WORDS_BLOCK,
+            interleave_half,
             num_warps=8,
         )
     return out
@@ -300,11 +324,78 @@ def _swiglu_quant(gate_up: torch.Tensor, limit: float):
 
 
 @triton.jit
+def _swiglu_epilogue_fn(acc, limit):
+    """triton_kernels fused activation (reduction_n 2) over a W13 tile whose columns are
+    gate/up pairs: the same arithmetic as _swiglu_quant_kernel on the bf16 GEMM output
+    (the tile is rounded to bf16 first), returned in fp32; the GEMM stores bf16."""
+    g, u = tl.split(tl.reshape(acc, (acc.shape[0], acc.shape[1] // 2, 2)))
+    g = g.to(tl.bfloat16).to(tl.float32)
+    u = u.to(tl.bfloat16).to(tl.float32)
+    g = tl.minimum(g, limit)
+    u = tl.minimum(tl.maximum(u, -limit), limit)
+    return g / (1.0 + tl.exp(-g)) * u
+
+
+_SWIGLU_ACTIVATIONS: dict = {}
+
+
+def _swiglu_activation(limit: float):
+    act = _SWIGLU_ACTIVATIONS.get(limit)
+    if act is None:
+        from triton_kernels.matmul import FusedActivation
+        from triton_kernels.specialize import FnSpecs
+
+        act = FusedActivation(
+            FnSpecs("dsv4_swiglu", _swiglu_epilogue_fn, ("limit",), reduction_n=2),
+            (limit,),
+        )
+        _SWIGLU_ACTIVATIONS[limit] = act
+    return act
+
+
+@triton.jit
+def _rows_quant_kernel(
+    A, Y, S, R, I: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr
+):
+    # The quantization half of _swiglu_quant_kernel on rows that already hold the bf16
+    # SwiGLU output, ROWS rows per program.
+    r = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    o = tl.arange(0, BLOCK)
+    m = (r < R)[:, None] & (o < I)[None, :]
+    a = tl.load(A + r[:, None] * I + o[None, :], mask=m, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(a), axis=1), 1e-4)
+    s = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    tl.store(
+        Y + r[:, None] * I + o[None, :], (a / s[:, None]).to(tl.float8e4nv), mask=m
+    )
+    tl.store(S + r, s, mask=r < R)
+
+
+def _rows_quant(a: torch.Tensor):
+    R, inter = a.shape
+    y = torch.empty(R, inter, device=a.device, dtype=torch.float8_e4m3fn)
+    s = torch.empty(R, device=a.device, dtype=torch.float32)
+    rows = 8
+    _rows_quant_kernel[(triton.cdiv(R, rows),)](
+        a, y, s, R, inter, rows, triton.next_power_of_2(inter), num_warps=8
+    )
+    return y, s
+
+
+@triton.jit
 def _gather_topk_sum_kernel(
-    Y, POS, OUT, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr
+    Y,
+    POS,
+    OUT,
+    H: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    ADD_TO_OUT: tl.constexpr = False,
 ):
     # OUT[t] = sum_k Y[POS[t * TOPK + k]] with fp32 accumulation in k order, the same
     # arithmetic as moe_topk_sum over token-major rows.
+    # ADD_TO_OUT: OUT[t] = bf16(OUT[t] + bf16(sum)) in fp32, i.e. what
+    # shared.add_(routed) computes after the plain sum (in place: one program per row block).
     t = tl.program_id(0).to(tl.int64)
     o = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
     m = o < H
@@ -313,20 +404,26 @@ def _gather_topk_sum_kernel(
         r = tl.load(POS + t * TOPK + k).to(tl.int64)
         # r < 0: a masked slot the direct routing dropped (contributes nothing).
         acc += tl.load(Y + r * H + o, mask=m & (r >= 0), other=0.0).to(tl.float32)
+    if ADD_TO_OUT:
+        prev = tl.load(OUT + t * H + o, mask=m, other=0.0).to(tl.float32)
+        acc = prev + acc.to(tl.bfloat16).to(tl.float32)
     tl.store(OUT + t * H + o, acc.to(tl.bfloat16), mask=m)
 
 
-def _topk_sum_by_pos(down_sorted, pos, out, top_k: int):
-    """out[t] = sum_k down_sorted[pos[t * top_k + k]], skipping pos < 0."""
+def _topk_sum_by_pos(down_sorted, pos, out, top_k: int, add_to_out: bool = False):
+    """out[t] = sum_k down_sorted[pos[t * top_k + k]], skipping pos < 0
+    (add_to_out: out[t] += that sum, rounded like a separate bf16 add)."""
     num_tokens, hidden = out.shape
     block_h = 1024
     _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
-        down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
+        down_sorted, pos, out, hidden, top_k, block_h, add_to_out, num_warps=4
     )
     return out
 
 
-def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
+def _gather_topk_sum(
+    down_sorted, combine_indx, out, top_k: int, add_to_out: bool = False
+):
     """out[t] = sum over the top-k slots of token t of down_sorted[sorted position of slot],
     where combine_indx[i] is the slot (token * top_k + k) at sorted position i."""
     n_slots = combine_indx.numel()
@@ -334,12 +431,7 @@ def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
     pos[combine_indx.long()] = torch.arange(
         n_slots, dtype=combine_indx.dtype, device=combine_indx.device
     )
-    num_tokens, hidden = out.shape
-    block_h = 1024
-    _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
-        down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
-    )
-    return out
+    return _topk_sum_by_pos(down_sorted, pos, out, top_k, add_to_out)
 
 
 # --- Small steps: W4A8 GEMMs that read the MXFP4 weights directly (no FP8 copy) ---------
@@ -564,6 +656,58 @@ def _direct_scatter_kernel(
     tl.store(GATHER + p, slot // TOPK, mask=valid)
     tl.store(SORTED_W + p, tl.load(WTS + slot, mask=valid, other=0.0), mask=valid)
     tl.store(POS + slot, tl.where(valid, p, -1), mask=m)
+
+
+@triton.jit
+def _count_scan_kernel(COUNTS, CURSOR, E, BLOCK_E: tl.constexpr):
+    # One program per expert e: CURSOR[e] = first sorted row of e (exclusive prefix sum).
+    e = tl.program_id(0)
+    ex = tl.arange(0, BLOCK_E)
+    c = tl.load(COUNTS + ex, mask=ex < E, other=0)
+    tl.store(CURSOR + e, tl.sum(tl.where(ex < e, c, 0), 0))
+
+
+class _CountRouting(NamedTuple):
+    expert_counts: torch.Tensor  # [E] int32
+    gather_indx: torch.Tensor  # [slots] int32 token of each sorted row
+    sorted_weights: torch.Tensor  # [slots] fp32 top-k weight of each sorted row
+    pos: torch.Tensor  # [slots] int32 sorted row of each slot, -1 for masked slots
+
+
+def _count_route(topk_ids, topk_weights, num_experts: int) -> _CountRouting:
+    """Counting sort of the valid top-k slots by expert for the FP8-copy path (histogram,
+    per-expert offsets, atomic-cursor scatter: 3 launches + a memset, no host sync). The
+    order of rows inside an expert is not deterministic; every row is computed on its own
+    and the top-k sum reads rows by position, so the MoE output does not depend on it.
+    Masked slots (id -1) get no row (pos -1), so valid rows come first."""
+    device = topk_ids.device
+    n_slots = topk_ids.numel()
+    ids = topk_ids.reshape(-1)
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    block = 1024
+    _direct_hist_kernel[(triton.cdiv(n_slots, block),)](
+        ids, counts, n_slots, block, num_warps=4
+    )
+    cursor = torch.empty(num_experts, dtype=torch.int32, device=device)
+    _count_scan_kernel[(num_experts,)](
+        counts, cursor, num_experts, triton.next_power_of_2(num_experts), num_warps=4
+    )
+    gather_indx = torch.empty(n_slots, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(n_slots, dtype=torch.float32, device=device)
+    pos = torch.empty(n_slots, dtype=torch.int32, device=device)
+    _direct_scatter_kernel[(triton.cdiv(n_slots, block),)](
+        ids,
+        topk_weights.reshape(-1).float(),
+        cursor,
+        gather_indx,
+        sorted_weights,
+        pos,
+        n_slots,
+        topk_ids.shape[1],
+        block,
+        num_warps=4,
+    )
+    return _CountRouting(counts, gather_indx, sorted_weights, pos)
 
 
 class _DirectRouting(NamedTuple):
@@ -827,6 +971,10 @@ class Mxfp4W4A8PrefillExperts:
         prefetch_chunks: int = 0,
         sorted_sum: bool = False,
         small_step_rows: int = 0,
+        fused_swiglu: bool = False,
+        fused_shared_add: bool = False,
+        counting_route: bool = False,
+        w2_two_cta_min_rows: int = 0,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -844,6 +992,25 @@ class Mxfp4W4A8PrefillExperts:
         # Calls with at most this many rows read the MXFP4 weights directly (no FP8 copy,
         # see _w4a8_direct_kernel). 0 = never.
         self.small_step_rows = small_step_rows
+        # INF-681 k-pmoe large-step switches (see environ.py); all bit-identical.
+        # fused_swiglu: the FP8 copy of w13 holds gate/up rows interleaved and the gate/up
+        # GEMM applies SwiGLU in its epilogue; the channel scale follows the row order.
+        self.fused_swiglu = fused_swiglu
+        if fused_swiglu:
+            half = w13.shape[1] // 2
+            cs = self.w13_channel_scale
+            self.w13_channel_scale_il = (
+                torch.stack([cs[:, :half], cs[:, half:]], -1)
+                .reshape(cs.shape)
+                .contiguous()
+            )
+        # The top-k sum adds into the shared expert's output (the position-gather sums:
+        # sorted-sum or counting-route large steps, and the small-step direct path).
+        self.fused_shared_add = fused_shared_add
+        # Counting-sort routing (sorted-sum path only: it needs the per-slot positions).
+        self.counting_route = counting_route and sorted_sum
+        # Calls with at least this many rows run W2 with 128x128 tiles, two CTAs per SM.
+        self.w2_two_cta_min_rows = w2_two_cta_min_rows
         self.successor = None  # the experts observed to run after these ones
         self.scratch = _scratch(w13.device)
         # Reserve the buffers now so KV-cache sizing sees them.
@@ -853,16 +1020,24 @@ class Mxfp4W4A8PrefillExperts:
 
     def _convert_into_scratch(self, num_launches: int = 0):
         sc = self.scratch
-        for w, scale, smax, buf in (
-            (self.w13, self.w13_scale, self.w13_smax, sc.w13),
-            (self.w2, self.w2_scale, self.w2_smax, sc.w2),
+        half13 = self.w13.shape[1] // 2 if self.fused_swiglu else 0
+        for w, scale, smax, buf, half in (
+            (self.w13, self.w13_scale, self.w13_smax, sc.w13, half13),
+            (self.w2, self.w2_scale, self.w2_smax, sc.w2, 0),
         ):
             E, N, KH = w.shape
             _mxfp4_to_fp8(
-                w, scale, smax, buf[: E * N * KH * 2].view(E, N, KH * 2), num_launches
+                w,
+                scale,
+                smax,
+                buf[: E * N * KH * 2].view(E, N, KH * 2),
+                num_launches,
+                interleave_half=half,
             )
 
-    def _direct(self, hidden_states, topk_ids, topk_weights) -> torch.Tensor:
+    def _direct(
+        self, hidden_states, topk_ids, topk_weights, add_to=None
+    ) -> torch.Tensor:
         """The experts with _w4a8_direct_kernel: same quantization as the FP8-copy path
         (exact FP8 weights, FP8 activations with a power-of-2 row scale), weights read once
         per block of BR rows of an expert instead of converted for the whole layer."""
@@ -900,6 +1075,8 @@ class Mxfp4W4A8PrefillExperts:
             gather=False,
             gamma=True,
         )
+        if add_to is not None:  # add_to += sum, rounded like a separate bf16 add
+            return _topk_sum_by_pos(down, routing.pos, add_to, top_k, True)
         return _topk_sum_by_pos(down, routing.pos, torch.empty_like(hidden_states), top_k)
 
     def _single_launch(self) -> int:
@@ -945,7 +1122,13 @@ class Mxfp4W4A8PrefillExperts:
             sc.ready.record(sc.stream)
         sc.holder = nxt
 
-    def __call__(self, hidden_states, topk_ids, topk_weights) -> torch.Tensor:
+    def __call__(
+        self, hidden_states, topk_ids, topk_weights, add_to: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Routed experts' output [tokens, hidden] bf16. add_to (the shared expert's
+        output, same shape): return add_to after add_to += routed output, the same bits
+        as a separate shared.add_(routed); fused into the top-k sum when
+        fused_shared_add is on and the call takes the sorted-sum path."""
         import triton_kernels.matmul_details.opt_flags as opt_flags
         from triton_kernels.matmul import PrecisionConfig, matmul
         from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -961,7 +1144,10 @@ class Mxfp4W4A8PrefillExperts:
         num_tokens = topk_ids.shape[0]
         if 0 < num_tokens <= self.small_step_rows:
             # No scratch, no events, no host sync: safe inside a CUDA graph.
-            return self._direct(hidden_states, topk_ids, topk_weights)
+            if add_to is not None and self.fused_shared_add:
+                return self._direct(hidden_states, topk_ids, topk_weights, add_to)
+            out = self._direct(hidden_states, topk_ids, topk_weights)
+            return out if add_to is None else add_to.add_(out)
         # The Python state of the shared scratch (which layer it holds, the prefetch
         # events) is not replayed by a CUDA graph: a captured call would freeze it and
         # could read another layer's FP8 weights, or fail capture on the events.
@@ -971,10 +1157,20 @@ class Mxfp4W4A8PrefillExperts:
                 "it only on a PD prefill server whose MoE runs eagerly."
             )
         num_tokens, top_k = topk_ids.shape
-        output = torch.empty_like(hidden_states)
         if num_tokens == 0:
-            return output
-        routing = route_slots_by_expert(topk_ids, topk_weights, self.num_experts)
+            return torch.empty_like(hidden_states) if add_to is None else add_to
+        fuse_add = (
+            add_to is not None
+            and self.fused_shared_add
+            and (self.sorted_sum or self.counting_route)
+        )
+        output = add_to if fuse_add else torch.empty_like(hidden_states)
+        pos = None
+        if self.counting_route:
+            routing = _count_route(topk_ids, topk_weights, self.num_experts)
+            pos = routing.pos
+        else:
+            routing = route_slots_by_expert(topk_ids, topk_weights, self.num_experts)
         ragged_metadata = make_ragged_tensor_metadata(
             routing.expert_counts, num_tokens * top_k
         )
@@ -987,40 +1183,74 @@ class Mxfp4W4A8PrefillExperts:
         # them, so replace the ContextVar directly (triton_kernels 3.8 internals).
         token = opt_flags._opt_flags_constraints.set({})
         try:
-            gate_up = matmul(
-                x_fp8,
-                self._fp8_view(self.w13, self.scratch.w13),
-                None,
-                a_ragged_metadata=ragged_metadata,
-                gather_indx=routing.gather_indx,
-                precision_config=PrecisionConfig(
-                    a_mx_tensor_scale=x_scale,
-                    b_mx_tensor_scale=self.w13_channel_scale,
-                    out_dtype=torch.bfloat16,
-                ),
-            )
-            a_fp8, a_scale = _swiglu_quant(gate_up, self.swiglu_limit)
-            del gate_up
-            down = matmul(
-                a_fp8,
-                self._fp8_view(self.w2, self.scratch.w2),
-                None,
-                a_ragged_metadata=ragged_metadata,
-                scatter_indx=None if self.sorted_sum else routing.combine_indx,
-                precision_config=PrecisionConfig(
-                    a_mx_tensor_scale=a_scale,
-                    b_mx_tensor_scale=self.w2_channel_scale,
-                    out_dtype=torch.bfloat16,
-                ),
-                gammas=routing.sorted_weights,
-            )
+            if self.fused_swiglu:
+                act = matmul(
+                    x_fp8,
+                    self._fp8_view(self.w13, self.scratch.w13),
+                    None,
+                    a_ragged_metadata=ragged_metadata,
+                    gather_indx=routing.gather_indx,
+                    precision_config=PrecisionConfig(
+                        a_mx_tensor_scale=x_scale,
+                        b_mx_tensor_scale=self.w13_channel_scale_il,
+                        out_dtype=torch.bfloat16,
+                    ),
+                    fused_activation=_swiglu_activation(self.swiglu_limit),
+                )
+                a_fp8, a_scale = _rows_quant(act.view(-1, act.shape[-1]))
+                del act
+            else:
+                gate_up = matmul(
+                    x_fp8,
+                    self._fp8_view(self.w13, self.scratch.w13),
+                    None,
+                    a_ragged_metadata=ragged_metadata,
+                    gather_indx=routing.gather_indx,
+                    precision_config=PrecisionConfig(
+                        a_mx_tensor_scale=x_scale,
+                        b_mx_tensor_scale=self.w13_channel_scale,
+                        out_dtype=torch.bfloat16,
+                    ),
+                )
+                a_fp8, a_scale = _swiglu_quant(gate_up, self.swiglu_limit)
+                del gate_up
+            w2_flags = None
+            # Only where triton_kernels' own choice is also 128-row persistent wgmma tiles
+            # (>= 128 rows per expert on average): those accumulate every output element
+            # in the same order, so the two tilings give the same bits (smaller row counts
+            # get other kernels with other accumulation).
+            if (
+                0 < self.w2_two_cta_min_rows <= num_tokens
+                and num_tokens * top_k >= 128 * self.num_experts
+            ):
+                w2_flags = _w2_two_cta_flags()
+            with (
+                opt_flags.scoped_opt_flags(w2_flags)
+                if w2_flags is not None
+                else contextlib.nullcontext()
+            ):
+                down = matmul(
+                    a_fp8,
+                    self._fp8_view(self.w2, self.scratch.w2),
+                    None,
+                    a_ragged_metadata=ragged_metadata,
+                    scatter_indx=None if self.sorted_sum else routing.combine_indx,
+                    precision_config=PrecisionConfig(
+                        a_mx_tensor_scale=a_scale,
+                        b_mx_tensor_scale=self.w2_channel_scale,
+                        out_dtype=torch.bfloat16,
+                    ),
+                    gammas=routing.sorted_weights,
+                )
         finally:
             opt_flags._opt_flags_constraints.reset(token)
         overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
         if self.prefetch and not overlapped:
             self._prefetch_next(self._single_launch())
-        if self.sorted_sum:
-            _gather_topk_sum(down, routing.combine_indx, output, top_k)
+        if pos is not None:
+            _topk_sum_by_pos(down, pos, output, top_k, fuse_add)
+        elif self.sorted_sum:
+            _gather_topk_sum(down, routing.combine_indx, output, top_k, fuse_add)
         else:
             moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         if self.prefetch and overlapped:
@@ -1030,4 +1260,38 @@ class Mxfp4W4A8PrefillExperts:
             # the top-k sum in slices, the all-reduce gets its SMs after one slice and the
             # rest of the conversion runs beside it.
             self._prefetch_next(self.prefetch_chunks)
+        if add_to is not None and not fuse_add:
+            return add_to.add_(output)
         return output
+
+
+_W2_TWO_CTA_FLAGS = None
+
+
+def _w2_two_cta_flags():
+    """triton_kernels flags for the K = 576 down-projection at large row counts: 128x128
+    tiles, 4 warps, 3 stages, epilogue in 2 subtiles, 2 CTAs per SM (~112 KB shared
+    memory each), so one CTA's epilogue (the 4 GB bf16 output) runs beside the other's
+    main loop. H200, 65,208 rows, real TP4 weights: 2.55 vs 2.69 ms, same bits."""
+    global _W2_TWO_CTA_FLAGS
+    if _W2_TWO_CTA_FLAGS is None:
+        from triton_kernels.matmul_details.opt_flags import OptFlags
+
+        _W2_TWO_CTA_FLAGS = OptFlags(
+            block_m=128,
+            block_n=128,
+            block_k=128,
+            num_warps=4,
+            num_stages=3,
+            group_m=8,
+            xcd_swizzle=1,
+            w_cache_modifier=None,
+            split_k=1,
+            is_persistent=True,
+            idle_sms=0,
+            epilogue_subtile=2,
+            arch=None,
+            occupancy_target=2,
+            target_kernel_kwargs={"maxnreg": 256, "FLATTEN_LOOPS": True},
+        )
+    return _W2_TWO_CTA_FLAGS
