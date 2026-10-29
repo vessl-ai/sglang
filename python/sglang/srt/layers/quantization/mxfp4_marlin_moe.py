@@ -306,11 +306,17 @@ class Mxfp4MarlinMoEMethod:
             (layer.w13_weight, layer.w13_weight_scale_inv),
             (layer.w2_weight, layer.w2_weight_scale_inv),
         ):
+            # Release the previous swizzle's scratch before the next one: otherwise the
+            # next swizzle's output is placed inside a cached scratch segment, the rest of
+            # that segment can never be returned, and KV-cache sizing (which sees driver
+            # free memory) loses ~0.5 GB per layer (~18 GB at TP4 on H200).
+            torch.cuda.empty_cache()
             tk_weight, flex, tk_scale = _swizzle_mxfp4(
                 weight.data.view(torch.uint8),
                 scale.data.view(torch.uint8),
                 swizzle_num_warps,
             )
+            torch.cuda.empty_cache()
             precision = PrecisionConfig(
                 b_mx_scale=tk_scale, flex_ctx=FlexCtx(rhs_data=flex), **mx_block
             )
