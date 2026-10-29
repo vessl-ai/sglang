@@ -1309,5 +1309,43 @@ class TestTorchPrefillRequests(CustomTestCase):
                 self.assertLess(int(scores.topk(16, dim=-1).indices.max()), lc)
 
 
+class TestDeepGemmPrefillChoice(CustomTestCase):
+    """_use_deep_gemm_prefill: arch x SGLANG_DSV41_TORCH_PREFILL_INDEXER x attention CP."""
+
+    def test_decision_matrix(self):
+        from sglang.srt.layers.attention.dsv4 import v41_indexer
+
+        choose = v41_indexer._use_deep_gemm_prefill.__wrapped__
+        # (sm100, sm90, torch env, cp size) -> DeepGEMM prefill
+        cases = {
+            (True, False, False, 1): True,
+            (True, False, True, 1): False,
+            # SM100 CP rows are served only by DeepGEMM: the env is ignored.
+            (True, False, False, 2): True,
+            (True, False, True, 2): True,
+            (False, True, False, 1): True,
+            (False, True, True, 1): False,
+            # SM90 CP stays on the torch path.
+            (False, True, False, 2): False,
+            (False, True, True, 2): False,
+            # Neither (e.g. SM8x or ROCm): torch.
+            (False, False, False, 1): False,
+        }
+        for (sm100, sm90, torch_env, cp), expected in cases.items():
+            with self.subTest(sm100=sm100, sm90=sm90, torch_env=torch_env, cp=cp):
+                with (
+                    patch.object(v41_indexer, "is_sm100_or_newer", lambda: sm100),
+                    patch.object(v41_indexer, "has_dense_fp4_indexer", lambda: True),
+                    patch.object(v41_indexer, "has_dense_fp8_indexer", lambda: True),
+                    patch.object(v41_indexer, "prefill_index_logits_fp8", lambda: sm90),
+                    patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(attn_cp_size=cp),
+                    ),
+                    envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(torch_env),
+                ):
+                    self.assertEqual(choose(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
