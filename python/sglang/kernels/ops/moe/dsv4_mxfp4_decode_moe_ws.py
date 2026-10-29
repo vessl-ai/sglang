@@ -5,7 +5,9 @@ Numerics are the W4A8 prefill path's: activations of both GEMMs in e4m3 with one
 row, exact MXFP4 weights (each 32-k block's product promoted to fp32 with its e8m0 scale).
 
 Entry points: ``pack_experts`` (load time, raw MXFP4 bytes -> stage-ordered layout of the same size) and
-``decode_moe`` (CUDA-graph safe, no host sync).
+``decode_moe`` (CUDA-graph safe, no host sync). Masked slots (topk id -1, e.g. the dp-attention pad rows
+that SGLANG_OPT_MASK_DP_PAD_MOE masks) are sorted to no expert and skipped by the top-k combine, so they
+cost no expert work.
 """
 
 from __future__ import annotations
@@ -48,6 +50,8 @@ def _module() -> Module:
         cuda_wrappers=[
             ("gate_up", "dsv4_moe_ws::gate_up"),
             ("down", "dsv4_moe_ws::down"),
+            ("combine", "dsv4_moe_ws::combine"),
+            ("sort_slots", "dsv4_moe_ws::sort_slots"),
         ],
     )
 
@@ -154,23 +158,43 @@ def _row_quant(x: torch.Tensor):
     return _row_quant(x)
 
 
+SORT_MAX_SLOTS = 16384  # one-CTA sort kernel limit
+
+
 def _sort_slots(topk_ids, topk_weights, num_experts):
+    """Slots sorted by expert, stable: (counts [E], sorted_slots, sorted_tokens, sorted_weights).
+    Masked slots (id -1, e.g. dp-attention pad rows under SGLANG_OPT_MASK_DP_PAD_MOE) belong to
+    no expert: they are not counted, sort after every real slot and are never computed."""
     num_tokens, top_k = topk_ids.shape
-    if num_tokens * top_k <= 16 * num_experts:
+    num_slots = num_tokens * top_k
+    device = topk_ids.device
+    if num_slots <= 16 * num_experts:
         from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
 
-        return expert_sort_small(topk_ids, topk_weights, num_experts)
-    valid = topk_ids >= 0
-    ids = torch.where(valid, topk_ids, 0).flatten().long()
-    weights = torch.where(valid, topk_weights, 0).flatten().float()
+        return expert_sort_small(topk_ids, topk_weights, num_experts, drop_masked=True)
+    if num_slots <= SORT_MAX_SLOTS and num_experts <= 1024:
+        counts = torch.empty(num_experts, dtype=torch.int32, device=device)
+        sorted_slots = torch.empty(num_slots, dtype=torch.int32, device=device)
+        sorted_tokens = torch.empty(num_slots, dtype=torch.int32, device=device)
+        sorted_weights = torch.empty(num_slots, dtype=torch.float32, device=device)
+        _module().sort_slots(
+            topk_ids.to(torch.int32).contiguous(),
+            topk_weights.float().contiguous(),
+            counts,
+            sorted_slots,
+            sorted_tokens,
+            sorted_weights,
+        )
+        return counts, sorted_slots, sorted_tokens, sorted_weights
+    ids = torch.where(topk_ids >= 0, topk_ids, num_experts).flatten().long()
     order = torch.argsort(ids, stable=True)
-    counts = torch.zeros(num_experts, dtype=torch.int32, device=ids.device)
+    counts = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
     counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
     return (
-        counts,
+        counts[:num_experts],
         order.to(torch.int32),
         (order // top_k).to(torch.int32),
-        weights[order],
+        topk_weights.flatten().float()[order],
     )
 
 
@@ -182,9 +206,8 @@ def decode_moe(
     swiglu_limit: float,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Routed experts, W4A8: out[t] = sum_k w[t,k] * expert_{id[t,k]}(x[t]). Masked ids (-1) add 0."""
-    from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
-
+    """Routed experts, W4A8: out[t] = sum_k w[t,k] * expert_{id[t,k]}(x[t]). Masked ids (-1) add 0
+    and cost no expert work."""
     num_tokens, top_k = topk_ids.shape
     if output is None:
         output = torch.empty_like(hidden_states)
@@ -212,5 +235,5 @@ def decode_moe(
     mod.down(
         h8.view(torch.uint8), hs, packed.w2, counts, sorted_slots, sorted_weights, y
     )
-    moe_topk_sum(y.view(num_tokens, top_k, HIDDEN), output)
+    mod.combine(y, topk_ids.to(torch.int32).contiguous(), output)
     return output

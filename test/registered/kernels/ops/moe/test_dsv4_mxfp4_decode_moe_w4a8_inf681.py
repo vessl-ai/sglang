@@ -2,9 +2,10 @@
 (dsv4_mxfp4_decode_moe_ws) for the DeepSeek-V4 TP4 MXFP4 experts.
 
 Checks against an fp32 W4A8 reference (activations of both GEMMs quantized to e4m3 with a power-of-2
-row scale, exact MXFP4 weights, the engine's bf16 rounding points) on target and draft shapes, with
-masked slots and experts that need several 32-row passes; CUDA graph capture/replay with fresh inputs;
-and the switch wiring in Mxfp4MarlinMoEMethod."""
+row scale, exact MXFP4 weights, the engine's bf16 rounding points) on target and draft shapes (DSpark
+gamma 5: 6 / 5 rows per request, gamma 3: 4 / 3), with masked slots and experts that need several
+32-row passes; dp-attention pad rows (topk_ids -1) are dropped by every sort path; CUDA graph
+capture/replay with fresh inputs; and the switch wiring in Mxfp4MarlinMoEMethod."""
 
 import sys
 from types import SimpleNamespace
@@ -24,10 +25,13 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, INTERMEDIATE = 5120, 576
 SWIGLU_LIMIT = 10.0
+# (experts, top_k, rows per request): gamma 5 and gamma 3 (verify = gamma + 1 rows, draft = gamma rows)
 SHAPES = {
     "target": (384, 6, 6),
     "draft": (128, 3, 5),
-}  # (experts, top_k, rows per request)
+    "target_g3": (384, 6, 4),
+    "draft_g3": (128, 3, 3),
+}
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
 
@@ -118,12 +122,47 @@ def test_w4a8_matches_reference(shape):
     w13f = torch.stack([_dequant(w13[e], s13[e]) for e in range(num_experts)])
     w2f = torch.stack([_dequant(w2[e], s2[e]) for e in range(num_experts)])
     for bs in (1, 48, 125, 300):
-        x, ids, wts = _routing(bs, rows_per_req, num_experts, top_k, bs, masked_rows=3)
+        # mask the last rows, but never all of them (the relative error needs a nonzero reference)
+        masked = min(3, bs * rows_per_req - 1)
+        x, ids, wts = _routing(
+            bs, rows_per_req, num_experts, top_k, bs, masked_rows=masked
+        )
         out = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
         assert not torch.isnan(out).any()
         err = _rel(out, _reference(x, ids, wts, w13f, w2f))
         # FP8 tensor-core accumulation inside each 32-k block; measured 0.1-0.26%.
         assert err < 5e-3, (bs, err)
+
+
+@pytest.mark.parametrize("shape", ["target_g3", "draft_g3"])
+def test_w4a8_dp_pad_rows(shape):
+    """dp-attention MAX_LEN pad rows reach the MoE with topk_ids -1 (SGLANG_OPT_MASK_DP_PAD_MOE):
+    their output is 0, they change no other row, and no sort path counts them for any expert."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+
+    num_experts, top_k, rows_per_req = SHAPES[shape]
+    w = _weights(num_experts)
+    packed = ws.pack_experts(
+        w["w13_weight"].cuda(),
+        w["w13_weight_scale_inv"].cuda(),
+        w["w2_weight"].cuda(),
+        w["w2_weight_scale_inv"].cuda(),
+    )
+    # bs 40 / 170 / 700: the triton sort, the one-CTA CUDA sort and the torch fallback
+    for bs in (40, 170, 700):
+        x, ids, wts = _routing(bs, rows_per_req, num_experts, top_k, 3 * bs)
+        pad = max(1, len(ids) // 5)
+        xp = torch.cat([x, torch.randn(pad, HIDDEN, device="cuda", dtype=x.dtype)])
+        idsp = torch.cat(
+            [ids, torch.full((pad, top_k), -1, dtype=ids.dtype, device="cuda")]
+        )
+        wtsp = torch.cat([wts, torch.rand(pad, top_k, device="cuda")])
+        counts = ws._sort_slots(idsp, wtsp, num_experts)[0]
+        assert int(counts.sum()) == ids.numel(), bs
+        out = ws.decode_moe(xp, idsp, wtsp, packed, SWIGLU_LIMIT)
+        assert torch.equal(out[len(ids) :], torch.zeros_like(out[len(ids) :])), bs
+        ref = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+        assert torch.equal(out[: len(ids)], ref), bs
 
 
 @pytest.mark.parametrize("shape", list(SHAPES))

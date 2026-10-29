@@ -20,6 +20,8 @@
 // gate/up item = 64 intermediate channels: m64 tile 0 = gate rows, tile 1 = up rows of the same channels,
 // so SwiGLU stays in registers; h is written bf16 in sorted-slot order.
 // down item = 128 output channels (2 m64 tiles); y[orig_slot] = acc * row scale * gamma.
+// Also here: a one-CTA stable expert sort (sort_slots) and the top-k combine; both leave masked slots (id < 0)
+// out, so dp-attention pad rows cost no expert work.
 //
 // Weight words (per lane, k64 step, 16-channel tile): 4 words [blk0 rows g, blk0 rows g+8, blk1 rows g,
 // blk1 rows g+8]; byte i holds A = k 4c+i (a0/a1) and B = k 4c+16+i (a2/a3):
@@ -381,6 +383,17 @@ struct PassState {
       }
     }
   }
+  // Pin the converted A fragments before wgmma.fence: otherwise ptxas sinks part of the conversion below the
+  // fence, sees A registers defined inside the wgmma batch and splits it with injected warpgroup.arrive (C7519).
+  SGL_DEVICE void fence_a() {
+#pragma unroll
+    for (int b = 0; b < kBatch; ++b)
+#pragma unroll
+      for (int t = 0; t < kT; ++t)
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+          asm volatile("" : "+r"(a[b][t][i])::"memory");
+  }
   SGL_DEVICE void fence_tmp() {
 #pragma unroll
     for (int b = 0; b < kBatch; ++b)
@@ -408,6 +421,32 @@ SGL_DEVICE void consumer_pass(
 #pragma unroll
     for (int i = 0; i < kN / 2; ++i)
       ps.acc[t][i] = 0.f;
+
+  // The epilogue's per-row inputs (activation row r = 8jj + 2c + e2): scale and destination row. Loaded
+  // before the K loop (their global-memory latency then overlaps it) except on the N = 32 path, which has no
+  // registers to spare.
+  constexpr bool kPrefetch = kNch <= 2;
+  auto row_inputs = [&](int r, float& scale, int& dst) {
+    const int sorted = off + r0 + r;
+    if constexpr (kGateUp) {
+      scale = p.xscale[p.gather[sorted]];
+      dst = sorted;
+    } else {
+      scale = p.xscale[sorted] * p.gammas[sorted];
+      dst = p.combine[sorted];
+    }
+  };
+  float row_scale[kNch][2];
+  int row_dst[kNch][2];
+  if constexpr (kPrefetch) {
+#pragma unroll
+    for (int jj = 0; jj < kNch; ++jj)
+#pragma unroll
+      for (int e2 = 0; e2 < 2; ++e2) {
+        const int r = 8 * jj + 2 * c + e2;
+        row_inputs(r < nrows ? r : 0, row_scale[jj][e2], row_dst[jj][e2]);
+      }
+  }
 
 #pragma unroll 1
   for (int st = 0; st < S::kStages; ++st, ++g) {
@@ -444,6 +483,7 @@ SGL_DEVICE void consumer_pass(
         ps.template convert<1>(wt[0], swt[0]);
         ps.template convert<2>(wt[1], swt[1]);
         ps.template convert<3>(wt[1], swt[1]);
+        ps.fence_a();
         wgmma_fence();
         ps.template mma<0>(xslot, 0);
         ps.template mma<1>(xslot, 0);
@@ -459,6 +499,7 @@ SGL_DEVICE void consumer_pass(
       } else {
         ps.template convert<0>(wt[0], swt[0]);
         ps.template convert<1>(wt[0], swt[0]);
+        ps.fence_a();
         wgmma_fence();
         ps.template mma<0>(xslot, 0);
         ps.template mma<1>(xslot, 0);
@@ -474,6 +515,7 @@ SGL_DEVICE void consumer_pass(
         if (step < nsteps) {
           ps.template convert<0>(wt[step], swt[step]);
           ps.template convert<1>(wt[step], swt[step]);
+          ps.fence_a();
           wgmma_fence();
           ps.template mma<0>(xslot, step);
           ps.template mma<1>(xslot, step);
@@ -497,8 +539,9 @@ SGL_DEVICE void consumer_pass(
       for (int e2 = 0; e2 < 2; ++e2) {
         const int r = 8 * jj + 2 * c + e2;
         if (r < nrows) {
-          const float rs = p.xscale[p.gather[off + r0 + r]];
-          __nv_bfloat16* hrow = p.out + static_cast<size_t>(off + r0 + r) * S::kOutLd;
+          if constexpr (!kPrefetch) row_inputs(r, row_scale[jj][e2], row_dst[jj][e2]);
+          const float rs = row_scale[jj][e2];
+          __nv_bfloat16* hrow = p.out + static_cast<size_t>(row_dst[jj][e2]) * S::kOutLd;
 #pragma unroll
           for (int ih = 0; ih < 2; ++ih) {
             const int idx = 4 * jj + 2 * ih + e2;
@@ -519,9 +562,9 @@ SGL_DEVICE void consumer_pass(
       for (int e2 = 0; e2 < 2; ++e2) {
         const int r = 8 * jj + 2 * c + e2;
         if (r < nrows) {
-          const int sorted = off + r0 + r;
-          const float sc = p.xscale[sorted] * p.gammas[sorted];
-          __nv_bfloat16* orow = p.out + static_cast<size_t>(p.combine[sorted]) * S::kOutLd;
+          if constexpr (!kPrefetch) row_inputs(r, row_scale[jj][e2], row_dst[jj][e2]);
+          const float sc = row_scale[jj][e2];
+          __nv_bfloat16* orow = p.out + static_cast<size_t>(row_dst[jj][e2]) * S::kOutLd;
 #pragma unroll
           for (int t = 0; t < kT; ++t)
 #pragma unroll
@@ -543,8 +586,8 @@ SGL_DEVICE void consumer(const Params& p, const Smem<kGateUp>& sm, int pipe, int
   while (items.next(e, j, cnt, off)) {
     for (int r0 = 0; r0 < cnt; r0 += 32) {
       const int nrows = min(cnt - r0, 32);
-      // Two code paths (N = 16 in 4-block batches, N = 32 in 2-block batches): all four row-chunk counts inlined
-      // together would not fit the 168-register budget of 10 warps per SM.
+      // Two code paths (N = 16 in 4-block batches, N = 32 in 2-block batches). An N = 8 path for <= 8 rows
+      // measured no faster: the consumer's per-stage cost is latency, not the N-proportional promotion work.
       if (nrows <= 16) {
         consumer_pass<kGateUp, 2>(p, sm, g, e, j, off, r0, nrows, cw, lane);
       } else {
@@ -681,6 +724,205 @@ inline void down(
   prm.num_experts = static_cast<int>(counts.size(0));
   RuntimeCheck(prm.num_experts <= 512, "ws: at most 512 local experts");
   launch<false>(prm, h8.device());
+}
+
+// Stable sort of routed slots by expert in one CTA (decode-sized batches): counts[E], and for the
+// sum(counts) valid slots in (expert, slot) order: sorted_slots, sorted_tokens (= slot / top_k), sorted_weights.
+// Masked slots (id < 0) belong to no expert and are left out. Warp w owns a contiguous run of slots; pass 1
+// counts per (warp, expert) and records each slot's rank in its warp, pass 2 turns the counts into output
+// offsets, pass 3 writes every slot at offset + rank. Shared memory: hist [32][E | 1] + rank [slots] (uint16).
+constexpr int kSortThreads = 1024;
+constexpr int kSortWarps = kSortThreads / 32;
+constexpr int kSortMaxSlots = 16384;
+
+__global__ void __launch_bounds__(kSortThreads, 1) sort_kernel(
+    const int32_t* __restrict__ ids,
+    const float* __restrict__ weights,
+    int num_slots,
+    int top_k,
+    int num_experts,
+    int32_t* __restrict__ counts,
+    int32_t* __restrict__ sorted_slots,
+    int32_t* __restrict__ sorted_tokens,
+    float* __restrict__ sorted_weights) {
+  constexpr int kChunks = kSortMaxSlots / kSortThreads;  // 32-slot chunks per warp
+  extern __shared__ int32_t sort_smem[];
+  const int ld = num_experts | 1;  // odd row stride: the per-expert scan over warps is bank-conflict free
+  int32_t* hist = sort_smem;       // [kSortWarps][ld]
+  uint16_t* rank = reinterpret_cast<uint16_t*>(hist + kSortWarps * ld);
+  __shared__ int32_t offset[1024];
+  __shared__ int32_t warp_sums[kSortWarps];
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+  const int per_warp = (num_slots + kSortWarps * 32 - 1) / (kSortWarps * 32) * 32;
+  const int begin = warp * per_warp;
+  const int end = min(num_slots, begin + per_warp);
+  // All of this warp's ids at once (independent loads), then the histogram in slot order.
+  int e_of[kChunks];
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    const int s = begin + 32 * c + lane;
+    e_of[c] = s < end ? ids[s] : -1;
+  }
+  for (int i = tid; i < kSortWarps * ld; i += kSortThreads)
+    hist[i] = 0;
+  __syncthreads();
+  int32_t* my_hist = hist + warp * ld;
+  const unsigned lt = (1u << lane) - 1u;
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (begin + 32 * c >= end) break;  // warp-uniform
+    const int e = e_of[c];
+    const unsigned peers = __match_any_sync(0xffffffffu, e);
+    const int leader = __ffs(peers) - 1;
+    int before = 0;
+    if (lane == leader && e >= 0) {
+      before = my_hist[e];
+      my_hist[e] = before + __popc(peers);
+    }
+    before = __shfl_sync(0xffffffffu, before, leader);
+    if (e >= 0) rank[begin + 32 * c + lane] = static_cast<uint16_t>(before + __popc(peers & lt));
+  }
+  __syncthreads();
+  // hist[w][e] <- slots of expert e in warps before w (scan over warps, one expert per warp step).
+  for (int e = warp; e < num_experts; e += kSortWarps) {
+    const int c = hist[lane * ld + e];
+    int incl = c;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(0xffffffffu, incl, o);
+      if (lane >= o) incl += v;
+    }
+    hist[lane * ld + e] = incl - c;
+    if (lane == 31) {
+      offset[e] = incl;  // count of expert e, for now
+      counts[e] = incl;
+    }
+  }
+  __syncthreads();
+  const int count = tid < num_experts ? offset[tid] : 0;
+  int incl = count;  // block-wide exclusive scan of the counts
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int v = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += v;
+  }
+  if (lane == 31) warp_sums[warp] = incl;
+  __syncthreads();
+  if (warp == 0) {
+    int ws = warp_sums[lane];
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int v = __shfl_up_sync(0xffffffffu, ws, o);
+      if (lane >= o) ws += v;
+    }
+    warp_sums[lane] = ws;
+  }
+  __syncthreads();
+  if (tid < num_experts) offset[tid] = incl - count + (warp > 0 ? warp_sums[warp - 1] : 0);
+  __syncthreads();
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    const int s = begin + 32 * c + lane;
+    if (begin + 32 * c >= end) break;  // warp-uniform
+    const int e = e_of[c];
+    if (e < 0) continue;
+    const int pos = offset[e] + my_hist[e] + rank[s];
+    sorted_slots[pos] = s;
+    sorted_tokens[pos] = s / top_k;
+    sorted_weights[pos] = weights[s];
+  }
+}
+
+inline void sort_slots(
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView topk_weights,
+    tvm::ffi::TensorView counts,
+    tvm::ffi::TensorView sorted_slots,
+    tvm::ffi::TensorView sorted_tokens,
+    tvm::ffi::TensorView sorted_weights) {
+  using namespace host;
+  const int tokens = static_cast<int>(topk_ids.size(0));
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  const int num_slots = tokens * top_k;
+  const int num_experts = static_cast<int>(counts.size(0));
+  RuntimeCheck(num_slots <= kSortMaxSlots && num_experts <= 1024, "ws sort: at most 16384 slots, 1024 experts");
+  const size_t smem = static_cast<size_t>(kSortWarps) * (num_experts | 1) * 4 + static_cast<size_t>(num_slots) * 2;
+  static const bool smem_set = [] {  // once: the largest layout (1024 experts, 16384 slots)
+    RuntimeDeviceCheck(cudaFuncSetAttribute(
+        sort_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSortWarps * 1025 * 4 + kSortMaxSlots * 2));
+    return true;
+  }();
+  (void)smem_set;
+  LaunchKernel(dim3(1), dim3(kSortThreads), topk_ids.device(), smem)(
+      sort_kernel,
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<const float*>(topk_weights.data_ptr()),
+      num_slots,
+      top_k,
+      num_experts,
+      static_cast<int32_t*>(counts.data_ptr()),
+      static_cast<int32_t*>(sorted_slots.data_ptr()),
+      static_cast<int32_t*>(sorted_tokens.data_ptr()),
+      static_cast<float*>(sorted_weights.data_ptr()));
+}
+
+// out[t] = sum over k with topk_ids[t, k] >= 0 of y[t * top_k + k], in fp32 with k ascending (as moe_topk_sum).
+// down writes no row for a masked slot (it is not sorted to any expert), so those rows are not read.
+constexpr int kCombineMaxTopK = 8;
+__global__ void combine_kernel(
+    const __nv_bfloat16* __restrict__ y, const int32_t* __restrict__ ids, __nv_bfloat16* __restrict__ out, int top_k) {
+  constexpr int kVecs = 5120 / 8;
+  const int t = blockIdx.y;
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= kVecs) return;
+  bool use[kCombineMaxTopK];  // ids first, so that the row loads below can all be in flight together
+#pragma unroll
+  for (int k = 0; k < kCombineMaxTopK; ++k)
+    use[k] = k < top_k && ids[t * top_k + k] >= 0;
+  uint4 w[kCombineMaxTopK];
+#pragma unroll
+  for (int k = 0; k < kCombineMaxTopK; ++k)
+    if (use[k]) w[k] = reinterpret_cast<const uint4*>(y + (static_cast<size_t>(t) * top_k + k) * 5120)[v];
+  float acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    acc[i] = 0.f;
+#pragma unroll
+  for (int k = 0; k < kCombineMaxTopK; ++k) {
+    if (!use[k]) continue;
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&w[k]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __bfloat1622float2(b[i]);
+      acc[2 * i] += f.x;
+      acc[2 * i + 1] += f.y;
+    }
+  }
+  uint4 o;
+  __nv_bfloat162* ob = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    ob[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+  reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * 5120)[v] = o;
+}
+
+// y [tokens * top_k, 5120] bf16 (original slot order), topk_ids [tokens, top_k] -> out [tokens, 5120] bf16.
+inline void combine(tvm::ffi::TensorView y, tvm::ffi::TensorView topk_ids, tvm::ffi::TensorView out) {
+  using namespace host;
+  RuntimeCheck(y.size(1) == 5120 && out.size(1) == 5120, "ws combine: hidden 5120 only");
+  const int tokens = static_cast<int>(topk_ids.size(0));
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  RuntimeCheck(y.size(0) == static_cast<int64_t>(tokens) * top_k && out.size(0) == tokens, "ws combine: shapes");
+  RuntimeCheck(top_k <= kCombineMaxTopK, "ws combine: top_k <= 8");
+  if (tokens == 0) return;
+  LaunchKernel(dim3(5, tokens), dim3(128), y.device())(
+      combine_kernel,
+      static_cast<const __nv_bfloat16*>(y.data_ptr()),
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<__nv_bfloat16*>(out.data_ptr()),
+      top_k);
 }
 
 }  // namespace dsv4_moe_ws
