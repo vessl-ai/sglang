@@ -1808,6 +1808,12 @@ class Envs:
     # byte-table (PRMT) lookups in inline PTX instead of per-element integer ops.
     # Scores stay bit-identical; ~25-28% less kernel time at the verdict shape.
     SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT = EnvBool(False)
+    # INF-681 k-vloop. DeepGEMM prefill indexer, candidate source (layer 20) and
+    # consumers (24/28/32/36): select the candidate blocks and the top-k among them
+    # once per score tile (a fused block-key kernel, one top-k per run of requests
+    # that keep the same block count) instead of once per request. The kernel count
+    # stops growing with the request count; selections stay bit-identical.
+    SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last

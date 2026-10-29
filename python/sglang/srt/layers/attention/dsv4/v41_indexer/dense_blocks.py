@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
     candidate_block_keep,
+    candidate_block_keys,
     candidate_block_mask,
     select_candidate_block_ids,
     topk_among_blocks,
@@ -84,6 +85,8 @@ class DenseBlocksBackend:
 
         # Only the Hopper paged decode builds and reads decode_mask.
         self.use_block_mask = envs.SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK.get()
+        # DeepGEMM prefill: one candidate pass per score tile instead of per request.
+        self.batched_blocks = envs.SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS.get()
         # This backend serves decode only where DeepGEMM does not (Hopper).
         self.decode_sharder = get_decode_row_sharder(use_deep_gemm_decode=False)
 
@@ -200,6 +203,7 @@ class DenseBlocksBackend:
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
+            batched=self.batched_blocks,
         )
         if shard is not None:
             # Block ids are request-relative and -1 padded, like the selection.
@@ -229,6 +233,7 @@ class DenseBlocksBackend:
             topk=inputs.indexer.index_topk,
             blocks=published.blocks if shard is None else published.blocks[shard],
             block_size=self.block_size,
+            batched=self.batched_blocks,
         )
         if shard is not None:
             selected = _unshard_rows(selected, shard, data.num_rows)
@@ -306,6 +311,7 @@ def _publish_prefill_blocks(
     topk: int,
     topk_blocks: int,
     block_size: int,
+    batched: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
@@ -314,8 +320,9 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
+    publish_tile = _publish_tile_blocks_batched if batched else _publish_tile_blocks
     for tile, logits in score_tiles(data, kv, width_align=4):
-        _publish_tile_blocks(
+        publish_tile(
             data=data,
             tile=tile,
             logits=logits,
@@ -359,6 +366,57 @@ def _publish_tile_blocks(
         blocks[rows, : ids.shape[1]] = ids
 
 
+def _publish_tile_blocks_batched(
+    *,
+    data: DeepGEMMPrefillData,
+    tile: slice,
+    logits: torch.Tensor,
+    blocks: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> None:
+    """``_publish_tile_blocks`` with one key pass over the whole tile and one block
+    top-k per run of consecutive requests that keep the same number of blocks (all of
+    them once every context has at least ``topk_blocks`` blocks), bit for bit.
+
+    A request's top-k sees its keys plus, past its own block count, only ``-inf``
+    columns, and torch.topk of a row depends neither on the other rows of the call
+    nor on trailing ``-inf`` columns when ``k`` is unchanged: it gathers the values
+    above the k-th in index order, then the ties in index order. torch does not
+    document that; test_dsv41_batched_candidate_blocks checks it bit for bit."""
+    keys = candidate_block_keys(
+        logits, data.compress_lens[tile], -(-logits.shape[1] // block_size), block_size
+    )
+    for rows, kept, num_blocks in _block_topk_runs(data, tile, topk_blocks, block_size):
+        scores = keys[rows, :num_blocks]
+        if num_blocks != keys.shape[1]:
+            # The per-request path ranks a fresh contiguous key tensor.
+            scores = scores.contiguous()
+        top = scores.topk(kept, dim=-1)
+        blocks[rows, :kept] = top.indices.to(torch.int32).masked_fill_(
+            ~(top.values > -torch.inf), -1
+        )
+
+
+def _block_topk_runs(
+    data: DeepGEMMPrefillData, tile: slice, topk_blocks: int, block_size: int
+):
+    """(tile rows, kept blocks, widest block count) per run of consecutive requests
+    of the tile that keep the same ``min(topk_blocks, ceil(lc / block_size))``."""
+    run = None  # [first row, end row, kept, widest]
+    for rows, lc in _requests_in_tile(data, tile):
+        num_blocks = -(-lc // block_size)
+        kept = min(topk_blocks, num_blocks)
+        if run is not None and run[2] == kept and run[1] == rows.start:
+            run[1], run[3] = rows.stop, max(run[3], num_blocks)
+            continue
+        if run is not None:
+            yield slice(run[0], run[1]), run[2], run[3]
+        run = [rows.start, rows.stop, kept, num_blocks]
+    if run is not None:
+        yield slice(run[0], run[1]), run[2], run[3]
+
+
 def _consume_prefill_blocks(
     *,
     data: DeepGEMMPrefillData,
@@ -366,10 +424,12 @@ def _consume_prefill_blocks(
     topk: int,
     blocks: torch.Tensor,
     block_size: int,
+    batched: bool = False,
 ) -> torch.Tensor:
     selected = data.empty_selection(topk)
+    consume_tile = _consume_tile_blocks_batched if batched else _consume_tile_blocks
     for tile, logits in score_tiles(data, kv, width_align=block_size):
-        _consume_tile_blocks(
+        consume_tile(
             data=data,
             tile=tile,
             logits=logits,
@@ -406,6 +466,27 @@ def _consume_tile_blocks(
         out[rows] = torch.where(positions >= 0, positions + starts[rows, None], -1).to(
             torch.int32
         )
+
+
+def _consume_tile_blocks_batched(
+    *,
+    data: DeepGEMMPrefillData,
+    tile: slice,
+    logits: torch.Tensor,
+    blocks: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+) -> None:
+    """``_consume_tile_blocks`` as one ``topk_among_blocks`` over the whole tile, bit
+    for bit. Every request already gathers ``blocks.shape[1]`` blocks with the same
+    ``k``; a request's narrower slice only changes the clamp of ids past its blocks,
+    which the causal mask drops either way (they start at or past its length). Rows
+    of a request with nothing visible keep ``-1``: their length is 0."""
+    positions = topk_among_blocks(
+        logits, data.compress_lens[tile], blocks, out.shape[1], block_size=block_size
+    )
+    starts = data.request_starts[tile]
+    out.copy_(torch.where(positions >= 0, positions + starts[:, None], -1))
 
 
 def _unshard_rows(part: torch.Tensor, rows: slice, num_rows: int) -> torch.Tensor:
