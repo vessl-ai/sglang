@@ -1517,6 +1517,10 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Opt-in: each attention-TP rank scores a contiguous share of the prefill
+    # indexer rows (logits + top-k) and the ranks all-gather the top-k indices.
+    SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
+    SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written

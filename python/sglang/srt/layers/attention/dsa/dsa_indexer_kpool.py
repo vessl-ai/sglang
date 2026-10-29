@@ -14,7 +14,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     rotate_activation,
 )
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.kpool_plan import IndexerRowSplit
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -965,12 +967,14 @@ class IndexerKPool(MultiPlatformOp):
         out_rows=None,
         page_table_row_index=None,
         clean_logits: bool = True,
+        row_split: Optional[IndexerRowSplit] = None,
     ) -> torch.Tensor:
         """fp8_mqa_logits + kpool topk, chunked over q rows when the logits buffer
         would not fit. Returns exactly what `_topk_from_kpool_logits` returns."""
         n_rows = q_rows.shape[0]
+        lo, hi = (0, n_rows) if row_split is None else (row_split.lo, row_split.hi)
         need_chunk, logits_budget_bytes = self._should_chunk_mqa_logits(
-            n_rows, num_k, q_rows.device
+            hi - lo, num_k, q_rows.device
         )
 
         def _topk(logits, sl):
@@ -997,19 +1001,20 @@ class IndexerKPool(MultiPlatformOp):
             )
 
         if not need_chunk:
+            sl = slice(lo, hi)
             logits = deep_gemm.fp8_mqa_logits(
-                q_rows.contiguous(),
+                q_rows[sl].contiguous(),
                 kv_fp8,
-                weight_rows.contiguous(),
-                ks,
-                ke,
+                weight_rows[sl].contiguous(),
+                ks[sl],
+                ke[sl],
                 clean_logits=clean_logits,
             )
-            result = _topk(logits, slice(0, n_rows))
+            result = _topk(logits, sl)
         else:
             bytes_per_row = num_k * self._MQA_LOGITS_BYTES_PER_ELEM
             max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-            max_rows = min(max_rows, n_rows)
+            max_rows = min(max_rows, hi - lo)
             live_free_mem_gib = torch.cuda.mem_get_info(q_rows.device)[0] / 2**30
             logger.warning(
                 "[R13-MARGIN] chunking mqa logits: rows=%d num_k=%d "
@@ -1023,9 +1028,9 @@ class IndexerKPool(MultiPlatformOp):
                 max_rows,
             )
             parts = []
-            start = 0
-            while start < n_rows:
-                end = min(start + max_rows, n_rows)
+            start = lo
+            while start < hi:
+                end = min(start + max_rows, hi)
                 sl = slice(start, end)
                 logits_chunk = deep_gemm.fp8_mqa_logits(
                     q_rows[sl].contiguous(),
@@ -1039,6 +1044,13 @@ class IndexerKPool(MultiPlatformOp):
                 del logits_chunk
                 start = end
             result = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+
+        if row_split is not None:
+            gathered = result.new_empty((n_rows, result.shape[1]))
+            get_attn_tp_group().all_gatherv(
+                result, sizes=row_split.rows_per_rank, output=gathered
+            )
+            result = gathered
 
         if out_rows is not None and out_rows != result.shape[0]:
             padded = torch.full(
@@ -1134,6 +1146,7 @@ class IndexerKPool(MultiPlatformOp):
                 out_rows=total_q,
                 page_table_row_index=page_table_row_index_all,
                 clean_logits=True,
+                row_split=plan.row_split,
             )
 
         return self._topk_from_kpool_logits(
