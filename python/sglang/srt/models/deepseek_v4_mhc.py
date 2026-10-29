@@ -602,6 +602,12 @@ def _sm90_fused_post_combine() -> bool:
     )
 
 
+def _fused_post_combine_min_rows() -> int:
+    """The fused post + combine + norm kernel's lower row bound: 4096, or what
+    SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS sets for small prefill steps."""
+    return max(1, min(4096, envs.SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS.get()))
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -642,7 +648,7 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and 4096 <= y.shape[0] <= 65536
+        and _fused_post_combine_min_rows() <= y.shape[0] <= 65536
         and (get_platform().is_blackwell or _sm90_fused_post_combine())
         and cfg.hidden == 5120
         and cfg.mult == 4

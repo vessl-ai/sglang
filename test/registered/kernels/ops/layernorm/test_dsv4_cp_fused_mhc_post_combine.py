@@ -10,7 +10,9 @@ stays unfused):
 * switch on, CP: the fused kernel runs, its output equals the non-CP fused path bit for bit,
   the rebuilt residual equals the unfused path bit for bit and the normed rows are within
   1 bf16 ulp of it (the kernel's documented rounding);
-* switch off, CP: the unfused path, as before.
+* switch off, CP: the unfused path, as before;
+* SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS below 4096: small steps take the kernel
+  too (residual bit-identical, normed within 1 bf16 ulp of mhc_post + hc_combine + RMSNorm).
 """
 
 import sys
@@ -70,7 +72,7 @@ def _layer(cp_prefill: bool, weight: torch.Tensor):
     return model_mhc.HcSubLayer(cfg, unused, unused, unused, norm), boundary, next_hc
 
 
-def _run(monkeypatch, m: int, cp_prefill: bool, switch: bool):
+def _run(monkeypatch, m: int, cp_prefill: bool, switch: bool, min_rows: int = 4096):
     import sglang.kernels.ops.layernorm.mhc as kernel_mhc
     from sglang.srt.environ import envs
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
@@ -84,6 +86,7 @@ def _run(monkeypatch, m: int, cp_prefill: bool, switch: bool):
     with (
         envs.SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE.override(True),
         envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.override(switch),
+        envs.SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS.override(min_rows),
     ):
         state = model_mhc._post_fusion(hc, y, residual, coefficients, boundary)
     fused = isinstance(state.input, model_mhc.HcNormed)
@@ -115,6 +118,24 @@ def test_cp_without_switch_or_below_4096_stays_unfused(monkeypatch, m):
     fused, residual, normed, ref_residual, ref_normed = _run(monkeypatch, m, True, switch)
     assert not fused
     assert torch.equal(residual, ref_residual) and torch.equal(normed, ref_normed)
+
+
+@pytest.mark.parametrize("m", [1, 32, 128, 1728, 4095])
+@pytest.mark.parametrize("cp_prefill", [True, False])
+def test_min_rows_extends_the_fused_kernel_to_small_steps(monkeypatch, m, cp_prefill):
+    """SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS=1: a 1-request CP4 step (1,728 rows
+    per rank) and the late-layer tails take the fused kernel; below 4096 rows the unfused
+    path is mhc_post + hc_combine + RMSNorm (or the <= 96-row combine + norm)."""
+    fused, residual, normed, ref_residual, ref_normed = _run(
+        monkeypatch, m, cp_prefill, cp_prefill, min_rows=1
+    )
+    assert fused
+    assert torch.equal(residual, ref_residual)
+    diff = (normed.float() - ref_normed.float()).abs()
+    assert (diff <= _bf16_ulp(ref_normed)).all(), diff.max().item()
+    assert (normed != ref_normed).float().mean().item() < 1e-3
+    fused, *_ = _run(monkeypatch, m, cp_prefill, cp_prefill, min_rows=m + 1)
+    assert not fused
 
 
 if __name__ == "__main__":

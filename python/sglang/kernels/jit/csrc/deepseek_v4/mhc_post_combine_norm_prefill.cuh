@@ -164,7 +164,9 @@ struct MhcPostCombineNormPrefill {
     TensorMatcher({m, 4}).with_dtype<float>().with_device(dev).verify(post).verify(pre);
     TensorMatcher({m, 4, 4}).with_dtype<float>().with_device(dev).verify(comb);
     TensorMatcher({5120}).with_dtype<bf16_t>().with_device(dev).verify(weight);
-    CHECK_HOST(m.unwrap() >= 4096 && m.unwrap() <= 65536) << "prefill rows must be in [4096, 65536]";
+    // INF-681 k-qcp: one CTA per row works for any row count; the callers bound it
+    // (4096 rows unless SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS lowers it).
+    CHECK_HOST(m.unwrap() >= 1 && m.unwrap() <= 65536) << "prefill rows must be in [1, 65536]";
     for (const auto* ptr :
          {x.data_ptr(), residual.data_ptr(), weight.data_ptr(), residual_out.data_ptr(), output.data_ptr()}) {
       CHECK_HOST(reinterpret_cast<uintptr_t>(ptr) % 16 == 0) << "BF16 pointers must be 16-byte aligned";

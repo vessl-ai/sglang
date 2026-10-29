@@ -1666,6 +1666,13 @@ class Envs:
     #   SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE is set. Same numerics as that switch on
     #   TP4: residual bit-identical, normed rows within 1 bf16 ulp of the unfused path.
     SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # - FUSED_MHC_POST_COMBINE_MIN_ROWS: the fewest rows the fused post + combine + RMSNorm
+    #   path takes (4096 = upstream; clamped to [1, 4096]). Below 4096 the unfused path is
+    #   mhc_post + hc_combine + RMSNorm (three launches, ~0.5 ms host per boundary at a
+    #   1-request CP4 step), which this replaces with one; the normed rows then round like
+    #   the fused kernel (within 1 bf16 ulp of the unfused path), the residual is
+    #   bit-identical. Prefill servers only: a decoder's verify rows would take it too.
+    SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS = EnvInt(4096)
     # - WO_B_FUSED_ACT_QUANT: with SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128 and attention TP 1
     #   (CP4 prefill), quantize wo_a's grouped output [T, G, R] for wo_b straight from the
     #   einsum's buffer (layers/quantization/dsv4_prefill_qcp.py) instead of flatten(1)'s
