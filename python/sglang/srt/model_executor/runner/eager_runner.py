@@ -406,18 +406,37 @@ class EagerRunner(BaseRunner):
         # DSpark aux capture is on, else it overrides the packed aux.
         if aux_hidden_states is not None and isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
-        # DSpark aux tensors ride the same CP token split; gather them the same way.
-        if aux_hidden_states is not None:
-            if isinstance(aux_hidden_states, torch.Tensor):
-                aux_hidden_states = cp_gather_after_forward(
-                    aux_hidden_states, forward_batch, stream
-                )
-            else:
-                aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
-                    for aux in aux_hidden_states
-                ]
+        # Decoder SWA bounded replay with DSpark capture returns only the replay
+        # tail's rows; they follow the tail's own CP layout, not the extend's.
+        tail = None
+        if aux_hidden_states is not None and hasattr(
+            model, "cp_logits_late_layer_tail"
+        ):
+            tail = model.cp_logits_late_layer_tail(forward_batch)
+        saved_cp_metadata = forward_batch.attn_cp_metadata
+        if tail is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+        try:
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            # DSpark aux tensors ride the same CP token split; gather them the same way.
+            if aux_hidden_states is not None:
+                if isinstance(aux_hidden_states, torch.Tensor):
+                    aux_hidden_states = cp_gather_after_forward(
+                        aux_hidden_states, forward_batch, stream
+                    )
+                else:
+                    aux_hidden_states = [
+                        cp_gather_after_forward(aux, forward_batch, stream)
+                        for aux in aux_hidden_states
+                    ]
+        finally:
+            forward_batch.attn_cp_metadata = saved_cp_metadata
+        if tail is not None:
+            return model.cp_logits_on_late_layer_tail(
+                tail, forward_batch, hidden_states, aux_hidden_states
+            )
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):

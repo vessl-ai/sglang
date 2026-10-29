@@ -4940,6 +4940,38 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         return output
 
+    def cp_logits_late_layer_tail(self, forward_batch: ForwardBatch):
+        """Under prefill CP with DSpark capture, the decoder-replay tail whose rows
+        the model body returned (the eager CP runner gathers with its layout)."""
+        if (
+            not self.capture_aux_hidden_states
+            or self.model.late_layer_start is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        assert tail is None or tail.global_token_indices is not None
+        return tail
+
+    def cp_logits_on_late_layer_tail(
+        self, tail, forward_batch: ForwardBatch, hidden_states, aux_hidden_states
+    ):
+        """Logits over the gathered tail rows, as forward() does without CP."""
+        indices = tail.global_token_indices
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = self.logits_processor(
+            forward_batch.input_ids[indices],
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+        )
+        output.hidden_states_token_indices = indices
+        return output
+
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         if _FP8_WO_A_UE8M0:
             from deep_gemm import transform_sf_into_required_layout
