@@ -1962,6 +1962,31 @@ class Envs:
     SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS = EnvStr("")
     # Only arm the hooks for extend batches with at least this many new tokens.
     SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS = EnvInt(0)
+    # INF-681 k-pcomm levers for the prefill-CP (attention CP x MoE TP) MoE collectives.
+    # All default off.
+    # - CP_SHARED_EXPERT_LOCAL: with SGLANG_SHARED_EXPERT_TP1=1 (replicated shared
+    #   expert), compute the shared expert on this rank's own CP shard (T/cp rows, full
+    #   intermediate) before the MoE all-gather and add it to the reduce-scattered shard,
+    #   instead of on the gathered T rows with TP-split weights (same FLOPs per rank).
+    #   The shared expert then no longer needs the all-gather. Numerics: the shared
+    #   output is summed once in fp32 over the full intermediate and added after the
+    #   reduce-scatter, instead of as 4 bf16 partials inside it.
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL = EnvBool(False)
+    # - CP_SHARED_EXPERT_OVERLAP: run that local shared expert on a side stream so it
+    #   overlaps the MoE all-gather (and the router / routed experts), joined before its
+    #   add. Eager steps with at least _MIN_ROWS local rows only; inline otherwise.
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS = EnvInt(1024)
+    #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
+    #   (NCCL's ring all-gather / reduce-scatter hold 24 SMs at the CP4 sizes); 0 = no cap.
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
+    # - W4A8_PREFETCH_AFTER_COMBINE: with the overlapped W4A8 weight prefetch
+    #   (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS > 0), launch the next layer's MXFP4 -> FP8
+    #   conversion right after the MoE-exit reduce-scatter instead of right after the
+    #   top-k sum, so the collective runs alone (the conversion's HBM traffic and SMs slow
+    #   it ~1.4-1.9x) and the conversion overlaps the next layer's attention side. Same
+    #   kernels and bits; only the launch point moves.
+    SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
