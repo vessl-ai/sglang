@@ -155,6 +155,21 @@ def candidate_block_mask(
     return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+def candidate_block_keep(
+    blocks: torch.Tensor, width: int, block_size: int
+) -> torch.Tensor:
+    """A source's block IDs as one flag per block, ``[rows, ceil(width /
+    block_size) + 1]`` bool (the last column absorbs the ``-1`` padding):
+    ``candidate_block_mask`` without expanding each flag to ``block_size``
+    positions. The paged decode scorer reads it with ``mask_block=block_size``."""
+    num_blocks = (width + block_size - 1) // block_size
+    keep = torch.zeros(
+        (*blocks.shape[:-1], num_blocks + 1), dtype=torch.bool, device=blocks.device
+    )
+    keep.scatter_(-1, blocks.to(torch.int64).masked_fill(blocks < 0, num_blocks), True)
+    return keep
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],

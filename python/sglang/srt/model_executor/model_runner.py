@@ -1841,6 +1841,7 @@ class ModelRunner:
                     split_forward_count,
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        self._maybe_log_step_memory(forward_batch)
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
         if (
@@ -1880,6 +1881,26 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    def _maybe_log_step_memory(self, forward_batch: ForwardBatch) -> None:
+        min_tokens = envs.SGLANG_LOG_STEP_MEMORY_MIN_TOKENS.get()
+        if min_tokens <= 0 or self.is_draft_worker or not torch.cuda.is_available():
+            return
+        if not forward_batch.forward_mode.is_extend():
+            return
+        num_tokens = forward_batch.input_ids.shape[0]
+        if num_tokens < min_tokens:
+            return
+        gib = 1 << 30
+        logger.info(
+            "step memory: tokens=%d allocated_peak=%.2f GiB allocated=%.2f GiB "
+            "reserved=%.2f GiB",
+            num_tokens,
+            torch.cuda.max_memory_allocated() / gib,
+            torch.cuda.memory_allocated() / gib,
+            torch.cuda.memory_reserved() / gib,
+        )
+        torch.cuda.reset_peak_memory_stats()
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch

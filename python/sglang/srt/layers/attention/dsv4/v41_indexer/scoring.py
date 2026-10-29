@@ -510,8 +510,10 @@ def decode_scores(
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
     compute_topk_plan: bool = True,
+    candidate_mask_block: int = 1,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
-    """None when there is no row, or nothing visible yet."""
+    """None when there is no row, or nothing visible yet. ``candidate_mask`` holds
+    one flag per ``candidate_mask_block`` positions (Hopper paged path only)."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -551,6 +553,7 @@ def decode_scores(
             ratio,
             candidate_mask,
             rows_per_request=inputs.rows_per_request,
+            mask_block=candidate_mask_block,
         )
         return PagedDecodeScores(
             bs=bs,
