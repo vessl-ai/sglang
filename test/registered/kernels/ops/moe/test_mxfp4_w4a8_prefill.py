@@ -3,8 +3,10 @@ against fp32 references, the side-stream prefetch against in-line conversion (al
 either stream delayed, so a missing event wait would corrupt the output), the refusal
 under CUDA graph capture, and the switch precedence in Mxfp4MarlinMoEMethod.
 INF-681: the word conversion kernel (bit-identical to the byte kernel, also sliced), the
-sliced prefetch after the top-k sum (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS) and the late-layer
-W4A16 selection (SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER)."""
+sliced prefetch after the top-k sum (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS), the late-layer
+W4A16 selection (SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER), and the small-step path that
+reads the MXFP4 weights directly (SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS): its routing, output
+against the references, run-to-run identity and CUDA graph capture."""
 
 import sys
 from types import SimpleNamespace
@@ -14,7 +16,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=150, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
@@ -346,6 +348,105 @@ def test_sorted_sum_matches_scattered_sum(rows):
     x, ids, wts = _inputs(rows, 8)
     ids[0, -1] = -1
     assert torch.equal(got(x, ids, wts), ref(x, ids, wts))
+
+
+@pytest.mark.parametrize("br", [64, 128])
+def test_direct_route(br):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import _direct_route
+
+    _, ids, wts = _inputs(777, 9)
+    ids[3, 2] = -1
+    ids[10, :] = -1
+    r = _direct_route(ids, wts, E, br, 2 * br)
+    flat = ids.flatten().long()
+    valid = flat >= 0
+    counts = torch.bincount(flat[valid], minlength=E)
+    offs = torch.zeros(E + 1, dtype=torch.long, device="cuda")
+    offs[1:] = counts.cumsum(0)
+    assert torch.equal(r.offs.long(), offs)
+    pos = r.pos.long()
+    assert torch.equal(pos[~valid], torch.full_like(pos[~valid], -1))
+    p = pos[valid]
+    # Every valid slot has its own row inside its expert's range.
+    assert torch.equal(torch.sort(p).values, torch.arange(int(valid.sum()), device="cuda"))
+    assert bool(((p >= offs[flat[valid]]) & (p < offs[flat[valid] + 1])).all())
+    slots = torch.nonzero(valid).flatten()
+    assert torch.equal(r.gather_indx[p].long(), slots // TOPK)
+    assert torch.equal(r.sorted_weights[p], wts.flatten()[slots])
+    for sched, rows in ((r.sched13, br), (r.sched2, 2 * br)):
+        items = sched[sched >= 0].long()
+        expect = torch.cat(
+            [
+                (e << 16) + torch.arange((int(c) + rows - 1) // rows, device="cuda")
+                for e, c in enumerate(counts.tolist())
+            ]
+        )
+        assert torch.equal(items, expect)
+        assert bool((sched[items.numel() :] == -1).all())
+
+
+def _direct_experts(seed, threshold=1 << 30):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w = _weights(seed)
+    return w, Mxfp4W4A8PrefillExperts(
+        *w, LIMIT, prefetch=False, small_step_rows=threshold
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 37, 768, 2048])
+def test_direct_matches_references(rows):
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w, direct = _direct_experts(80)
+    copy_path = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False)
+    x, ids, wts = _inputs(rows, 10)
+    ids[0, -1] = -1
+    y = direct(x, ids, wts)
+    native = _reference(*w, x, ids, wts, native_fp8=True)
+    bf16 = _reference(*w, x, ids, wts, native_fp8=False)
+    assert torch.isfinite(y).all()
+    assert _rel(y, native) < 0.025
+    assert _rel(y, bf16) < 0.08
+    assert _rel(y, copy_path(x, ids, wts)) < 0.025
+    # The counting sort's row order inside an expert varies; the output must not.
+    assert torch.equal(direct(x, ids, wts), y)
+
+
+def test_direct_only_below_threshold():
+    _, experts = _direct_experts(81, threshold=100)
+    sc = experts.scratch
+    sc.holder = None
+    x, ids, wts = _inputs(100, 11)
+    experts(x, ids, wts)
+    assert sc.holder is None  # direct: the FP8 scratch is not touched
+    x, ids, wts = _inputs(101, 11)
+    experts(x, ids, wts)
+    assert sc.holder is experts  # copy path
+
+
+def test_direct_cuda_graph_replay():
+    """The direct path captures; replays on new activations and new routing match eager."""
+    _, experts = _direct_experts(82)
+    x, ids, wts = _inputs(512, 12)
+    sx, sids, swts = x.clone(), ids.clone(), wts.clone()
+    experts(sx, sids, swts)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = experts(sx, sids, swts)
+    for seed in (13, 14):
+        x2, ids2, wts2 = _inputs(512, seed)
+        ids2[5, 0] = -1
+        sx.copy_(x2)
+        sids.copy_(ids2)
+        swts.copy_(wts2)
+        graph.replay()
+        assert torch.equal(out, experts(x2, ids2, wts2))
 
 
 @pytest.mark.parametrize(

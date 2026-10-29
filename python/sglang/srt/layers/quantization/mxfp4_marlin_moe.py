@@ -358,6 +358,7 @@ class Mxfp4MarlinMoEMethod:
             prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
             prefetch_chunks=envs.SGLANG_DSV4_W4A8_PREFETCH_CHUNKS.get(),
             sorted_sum=envs.SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.get(),
+            small_step_rows=envs.SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS.get(),
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 

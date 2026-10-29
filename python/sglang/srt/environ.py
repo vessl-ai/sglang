@@ -1687,6 +1687,12 @@ class Envs:
     # sum gathers each token's rows by position. Same output bit for bit; on H200 at 32k
     # rows W2 1.90 vs 2.16 ms and the sum 0.56 vs 0.53 ms.
     SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM = EnvBool(False)
+    # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE: MoE calls with at most this many rows (tokens
+    # on this rank) skip the per-layer MXFP4 -> FP8 weight copy (~1.3 ms per layer at any
+    # row count on H200) and run W4A8 GEMMs that expand the MXFP4 weights in registers.
+    # Same numerics scheme (exact FP8 weights, FP8 activations with a power-of-2 row
+    # scale), no extra weight memory, no host sync (CUDA-graph safe). 0 = off.
+    SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS = EnvInt(0)
     # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE and --enable-decoder-swa-bounded-replay: MoE
     # layers with id >= this value skip the W4A8 path and run W4A16 experts that read
     # the MXFP4 weights directly. Set it to the first layer past the last kv_source layer
