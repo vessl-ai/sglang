@@ -41,6 +41,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.quantization import dsv4_prefill_qcp as _qcp
+
 _LUT: dict[torch.device, torch.Tensor] = {}
 
 # A FP4 nibble scaled by 2^d with d in [_MIN_SHIFT, _MAX_SHIFT] is a normal e4m3 number.
@@ -340,6 +342,13 @@ def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
         down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
     )
     return out
+
+
+def _qcp_take_shared_add(runner, hidden_states):
+    # SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM (layers/quantization/dsv4_prefill_qcp.py)
+    if getattr(runner, "qcp_shared_add", None) is None:
+        return None
+    return _qcp.take_shared_add(runner, *hidden_states.shape)
 
 
 # --- Small steps: W4A8 GEMMs that read the MXFP4 weights directly (no FP8 copy) ---------
@@ -900,6 +909,9 @@ class Mxfp4W4A8PrefillExperts:
             gather=False,
             gamma=True,
         )
+        fold = _qcp_take_shared_add(self, hidden_states)
+        if fold is not None:  # INF-681 k-qcp: shared-expert add in the top-k sum
+            return _qcp.topk_sum_by_pos_add(down, routing.pos, fold[0], top_k, fold[1])
         return _topk_sum_by_pos(down, routing.pos, torch.empty_like(hidden_states), top_k)
 
     def _single_launch(self) -> int:
@@ -1019,7 +1031,12 @@ class Mxfp4W4A8PrefillExperts:
         overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
         if self.prefetch and not overlapped:
             self._prefetch_next(self._single_launch())
-        if self.sorted_sum:
+        fold = _qcp_take_shared_add(self, hidden_states) if self.sorted_sum else None
+        if fold is not None:  # INF-681 k-qcp: shared-expert add in the top-k sum
+            output = _qcp.gather_topk_sum_add(
+                down, routing.combine_indx, fold[0], top_k, fold[1]
+            )
+        elif self.sorted_sum:
             _gather_topk_sum(down, routing.combine_indx, output, top_k)
         else:
             moe_topk_sum(down.view(num_tokens, top_k, -1), output)

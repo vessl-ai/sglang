@@ -1666,6 +1666,17 @@ class Envs:
     #   SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE is set. Same numerics as that switch on
     #   TP4: residual bit-identical, normed rows within 1 bf16 ulp of the unfused path.
     SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # - WO_B_FUSED_ACT_QUANT: with SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128 and attention TP 1
+    #   (CP4 prefill), quantize wo_a's grouped output [T, G, R] for wo_b straight from the
+    #   einsum's buffer (layers/quantization/dsv4_prefill_qcp.py) instead of flatten(1)'s
+    #   contiguous copy followed by the 1x128 quant. Bit-identical (same q and scales,
+    #   same DeepGEMM call).
+    SGLANG_OPT_DSV4_WO_B_FUSED_ACT_QUANT = EnvBool(False)
+    # - MOE_SHARED_ADD_IN_TOPK_SUM: the W4A8 prefill experts' sorted top-k sum
+    #   (SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM) adds the shared expert's output in its
+    #   epilogue instead of the separate shared.add_(routed, alpha) over [T, hidden].
+    #   Bit-identical (the routed sum is rounded to bf16 before the add, as before).
+    SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM = EnvBool(False)
     # INF-681 k-fuse-p. Sparse prefill: copy each request's compressed length to the
     # device from pinned memory without blocking, instead of torch.tensor(list,
     # device=cuda), whose pageable copy waits for the whole stream to drain. Removes
