@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    dsv41_dspark_attn_tp_compatible,
     filter_kv_indices_for_cp_rank,
     get_dsv41_spec_layout,
 )
@@ -1215,19 +1216,21 @@ class CommonKVManager(BaseKVManager):
                     "layout. Upgrade both servers together."
                 )
 
-            decode_tp_size_aligns_prefill_world_size = (
-                info.attn_cp_size > 1
-                and (self.is_mla_backend or self.is_hybrid_mla_backend)
-                and self.attn_cp_size == 1
-                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
-            )
-            if (
-                info.attn_tp_size != self.attn_tp_size
-                and not decode_tp_size_aligns_prefill_world_size
+            if not dsv41_dspark_attn_tp_compatible(
+                prefill_attn_tp=info.attn_tp_size,
+                prefill_attn_cp=info.attn_cp_size,
+                decode_attn_tp=self.attn_tp_size,
+                decode_attn_cp=self.attn_cp_size,
+                mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
+                allow_tp_prefill_dp_decode=(
+                    envs.SGLANG_OPT_DSV4_PD_TP_PREFILL_DP_DECODE.get()
+                ),
             ):
                 raise RuntimeError(
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "servers (including prefill CP ranks for MLA); a CP-1 prefill "
+                    "may feed an attention-TP-1 decode only with "
+                    "SGLANG_OPT_DSV4_PD_TP_PREFILL_DP_DECODE=1"
                 )
 
         # Every send path rejects head-sharded MXFP8 block scales across
