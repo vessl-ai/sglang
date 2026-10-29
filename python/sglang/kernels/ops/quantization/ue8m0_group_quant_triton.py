@@ -42,7 +42,9 @@ def _ue8m0_group_quant_kernel(
     amax = tl.maximum(tl.max(tl.abs(xg), axis=2), 1e-10)
     # ceil(log2(amax / 448)) from the exponent and mantissa bits, as the CUDA kernel.
     bits = (amax * (1.0 / 448.0)).to(tl.uint32, bitcast=True)
-    exp = ((bits >> 23) & 0xFF).to(tl.int32) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    exp = (
+        ((bits >> 23) & 0xFF).to(tl.int32) - 127 + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    )
     scale_inv = ((exp + 127) << 23).to(tl.float32, bitcast=True)
     scale = ((127 - exp) << 23).to(tl.float32, bitcast=True)
     q = xg * scale[:, :, None]
