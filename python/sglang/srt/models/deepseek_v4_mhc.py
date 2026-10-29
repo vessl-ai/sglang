@@ -545,7 +545,9 @@ def can_fuse_post(cfg: HcConfig) -> bool:
     parallel layout.
 
     The capability half of the decision; which token ranges should take it, and what
-    batch-invariant mode should do about it, are the caller's policy.
+    batch-invariant mode should do about it, are the caller's policy. This covers the
+    fused post with a collective (all-reduce) only; the collective-free fused post +
+    combine + norm in _post_fusion has its own conditions (and also runs on SM90).
     """
     return (
         get_platform().is_blackwell
@@ -583,6 +585,20 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
         and get_platform().is_sm100
         and not cfg.cp_prefill
+    )
+
+
+def _sm90_fused_post_combine() -> bool:
+    """Hopper opt-in to the fused post + combine + RMSNorm prefill kernel. It rounds
+    the normed output differently from the unfused SM90 path (up to 1 bf16 ulp) and
+    only from 4096 rows on, so batch-invariant mode keeps the unfused path, like the
+    SM90 fused combine."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return (
+        get_platform().is_sm90
+        and envs.SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE.get()
+        and not is_batch_invariant_mode_enabled()
     )
 
 
@@ -626,8 +642,8 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and get_platform().is_blackwell
         and 4096 <= y.shape[0] <= 65536
+        and (get_platform().is_blackwell or _sm90_fused_post_combine())
         and cfg.hidden == 5120
         and cfg.mult == 4
         and get_parallel().attn_dp_size == 1
