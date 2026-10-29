@@ -1318,23 +1318,29 @@ class TestDeepGemmPrefillChoice(CustomTestCase):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
 
         choose = v41_indexer._use_deep_gemm_prefill.__wrapped__
-        # (sm100, sm90, torch env, cp size) -> DeepGEMM prefill
+        # (sm100, sm90, torch env, cp size, SM90 CP opt-in) -> DeepGEMM prefill
         cases = {
-            (True, False, False, 1): True,
-            (True, False, True, 1): False,
+            (True, False, False, 1, False): True,
+            (True, False, True, 1, False): False,
             # SM100 CP rows are served only by DeepGEMM: the env is ignored.
-            (True, False, False, 2): True,
-            (True, False, True, 2): True,
-            (False, True, False, 1): True,
-            (False, True, True, 1): False,
-            # SM90 CP stays on the torch path.
-            (False, True, False, 2): False,
-            (False, True, True, 2): False,
+            (True, False, False, 2, False): True,
+            (True, False, True, 2, False): True,
+            (False, True, False, 1, False): True,
+            (False, True, True, 1, False): False,
+            # SM90 CP stays on the torch path unless opted in.
+            (False, True, False, 2, False): False,
+            (False, True, True, 2, False): False,
+            (False, True, False, 2, True): True,
+            # The torch switch still wins over the CP opt-in.
+            (False, True, True, 2, True): False,
             # Neither (e.g. SM8x or ROCm): torch.
-            (False, False, False, 1): False,
+            (False, False, False, 1, False): False,
+            (False, False, False, 2, True): False,
         }
-        for (sm100, sm90, torch_env, cp), expected in cases.items():
-            with self.subTest(sm100=sm100, sm90=sm90, torch_env=torch_env, cp=cp):
+        for (sm100, sm90, torch_env, cp, cp_opt_in), expected in cases.items():
+            with self.subTest(
+                sm100=sm100, sm90=sm90, torch_env=torch_env, cp=cp, cp_opt_in=cp_opt_in
+            ):
                 with (
                     patch.object(v41_indexer, "is_sm100_or_newer", lambda: sm100),
                     patch.object(v41_indexer, "has_dense_fp4_indexer", lambda: True),
@@ -1345,6 +1351,7 @@ class TestDeepGemmPrefillChoice(CustomTestCase):
                         return_value=SimpleNamespace(attn_cp_size=cp),
                     ),
                     envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.override(torch_env),
+                    envs.SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER.override(cp_opt_in),
                 ):
                     self.assertEqual(choose(), expected)
 
