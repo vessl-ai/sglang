@@ -1647,9 +1647,12 @@ class Envs:
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
     SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
-    # Hopper DeepGEMM linears with UE8M0 activation scales: quantize prefill-sized
-    # activations (>= 256 rows) with a Triton kernel that is bit-identical to
-    # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows.
+    # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
+    # >= 256 rows with a Triton kernel that is bit-identical to
+    # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
+    # 32728 rows only). Meant for prefill servers: the gate looks only at the row
+    # count, so a decoder would also take it for verify batches of >= 256 rows (about
+    # 52 requests x 5 draft rows), unmeasured and inside CUDA graph capture.
     SGLANG_SM90_TRITON_UE8M0_ACT_QUANT = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
