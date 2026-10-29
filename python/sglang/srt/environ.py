@@ -1974,9 +1974,11 @@ class Envs:
     SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL = EnvBool(False)
     # - CP_SHARED_EXPERT_OVERLAP: run that local shared expert on a side stream so it
     #   overlaps the MoE all-gather (and the router / routed experts), joined before its
-    #   add. Eager steps with at least _MIN_ROWS local rows only; inline otherwise.
+    #   add. Eager steps with at least _MIN_ROWS local rows only; inline otherwise (on the
+    #   1-request CP4 step, 1,728 rows per rank, the fork/join and the slower overlapped
+    #   all-gather cost more than the ~0.15 ms shared expert it hides).
     SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP = EnvBool(False)
-    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS = EnvInt(1024)
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS = EnvInt(4096)
     #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
     #   (NCCL's ring all-gather / reduce-scatter hold 24 SMs at the CP4 sizes); 0 = no cap.
     SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
