@@ -1645,6 +1645,8 @@ class Envs:
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
+    # Prefill only: the MoE raises under CUDA graph capture, so set it only where
+    # the MoE runs eagerly (a PD prefill server without a prefill CUDA graph).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)

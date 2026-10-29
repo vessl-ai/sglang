@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch.nn import Module
@@ -40,6 +40,44 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         w2_bias=getattr(layer, "w2_weight_bias", None),
         expert_map=expert_map,
         global_num_experts=global_num_experts,
+    )
+
+
+class ExpertRouting(NamedTuple):
+    """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
+
+    expert_counts: torch.Tensor  # [num_experts] int32 slots routed to each expert
+    combine_indx: torch.Tensor  # [slots] int32 slot (token * top_k + k) in sorted order
+    gather_indx: torch.Tensor  # [slots] int32 token of each sorted slot
+    sorted_weights: torch.Tensor  # [slots] top-k weight of each sorted slot
+
+
+def route_slots_by_expert(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int
+) -> ExpertRouting:
+    """Sort the top-k slots by expert without a host sync.
+
+    Masked slots (id -1) contribute nothing: they are routed to expert 0 with weight 0.
+    The sort is stable, so slots of one expert keep token order. Expert ids must be in
+    [-1, num_experts). The per-expert counts use a fixed-size scatter-add histogram:
+    torch.bincount reads its max on the host, which stalls the CPU's kernel launches at
+    every MoE layer and cannot be captured in a CUDA graph.
+    """
+    top_k = topk_ids.shape[1]
+    valid = topk_ids >= 0
+    expert_ids = torch.where(valid, topk_ids, 0).flatten().long()
+    weights = torch.where(valid, topk_weights, 0).flatten()
+    # triton_kernels' own topk needs a power-of-2 top_k, so sort here.
+    combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+    expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    expert_counts.scatter_add_(
+        0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+    )
+    return ExpertRouting(
+        expert_counts=expert_counts,
+        combine_indx=combine_indx,
+        gather_indx=combine_indx // top_k,
+        sorted_weights=weights[combine_indx.long()],
     )
 
 
@@ -281,19 +319,21 @@ class Mxfp4MarlinMoEMethod:
             swiglu_limit_func,
         )
 
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE is prefill-only and does not support "
+                "CUDA graphs; enable it only where the MoE runs eagerly (a PD prefill "
+                "server without a prefill CUDA graph)."
+            )
         num_tokens, top_k = topk_output.topk_ids.shape
         output = torch.empty_like(hidden_states)
         if num_tokens == 0:
             return output
-        # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
-        valid = topk_output.topk_ids >= 0
-        expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
-        weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
-        # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
-        combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+        routing = route_slots_by_expert(
+            topk_output.topk_ids, topk_output.topk_weights, self._tk_num_experts
+        )
         ragged_metadata = make_ragged_tensor_metadata(
-            torch.bincount(expert_ids, minlength=self._tk_num_experts).to(torch.int32),
-            expert_ids.numel(),
+            routing.expert_counts, num_tokens * top_k
         )
         (w13, w13_precision), (w2, w2_precision) = self._tk_weights
         gate_up = matmul(
@@ -301,7 +341,7 @@ class Mxfp4MarlinMoEMethod:
             w13,
             None,
             a_ragged_metadata=ragged_metadata,
-            gather_indx=combine_indx // top_k,
+            gather_indx=routing.gather_indx,
             precision_config=w13_precision,
         )
         activated = gate_up.new_empty(gate_up.shape[0], self._tk_intermediate_size)
@@ -313,9 +353,9 @@ class Mxfp4MarlinMoEMethod:
             w2,
             None,
             a_ragged_metadata=ragged_metadata,
-            scatter_indx=combine_indx,
+            scatter_indx=routing.combine_indx,
             precision_config=w2_precision,
-            gammas=weights[combine_indx.long()],
+            gammas=routing.sorted_weights,
         )
         moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         return output
