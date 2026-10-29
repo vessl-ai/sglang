@@ -1710,6 +1710,24 @@ class Envs:
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)
+    # Hopper decode / verify: split the DeepSeek-V4.1 low-ratio indexer's requests
+    # across the attention TP ranks instead of scoring every row on every rank (the
+    # indexer heads are replicated), then all-gather the selected pool slots. Each
+    # rank keeps its own rows' candidate blocks. Off under attention DP or CP, and
+    # where DeepGEMM serves the decode indexer (SM100).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_SHARD = EnvBool(False)
+    # Hopper decode / verify: hand the candidate consumers the source's kept blocks
+    # as one flag per block instead of materializing a per-position mask over the
+    # whole graph capacity (scores stay bit-identical).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK = EnvBool(False)
+    # With BLOCK_MASK: skip the consumer score tiles (128 positions) no row of a
+    # verify row pair keeps. Pays only when candidates cluster; costs ~10% of the
+    # consumer kernel when every tile is kept (synthetic data).
+    SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP = EnvBool(False)
+    # Hopper paged tensor-core decode indexer: dequantize the fp4 index K with
+    # byte-table (PRMT) lookups in inline PTX instead of per-element integer ops.
+    # Scores stay bit-identical; ~25-28% less kernel time at the verdict shape.
+    SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

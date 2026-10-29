@@ -10,11 +10,13 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
+    candidate_block_keep,
     candidate_block_mask,
     select_candidate_block_ids,
     topk_among_blocks,
 )
 
+from .decode_shard import get_decode_row_sharder
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
@@ -49,6 +51,9 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     rows_per_request: Optional[List[int]] = None
     # Hopper decode materializes this once at the source and reuses it in consumers.
     decode_mask: Optional[torch.Tensor] = None
+    # Positions per decode_mask entry: 1 for the per-position mask, the block size
+    # for SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK's per-block flags.
+    decode_mask_block: int = 1
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
         assert self.rows_per_request is not None, "prefill block ids missing"
@@ -75,6 +80,12 @@ class DenseBlocksBackend:
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        from sglang.srt.environ import envs
+
+        # Only the Hopper paged decode builds and reads decode_mask.
+        self.use_block_mask = envs.SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK.get()
+        # This backend serves decode only where DeepGEMM does not (Hopper).
+        self.decode_sharder = get_decode_row_sharder(use_deep_gemm_decode=False)
 
     def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_prefill:
@@ -92,6 +103,24 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
+        if self.decode_sharder is not None:
+            return self.decode_sharder.run(inputs, self._publish_decode)
+        return self._publish_decode(inputs)
+
+    def consume_decode(
+        self,
+        inputs: DecodeInputs,
+        published: Optional[BlockIds],
+    ) -> None:
+        if self.decode_sharder is not None:
+            # published holds this rank's rows: its source ran on the same shard.
+            self.decode_sharder.run(
+                inputs, lambda local: self._consume_decode(local, published)
+            )
+            return
+        self._consume_decode(inputs, published)
+
+    def _publish_decode(self, inputs: DecodeInputs):
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -104,10 +133,17 @@ class DenseBlocksBackend:
             blocks = amax_topk_blocks(
                 d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
             )
-            published = BlockIds(
-                blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
-            )
+            if self.use_block_mask:
+                published = BlockIds(
+                    blocks=blocks,
+                    decode_mask=candidate_block_keep(blocks, d.lmax, self.block_size),
+                    decode_mask_block=self.block_size,
+                )
+            else:
+                published = BlockIds(
+                    blocks=blocks,
+                    decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
+                )
         else:
             published = BlockIds(
                 blocks=select_candidate_block_ids(
@@ -120,7 +156,7 @@ class DenseBlocksBackend:
         select_decode(inputs, d, inputs.indexer.index_topk)
         return published
 
-    def consume_decode(
+    def _consume_decode(
         self,
         inputs: DecodeInputs,
         published: Optional[BlockIds],
@@ -130,6 +166,9 @@ class DenseBlocksBackend:
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             candidate_mask=published.decode_mask if published is not None else None,
+            candidate_mask_block=(
+                published.decode_mask_block if published is not None else 1
+            ),
         )
         if d is None:
             return
