@@ -3,6 +3,7 @@
 reference (next to Marlin's), CUDA graph capture/replay at every speculative decode
 capture size, and the one-launch expert sort against a stable argsort."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -281,3 +282,7 @@ def test_expert_sort_small_matches_stable_argsort(num_slots, num_experts, top_k)
     assert torch.equal(toks.long(), ref_slots // top_k)
     ref_w = torch.where(ids >= 0, weights, 0).flatten()[ref_slots]
     assert torch.equal(sorted_w, ref_w)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
