@@ -44,6 +44,12 @@ _LUT: dict[torch.device, torch.Tensor] = {}
 # A FP4 nibble scaled by 2^d with d in [_MIN_SHIFT, _MAX_SHIFT] is a normal e4m3 number.
 _MAX_SHIFT = 6
 _MIN_SHIFT = -5
+# Conversion tile: scale blocks (16 packed bytes each) per program.
+_CONVERT_BLOCK = 256
+# An overlapped prefetch (SGLANG_DSV4_W4A8_PREFETCH_CHUNKS > 0) is launched only after a
+# layer with at least this many rows, whose MoE all-reduce is long enough to cover the
+# conversion. A smaller layer keeps the single launch before its top-k sum.
+_OVERLAP_MIN_ROWS = 8192
 
 
 class _Scratch:
@@ -111,13 +117,15 @@ def _mxfp4_to_fp8_kernel(
     SMAX,
     LUT,
     OUT,
+    first_block,
     n_blocks,
     BLOCKS_PER_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # W viewed as [n_blocks, 16] bytes: one 32-element scale block per row of 16 bytes.
+    # This launch converts scale blocks [first_block, n_blocks).
     pid = tl.program_id(0).to(tl.int64)
-    blk = pid * BLOCK + tl.arange(0, BLOCK)
+    blk = first_block + pid * BLOCK + tl.arange(0, BLOCK)
     mask = blk < n_blocks
     j = tl.arange(0, 16)
     b = tl.load(W + blk[:, None] * 16 + j[None, :], mask=mask[:, None], other=0).to(
@@ -131,21 +139,113 @@ def _mxfp4_to_fp8_kernel(
     tl.store(OUT + blk[:, None] * 16 + j[None, :], v.to(tl.int16), mask=mask[:, None])
 
 
-def _mxfp4_to_fp8(w: torch.Tensor, scale: torch.Tensor, smax: torch.Tensor, out):
-    """[E, N, K/2] packed e2m1 + [E, N, K/32] e8m0 -> [E, N, K] e4m3 (scaled by 2^(133 - smax))."""
-    n_blocks = w.numel() // 16
-    block = 256
-    _mxfp4_to_fp8_kernel[(triton.cdiv(n_blocks, block),)](
-        w.view(torch.uint8),
-        scale.view(torch.uint8),
-        smax,
-        _lut(w.device),
-        out.view(torch.int16),
-        n_blocks,
-        scale.shape[-1],
-        block,
-        num_warps=4,
+# e4m3 bytes of the e2m1 magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6 at exponent shift 0, as
+# the two source registers of PTX prmt (byte i of the pair = magnitude code i).
+_PRMT_LUT_LO = tl.constexpr(0x3C383000)
+_PRMT_LUT_HI = tl.constexpr(0x4C484440)
+_WORDS_BLOCK = 1024
+
+
+@triton.jit
+def _prmt(a, b, c):
+    return tl.inline_asm_elementwise(
+        "prmt.b32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        [a, b, c],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
     )
+
+
+@triton.jit
+def _nibbles_to_fp8(x16, dd, lut_lo, lut_hi):
+    """4 e2m1 nibbles (bits 0..15, nibble i = element i) -> 4 e4m3 bytes (byte i).
+    dd = 8 * d + 128 with d the exponent shift of the 32-element block."""
+    mag = _prmt(lut_lo, lut_hi, x16 & 0x7777)
+    # 0x01 in each byte whose magnitude is nonzero (bytes are <= 0x4C: no carries).
+    nz = ((mag + 0x7F7F7F7F) >> 7) & 0x01010101
+    # Add 8d to each nonzero exponent field: +128 keeps every byte positive and below 256,
+    # so bytes do not carry into each other; the xor removes the 128 again.
+    v = (mag + nz * dd) ^ (nz << 7)
+    # Sign: nibble bit 3 -> byte bit 7.
+    t = (x16 & 0xFF) | ((x16 & 0xFF00) << 8)
+    spread = (t & 0x000F000F) | ((t & 0x00F000F0) << 4)
+    return v | ((spread << 4) & -2139062144)  # 0x80808080 as int32
+
+
+@triton.jit
+def _mxfp4_to_fp8_words_kernel(
+    W,
+    SCALE,
+    SMAX,
+    OUT,
+    first_word,
+    n_words,
+    BLOCKS_PER_ROW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Same result as _mxfp4_to_fp8_kernel, bit for bit, but on 32-bit words (8 nibbles,
+    # 4 words per scale block) with the nibble table in registers (prmt) instead of a
+    # per-byte table gather: HBM-bound (~4.1 TB/s on H200) instead of SM-bound (~3.9),
+    # so it keeps its speed beside other kernels on fewer SMs.
+    pid = tl.program_id(0).to(tl.int64)
+    wi = first_word + pid * BLOCK + tl.arange(0, BLOCK)
+    m = wi < n_words
+    w = tl.load(W + wi, mask=m, other=0)
+    blk = wi // 4
+    s = tl.load(SCALE + blk, mask=m, other=0).to(tl.int32)
+    smax = tl.load(SMAX + blk // BLOCKS_PER_ROW, mask=m, other=0)
+    dd = (s - smax + 6) * 8 + 128
+    lut_lo = tl.full([BLOCK], _PRMT_LUT_LO, tl.int32)
+    lut_hi = tl.full([BLOCK], _PRMT_LUT_HI, tl.int32)
+    lo = _nibbles_to_fp8(w & 0xFFFF, dd, lut_lo, lut_hi)
+    hi = _nibbles_to_fp8((w >> 16) & 0xFFFF, dd, lut_lo, lut_hi)
+    tl.store(OUT + wi, (hi.to(tl.int64) << 32) | (lo.to(tl.int64) & 0xFFFFFFFF), mask=m)
+
+
+def _mxfp4_to_fp8(
+    w: torch.Tensor, scale: torch.Tensor, smax: torch.Tensor, out, num_launches: int = 0
+):
+    """[E, N, K/2] packed e2m1 + [E, N, K/32] e8m0 -> [E, N, K] e4m3 (scaled by 2^(133 - smax)).
+
+    num_launches = 0: the INF-674 byte kernel in one launch. num_launches >= 1: the word
+    kernel (same bits) split into that many back-to-back launches on the current stream.
+    One launch takes every SM until all its programs have been dispatched, so a kernel
+    another stream launches meanwhile (e.g. an all-reduce) waits for the whole conversion.
+    Between two launches the hardware can dispatch such a kernel, so it waits for at most
+    one slice and then runs beside the remaining slices.
+    """
+    if num_launches <= 0:
+        n_blocks = w.numel() // 16
+        _mxfp4_to_fp8_kernel[(triton.cdiv(n_blocks, _CONVERT_BLOCK),)](
+            w.view(torch.uint8),
+            scale.view(torch.uint8),
+            smax,
+            _lut(w.device),
+            out.view(torch.int16),
+            0,
+            n_blocks,
+            scale.shape[-1],
+            _CONVERT_BLOCK,
+            num_warps=4,
+        )
+        return out
+    n_words = w.numel() // 4
+    n_programs = triton.cdiv(n_words, _WORDS_BLOCK)
+    per_launch = triton.cdiv(n_programs, num_launches)
+    for first in range(0, n_programs, per_launch):
+        _mxfp4_to_fp8_words_kernel[(min(per_launch, n_programs - first),)](
+            w.view(torch.int32),
+            scale.view(torch.uint8),
+            smax,
+            out.view(torch.int64),
+            first * _WORDS_BLOCK,
+            n_words,
+            scale.shape[-1],
+            _WORDS_BLOCK,
+            num_warps=8,
+        )
     return out
 
 
@@ -197,6 +297,38 @@ def _swiglu_quant(gate_up: torch.Tensor, limit: float):
     return y, s
 
 
+@triton.jit
+def _gather_topk_sum_kernel(
+    Y, POS, OUT, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    # OUT[t] = sum_k Y[POS[t * TOPK + k]] with fp32 accumulation in k order, the same
+    # arithmetic as moe_topk_sum over token-major rows.
+    t = tl.program_id(0).to(tl.int64)
+    o = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    m = o < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        r = tl.load(POS + t * TOPK + k).to(tl.int64)
+        acc += tl.load(Y + r * H + o, mask=m, other=0.0).to(tl.float32)
+    tl.store(OUT + t * H + o, acc.to(tl.bfloat16), mask=m)
+
+
+def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
+    """out[t] = sum over the top-k slots of token t of down_sorted[sorted position of slot],
+    where combine_indx[i] is the slot (token * top_k + k) at sorted position i."""
+    n_slots = combine_indx.numel()
+    pos = torch.empty_like(combine_indx)
+    pos[combine_indx.long()] = torch.arange(
+        n_slots, dtype=combine_indx.dtype, device=combine_indx.device
+    )
+    num_tokens, hidden = out.shape
+    block_h = 1024
+    _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
+    )
+    return out
+
+
 def _fold(scale: torch.Tensor, name: str):
     """Per-output-channel max exponent and the matching fp32 channel scale."""
     s = scale.view(torch.uint8).to(torch.int16)
@@ -217,7 +349,15 @@ class Mxfp4W4A8PrefillExperts:
     them as FP8 x FP8 GEMMs."""
 
     def __init__(
-        self, w13, w13_scale, w2, w2_scale, swiglu_limit: float, prefetch: bool
+        self,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        swiglu_limit: float,
+        prefetch: bool,
+        prefetch_chunks: int = 0,
+        sorted_sum: bool = False,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -226,6 +366,12 @@ class Mxfp4W4A8PrefillExperts:
         self.num_experts = w13.shape[0]
         self.swiglu_limit = swiglu_limit
         self.prefetch = prefetch
+        # > 0: after a large layer, prefetch in this many launches per weight, issued
+        # after the layer's top-k sum so the all-reduce does not queue behind it.
+        self.prefetch_chunks = prefetch_chunks
+        # W2 writes its rows in expert order (no epilogue scatter) and the top-k sum
+        # gathers them by position: same sums, bit for bit, ~12% less W2 time at 32k rows.
+        self.sorted_sum = sorted_sum
         self.successor = None  # the experts observed to run after these ones
         self.scratch = _scratch(w13.device)
         # Reserve the buffers now so KV-cache sizing sees them.
@@ -233,14 +379,21 @@ class Mxfp4W4A8PrefillExperts:
         _lut(w13.device)
         _INSTANCES.append(self)
 
-    def _convert_into_scratch(self):
+    def _convert_into_scratch(self, num_launches: int = 0):
         sc = self.scratch
         for w, scale, smax, buf in (
             (self.w13, self.w13_scale, self.w13_smax, sc.w13),
             (self.w2, self.w2_scale, self.w2_smax, sc.w2),
         ):
             E, N, KH = w.shape
-            _mxfp4_to_fp8(w, scale, smax, buf[: E * N * KH * 2].view(E, N, KH * 2))
+            _mxfp4_to_fp8(
+                w, scale, smax, buf[: E * N * KH * 2].view(E, N, KH * 2), num_launches
+            )
+
+    def _single_launch(self) -> int:
+        """num_launches for a conversion that is not sliced: the word kernel when the
+        overlapped prefetch is on (same bits, faster), else the INF-674 byte kernel."""
+        return 1 if self.prefetch_chunks > 0 else 0
 
     def _fp8_view(self, w, buf):
         E, N, KH = w.shape
@@ -255,13 +408,13 @@ class Mxfp4W4A8PrefillExperts:
             # A prefetch may still be writing the buffers.
             current.wait_event(sc.ready)
         if sc.holder is not self:
-            self._convert_into_scratch()
+            self._convert_into_scratch(self._single_launch())
             sc.holder = self
         if sc.last_called is not None and sc.last_called is not self:
             sc.last_called.successor = self
         sc.last_called = self
 
-    def _prefetch_next(self):
+    def _prefetch_next(self, num_launches: int = 0):
         sc = self.scratch
         nxt = self.successor
         if nxt is None:
@@ -276,7 +429,7 @@ class Mxfp4W4A8PrefillExperts:
         sc.free.record(torch.cuda.current_stream(sc.device))
         with torch.cuda.stream(sc.stream):
             sc.stream.wait_event(sc.free)
-            nxt._convert_into_scratch()
+            nxt._convert_into_scratch(num_launches)
             sc.ready.record(sc.stream)
         sc.holder = nxt
 
@@ -337,7 +490,7 @@ class Mxfp4W4A8PrefillExperts:
                 self._fp8_view(self.w2, self.scratch.w2),
                 None,
                 a_ragged_metadata=ragged_metadata,
-                scatter_indx=routing.combine_indx,
+                scatter_indx=None if self.sorted_sum else routing.combine_indx,
                 precision_config=PrecisionConfig(
                     a_mx_tensor_scale=a_scale,
                     b_mx_tensor_scale=self.w2_channel_scale,
@@ -347,7 +500,18 @@ class Mxfp4W4A8PrefillExperts:
             )
         finally:
             opt_flags._opt_flags_constraints.reset(token)
-        if self.prefetch:
-            self._prefetch_next()
-        moe_topk_sum(down.view(num_tokens, top_k, -1), output)
+        overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
+        if self.prefetch and not overlapped:
+            self._prefetch_next(self._single_launch())
+        if self.sorted_sum:
+            _gather_topk_sum(down, routing.combine_indx, output, top_k)
+        else:
+            moe_topk_sum(down.view(num_tokens, top_k, -1), output)
+        if self.prefetch and overlapped:
+            # Launched before the top-k sum in one piece, the conversion takes every SM
+            # and the main stream's next kernels (shared add, all-reduce) queue behind it
+            # (equal stream priority): p1 measured 0.8 of 57 ms overlapped. Issued after
+            # the top-k sum in slices, the all-reduce gets its SMs after one slice and the
+            # rest of the conversion runs beside it.
+            self._prefetch_next(self.prefetch_chunks)
         return output

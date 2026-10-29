@@ -1677,6 +1677,29 @@ class Envs:
     # weights on a side stream, overlapping the rest of the layer and the next layer's
     # attention (0 = convert in line, before each layer's GEMMs).
     SGLANG_DSV4_W4A8_PREFETCH = EnvBool(True)
+    # With the prefetch: after a layer of >= 8192 rows, issue the next layer's conversion
+    # after the layer's top-k sum in this many launches per weight, so the MoE all-reduce
+    # (24 SMs) waits for one slice instead of the whole conversion and the rest runs beside
+    # it. 0 = one launch before the top-k sum (INF-674 behavior, ~no overlap in-engine).
+    SGLANG_DSV4_W4A8_PREFETCH_CHUNKS = EnvInt(0)
+    # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE: the down-projection GEMM writes its rows in
+    # expert order instead of scattering them token-major in its epilogue, and the top-k
+    # sum gathers each token's rows by position. Same output bit for bit; on H200 at 32k
+    # rows W2 1.90 vs 2.16 ms and the sum 0.56 vs 0.53 ms.
+    SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM = EnvBool(False)
+    # With SGLANG_OPT_DSV4_W4A8_PREFILL_MOE and --enable-decoder-swa-bounded-replay: MoE
+    # layers with id >= this value skip the W4A8 path and run W4A16 experts that read
+    # the MXFP4 weights directly. Set it to the first layer past the last kv_source layer
+    # (21 for DeepSeek-V4.1-Flash): bounded replay runs those layers over at most 128 rows
+    # per request, where converting every expert to FP8 costs more than the GEMMs.
+    # -1 = off. Ignored without bounded replay.
+    SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER = EnvInt(-1)
+    # W4A16 backend of those layers. "marlin": ~0.16 GB more device memory per TP4 layer
+    # than the W4A8 path's raw MXFP4 (H200, 768 rows: 1.03 vs 2.55 ms per layer).
+    # "triton": triton_kernels with the decode tiles of
+    # SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE, ~0.5 GB more per layer (intermediate 576
+    # padded to 640), 0.78 ms per layer.
+    SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND = EnvStr("marlin")
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)
