@@ -1180,6 +1180,8 @@ def _fp4_index_logits_paged_tc_kernel(
     # cores against two rows x H heads at a time ([BLOCK_N, 64] x [64, 2H], even and
     # odd halves), with the same rounding points as _fp4_index_logits_dot.
     PAIRS: tl.constexpr = GROUP // 2
+    # The pair loads below hold at most three row pairs.
+    tl.static_assert(GROUP % 2 == 0 and GROUP <= 6)
     M: tl.constexpr = 2 * H
     offs_i = tl.arange(0, HALF_D)
     offs_m = tl.arange(0, M)
@@ -1309,9 +1311,13 @@ def fp4_index_logits_paged(
     The FP4 decoding and BF16 rounding are shared with the dense-slot path.
     Each run of ``rows_per_request`` consecutive rows must belong to one request
     (verify draft tokens); those rows read and decode each K tile once. For 2, 4
-    or 6 such rows the tile is scored on tensor cores two rows at a time, with the
-    same rounding points and scores (``SGLANG_DSV41_PAGED_INDEXER_NO_TC=1`` keeps
-    the per-row kernel).
+    or 6 such rows, 16 or 32 heads and a power-of-2 page size, the tile is scored
+    on tensor cores two rows at a time (``SGLANG_DSV41_PAGED_INDEXER_NO_TC=1``
+    keeps the per-row kernel). Both kernels round at the same points (bf16 dot,
+    relu, times bf16 weight, bf16, head sum, bf16), but their fp32 accumulation
+    order inside the dot and the head sum is not specified: scores are identical
+    on the measured H200 runs, not by construction, and may differ by bf16 ulps
+    on other hardware or Triton versions (which can reorder top-k ties).
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
@@ -1335,7 +1341,8 @@ def fp4_index_logits_paged(
     if not batch or not max_len:
         return out
     use_tc = _use_paged_tc_kernel(rows_per_request, heads, page_size)
-    # Timed on H200 at 75k-position verify batches (block, chunk tiles, programs/SM).
+    # (block positions, chunk tiles), timed on H200 at 75k-position verify batches;
+    # the programs per SM are set at each launch below.
     block_l, chunk_tiles = (128, 8) if use_tc else (64, 4)
     chunk_len = block_l * chunk_tiles
     group_lens = lens.view(-1, rows_per_request).amax(dim=1).clamp(max=max_len)
