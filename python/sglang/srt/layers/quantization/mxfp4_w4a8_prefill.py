@@ -91,6 +91,18 @@ _INSTANCES: list = []
 _PENDING_PREFETCH: list = [None]
 
 
+# INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_MOE_PIPELINE): the next experts call is the first
+# of two row chunks of the same layer, so it must not prefetch the next layer's weights
+# over the FP8 scratch the second chunk still reads. Consumed by that call.
+_SKIP_PREFETCH: list = [False]
+
+
+def skip_next_prefetch(skip: bool = True) -> None:
+    """Make the next W4A8 prefill experts call leave the weight prefetch to a later call
+    (the second chunk of a pipelined CP MoE); skip_next_prefetch(False) withdraws it."""
+    _SKIP_PREFETCH[0] = skip
+
+
 def fire_pending_prefetch() -> None:
     """Launch the overlapped weight prefetch that SGLANG_OPT_DSV4_W4A8_PREFETCH_AFTER_COMBINE
     held back, if any (the MoE-exit reduce-scatter has just been launched)."""
@@ -1209,6 +1221,8 @@ class Mxfp4W4A8PrefillExperts:
             routing.expert_counts, num_tokens * top_k
         )
 
+        skip_prefetch = _SKIP_PREFETCH[0]  # INF-681 k-pcomm: first chunk of a pipelined MoE
+        _SKIP_PREFETCH[0] = False
         row = _qcp.take_row_quant(self, hidden_states)  # INF-681 k-qcp dual quant
         x_fp8, x_scale = row if row is not None else _row_quant(hidden_states.contiguous())
         self._acquire()
@@ -1259,6 +1273,14 @@ class Mxfp4W4A8PrefillExperts:
                 and num_tokens * top_k >= 128 * self.num_experts
             ):
                 w2_flags = _w2_two_cta_flags()
+                if opt_flags._get_idle_sms() > 0:
+                    # INF-681 k-pcomm: a pipelined CP MoE leaves SMs to the collective
+                    # beside it; the fixed flags would otherwise take every SM.
+                    import dataclasses
+
+                    w2_flags = dataclasses.replace(
+                        w2_flags, idle_sms=opt_flags._get_idle_sms()
+                    )
             with (
                 opt_flags.scoped_opt_flags(w2_flags)
                 if w2_flags is not None
@@ -1280,7 +1302,7 @@ class Mxfp4W4A8PrefillExperts:
         finally:
             opt_flags._opt_flags_constraints.reset(token)
         overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
-        if self.prefetch and not overlapped:
+        if self.prefetch and not overlapped and not skip_prefetch:
             self._prefetch_next(self._single_launch())
         # counting_route implies sorted_sum, so pos is set only on sorted-sum calls.
         fold = _qcp_take_shared_add(self, hidden_states) if self.sorted_sum else None
@@ -1298,7 +1320,7 @@ class Mxfp4W4A8PrefillExperts:
             _gather_topk_sum(down, routing.combine_indx, output, top_k, fuse_add)
         else:
             moe_topk_sum(down.view(num_tokens, top_k, -1), output)
-        if self.prefetch and overlapped:
+        if self.prefetch and overlapped and not skip_prefetch:
             # Launched before the top-k sum in one piece, the conversion takes every SM
             # and the main stream's next kernels (shared add, all-reduce) queue behind it
             # (equal stream priority): p1 measured 0.8 of 57 ms overlapped. Issued after
