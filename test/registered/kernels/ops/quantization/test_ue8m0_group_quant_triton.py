@@ -27,9 +27,24 @@ def test_matches_cuda_v2_bitwise(m, k):
         torch.randn(m, 1, device="cuda") * 3
     )
     x[:, :32] = 0  # an all-zero group takes the eps floor
-    x[0, 40] = 3e4  # saturates at +448 after scaling
+    x[0, 40] = 3e4  # the largest group amax (scale 2^7; ceil scaling never clamps it)
     x = x.bfloat16()
     q_ref, s_ref = sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
     q, s = ue8m0_group_quant_fp8(x, 32)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s, s_ref)
+
+
+@pytest.mark.parametrize("group,k", [(128, 1280), (128, 5120), (32, 2048)])
+def test_matches_cuda_v2_group_sizes_and_strided_rows(group, k):
+    # The switch applies to every UE8M0 model: group 128 (DeepSeek-V3.x blocks) too.
+    # The Triton kernel also takes a row-strided view; v2 needs contiguous input.
+    torch.manual_seed(group + k)
+    wide = torch.randn(130, k + 256, device="cuda").bfloat16()
+    x = wide[:, :k]
+    q_ref, s_ref = sglang_per_token_group_quant_fp8(
+        x.contiguous(), group, scale_ue8m0=True
+    )
+    q, s = ue8m0_group_quant_fp8(x, group)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert torch.equal(s, s_ref)
