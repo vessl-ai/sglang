@@ -1195,7 +1195,8 @@ class CommonKVManager(BaseKVManager):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
                 f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
-                f"Both servers must use the same --kv-cache-dtype value."
+                f"Both servers must use the same --kv-cache-dtype value "
+                f"and KV layout (for DeepSeek-V4, the same --dsv4-attn-backend)."
             )
 
         local_layout = self.dsv41_spec_layout

@@ -2030,6 +2030,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # Byte layout that kv_cache_dtype alone does not determine; PD prefill and
+    # decode must agree on it before transferring pages.
+    kv_transfer_layout: Optional[str] = None
 
     @abc.abstractmethod
     def __init__(

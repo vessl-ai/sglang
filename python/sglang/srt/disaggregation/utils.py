@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -1811,6 +1812,14 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def get_kv_transfer_format(*, kv_cache_dtype_str: str, kv_pool: KVCache) -> str:
+    # Compared verbatim in the PD handshake, so a pool without its own layout
+    # keeps the bare dtype that older peers send.
+    if kv_pool.kv_transfer_layout is None:
+        return kv_cache_dtype_str
+    return f"{kv_cache_dtype_str}/{kv_pool.kv_transfer_layout}"
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
