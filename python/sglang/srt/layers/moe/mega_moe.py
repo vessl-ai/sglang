@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-from sglang.srt.utils import ceil_div, is_hip, is_sm100_supported
+from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -299,7 +299,7 @@ def _run_mega_routed(
         topk_ids,
         topk_weights,
         hidden_size=hidden_size,
-        intermediate_size=moe.experts.mega_moe_intermediate_size,
+        intermediate_size=moe.config.moe_intermediate_size,
         top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         num_tokens=num_tokens,
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,
@@ -535,10 +535,6 @@ def build_mega_moe_experts_weights(experts) -> None:
     w13_sf_fp32 = experts.w13_weight_scale_inv.data
     w2 = experts.w2_weight.data
     w2_sf_fp32 = experts.w2_weight_scale_inv.data
-    if mma_type == "mxf4xmxf4":
-        w13, w13_sf_fp32, w2, w2_sf_fp32 = _pad_mxf4_mega_moe_intermediate(
-            w13=w13, w13_sf=w13_sf_fp32, w2=w2, w2_sf=w2_sf_fp32
-        )
 
     num_groups, n1, half_k1 = w13.shape
     k1 = half_k1 * 2
@@ -581,44 +577,10 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.w13_weight_scale_inv.format_ue8m0 = True
     experts.w2_weight_scale_inv.format_ue8m0 = True
 
-    experts.w2_weight.data = w2
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
-    experts.mega_moe_intermediate_size = n1 // 2
 
     experts._mega_moe_weights_built = True
-
-
-def _pad_mxf4_mega_moe_intermediate(
-    *,
-    w13: torch.Tensor,
-    w13_sf: torch.Tensor,
-    w2: torch.Tensor,
-    w2_sf: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # MXFP4 activations need 16-byte SF rows along the intermediate dimension
-    # (a multiple of 512). Zero gate/up rows give zero activations, and the
-    # matching zero w2 columns add nothing, so the padded experts are exact.
-    intermediate = w13.shape[1] // 2
-    padded = ceil_div(intermediate, 512) * 512
-    if padded == intermediate:
-        return w13, w13_sf, w2, w2_sf
-
-    def pad_gate_up(t: torch.Tensor, fill: float) -> torch.Tensor:
-        pad = t.new_full((t.shape[0], padded - intermediate, *t.shape[2:]), fill)
-        return torch.cat([t[:, :intermediate], pad, t[:, intermediate:], pad], dim=1)
-
-    def pad_k(t: torch.Tensor, width: int, fill: float) -> torch.Tensor:
-        pad = t.new_full((*t.shape[:2], width - t.shape[2]), fill)
-        return torch.cat([t, pad], dim=2)
-
-    # The scale under an all-zero block is arbitrary; 1.0 keeps it a valid UE8M0.
-    return (
-        pad_gate_up(w13, 0),
-        pad_gate_up(w13_sf, 1.0),
-        pad_k(w2, padded // 2, 0),
-        pad_k(w2_sf, padded // 32, 1.0),
-    )
 
 
 def build_mega_moe_shared_weights(
