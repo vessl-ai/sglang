@@ -49,10 +49,11 @@ logger = logging.getLogger(__name__)
 
 # Rows per late-layer block (this rank's tail rows, CP padding included). A step uses
 # the smallest bucket that holds its rows; more rows than the largest bucket run eager.
-_DEFAULT_BUCKETS = (
-    32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024,
-    1280, 1536, 1792, 2048, 2304, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192,
-)  # fmt: skip
+# Every request with a full tail adds SWA_WINDOW rows, i.e. 32 per rank under CP4: steps
+# of 32 rows (128 past 2304) make those steps exact, so the replay is bit-identical to
+# the eager late layers there. Padded rows change the MoE's and GEMMs' row-dependent
+# kernel choices (as another batch composition would); captures cost ~0.06 s each.
+_DEFAULT_BUCKETS = tuple(range(32, 2304 + 1, 32)) + tuple(range(2432, 8192 + 1, 128))
 
 
 def parse_buckets(spec: str) -> Tuple[int, ...]:
@@ -145,7 +146,7 @@ def store_window_kv(layer, x, positions, qkv_a, q_rope) -> None:
     step = _live()
     n = step.rows
     layer._compute_kv_to_cache(
-        x[:n],
+        _rows(x, n),  # None when the fused qkv_a projection carries the KV
         positions[:n],
         step.forward_batch,
         get_attn_backend(),
@@ -187,10 +188,11 @@ def attention_core(
 
     step = _live()
     n = step.rows
+    kv = k[:n]  # the backend asserts k is v
     ret = get_attn_backend().forward(
         q=q[:n],
-        k=k[:n],
-        v=k[:n],
+        k=kv,
+        v=kv,
         layer=attn_layer,
         forward_batch=step.forward_batch,
         compress_ratio=compress_ratio,
@@ -340,11 +342,12 @@ class LateLayerGraphRunner:
                 key_sig, bucket, inputs, step, capture_dspark, ids
             )
         else:
+            snapshot = _TailSnapshot() if self.verify else None
             result = self._replay(entry, step)
             if self.verify:
                 result = self._verify(
                     entry, key_sig, inputs, step, capture_dspark, ids, result,
-                    state, positions, input_ids, input_ids_global,
+                    state, positions, input_ids, input_ids_global, snapshot,
                 )  # fmt: skip
         residual, pre, aux = result
         aux_out.extend(aux)
@@ -524,26 +527,36 @@ class LateLayerGraphRunner:
 
     def _verify(
         self, entry, key_sig, inputs, step, capture_dspark, ids, graph_result,
-        state, positions, input_ids, input_ids_global,
+        state, positions, input_ids, input_ids_global, snapshot,
     ):  # fmt: skip
         """Replay vs the same block run eagerly (must be bit-identical), and vs the
         unpadded eager late layers (padding effects only). Returns the unpadded
         eager result, so a verify run serves exactly what the default path serves.
         """
-        # Re-fill: a replay may have written into its input rows in place.
         _, state_tensors = _flatten_state(state)
-        self._fill_inputs(
-            inputs,
-            [*state_tensors, positions, input_ids, input_ids_global],
-            step.rows,
-            entry.bucket,
-        )
-        with _on_block(step, entry.num_token_non_padded):
-            block_eager = self._live_rows(
-                self._body(key_sig, inputs, entry.bucket, step, capture_dspark, ids),
+        block_runs = []
+        for _ in range(2):
+            # Twice: the second run is the eager path's own run-to-run spread.
+            # Re-fill: a run may have written into its input rows in place.
+            self._fill_inputs(
+                inputs,
+                [*state_tensors, positions, input_ids, input_ids_global],
                 step.rows,
+                entry.bucket,
             )
-        _drop_lazy_metadata_buffers()
+            snapshot.restore()
+            with _on_block(step, entry.num_token_non_padded):
+                block_runs.append(
+                    self._live_rows(
+                        self._body(
+                            key_sig, inputs, entry.bucket, step, capture_dspark, ids
+                        ),
+                        step.rows,
+                    )
+                )
+            _drop_lazy_metadata_buffers()
+        block_eager, block_eager2 = block_runs
+        snapshot.restore()
         unpadded, aux = self.model._forward_late_layers(
             state=state,
             positions=positions,
@@ -555,11 +568,14 @@ class LateLayerGraphRunner:
         unpadded_result = (unpadded.residual, unpadded.pre, aux)
         logger.info(
             "late-layer graph verify: bucket %d rows %d | graph vs block eager %s | "
-            "graph vs unpadded eager %s",
+            "block eager vs block eager %s | graph vs unpadded eager %s | "
+            "block eager vs unpadded eager %s",
             entry.bucket,
             step.rows,
             _compare(graph_result, block_eager),
+            _compare(block_eager2, block_eager),
             _compare(graph_result, unpadded_result),
+            _compare(block_eager, unpadded_result),
         )
         return unpadded_result
 
@@ -588,6 +604,35 @@ class LateLayerGraphRunner:
         if reason not in self._logged_unsupported:
             self._logged_unsupported.add(reason)
             logger.warning("late-layer graph: eager late layers (%s)", reason)
+
+
+class _TailSnapshot:
+    """What the late layers overwrite in the live tail metadata and read again
+    (verify runs them more than once): the index-source top-k the layers before the
+    tail published (enter_late_layer_tail carries it in once; each index-source
+    layer of the tail overwrites it) and the published candidates."""
+
+    def __init__(self) -> None:
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        meta = get_attn_backend().forward_metadata
+        self.meta = meta
+        self.candidates = getattr(meta, "candidate_metadata", None)
+        core = meta.core_attn_metadata
+        self.buffers = []
+        for ratio in getattr(core, "low_ratios", ()):
+            for buf in (
+                core.sparse_page_indices(ratio),
+                core.sparse_topk_lengths(ratio),
+                core.sparse_raw_indices(ratio),
+            ):
+                if buf is not None:
+                    self.buffers.append((buf, buf.clone()))
+
+    def restore(self) -> None:
+        for buf, saved in self.buffers:
+            buf.copy_(saved)
+        self.meta.candidate_metadata = self.candidates
 
 
 def _drop_lazy_metadata_buffers() -> None:
@@ -620,9 +665,9 @@ def _compare(a, b) -> str:
             continue
         equal = torch.equal(x, y)
         diff = (x.float() - y.float()).abs()
+        rel = diff.norm() / y.float().norm().clamp_min(1e-30)
         parts.append(
-            f"{name} equal={equal} max={diff.max().item():.3g} "
-            f"mean={diff.mean().item():.3g}"
+            f"{name} eq={int(equal)} rel={rel.item():.3g} max={diff.max().item():.3g}"
         )
     return "; ".join(parts)
 
