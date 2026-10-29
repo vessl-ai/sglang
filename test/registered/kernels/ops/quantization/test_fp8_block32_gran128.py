@@ -219,5 +219,133 @@ def test_fp8_linear_method_hook(monkeypatch):
     assert ((y.float() - y32.float()).norm() / y32.float().norm()).item() < 3e-3
 
 
+_CKPT = os.environ.get(
+    "SGLANG_TEST_DSV41_CKPT", "/opt/lv/data/models/DeepSeek-V4.1-Flash-1017"
+)
+
+
+def _draft_wkv_weights():
+    """The DSpark draft stages' wkv weights (checkpoint mtp.{0,1,2}.attn.wkv, [512, 5120]
+    FP8 with 32x32 UE8M0 scales); random weights of that shape without the checkpoint."""
+    index = os.path.join(_CKPT, "model.safetensors.index.json")
+    if not os.path.exists(index):
+        return [_random_block32_weight(512, 5120, seed=40 + i) for i in range(3)], False
+    import json
+
+    from safetensors import safe_open
+
+    weight_map = json.load(open(index))["weight_map"]
+    out = []
+    for i in range(3):
+        tensors = []
+        for suffix in ("weight", "scale"):
+            name = f"mtp.{i}.attn.wkv.{suffix}"
+            with safe_open(
+                os.path.join(_CKPT, weight_map[name]), "pt", device="cpu"
+            ) as f:
+                tensors.append(f.get_tensor(name).cuda())
+        out.append((tensors[0], tensors[1].float()))
+    return out, True
+
+
+class _Fp8Linear(torch.nn.Module):
+    """Just enough of ReplicatedLinear: forward = quant_method.apply, returns (y, None)."""
+
+    def forward(self, x):
+        return self.quant_method.apply(self, x), None
+
+
+def _draft_wkv_layers(switch_on, monkeypatch):
+    from torch.nn import Parameter
+
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+    monkeypatch.setenv("SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128", "1" if switch_on else "0")
+    cfg = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[32, 32],
+        scale_fmt="ue8m0",
+    )
+    weights, real = _draft_wkv_weights()
+    layers = []
+    for q, s in weights:
+        layer = _Fp8Linear()
+        layer.weight = Parameter(q.clone(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(s.clone(), requires_grad=False)
+        layer.orig_dtype = torch.bfloat16
+        layer.quant_method = Fp8LinearMethod(cfg)
+        layer.quant_method.process_weights_after_loading(layer)
+        layers.append(layer)
+    return layers, real
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+# 1: draft step, 750: decode verify (bs 125 x 6), 2560: inside the (1536, 5120) gran-32
+# window, 32728: a full prefill chunk
+@pytest.mark.parametrize("m", [1, 750, 2560, 32728])
+def test_dspark_commit_kv_proj_fused_gran128(m, monkeypatch):
+    """The DSpark draft stacks its stages' wkv weights and calls the linear kernel itself
+    (prefill KV injection and the decode verify epilogue). With the switch on, the stack
+    must use the 128x128 scales the conversion left and match the switch-off output."""
+    from sglang.kernels.ops.speculative.dspark import dspark_draft_model as ddm
+
+    torch.manual_seed(m)
+    x = torch.randn(m, 5120, device="cuda").bfloat16()
+    ddm._STACKED_WEIGHT_CACHE.clear()
+    off, _ = _draft_wkv_layers(False, monkeypatch)
+    assert not any(getattr(layer, "dense_gran128", False) for layer in off)
+    y_off = ddm.CommitKvProj.execute(main_x=x, wkv_linears=off)
+    assert not getattr(ddm._stacked_wkv_weight(wkv_linears=off), "gran128", False)
+    ddm._STACKED_WEIGHT_CACHE.clear()
+    on, real = _draft_wkv_layers(True, monkeypatch)
+    assert all(getattr(layer, "dense_gran128", False) for layer in on)
+    assert ddm._fused_commit_kv_proj_supported(wkv_linears=on)
+    y_on = ddm.CommitKvProj.execute(main_x=x, wkv_linears=on)
+    stacked = ddm._stacked_wkv_weight(wkv_linears=on)
+    assert stacked.gran128 and stacked.fp8_scale.shape == (1536 // 128, 5120 // 128)
+    # (1536, 5120) has a gran-32 window, so the stack carries the expanded scale
+    assert stacked.fp8_scale_32x is not None
+    assert fp8_block32_gran128.prefer_gran32_kernel(m, 1536, 5120) == (
+        2305 <= m <= 2816
+    )
+    # the per-linear path (Fp8LinearMethod.apply) on the same converted layers
+    y_lin = ddm.commit_kv_proj(main_x=x, wkv_linears=on)
+    assert len(y_on) == len(y_off) == 3
+    for a, b, c in zip(y_on, y_off, y_lin):
+        assert a.shape == b.shape == (m, 512)
+        assert _rel(a, b) < 3e-3, (m, real, _rel(a, b))
+        assert _rel(a, c) < 3e-3, (m, real, _rel(a, c))
+    ddm._STACKED_WEIGHT_CACHE.clear()
+
+
+@pytest.mark.parametrize("m", [528, 750])
+def test_dspark_commit_kv_proj_fused_gran128_cuda_graph(m, monkeypatch):
+    """The decoder runs the commit inside its verify CUDA graph (dspark_verify
+    _static_epilogue): capture it and replay on new input."""
+    from sglang.kernels.ops.speculative.dspark import dspark_draft_model as ddm
+
+    ddm._STACKED_WEIGHT_CACHE.clear()
+    on, _ = _draft_wkv_layers(True, monkeypatch)
+    static_x = torch.randn(m, 5120, device="cuda").bfloat16()
+    for _ in range(2):  # build the stack and JIT-compile outside the capture
+        ddm.commit_kv_proj_fused(main_x=static_x, wkv_linears=on)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y_static = ddm.commit_kv_proj_fused(main_x=static_x, wkv_linears=on)
+    new_x = torch.randn(m, 5120, device="cuda").bfloat16()
+    static_x.copy_(new_x)
+    graph.replay()
+    torch.cuda.synchronize()
+    y_eager = ddm.commit_kv_proj_fused(main_x=new_x, wkv_linears=on)
+    for a, b in zip(y_static, y_eager):
+        assert torch.equal(a, b)
+    ddm._STACKED_WEIGHT_CACHE.clear()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

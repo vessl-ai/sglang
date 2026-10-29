@@ -262,6 +262,16 @@ def commit_kv_proj_fused(
                 input_scale=None,
                 bias=None,
             )
+    elif stacked.fp8_scale is not None and stacked.gran128:
+        # SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128 requantized these wkv weights to
+        # 128x128 blocks; quant_config.weight_block_size still says [32, 32].
+        from sglang.srt.layers.quantization.fp8_block32_gran128 import (
+            block128_fp8_linear,
+        )
+
+        kv_all = block128_fp8_linear(
+            main_x, stacked.weight, stacked.fp8_scale, None, stacked.fp8_scale_32x
+        )
     elif stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
         kv_all = quant_method.w8a8_block_fp8_linear(
@@ -284,6 +294,9 @@ class _StackedWkvWeight(msgspec.Struct):
     weight: torch.Tensor
     fp8_scale: Optional[torch.Tensor]
     mxfp8_scale: Optional[torch.Tensor] = None
+    # fp8_scale is a 128x128 block grid (SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128)
+    gran128: bool = False
+    fp8_scale_32x: Optional[torch.Tensor] = None
 
 
 def _stacked_wkv_weight(*, wkv_linears: list[torch.nn.Module]) -> _StackedWkvWeight:
@@ -312,12 +325,17 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
             )
         ):
             return False
-    block_out = quant_method.quant_config.weight_block_size[0]
+    # Weights requantized to 128x128 blocks at load stack only in whole 128-row
+    # blocks, and only when every stage was converted (a mixed list falls back to
+    # the per-linear path).
+    gran128 = getattr(wkv_linears[0], "dense_gran128", False)
+    block_out = 128 if gran128 else quant_method.quant_config.weight_block_size[0]
     # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
     return all(
         linear.weight.dtype == torch.float8_e4m3fn
         and linear.weight.dim() == 2
         and linear.weight.shape[0] % block_out == 0
+        and getattr(linear, "dense_gran128", False) == gran128
         for linear in wkv_linears
     )
 
@@ -373,6 +391,21 @@ def _build_stacked_wkv_weight(
                 [linear.weight_scale_mx_e8m0 for linear in wkv_linears], dim=0
             )
             return _StackedWkvWeight(weight=weight, fp8_scale=None, mxfp8_scale=scale)
+        if getattr(wkv_linears[0], "dense_gran128", False):
+            from sglang.srt.layers.quantization.fp8_block32_gran128 import (
+                window_scale_32x,
+            )
+
+            # Row-concatenated 128x128 scales, K-major as for the single layers.
+            scale = torch.cat(
+                [linear.weight_scale_inv for linear in wkv_linears], dim=0
+            ).contiguous()
+            return _StackedWkvWeight(
+                weight=weight,
+                fp8_scale=scale,
+                gran128=True,
+                fp8_scale_32x=window_scale_32x(scale, *weight.shape),
+            )
         if wkv_linears[0].weight_scale_inv.dtype == torch.int32:
             from sglang.srt.layers.quantization.fp8_utils import (
                 inverse_transform_scale_ue8m0,
