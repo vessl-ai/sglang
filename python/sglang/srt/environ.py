@@ -1636,8 +1636,13 @@ class Envs:
     # oracle / fallback) instead of DeepGEMM: fp8_fp4_mqa_logits on SM100+, and on
     # SM90 fp8_mqa_logits over e4m3-widened operands, which is the SM90 default.
     # SM100 ignores it under attention CP (only DeepGEMM serves CP rows there);
-    # SM90 always runs CP on the torch path, so the env changes nothing there.
+    # SM90 runs CP on the torch path unless SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER.
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Hopper prefill CP: score each CP rank's own query rows with the DeepGEMM
+    # fp8_mqa_logits prefill indexer (the SM90 default without CP) instead of the
+    # torch path, which is ~17x slower per index layer at 75k context. The selection
+    # of a row does not depend on which other rows are scored with it.
+    SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER = EnvBool(False)
     # Split the DeepSeek-V4.1 prefill indexer's query rows across the attention TP
     # ranks instead of scoring every row on every rank, and max-merge the per-rank
     # selections. Applies to the torch and the DeepGEMM prefill paths on any arch;

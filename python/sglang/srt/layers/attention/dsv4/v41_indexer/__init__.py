@@ -84,13 +84,16 @@ def _use_deep_gemm_prefill() -> bool:
             get_parallel().attn_cp_size > 1 or not torch_prefill
         )
     # SM90 widens the fp4 operands to e4m3 for DeepGEMM's fp8 logits. Attention CP
-    # stays on the torch path, which serves CP rows (#45794): the DeepGEMM CP path
-    # has not been validated end to end on SM90.
+    # stays on the torch path, which serves CP rows (#45794), unless the CP opt-in
+    # routes a rank's own rows through the same DeepGEMM path as SM100 CP.
     return (
         prefill_index_logits_fp8()
         and has_dense_fp8_indexer()
         and not torch_prefill
-        and get_parallel().attn_cp_size == 1
+        and (
+            get_parallel().attn_cp_size == 1
+            or envs.SGLANG_DSV41_SM90_CP_DEEPGEMM_INDEXER.get()
+        )
     )
 
 
