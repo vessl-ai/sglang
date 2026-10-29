@@ -1128,7 +1128,13 @@ def _e2m1_bits(code):
 
 @triton.jit
 def _load_pair_q(
-    qs_ptr, row0, offs_m, offs_i, H: tl.constexpr, HALF_D: tl.constexpr, LIVE: tl.constexpr
+    qs_ptr,
+    row0,
+    offs_m,
+    offs_i,
+    H: tl.constexpr,
+    HALF_D: tl.constexpr,
+    LIVE: tl.constexpr,
 ):
     """The even and odd halves ``[2H, HALF_D]`` of rows ``row0, row0 + 1``; zeros
     for a pair the group does not have."""

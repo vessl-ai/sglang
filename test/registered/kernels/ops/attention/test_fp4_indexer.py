@@ -769,7 +769,6 @@ def test_fp4_paged_logits_grouped_rows_replay(requests, ratio, width, masked):
         )
 
 
-
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize(
     "requests,group,ratio,width,masked",
@@ -803,9 +802,7 @@ def test_fp4_paged_logits_tensor_core_matches_per_row(
     args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
 
     def run():
-        return fp4_index_logits_paged(
-            *args, candidate_mask, rows_per_request=group
-        )
+        return fp4_index_logits_paged(*args, candidate_mask, rows_per_request=group)
 
     for _ in range(3):
         run()
@@ -813,7 +810,9 @@ def test_fp4_paged_logits_tensor_core_matches_per_row(
     with torch.cuda.graph(graph):
         scores = run()
     for step, visible in enumerate([width, 0, 1, 63, 64, 65, 129, width]):
-        lengths.copy_((visible - torch.arange(batch, device=q.device) % group).clamp_min(0))
+        lengths.copy_(
+            (visible - torch.arange(batch, device=q.device) % group).clamp_min(0)
+        )
         req_table[:, : width * ratio : ratio] = (
             slots[::group].roll(step, 1) * ratio
         ).int()
@@ -823,15 +822,14 @@ def test_fp4_paged_logits_tensor_core_matches_per_row(
         graph.replay()
         with envs.SGLANG_DSV41_PAGED_INDEXER_NO_TC.override(True):
             expected = run()
-        visible_mask = (
-            torch.arange(width, device=q.device)[None, :] < lengths[:, None]
-        )
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lengths[:, None]
         torch.testing.assert_close(
             scores[:, :width][visible_mask],
             expected[:, :width][visible_mask],
             atol=0,
             rtol=0,
         )
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
