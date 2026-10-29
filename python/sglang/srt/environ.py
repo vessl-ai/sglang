@@ -1668,6 +1668,21 @@ class Envs:
     # are ~8.8 GB per GPU larger than Marlin's at TP4 (intermediate 576 padded to
     # 640): raise --mem-fraction-static (the e3 decoder runs 0.75 instead of 0.70).
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE = EnvBool(False)
+    # INF-681: with SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE, pick the row tile from the
+    # routed rows per expert (num_slots / local experts) instead of always 16: <= 10 -> 16,
+    # <= 36 -> 32, <= 160 -> 64, above -> triton_kernels' own choice. Every extra 16-row
+    # tile of an expert repeats the whole dequantize pass over its weights, so at decode
+    # bs 125-192 x 6 verify rows (DSpark) the 32-row tile is 7-21% faster per MoE layer,
+    # and prefill steps of 1.5k-8k rows (bounded replay late layers) 1.4-1.8x. Output is
+    # bit-identical (the k order of each output element does not change).
+    SGLANG_OPT_DSV4_DECODE_MOE_ROWS_AWARE_TILES = EnvBool(False)
+    # INF-681, SM90: run the DeepSeek-V4 TP4 MXFP4 experts (hidden 5120, 576 per rank) with
+    # the dsv4_mxfp4_decode_moe CUDA kernels: W4A16 with the same numerics as the
+    # triton_kernels decode path (bit-identical in tests), each expert's weights streamed
+    # once for up to 32 rows, raw MXFP4 bytes repacked in place (no padding: ~8.8 GB per GPU
+    # less than triton_kernels at TP4). CUDA-graph safe. Takes precedence over the triton
+    # switches (not over W4A8 prefill). Other shapes keep the configured path.
+    SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL = EnvBool(False)
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
