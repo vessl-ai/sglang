@@ -546,6 +546,10 @@ class Mxfp4MarlinMoEMethod:
         if w4a8:
             # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
             dk.prepare(self._sm90_packed.w13.device.index)
+            if self._sm90_decode_w4a8_v2:  # INF-681 k-dmoe2: the same for the v2 kernels
+                from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2
+
+                dsv4_mxfp4_decode_moe_v2.prepare(self._sm90_packed.w13.device.index)
         layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
         return True
 

@@ -4,8 +4,9 @@ quantization, down, dynamically handed-out items) plus a one-launch prologue (ds
 Its output must be bit-identical to the W4A8 kernels it replaces (dsv4_mxfp4_decode_moe_ws, whose accuracy
 test_dsv4_mxfp4_decode_moe_w4a8_inf681.py checks against an fp32 W4A8 reference): on target and draft shapes
 (DSpark gamma 5 and 3), with masked slots and dp-attention pad rows, experts that need several 32-row passes,
-repeated calls (no ordering race), CUDA graph replay with fresh inputs, batches above the prologue's limit, and
-through the engine's Mxfp4MarlinMoEMethod switch."""
+repeated calls (no ordering race), CUDA graph replay with fresh inputs, capture as the first call after
+prepare() (also in a fresh process with JIT module builds forbidden during capture), batches above the prologue's
+limit, and through the engine's Mxfp4MarlinMoEMethod switch."""
 
 import sys
 from types import SimpleNamespace
@@ -208,6 +209,71 @@ def test_v2_large_batch_fallback():
     )
 
 
+def test_v2_prepare_then_capture():
+    """After prepare(), the first v2 call of a process may be CUDA graph capture itself (no eager warmup);
+    replay with fresh inputs matches the W4A8 kernels."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+
+    v2.prepare(torch.cuda.current_device())
+    v2.prepare(torch.cuda.current_device())  # once per process and device
+    num_experts, top_k, rows_per_req = SHAPES["target_g3"]
+    packed = _packed(num_experts)
+    x, ids, wts = _routing(64, rows_per_req, num_experts, top_k, 21, masked_rows=6)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+    for rep in range(2):
+        x2, ids2, wts2 = _routing(64, rows_per_req, num_experts, top_k, 30 + rep, masked_rows=6)
+        x.copy_(x2)
+        ids.copy_(ids2)
+        wts.copy_(wts2)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)), rep
+
+
+_FRESH = r"""
+import sys, torch
+sys.path.insert(0, {testdir!r})
+import test_dsv4_mxfp4_decode_moe_v2_inf681 as t
+from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
+from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+v2.prepare(torch.cuda.current_device())
+packed = t._packed(384)
+x, ids, wts = t._routing(48, 4, 384, 6, 5, masked_rows=4)
+
+def no_build(*args, **kwargs):
+    raise RuntimeError("JIT build during capture")
+
+saved = (v2.load_jit, ws.load_jit)
+v2.load_jit = ws.load_jit = no_build  # a JIT module build inside capture raises
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):  # the first v2 call of this process
+    out = v2.decode_moe(x, ids, wts, packed, t.SWIGLU_LIMIT)
+v2.load_jit, ws.load_jit = saved
+x2, ids2, wts2 = t._routing(48, 4, 384, 6, 6, masked_rows=4)
+x.copy_(x2); ids.copy_(ids2); wts.copy_(wts2)
+graph.replay()
+torch.cuda.synchronize()
+assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, t.SWIGLU_LIMIT))
+print("FRESH_OK")
+"""
+
+
+def test_v2_capture_first_call_in_fresh_process():
+    """A fresh process: prepare(), then capture is the first v2 call, with JIT module builds forbidden during
+    capture (the v2 call path inside capture has no Triton kernel); replay matches the W4A8 kernels."""
+    import os
+    import subprocess
+
+    code = _FRESH.format(testdir=os.path.dirname(os.path.abspath(__file__)))
+    run = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=900
+    )
+    assert run.returncode == 0 and "FRESH_OK" in run.stdout, run.stderr[-4000:]
+
+
 def test_v2_switch_wiring(monkeypatch):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
@@ -248,8 +314,12 @@ def test_v2_switch_wiring(monkeypatch):
     )
     layer.moe_runner_config = config
     method.create_moe_runner(layer, config)
+    prepared = []
+    real_prepare = v2.prepare
+    monkeypatch.setattr(v2, "prepare", lambda dev: (prepared.append(dev), real_prepare(dev)))
     method.process_weights_after_loading(layer)
     assert layer._dsv4_mxfp4_backend == "sm90_decode_w4a8"
+    assert prepared == [torch.cuda.current_device()]  # the v2 kernels were built at weight processing
     calls = []
     real = v2.decode_moe
 

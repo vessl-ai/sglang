@@ -38,8 +38,32 @@ def _module() -> Module:
         cuda_wrappers=[
             ("prep", "dsv4_moe_v2::prep"),
             ("experts", "dsv4_moe_v2::experts"),
+            ("prepare_kernels", "dsv4_moe_v2::prepare_kernels"),
         ],
     )
+
+
+@cache_once
+def prepare(device_index: int) -> None:
+    """Build and load everything ``decode_moe`` launches, once per process and device, at weight-processing
+    time (as ``dsv4_mxfp4_decode_moe_ws.prepare``, which this calls for the top-k combine it shares and for
+    the fallback prologue): this module's JIT build (under a lock shared by the node's ranks on a cold cache),
+    its CUDA kernels (loaded lazily at the first launch otherwise), and one launch of the whole call on a
+    routing with every slot masked (no expert work, no weight read). The first MoE call of CUDA graph capture
+    then compiles and loads nothing."""
+    ws.prepare(device_index)
+    with torch.cuda.device(device_index):
+        _module().prepare_kernels()
+        for num_experts in (384, 128):  # target and DSpark draft experts
+            # Zero-stride stand-ins for the packed weights: with every slot masked nothing reads them.
+            one = torch.zeros(1, dtype=torch.uint8, device="cuda")
+            packed = ws.PackedExperts(
+                one.expand(num_experts, 9, 348160), one.expand(num_experts, 40, 39168)
+            )
+            x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16, device="cuda")
+            ids = torch.full((2, 6), -1, dtype=torch.int32, device="cuda")
+            decode_moe(x, ids, torch.ones(ids.shape, device="cuda"), packed, 10.0)
+        torch.cuda.synchronize()
 
 
 def decode_moe(

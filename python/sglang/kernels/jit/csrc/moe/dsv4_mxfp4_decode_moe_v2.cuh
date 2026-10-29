@@ -1278,5 +1278,16 @@ inline void prep(
       static_cast<int>(ws.size(0)));
 }
 
+// Load both kernels of this module on the current device now (CUDA loads modules lazily, at a kernel's first
+// launch otherwise) and set the experts kernel's shared-memory limit, so that the first MoE call inside CUDA graph
+// capture loads nothing.
+inline void prepare_kernels() {
+  using namespace host;
+  RuntimeDeviceCheck(
+      cudaFuncSetAttribute(moe_v2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem)));
+  cudaFuncAttributes attr;
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, prep_kernel));
+}
+
 }  // namespace dsv4_moe_v2
 }  // namespace sglang
