@@ -331,27 +331,23 @@ def deep_gemm_row_shard(num_rows: int):
 
 def merge_row_shards(group, *selections: torch.Tensor) -> None:
     """Max-merge selections that are -1 outside each rank's rows (a union, since
-    every entry is >= 0 or -1). Each must be contiguous."""
+    every entry is >= 0 or -1), in place. A non-contiguous view is merged through
+    a contiguous copy."""
     for selection in selections:
+        buf = selection if selection.is_contiguous() else selection.contiguous()
         torch.distributed.all_reduce(
-            selection, op=torch.distributed.ReduceOp.MAX, group=group
+            buf, op=torch.distributed.ReduceOp.MAX, group=group
         )
+        if buf is not selection:
+            selection.copy_(buf)
 
 
 def _merge_row_shards(inputs: PrefillInputs, group) -> None:
     """Every rank wrote only its own rows of the selection (-1 elsewhere); max-merge
-    so each rank holds all rows. Selections are >= 0 or -1, so max is the union."""
+    so each rank holds all rows."""
     n = inputs.positions.shape[0]
-    for out in (inputs.out_raw_indices, inputs.out_page_indices):
-        if out is None:
-            continue
-        view = out[:n]
-        buf = view if view.is_contiguous() else view.contiguous()
-        torch.distributed.all_reduce(
-            buf, op=torch.distributed.ReduceOp.MAX, group=group
-        )
-        if buf is not view:
-            view.copy_(buf)
+    outs = (inputs.out_raw_indices, inputs.out_page_indices)
+    merge_row_shards(group, *(out[:n] for out in outs if out is not None))
 
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
