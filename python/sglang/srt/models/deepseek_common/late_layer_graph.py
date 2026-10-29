@@ -728,4 +728,11 @@ def _unsupported_model_reason(model) -> Optional[str]:
             return f"layer {i} has an Engram"
         if getattr(layer, "hc_boundary_fused", False):
             return f"layer {i} uses the HIP fused mHC boundary"
+        experts = getattr(getattr(layer, "mlp", None), "experts", None)
+        if getattr(getattr(experts, "quant_method", None), "_use_w4a8", False):
+            # The W4A8 prefill MoE refuses CUDA graph capture.
+            return (
+                f"layer {i} runs the W4A8 prefill MoE; set "
+                "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER to the first late layer"
+            )
     return None
