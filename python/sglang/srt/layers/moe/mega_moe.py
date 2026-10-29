@@ -587,6 +587,10 @@ def build_mega_moe_experts_weights(experts) -> None:
     experts.mega_moe_intermediate_size = n1 // 2
 
     experts._mega_moe_weights_built = True
+    if mma_type == "mxf4xmxf4":
+        # The freed unpadded experts are too small to hold the next layer's
+        # padded ones, and KV-cache sizing counts reserved memory as used.
+        torch.cuda.empty_cache()
 
 
 def _pad_mxf4_mega_moe_intermediate(
