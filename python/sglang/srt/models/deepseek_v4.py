@@ -373,6 +373,43 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+_DP_SHARED_EXPERT_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _dp_shared_expert_stream() -> Optional[torch.cuda.Stream]:
+    """INF-681: the side stream the DP-local shared expert runs on, or None (inline).
+
+    One stream for all layers, created on first use; only with
+    SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP on CUDA."""
+    global _DP_SHARED_EXPERT_STREAM
+    if not (_is_cuda and envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP.get()):
+        return None
+    if _DP_SHARED_EXPERT_STREAM is None:
+        _DP_SHARED_EXPERT_STREAM = torch.cuda.Stream()
+    return _DP_SHARED_EXPERT_STREAM
+
+
+@contextmanager
+def _dp_shared_expert_sm_cap():
+    """Leave SMs free for the NCCL all-gather the side-stream shared expert overlaps.
+
+    DeepGEMM's SM90 kernels are persistent on every SM (132 CTAs, ~170 KB smem each)
+    and NCCL's ring kernels hold ~23 SMs (~119 KB smem each), so the two cannot share an
+    SM: uncapped, the GEMM's last CTAs wait for the collective and both slow down
+    (rig: all-gather 45 -> 70 us, gate_up 15 -> 37 us). The cap is a host-side DeepGEMM
+    launch setting, restored right after the shared expert's GEMMs are issued."""
+    reserve = envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.get()
+    if reserve <= 0:
+        yield
+        return
+    import deep_gemm
+
+    total = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(max(1, total - reserve))
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(total)
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -558,6 +595,28 @@ def _apply_wo_a_bf16_matmul(
                 "falling back to einsum for the rest of this process: %s",
                 err,
             )
+    if (
+        envs.SGLANG_OPT_DSV4_WO_A_STRIDED_BMM.get()
+        and fast_path
+        and _is_cuda
+        and (is_decode or is_target_verify)
+        and o.shape[0] > 0
+        and o.shape[1:] == (wo_a.shape[0], wo_a.shape[2])
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.stride(2) == 1
+        and wo_a.is_contiguous()
+    ):
+        # INF-681: the einsum below runs the same bmm into [G, T, R] and wo_b's
+        # flatten(1) then copies it to [T, G * R]; writing token-major directly
+        # skips that copy (DP-attention decoder: 8 groups, 5.2 us per layer at 192 rows).
+        result = torch.empty(
+            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+        )
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
@@ -3486,6 +3545,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
         # M_global * dim/tp), so decode no longer pays the ~attn_dp_size x penalty.
         _shared_local = None
+        _shared_stream = None
         _do_shared_local = (
             _SHARED_EXPERT_LOCAL
             and _use_tp_moe_gather
@@ -3511,7 +3571,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                _shared_stream = _dp_shared_expert_stream()
+                if _shared_stream is not None:
+                    # INF-681 SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP: the shared
+                    # expert only needs this rank's rows, so it runs beside the
+                    # gather and the routed MoE and is joined before its add below.
+                    _shared_stream.wait_stream(torch.cuda.current_stream())
+                    local_hidden_states.record_stream(_shared_stream)
+                    with torch.cuda.stream(_shared_stream), _dp_shared_expert_sm_cap():
+                        _shared_local = self.mlp._forward_shared_experts(
+                            local_hidden_states
+                        )
+                    _shared_local.record_stream(torch.cuda.current_stream())
+                else:
+                    _shared_local = self.mlp._forward_shared_experts(
+                        local_hidden_states
+                    )
             # The gather ships the whole padded chunk and the MoE runs on it, but
             # graph replay never refreshes pad rows, so they hold stale pool
             # memory (bf16-max scale) that overflows the MoE and the combine.
@@ -3599,6 +3674,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
             if _shared_local is not None:
+                if _shared_stream is not None:
+                    torch.cuda.current_stream().wait_stream(_shared_stream)
                 n = hidden_states.shape[0]
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:

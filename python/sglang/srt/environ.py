@@ -1647,6 +1647,42 @@ class Envs:
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
     SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # INF-681 k-dnm levers for the DP-attention (attn_dp_size > 1) decoder, where each
+    # rank runs its own verify rows (~150-200 at the gamma-3 operating point) instead of
+    # the TP4 decoder's 4x replicated rows. All default off.
+    # - DP_SHARED_EXPERT_OVERLAP: with SGLANG_SHARED_EXPERT_TP1=1 and
+    #   SGLANG_DP_SHARED_EXPERT_LOCAL=1 (replicated shared expert on the rank's local
+    #   rows), run that shared expert on a side stream so it overlaps the MoE gather,
+    #   the router and the routed experts instead of running before the gather.
+    SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
+    #   (NCCL's ring all-gather holds 23 SMs at these sizes on 4 H200s); 0 = no cap.
+    SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
+    # - DP_DECODE_STATS_STREAM: compute the mHC mix stats + Sinkhorn of a sublayer on
+    #   the existing stats side stream beside the sublayer (as SM90 already does for
+    #   decode batches <= 64 rows) for DP-attention decode / verify batches up to
+    #   SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS rows per rank.
+    SGLANG_OPT_DSV4_DP_DECODE_STATS_STREAM = EnvBool(False)
+    # - DP_DECODE_MHC_FUSED: take the fused combine + RMSNorm (hc_combine_norm) and the
+    #   split-H post kernel at DP-attention decode / verify batches up to
+    #   SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS rows per rank (SM90 gates them to <= 96 and
+    #   <= 64 rows today). The post kernel is bit-identical; the fused combine + norm
+    #   rounds the normed row differently from FlashInfer RMSNorm in rare elements
+    #   (1 BF16 ulp), as it already does at <= 96 rows.
+    SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED = EnvBool(False)
+    SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS = EnvInt(512)
+    # - WO_A_STRIDED_BMM: V4.1 BF16 wo_a for any group count on CUDA decode / verify
+    #   rows: one strided bmm that writes the token-major [T, G, R] output wo_b reads,
+    #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes
+    #   before wo_b. Bit-identical (same cuBLAS reduction, different output strides).
+    SGLANG_OPT_DSV4_WO_A_STRIDED_BMM = EnvBool(False)
+    # - DP_SYMM_MOE_OUTPUT: with --enable-symm-mem, allocate the triton_kernels MoE
+    #   output (the reduce-scatter's send buffer under attention DP + MAX_LEN padding)
+    #   from the NCCL symmetric pool, as FusedMoE already does for its combine output.
+    #   The all-gather's receive buffer (the global DP buffer) is symmetric already.
+    #   4 ranks, 1.97 MB per rank on H200: all-gather 42.7 -> 28.5 us (recv symmetric),
+    #   reduce-scatter 38.5 -> 30.0 us (send symmetric).
+    SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT = EnvBool(False)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and
