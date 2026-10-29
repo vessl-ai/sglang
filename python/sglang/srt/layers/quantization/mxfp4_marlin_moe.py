@@ -119,6 +119,11 @@ class Mxfp4MarlinMoEMethod:
             and get_platform().is_sm90
             and not self._use_w4a8
         )
+        self._sm90_decode_w4a8 = (
+            envs.SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8.get()
+            and get_platform().is_sm90
+            and not self._use_w4a8
+        )
 
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
@@ -235,6 +240,11 @@ class Mxfp4MarlinMoEMethod:
         if self._use_w4a8:
             self._prepare_w4a8_weights(layer)
             return
+        if self._sm90_decode_w4a8 and self._prepare_sm90_decode_weights(
+            layer, w4a8=True
+        ):
+            return
+        self._sm90_decode_w4a8 = False
         if self._sm90_decode_kernel and self._prepare_sm90_decode_weights(layer):
             return
         self._sm90_decode_kernel = False
@@ -267,6 +277,20 @@ class Mxfp4MarlinMoEMethod:
             return StandardCombineInput(
                 hidden_states=self._w4a8(
                     hidden_states, topk_output.topk_ids, topk_output.topk_weights
+                )
+            )
+        if self._sm90_decode_w4a8:
+            from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ws import (
+                decode_moe as decode_moe_w4a8,
+            )
+
+            return StandardCombineInput(
+                hidden_states=decode_moe_w4a8(
+                    hidden_states,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self._sm90_packed,
+                    self.runner.config.swiglu_limit,
                 )
             )
         if self._sm90_decode_kernel:
@@ -334,10 +358,14 @@ class Mxfp4MarlinMoEMethod:
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 
-    def _prepare_sm90_decode_weights(self, layer: Module) -> bool:
-        """Repack the experts for the dsv4_mxfp4_decode_moe kernels. Returns False (weights
-        untouched) when the layer is not the DeepSeek-V4 TP4 shape the kernels cover."""
-        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe as dk
+    def _prepare_sm90_decode_weights(self, layer: Module, w4a8: bool = False) -> bool:
+        """Repack the experts for the dsv4_mxfp4_decode_moe kernels (W4A16) or the
+        dsv4_mxfp4_decode_moe_ws kernels (W4A8). Returns False (weights untouched) when the layer
+        is not the DeepSeek-V4 TP4 shape the kernels cover."""
+        if w4a8:
+            from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as dk
+        else:
+            from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe as dk
 
         config = self.runner.config
         hidden = layer.w2_weight.shape[1]
@@ -365,7 +393,9 @@ class Mxfp4MarlinMoEMethod:
             )
             return False
         log_info_on_rank0(
-            logger, f"Using the SM90 decode MoE kernel for MXFP4 experts (layer: {self.prefix})"
+            logger,
+            f"Using the SM90 decode MoE kernel ({'W4A8 warp-specialized wgmma' if w4a8 else 'W4A16'}) "
+            f"for MXFP4 experts (layer: {self.prefix})",
         )
         torch.cuda.empty_cache()
         self._sm90_packed = dk.pack_experts(
@@ -377,7 +407,7 @@ class Mxfp4MarlinMoEMethod:
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
         torch.cuda.empty_cache()
-        layer._dsv4_mxfp4_backend = "sm90_decode"
+        layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
@@ -479,7 +509,11 @@ class Mxfp4MarlinMoEMethod:
         dict(block_m=64, block_n=128, block_k=128, num_warps=4, num_stages=3),
         dict(block_m=64, block_n=256, block_k=64, num_warps=4, num_stages=3),
     )
-    _ROWS_AWARE_TILES = ((10, _DECODE_TILES), (36, _DECODE_TILES_32), (160, _DECODE_TILES_64))
+    _ROWS_AWARE_TILES = (
+        (10, _DECODE_TILES),
+        (36, _DECODE_TILES_32),
+        (160, _DECODE_TILES_64),
+    )
 
     def _decode_tiles(self, decode_tiles: bool, num_slots: int = 0):
         if not self._triton_kernels_decode:
