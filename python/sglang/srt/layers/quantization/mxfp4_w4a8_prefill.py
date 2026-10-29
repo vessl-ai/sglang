@@ -297,6 +297,38 @@ def _swiglu_quant(gate_up: torch.Tensor, limit: float):
     return y, s
 
 
+@triton.jit
+def _gather_topk_sum_kernel(
+    Y, POS, OUT, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr
+):
+    # OUT[t] = sum_k Y[POS[t * TOPK + k]] with fp32 accumulation in k order, the same
+    # arithmetic as moe_topk_sum over token-major rows.
+    t = tl.program_id(0).to(tl.int64)
+    o = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    m = o < H
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        r = tl.load(POS + t * TOPK + k).to(tl.int64)
+        acc += tl.load(Y + r * H + o, mask=m, other=0.0).to(tl.float32)
+    tl.store(OUT + t * H + o, acc.to(tl.bfloat16), mask=m)
+
+
+def _gather_topk_sum(down_sorted, combine_indx, out, top_k: int):
+    """out[t] = sum over the top-k slots of token t of down_sorted[sorted position of slot],
+    where combine_indx[i] is the slot (token * top_k + k) at sorted position i."""
+    n_slots = combine_indx.numel()
+    pos = torch.empty_like(combine_indx)
+    pos[combine_indx.long()] = torch.arange(
+        n_slots, dtype=combine_indx.dtype, device=combine_indx.device
+    )
+    num_tokens, hidden = out.shape
+    block_h = 1024
+    _gather_topk_sum_kernel[(num_tokens, triton.cdiv(hidden, block_h))](
+        down_sorted, pos, out, hidden, top_k, block_h, num_warps=4
+    )
+    return out
+
+
 def _fold(scale: torch.Tensor, name: str):
     """Per-output-channel max exponent and the matching fp32 channel scale."""
     s = scale.view(torch.uint8).to(torch.int16)
@@ -325,6 +357,7 @@ class Mxfp4W4A8PrefillExperts:
         swiglu_limit: float,
         prefetch: bool,
         prefetch_chunks: int = 0,
+        sorted_sum: bool = False,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -336,6 +369,9 @@ class Mxfp4W4A8PrefillExperts:
         # > 0: after a large layer, prefetch in this many launches per weight, issued
         # after the layer's top-k sum so the all-reduce does not queue behind it.
         self.prefetch_chunks = prefetch_chunks
+        # W2 writes its rows in expert order (no epilogue scatter) and the top-k sum
+        # gathers them by position: same sums, bit for bit, ~12% less W2 time at 32k rows.
+        self.sorted_sum = sorted_sum
         self.successor = None  # the experts observed to run after these ones
         self.scratch = _scratch(w13.device)
         # Reserve the buffers now so KV-cache sizing sees them.
@@ -454,7 +490,7 @@ class Mxfp4W4A8PrefillExperts:
                 self._fp8_view(self.w2, self.scratch.w2),
                 None,
                 a_ragged_metadata=ragged_metadata,
-                scatter_indx=routing.combine_indx,
+                scatter_indx=None if self.sorted_sum else routing.combine_indx,
                 precision_config=PrecisionConfig(
                     a_mx_tensor_scale=a_scale,
                     b_mx_tensor_scale=self.w2_channel_scale,
@@ -467,7 +503,10 @@ class Mxfp4W4A8PrefillExperts:
         overlapped = self.prefetch_chunks > 0 and num_tokens >= _OVERLAP_MIN_ROWS
         if self.prefetch and not overlapped:
             self._prefetch_next(self._single_launch())
-        moe_topk_sum(down.view(num_tokens, top_k, -1), output)
+        if self.sorted_sum:
+            _gather_topk_sum(down, routing.combine_indx, output, top_k)
+        else:
+            moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         if self.prefetch and overlapped:
             # Launched before the top-k sum in one piece, the conversion takes every SM
             # and the main stream's next kernels (shared add, all-reduce) queue behind it

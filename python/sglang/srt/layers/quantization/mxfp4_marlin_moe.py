@@ -357,6 +357,7 @@ class Mxfp4MarlinMoEMethod:
             config.swiglu_limit,
             prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
             prefetch_chunks=envs.SGLANG_DSV4_W4A8_PREFETCH_CHUNKS.get(),
+            sorted_sum=envs.SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.get(),
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 

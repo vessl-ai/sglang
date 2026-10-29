@@ -333,6 +333,21 @@ def test_sliced_prefetch_orders_streams_under_delay(delayed, monkeypatch):
     _run_prefetch_sequence(fetched, inline, x, ids, wts)
 
 
+@pytest.mark.parametrize("rows", [1, 37, 2048])
+def test_sorted_sum_matches_scattered_sum(rows):
+    """SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM: same output bit for bit, masked slots too."""
+    from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+        Mxfp4W4A8PrefillExperts,
+    )
+
+    w = _weights(70)
+    ref = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False)
+    got = Mxfp4W4A8PrefillExperts(*w, LIMIT, prefetch=False, sorted_sum=True)
+    x, ids, wts = _inputs(rows, 8)
+    ids[0, -1] = -1
+    assert torch.equal(got(x, ids, wts), ref(x, ids, wts))
+
+
 @pytest.mark.parametrize(
     "start,prefix,bounded,expected",
     [
