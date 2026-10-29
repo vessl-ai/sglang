@@ -172,6 +172,8 @@ class Mxfp4MarlinMoEMethod:
             and get_platform().is_sm90
             and not self._use_w4a8
         )
+        # INF-681 k-dmoe2: those experts through the fused v2 kernels (same weights, same output bits).
+        self._sm90_decode_w4a8_v2 = envs.SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_V2.get()
 
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
@@ -372,9 +374,14 @@ class Mxfp4MarlinMoEMethod:
                 )
             )
         if self._sm90_decode_w4a8:
-            from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ws import (
-                decode_moe as decode_moe_w4a8,
-            )
+            if self._sm90_decode_w4a8_v2:
+                from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_v2 import (
+                    decode_moe as decode_moe_w4a8,
+                )
+            else:
+                from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ws import (
+                    decode_moe as decode_moe_w4a8,
+                )
 
             return StandardCombineInput(
                 hidden_states=decode_moe_w4a8(
@@ -539,6 +546,10 @@ class Mxfp4MarlinMoEMethod:
         if w4a8:
             # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
             dk.prepare(self._sm90_packed.w13.device.index)
+            if self._sm90_decode_w4a8_v2:  # INF-681 k-dmoe2: the same for the v2 kernels
+                from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2
+
+                dsv4_mxfp4_decode_moe_v2.prepare(self._sm90_packed.w13.device.index)
         layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
         return True
 

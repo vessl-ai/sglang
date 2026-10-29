@@ -1816,6 +1816,11 @@ class Envs:
     # BF16 experts, like the W4A8 prefill path): needs GSM8K. CUDA-graph safe. Takes precedence over the
     # other decode switches (not over W4A8 prefill).
     SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 = EnvBool(False)
+    # INF-681 k-dmoe2, sub-switch of SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 (no effect without it): run those
+    # experts through dsv4_mxfp4_decode_moe_v2, one persistent kernel for gate/up, the h row quantization
+    # and down with dynamically handed-out work, plus one prologue launch (expert sort, token row quant).
+    # Same packed weights; output bit-identical to the W4A8 kernels. CUDA-graph safe.
+    SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_V2 = EnvBool(False)
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
