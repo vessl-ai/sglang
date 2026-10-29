@@ -73,8 +73,8 @@ __global__ void __launch_bounds__(kThreads) flashmla_sched_meta_large_kernel(__g
   extern __shared__ int smem[];
   const int b = p.b;
   const int f = p.fixed_overhead_num_blocks;
-  int* cum = smem;                                     // [b + 1], exclusive prefix of num_blocks + f
-  int* out_shared = smem + b + 1;                      // [num_sm_parts * kMetaInts]
+  int* cum = smem;                                            // [b + 1], exclusive prefix of num_blocks + f
+  int* out_shared = smem + b + 1;                             // [num_sm_parts * kMetaInts]
   int* split_rows = out_shared + p.num_sm_parts * kMetaInts;  // [num_sm_parts], rows split, ascending
 
   __shared__ int warp_sums[kThreads / 32];

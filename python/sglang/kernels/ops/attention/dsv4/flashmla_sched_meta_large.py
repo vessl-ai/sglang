@@ -41,9 +41,7 @@ def smem_bytes(batch_size: int, num_sm_parts: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def max_smem_bytes(device_index: int) -> int:
-    return torch.cuda.get_device_properties(
-        device_index
-    ).shared_memory_per_block_optin
+    return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
 
 
 def fits(batch_size: int, num_sm_parts: int, device_index: int) -> bool:

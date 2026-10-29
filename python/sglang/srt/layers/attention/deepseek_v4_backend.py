@@ -16,6 +16,7 @@ from typing import (
 )
 
 import msgspec
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -1754,12 +1755,24 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
-        cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
-            if is_cp_active(forward_batch)
-            else None
-        )
+        no_sync = envs.SGLANG_OPT_DSV4_TAIL_LAYOUT_NO_SYNC.get()
+        if no_sync:
+            tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
+        else:
+            tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        cp_tail = None
+        if is_cp_active(forward_batch):
+            cp_tail = (
+                self._late_layer_tail_cp_layout_host(
+                    forward_batch, token_indices, tail_lens_cpu, contiguous_start
+                )
+                if no_sync
+                else self._late_layer_tail_cp_layout(
+                    forward_batch, token_indices, tail_lens
+                )
+            )
+        # Known on the host, so repeat_interleave does not read the total back.
+        tail_rows_total = sum(tail_lens_cpu) if no_sync else None
 
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=(
@@ -1794,6 +1807,7 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
+                output_size=tail_rows_total,
             )
             positions = _tail_rows(
                 forward_batch.positions,
@@ -1813,6 +1827,7 @@ class DeepseekV4AttnBackend(
                 req = torch.repeat_interleave(
                     forward_batch.req_pool_indices.to(torch.int64),
                     tail_lens.to(torch.int64),
+                    output_size=tail_rows_total,
                 )
                 metadata.low_ratio_req_indices = torch.cat(
                     [req, req[-1:].expand(cap - real_rows)]
@@ -1915,6 +1930,83 @@ class DeepseekV4AttnBackend(
             local_positions=local_positions,
             local_lens_cpu=torch.bincount(
                 tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
+            ).tolist(),
+            pad_rows=pad_rows,
+        )
+
+    def _late_layer_tail_cp_layout_host(
+        self,
+        forward_batch: ForwardBatch,
+        token_indices: torch.Tensor,
+        tail_lens_cpu: List[int],
+        contiguous_start: Optional[int],
+    ) -> dict:
+        """`_late_layer_tail_cp_layout` with every value that needs a host read
+        computed from the host extend lengths (SGLANG_OPT_DSV4_TAIL_LAYOUT_NO_SYNC):
+        the owner-rank counts, the rank starts, this rank's tail rows and its
+        per-request lengths. The device tensors it returns hold the same values and
+        dtypes."""
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        device = token_indices.device
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        # Host copy of `token_indices` (late_layer_tail_layout's layout): the last
+        # tail_len rows of each request's extend.
+        ends = np.cumsum(np.asarray(extend_lens_cpu, dtype=np.int64))
+        tails = np.asarray(tail_lens_cpu, dtype=np.int64)
+        host_tokens = np.concatenate(
+            [np.arange(e - t, e, dtype=np.int64) for e, t in zip(ends, tails)]
+        )
+        assert contiguous_start is None or host_tokens[0] == contiguous_start
+        total = int(host_tokens.shape[0])
+        owner_host = host_tokens % cp_size
+        counts = np.bincount(owner_host, minlength=cp_size).tolist()
+        max_local = max(counts)
+        owner_rank = token_indices % cp_size
+        order = torch.argsort(owner_rank, stable=True)
+        rank_starts = async_h2d(
+            [sum(counts[:r]) for r in range(cp_size)], dtype=torch.int64, device=device
+        )
+        slot = torch.empty_like(owner_rank)
+        slot[order] = (
+            torch.arange(total, device=device) - rank_starts[owner_rank[order]]
+        )
+        gather_index = owner_rank * max_local + slot
+
+        local_host = np.nonzero(owner_host == cp_rank)[0]
+        local_tail_rows = async_h2d(
+            local_host.tolist(), dtype=torch.int64, device=device
+        )
+        pad_rows = max_local - counts[cp_rank]
+        pad_start = total + sum(max_local - c for c in counts[:cp_rank])
+        local_metadata_rows = torch.cat(
+            [
+                local_tail_rows,
+                torch.arange(pad_start, pad_start + pad_rows, device=device),
+            ]
+        )
+        request_of_row = np.repeat(np.arange(len(tail_lens_cpu), dtype=np.int64), tails)
+        local_positions = torch.cat(
+            [
+                forward_batch.positions[token_indices[local_tail_rows]],
+                forward_batch.positions.new_zeros(pad_rows),
+            ]
+        )
+        cp_metadata = InterleaveContextParallelMetadata(
+            per_rank_actual_token=[max_local] * cp_size,
+            max_rank_len=[max_local] * cp_size,
+            total_seq_lens=total,
+            bs=forward_batch.batch_size,
+            per_rank_logical_token=counts,
+            gather_index=gather_index,
+            local_index=local_metadata_rows,
+        )
+        return dict(
+            cp_metadata=cp_metadata,
+            local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
+            local_positions=local_positions,
+            local_lens_cpu=np.bincount(
+                request_of_row[local_host], minlength=forward_batch.batch_size
             ).tolist(),
             pad_rows=pad_rows,
         )

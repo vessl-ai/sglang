@@ -1682,6 +1682,13 @@ class Envs:
     # at 1.7k-11.3k rows). Once per compress ratio per forward, as before; never while
     # a CUDA graph is being captured.
     SGLANG_OPT_DSV4_SM90_MLA_SCHED_META = EnvBool(False)
+    # INF-681 k-fuse-p. Bounded-replay late-layer tail metadata: build the row layout
+    # (tail lengths, the CP owner-rank layout, per-request local lengths) from the host
+    # extend lengths and copy it from pinned memory, instead of pageable copies,
+    # bincount, nonzero and repeat_interleave without output_size. Removes the 12 host
+    # syncs at the start of every CP4 prefill forward that hold the CPU until the
+    # previous forward's GPU work is done. Same values and dtypes.
+    SGLANG_OPT_DSV4_TAIL_LAYOUT_NO_SYNC = EnvBool(False)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of
     # >= 256 rows with a Triton kernel that is bit-identical to
     # per_token_group_quant_8bit_v2 and ~3x faster at 32k rows (measured at 4096 and

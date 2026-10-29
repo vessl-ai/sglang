@@ -54,7 +54,12 @@ def _inputs(b, topk, extra_topk, mode, seed):
     extra = None
     if extra_topk:
         extra_indices = torch.randint(
-            0, 256 * PAGE, (b, 1, extra_topk), device="cuda", dtype=torch.int32, generator=g
+            0,
+            256 * PAGE,
+            (b, 1, extra_topk),
+            device="cuda",
+            dtype=torch.int32,
+            generator=g,
         )
         if mode == "prefill":
             # A chunk's rows: the compressed history grows with the position.
