@@ -1749,6 +1749,9 @@ class Envs:
     # "triton": triton_kernels with the decode tiles of
     # SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE, ~0.5 GB more per layer (intermediate 576
     # padded to 640), 0.78 ms per layer.
+    # "sm90": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL CUDA kernels (raw MXFP4 bytes, no
+    # extra memory; 0.705 ms at 768 rows, slower than triton from ~3k rows); shapes they do
+    # not cover fall back to Marlin. Unmeasured in an engine.
     SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND = EnvStr("marlin")
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).

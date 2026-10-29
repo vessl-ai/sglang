@@ -373,7 +373,11 @@ def test_late_layer_w4a16_selection(start, prefix, bounded, expected, monkeypatc
 
 @pytest.mark.parametrize(
     "backend,expected",
-    [("triton", (False, True, True)), ("marlin", (False, False, False))],
+    [
+        ("triton", (False, True, True, False)),
+        ("marlin", (False, False, False, False)),
+        ("sm90", (False, False, False, True)),
+    ],
 )
 def test_late_layer_w4a16_backend(backend, expected, monkeypatch):
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
@@ -390,10 +394,11 @@ def test_late_layer_w4a16_backend(backend, expected, monkeypatch):
         method._use_w4a8,
         method._use_triton_kernels,
         method._triton_kernels_decode,
+        method._sm90_decode_kernel,
     )
     assert got == expected
     monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND", "other")
-    with pytest.raises(ValueError, match="triton' or 'marlin"):
+    with pytest.raises(ValueError, match="'triton', 'marlin' or 'sm90'"):
         method._use_late_w4a16()
 
 

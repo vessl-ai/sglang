@@ -336,10 +336,10 @@ class Mxfp4MarlinMoEMethod:
     def _use_late_w4a16(self) -> None:
         """Switch this layer from W4A8 to a W4A16 backend (before its weights are prepared)."""
         backend = envs.SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND.get()
-        if backend not in ("triton", "marlin"):
+        if backend not in ("triton", "marlin", "sm90"):
             raise ValueError(
-                "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND must be 'triton' or 'marlin', "
-                f"got {backend!r}"
+                "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND must be 'triton', 'marlin' or "
+                f"'sm90', got {backend!r}"
             )
         log_info_on_rank0(
             logger,
@@ -351,6 +351,9 @@ class Mxfp4MarlinMoEMethod:
         # path falls back to its default tiles above that (up to 64 x 128 rows).
         self._triton_kernels_decode = backend == "triton"
         self._use_triton_kernels = backend == "triton"
+        # "sm90": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL kernels; a layer shape they do
+        # not cover falls back to Marlin in process_weights_after_loading.
+        self._sm90_decode_kernel = backend == "sm90"
 
     def _prepare_w4a8_weights(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
