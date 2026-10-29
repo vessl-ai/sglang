@@ -1962,6 +1962,26 @@ class Envs:
     SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS = EnvStr("")
     # Only arm the hooks for extend batches with at least this many new tokens.
     SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS = EnvInt(0)
+    # INF-681 k-pcomm levers for the prefill-CP (attention CP x MoE TP) MoE collectives.
+    # All default off.
+    # - CP_SHARED_EXPERT_LOCAL: with SGLANG_SHARED_EXPERT_TP1=1 (replicated shared
+    #   expert), compute the shared expert on this rank's own CP shard (T/cp rows, full
+    #   intermediate) before the MoE all-gather and add it to the reduce-scattered shard,
+    #   instead of on the gathered T rows with TP-split weights (same FLOPs per rank).
+    #   The shared expert then no longer needs the all-gather. Numerics: the shared
+    #   output is summed once in fp32 over the full intermediate and added after the
+    #   reduce-scatter, instead of as 4 bf16 partials inside it.
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL = EnvBool(False)
+    # - CP_SHARED_EXPERT_OVERLAP: run that local shared expert on a side stream so it
+    #   overlaps the MoE all-gather (and the router / routed experts), joined before its
+    #   add. Eager steps with at least _MIN_ROWS local rows only; inline otherwise (on the
+    #   1-request CP4 step, 1,728 rows per rank, the fork/join and the slower overlapped
+    #   all-gather cost more than the ~0.15 ms shared expert it hides).
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS = EnvInt(4096)
+    #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
+    #   (NCCL's ring all-gather / reduce-scatter hold 24 SMs at the CP4 sizes); 0 = no cap.
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)

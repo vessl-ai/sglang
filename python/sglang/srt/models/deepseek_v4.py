@@ -417,6 +417,74 @@ def _dp_shared_expert_sm_cap():
         yield
     finally:
         deep_gemm.set_num_sms(total)
+
+
+_CP_SHARED_EXPERT_STREAM: Optional[torch.cuda.Stream] = None
+_CP_SHARED_EXPERT_LOGGED = False
+
+
+def _cp_shared_expert_local_on(mlp) -> bool:
+    """INF-681 k-pcomm SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL: the prefill-CP MoE takes
+    its shared expert from this rank's own shard (needs the replicated TP1 shared
+    expert, SGLANG_SHARED_EXPERT_TP1=1)."""
+    global _CP_SHARED_EXPERT_LOGGED
+    if not envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL.get():
+        return False
+    if getattr(mlp, "shared_experts", None) is None:
+        return False
+    ok = getattr(mlp, "_shared_expert_tp1", False)
+    if not _CP_SHARED_EXPERT_LOGGED:
+        _CP_SHARED_EXPERT_LOGGED = True
+        if ok:
+            logger.info(
+                "k-pcomm CP local shared expert on: overlap=%s min_rows=%d reserve_sms=%d",
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP.get(),
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS.get(),
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS.get(),
+            )
+        else:
+            logger.warning(
+                "SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL needs SGLANG_SHARED_EXPERT_TP1=1 "
+                "(replicated shared expert); ignored"
+            )
+    return ok
+
+
+def _cp_shared_expert_stream(num_rows: int) -> Optional[torch.cuda.Stream]:
+    """The side stream the CP-local shared expert runs on, or None (inline): only with
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP on CUDA, in eager steps (a CUDA graph would
+    freeze the fork/join), and for shards of at least _MIN_ROWS rows."""
+    global _CP_SHARED_EXPERT_STREAM
+    if not (_is_cuda and envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP.get()):
+        return None
+    if num_rows < envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS.get():
+        return None
+    if torch.cuda.is_current_stream_capturing() or get_is_capture_mode():
+        return None
+    if _CP_SHARED_EXPERT_STREAM is None:
+        _CP_SHARED_EXPERT_STREAM = torch.cuda.Stream()
+    return _CP_SHARED_EXPERT_STREAM
+
+
+@contextmanager
+def _cp_shared_expert_sm_cap():
+    """Leave SMs free for the NCCL collective the side-stream shared expert overlaps
+    (same reason as _dp_shared_expert_sm_cap: DeepGEMM's persistent SM90 kernels take
+    every SM and NCCL's ring CTAs cannot share one)."""
+    reserve = envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS.get()
+    if reserve <= 0:
+        yield
+        return
+    import deep_gemm
+
+    total = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(max(1, total - reserve))
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(total)
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -3633,9 +3701,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        # INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL): the replicated shared
+        # expert on this rank's own CP shard, before (or beside) the MoE all-gather.
+        _cp_shared = None
+        _cp_shared_stream = None
+        _cp_shared_input = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
+                if hidden_states.shape[0] > 0 and _cp_shared_expert_local_on(self.mlp):
+                    _cp_shared_stream = _cp_shared_expert_stream(hidden_states.shape[0])
+                    if _cp_shared_stream is not None:
+                        # The input stays referenced until the join below, so the
+                        # allocator cannot hand its block to the main stream while the
+                        # side stream still reads it (no record_stream: KEEP-facts).
+                        _cp_shared_input = hidden_states
+                        _cp_shared_stream.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(_cp_shared_stream), _cp_shared_expert_sm_cap():
+                            _cp_shared = self.mlp._forward_shared_experts(hidden_states)
+                    else:
+                        _cp_shared = self.mlp._forward_shared_experts(hidden_states)
                 hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
@@ -3710,7 +3795,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
+                skip_shared_experts=_do_shared_local or _cp_shared is not None,
                 return_moe_output=return_moe_output,
             )
 
@@ -3718,6 +3803,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _cp_moe_return_shard(
                 hidden_states, dsv41=self.config.model_type == "deepseek_v41"
             )
+            if _cp_shared is not None:
+                if _cp_shared_stream is not None:
+                    torch.cuda.current_stream().wait_stream(_cp_shared_stream)
+                    _cp_shared_input = None
+                hidden_states.add_(_cp_shared)
+                _cp_shared = None
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),

@@ -450,6 +450,13 @@ class LateLayerGraphRunner:
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._stream = torch.cuda.Stream()
+        # --enable-symm-mem: the symmetric-memory allocations made inside the capture
+        # (the CP all-gather outputs) pause this graph's pool, which they look up here
+        # (INF-681 k-pcomm: without it every capture fails with "graph_pool_id is not set
+        # under graph capture" and the late layers stay eager).
+        from sglang.srt.distributed.device_communicators import pynccl_allocator
+
+        pynccl_allocator.set_graph_pool_id(self._pool)
         t0 = time.perf_counter()
         graph = BreakableCUDAGraph()
         ntnp = self._num_token_non_padded(step, bucket)
