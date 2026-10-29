@@ -2684,6 +2684,33 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+def _cp_moe_combine_reduce_scatters() -> bool:
+    """Whether the V4.1 prefill-CP MoE exit reduce-scatters its output.
+
+    The expert partial sums span the TP group. A reduce-scatter over the
+    attention-CP group completes them only when that group is the TP group
+    (attention TP 1); its rank-major chunk is then the same CP shard that the
+    all-reduce + split returns.
+    """
+    parallel = get_parallel()
+    return (
+        envs.SGLANG_DSV41_CP_MOE_REDUCE_SCATTER.get()
+        and parallel.attn_cp_size == parallel.tp_size
+    )
+
+
+def _cp_moe_return_shard(hidden_states: torch.Tensor, *, dsv41: bool) -> torch.Tensor:
+    """Sum the MoE partials of the rank-major gathered CP batch and keep this
+    rank's equal, padded interleave shard."""
+    if dsv41 and not _cp_moe_combine_reduce_scatters():
+        parallel = get_parallel()
+        hidden_states = parallel.tp_group.all_reduce(hidden_states)
+        return hidden_states.tensor_split(parallel.attn_cp_size)[
+            parallel.attn_cp_rank
+        ].contiguous()
+    return attn_cp_interleave_reduce_scatter(hidden_states)
+
+
 @contextmanager
 def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
     # Under CP the real rows are not a prefix, so every row must be routed.
@@ -3559,14 +3586,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            if self.config.model_type == "deepseek_v41":
-                parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
-            else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+            hidden_states = _cp_moe_return_shard(
+                hidden_states, dsv41=self.config.model_type == "deepseek_v41"
+            )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -4916,6 +4938,38 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if tail.real_rows_count is not None
                 else tail.token_indices
             )
+        return output
+
+    def cp_logits_late_layer_tail(self, forward_batch: ForwardBatch):
+        """Under prefill CP with DSpark capture, the decoder-replay tail whose rows
+        the model body returned (the eager CP runner gathers with its layout)."""
+        if (
+            not self.capture_aux_hidden_states
+            or self.model.late_layer_start is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        assert tail is None or tail.global_token_indices is not None
+        return tail
+
+    def cp_logits_on_late_layer_tail(
+        self, tail, forward_batch: ForwardBatch, hidden_states, aux_hidden_states
+    ):
+        """Logits over the gathered tail rows, as forward() does without CP."""
+        indices = tail.global_token_indices
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = self.logits_processor(
+            forward_batch.input_ids[indices],
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+        )
+        output.hidden_states_token_indices = indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
