@@ -1655,6 +1655,9 @@ class Envs:
     #   rows), run that shared expert on a side stream so it overlaps the MoE gather,
     #   the router and the routed experts instead of running before the gather.
     SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
+    #   (NCCL's ring all-gather holds 23 SMs at these sizes on 4 H200s); 0 = no cap.
+    SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
     # - DP_DECODE_STATS_STREAM: compute the mHC mix stats + Sinkhorn of a sublayer on
     #   the existing stats side stream beside the sublayer (as SM90 already does for
     #   decode batches <= 64 rows) for DP-attention decode / verify batches up to

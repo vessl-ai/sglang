@@ -387,6 +387,29 @@ def _dp_shared_expert_stream() -> Optional[torch.cuda.Stream]:
     if _DP_SHARED_EXPERT_STREAM is None:
         _DP_SHARED_EXPERT_STREAM = torch.cuda.Stream()
     return _DP_SHARED_EXPERT_STREAM
+
+
+@contextmanager
+def _dp_shared_expert_sm_cap():
+    """Leave SMs free for the NCCL all-gather the side-stream shared expert overlaps.
+
+    DeepGEMM's SM90 kernels are persistent on every SM (132 CTAs, ~170 KB smem each)
+    and NCCL's ring kernels hold ~23 SMs (~119 KB smem each), so the two cannot share an
+    SM: uncapped, the GEMM's last CTAs wait for the collective and both slow down
+    (rig: all-gather 45 -> 70 us, gate_up 15 -> 37 us). The cap is a host-side DeepGEMM
+    launch setting, restored right after the shared expert's GEMMs are issued."""
+    reserve = envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.get()
+    if reserve <= 0:
+        yield
+        return
+    import deep_gemm
+
+    total = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(max(1, total - reserve))
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(total)
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -3555,7 +3578,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     # gather and the routed MoE and is joined before its add below.
                     _shared_stream.wait_stream(torch.cuda.current_stream())
                     local_hidden_states.record_stream(_shared_stream)
-                    with torch.cuda.stream(_shared_stream):
+                    with torch.cuda.stream(_shared_stream), _dp_shared_expert_sm_cap():
                         _shared_local = self.mlp._forward_shared_experts(
                             local_hidden_states
                         )
