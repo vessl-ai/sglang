@@ -1616,6 +1616,17 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Extend steps of a TP-sharded engram table (device or per_rank host): start the
+    # row gathers of every engram layer before layer 0 on a side stream (the hash ids
+    # only depend on the input tokens), copy fp8 + scale bytes instead of bf16, and
+    # combine the shards with an integer reduce-scatter under prefill CP (all-reduce
+    # otherwise) at the first engram layer. Bit-identical to the in-layer lookup
+    # (INF-681 k-engram).
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH = EnvBool(False)
+    # Programs of the side-stream gather; 0 = one per SM. Few programs keep the
+    # gather from crowding the layers it overlaps (INF-681 k-engram: 16 programs
+    # finish a 65k-token step's lookup well inside layer 0).
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH_PROGRAMS = EnvInt(16)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

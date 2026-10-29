@@ -96,7 +96,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    EngramPrefetch,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
@@ -4187,6 +4192,17 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
+    def _engram_layers(self) -> List[Tuple[int, Engram]]:
+        layers = getattr(self, "_engram_layer_list", None)
+        if layers is None:
+            layers = [
+                (i, self.layers[i].engram)
+                for i in range(self.start_layer, self.end_layer)
+                if getattr(self.layers[i], "engram", None) is not None
+            ]
+            self._engram_layer_list = layers
+        return layers
+
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
         if (
@@ -4224,20 +4240,29 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        engram_prefetch = None
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
+                hash_full = self.engram_hasher(
                     forward_batch.input_ids[:total], forward_batch
                 )
                 parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                hash_ids = hash_full[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                 if pad_rows > 0:
                     hash_ids = torch.cat(
                         [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                     )
+                engram_prefetch = EngramPrefetch.maybe_start(
+                    self._engram_layers(),
+                    hash_full,
+                    forward_batch,
+                    cp=True,
+                    local_rows=hidden_states.shape[0],
+                    late_layer_start=self.late_layer_start,
+                )
             elif (
                 forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             ):
@@ -4246,6 +4271,14 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+                engram_prefetch = EngramPrefetch.maybe_start(
+                    self._engram_layers(),
+                    hash_ids,
+                    forward_batch,
+                    cp=False,
+                    local_rows=hash_ids.shape[0],
+                    late_layer_start=self.late_layer_start,
+                )
         tail = None
         if (
             self.late_layer_start is not None
@@ -4329,6 +4362,8 @@ class DeepseekV4Model(nn.Module):
                 if late_state is not None:
                     state = late_state
                     break
+            if engram_prefetch is not None:
+                engram_prefetch.reduce_due(i)
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4337,6 +4372,11 @@ class DeepseekV4Model(nn.Module):
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
                     cp_all_tokens=cp_extend,
+                    prefetched=(
+                        engram_prefetch.take(i)
+                        if engram_prefetch is not None
+                        else None
+                    ),
                 )
                 # Only multimodal placeholders become image_token_id, so a text-only
                 # batch skips this full-residual where.
