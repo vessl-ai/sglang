@@ -53,6 +53,9 @@ def _layer(cpu_weights, backend, monkeypatch):
         "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE",
         "1" if backend == "triton_kernels" else "0",
     )
+    # The prefill path only; an exported decode or W4A8 switch would change it.
+    monkeypatch.setenv("SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE", "0")
+    monkeypatch.setenv("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE", "0")
     method = Mxfp4MarlinMoEMethod(
         SimpleNamespace(process_weights_after_loading=lambda layer: None), "test"
     )
@@ -167,6 +170,43 @@ def test_route_slots_by_expert_matches_bincount_and_stable_argsort(
     assert torch.equal(routing.gather_indx.long(), ref_slots // top_k)
     ref_w = torch.where(ids >= 0, weights, 0).flatten()[ref_slots]
     assert torch.equal(routing.sorted_weights, ref_w)
+
+
+def test_route_slots_by_expert_has_no_host_sync():
+    """Captured in a CUDA graph and replayed with new routing: a host-syncing
+    histogram (torch.bincount) cannot be captured, and a replay must see the new ids."""
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import route_slots_by_expert
+
+    tokens, num_experts, top_k = 300, 384, 6
+    g = torch.Generator(device="cuda").manual_seed(7)
+
+    def draw():
+        ids = torch.randint(
+            0, num_experts, (tokens, top_k), device="cuda", generator=g
+        ).int()
+        ids[::5, -1] = -1
+        return ids, torch.rand(tokens, top_k, device="cuda", generator=g)
+
+    ids, weights = draw()
+    route_slots_by_expert(ids, weights, num_experts)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        routing = route_slots_by_expert(ids, weights, num_experts)
+    new_ids, new_weights = draw()
+    ids.copy_(new_ids)
+    weights.copy_(new_weights)
+    graph.replay()
+    torch.cuda.synchronize()
+    flat = torch.where(new_ids >= 0, new_ids, 0).flatten().long()
+    ref_slots = torch.argsort(flat, stable=True)
+    assert torch.equal(
+        routing.expert_counts.long(), torch.bincount(flat, minlength=num_experts)
+    )
+    assert torch.equal(routing.combine_indx.long(), ref_slots)
+    ref_w = torch.where(new_ids >= 0, new_weights, 0).flatten()[ref_slots]
+    assert torch.equal(routing.sorted_weights, ref_w)
+    del graph
 
 
 def test_prefill_accuracy_vs_marlin(monkeypatch):
