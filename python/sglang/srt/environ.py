@@ -1864,7 +1864,27 @@ class Envs:
     # "sm90": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL CUDA kernels (raw MXFP4 bytes, no
     # extra memory; 0.705 ms at 768 rows, slower than triton from ~3k rows); shapes they do
     # not cover fall back to Marlin. Unmeasured in an engine.
+    # "sm90_w4a8" (INF-681 k-pmoe): the SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 warp-specialized
+    # W4A8 kernels (FP8 activations as in the early layers: numerics change; raw-MXFP4 byte
+    # count, ~0.16 GB less per layer than Marlin). H200, layer 25, 1,280 rows: 0.875 vs 1.508
+    # ms per MoE call (768 rows 0.651 vs 1.146). Unmeasured in an engine.
     SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND = EnvStr("marlin")
+    # INF-681 k-pmoe, large-step (FP8-copy) W4A8 prefill MoE path; each is bit-identical to
+    # the path without it (SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM=1 is the reference).
+    # SwiGLU in the gate/up GEMM's epilogue: the FP8 weight copy stores gate and up rows
+    # interleaved, the GEMM writes the bf16 SwiGLU output (half the bytes) and a row
+    # quantization replaces the separate SwiGLU + quant kernel.
+    SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU = EnvBool(False)
+    # The top-k sum also adds the shared expert's output in place (one pass over the
+    # tokens instead of the sum + a separate add); needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
+    SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD = EnvBool(False)
+    # Counting sort of the top-k slots by expert (4 Triton launches) instead of the stable
+    # argsort + scatter-add routing; needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
+    SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE = EnvBool(False)
+    # Down-projection GEMM tiles for calls with at least this many rows: 128x128 tiles, two
+    # CTAs per SM (one CTA's epilogue runs beside the other's main loop; K is only 576).
+    # 0 = off (triton_kernels' own 128x256 tile, one CTA per SM).
+    SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS = EnvInt(0)
     # Score the DeepSeek-V4.1 Hopper paged decode indexer's verify rows with the
     # per-row kernel instead of the tensor-core one (A/B and fallback).
     SGLANG_DSV41_PAGED_INDEXER_NO_TC = EnvBool(False)

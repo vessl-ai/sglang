@@ -290,6 +290,41 @@ class Mxfp4MarlinMoEMethod:
         prepare_moe_mxfp4_layer_for_marlin(layer)
         layer._dsv4_mxfp4_backend = "marlin"
 
+    # INF-681 k-pmoe (SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD): the MoE block may hand the
+    # shared expert's output to the next apply(), which then returns shared + routed
+    # (added in place by the W4A8 top-k sum) instead of the routed output alone.
+    _pending_shared_add = None
+    _logged_shared_add = False
+
+    def accepts_shared_add(self, experts) -> bool:
+        """True when the next apply() can return shared + routed for this layer: the W4A8
+        prefill experts with the fused add on, and the routed scaling factor already in
+        the top-k weights (so the add has no scale)."""
+        w4a8 = getattr(self, "_w4a8", None)
+        return (
+            self._use_w4a8
+            and w4a8 is not None
+            and w4a8.fused_shared_add
+            and bool(
+                getattr(experts, "should_fuse_routed_scaling_factor_in_topk", False)
+            )
+        )
+
+    def set_pending_shared_add(self, shared_output) -> None:
+        if not Mxfp4MarlinMoEMethod._logged_shared_add:
+            Mxfp4MarlinMoEMethod._logged_shared_add = True
+            log_info_on_rank0(
+                logger,
+                "SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD: the shared expert output is added "
+                f"inside the routed top-k sum (first layer: {self.prefix})",
+            )
+        self._pending_shared_add = shared_output
+
+    def take_unconsumed_shared_add(self):
+        """Clear and return a shared output that no apply() consumed (None if consumed)."""
+        pending, self._pending_shared_add = self._pending_shared_add, None
+        return pending
+
     def apply(
         self,
         layer: Module,
@@ -303,9 +338,13 @@ class Mxfp4MarlinMoEMethod:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
         if self._use_w4a8:
+            add_to, self._pending_shared_add = self._pending_shared_add, None
             return StandardCombineInput(
                 hidden_states=self._w4a8(
-                    hidden_states, topk_output.topk_ids, topk_output.topk_weights
+                    hidden_states,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    add_to=add_to,
                 )
             )
         if self._sm90_decode_w4a8:
@@ -360,10 +399,10 @@ class Mxfp4MarlinMoEMethod:
     def _use_late_w4a16(self) -> None:
         """Switch this layer from W4A8 to a W4A16 backend (before its weights are prepared)."""
         backend = envs.SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND.get()
-        if backend not in ("triton", "marlin", "sm90"):
+        if backend not in ("triton", "marlin", "sm90", "sm90_w4a8"):
             raise ValueError(
                 "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND must be 'triton', 'marlin' or "
-                f"'sm90', got {backend!r}"
+                f"'sm90' (W4A16), or 'sm90_w4a8', got {backend!r}"
             )
         log_info_on_rank0(
             logger,
@@ -378,6 +417,9 @@ class Mxfp4MarlinMoEMethod:
         # "sm90": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL kernels; a layer shape they do
         # not cover falls back to Marlin in process_weights_after_loading.
         self._sm90_decode_kernel = backend == "sm90"
+        # INF-681 k-pmoe "sm90_w4a8": the SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 kernels (W4A8,
+        # FP8 activations like the early layers, raw-MXFP4 byte count; same fallback).
+        self._sm90_decode_w4a8 = backend == "sm90_w4a8"
 
     def _prepare_w4a8_weights(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
@@ -397,7 +439,12 @@ class Mxfp4MarlinMoEMethod:
                 "clamped SwiGLU experts with an unpadded hidden size."
             )
         log_info_on_rank0(
-            logger, f"Using W4A8 (FP8 tensor core) MXFP4 experts (layer: {self.prefix})"
+            logger,
+            f"Using W4A8 (FP8 tensor core) MXFP4 experts (layer: {self.prefix}; k-pmoe "
+            f"fused_swiglu={envs.SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU.get()} "
+            f"fused_shared_add={envs.SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD.get()} "
+            f"counting_route={envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get()} "
+            f"w2_two_cta_min_rows={envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get()})",
         )
         self._w4a8 = Mxfp4W4A8PrefillExperts(
             layer.w13_weight.data,
@@ -409,6 +456,10 @@ class Mxfp4MarlinMoEMethod:
             prefetch_chunks=envs.SGLANG_DSV4_W4A8_PREFETCH_CHUNKS.get(),
             sorted_sum=envs.SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.get(),
             small_step_rows=envs.SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS.get(),
+            fused_swiglu=envs.SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU.get(),
+            fused_shared_add=envs.SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD.get(),
+            counting_route=envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get(),
+            w2_two_cta_min_rows=envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get(),
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 

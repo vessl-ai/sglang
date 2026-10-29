@@ -1375,6 +1375,17 @@ class DeepseekV2MoE(nn.Module):
             qcp_armed = dsv4_prefill_qcp.arm_shared_add(
                 self.experts, shared_output, self.routed_scaling_factor
             )
+        # INF-681 k-pmoe (SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD): the W4A8 prefill experts
+        # add the shared expert's output inside their top-k sum and return shared + routed.
+        fused_shared_add = (
+            shared_output is not None
+            and not self._shared_expert_tp1
+            and not return_moe_output
+            and hasattr(self.experts.quant_method, "accepts_shared_add")
+            and self.experts.quant_method.accepts_shared_add(self.experts)
+        )
+        if fused_shared_add:
+            self.experts.quant_method.set_pending_shared_add(shared_output)
         if pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
@@ -1394,6 +1405,12 @@ class DeepseekV2MoE(nn.Module):
             if self.reduce_results:
                 return post_experts_all_reduce(shared_output)
             return shared_output
+        if (
+            fused_shared_add
+            and self.experts.quant_method.take_unconsumed_shared_add() is not None
+        ):
+            # No apply() took it (another expert path ran): add it the usual way below.
+            fused_shared_add = False
         if (
             not _is_cuda
             and not _is_musa
@@ -1428,7 +1445,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
+            None if (self._shared_expert_tp1 or fused_shared_add) else shared_output,
             self.routed_scaling_factor,
         )
         if self.reduce_results:
