@@ -157,3 +157,25 @@ def test_stats_stream_gate(dp4):
         assert not dp4.use_stats_stream(cfg, extend, x)
         big = torch.empty(513, MULT, HIDDEN, device="cuda", dtype=torch.bfloat16)
         assert not dp4.use_stats_stream(cfg, verify, big)
+
+
+def test_shared_expert_sm_cap_restores():
+    import deep_gemm
+
+    from sglang.srt.environ import envs
+    from sglang.srt.models.deepseek_v4 import _dp_shared_expert_sm_cap
+
+    total = deep_gemm.get_num_sms()
+    with envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.override(24):
+        with _dp_shared_expert_sm_cap():
+            assert deep_gemm.get_num_sms() == total - 24
+        assert deep_gemm.get_num_sms() == total
+        try:
+            with _dp_shared_expert_sm_cap():
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        assert deep_gemm.get_num_sms() == total
+    with envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.override(0):
+        with _dp_shared_expert_sm_cap():
+            assert deep_gemm.get_num_sms() == total
