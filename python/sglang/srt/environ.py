@@ -1658,6 +1658,14 @@ class Envs:
     # combine + RMSNorm (the JIT kernel Blackwell already takes for 4096-65536
     # rows), so the rebuilt residual is not read back a second time.
     SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE = EnvBool(False)
+    # INF-681 k-qcp (prefill quant/copy + mHC levers), all default off:
+    # - CP_FUSED_MHC_POST_COMBINE: let prefill context parallelism (CP4, attention TP 1)
+    #   take the fused post + combine + RMSNorm kernel above (or Blackwell's) on its
+    #   CP-local rows. The kernel is per row, so CP changes nothing for it; without this
+    #   switch the CP path silently keeps the unfused post and combine even when
+    #   SGLANG_DSV41_SM90_FUSED_MHC_POST_COMBINE is set. Same numerics as that switch on
+    #   TP4: residual bit-identical, normed rows within 1 bf16 ulp of the unfused path.
+    SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE = EnvBool(False)
     # INF-681 k-fuse-p. Sparse prefill: copy each request's compressed length to the
     # device from pinned memory without blocking, instead of torch.tensor(list,
     # device=cuda), whose pageable copy waits for the whole stream to drain. Removes

@@ -647,12 +647,19 @@ def _post_fusion(
         and cfg.hidden == 5120
         and cfg.mult == 4
         and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
+        and (not cfg.cp_prefill or envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.get())
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
             mhc_post_combine_norm_prefill,
         )
 
+        if cfg.cp_prefill:
+            # The kernel indexes dense rows; mhc_post makes the same guarantee under CP.
+            from sglang.srt.layers.utils.common import strict_contiguous
+
+            y, residual = strict_contiguous(y), strict_contiguous(residual)
+            post_mix, comb = strict_contiguous(post_mix), strict_contiguous(comb)
+            pre = strict_contiguous(pre)
         updated, normalized = mhc_post_combine_norm_prefill(
             y,
             residual,
