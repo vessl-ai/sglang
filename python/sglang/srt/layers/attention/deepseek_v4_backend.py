@@ -207,6 +207,59 @@ def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
     return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
 
 
+def _maybe_precompute_sm90_flashmla_sched_meta(
+    flashmla_metadata,
+    *,
+    q: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+) -> bool:
+    """SGLANG_OPT_DSV4_SM90_MLA_SCHED_META: fill the schedule with the parallel
+    large-batch kernel. True when it did. The 64-head sparse FP8 decode kernel on SM90
+    schedules with block_size_n 64, fixed overhead 5 and one part per SM (s_q 1), the
+    same constants as SM100 (checked against FlashMLA's own metadata for 1-30,000
+    rows). Skipped under CUDA graph capture, so a captured region keeps FlashMLA's own
+    in-graph schedule."""
+    if not (
+        envs.SGLANG_OPT_DSV4_SM90_MLA_SCHED_META.get()
+        and q.is_cuda
+        and get_platform().is_sm90
+        and q.ndim == 4
+        and q.shape[1] == 1
+        and q.shape[-2] == 64
+        and indices is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta_large import (
+        META_INTS,
+        fits,
+        flashmla_sched_meta_large,
+    )
+
+    b = q.shape[0]
+    num_sm_parts = _num_sms(q.device.index)
+    if b < 1 or not fits(b, num_sm_parts, q.device.index):
+        return False
+    meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
+    num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
+    flashmla_sched_meta_large(
+        meta,
+        num_splits,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
+        topk=indices.shape[-1],
+        extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+    )
+    flashmla_metadata.tile_scheduler_metadata = meta
+    flashmla_metadata.num_splits = num_splits
+    return True
+
+
 def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata,
     *,
@@ -222,6 +275,15 @@ def _maybe_precompute_flashmla_sched_meta(
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
+        return
+    if _maybe_precompute_sm90_flashmla_sched_meta(
+        flashmla_metadata,
+        q=q,
+        indices=indices,
+        topk_length=topk_length,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+    ):
         return
     if not _fast_flashmla_sched_shape(q):
         return
