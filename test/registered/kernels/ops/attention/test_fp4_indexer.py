@@ -20,6 +20,9 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_rows_to_fp8,
+    gather_fp4_index_k,
+    gather_fp4_index_k_fp8,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
 )
@@ -226,6 +229,120 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+def _ref_dequant_fp4_rows(payload: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """fp32 values of packed fp4 rows: e2m1 code times its block's ue8m0 scale."""
+    table = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=payload.device
+    )
+    u = payload.view(torch.uint8).to(torch.int64)
+    codes = torch.stack([u & 0x0F, u >> 4], dim=-1).flatten(-2)
+    values = table[codes & 7] * torch.where(codes >= 8, -1.0, 1.0)
+    exps = torch.stack([(sf >> (8 * b)) & 0xFF for b in range(SCALE_GROUPS)], -1)
+    return values * torch.exp2(exps.float() - 127).repeat_interleave(GROUP_SIZE, -1)
+
+
+def _fp4_rows_with_block_spread(num_rows: int, spread: int, seed: int):
+    """Random packed fp4 rows whose block exponents span exactly ``spread``."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    payload = torch.randint(
+        0, 256, (num_rows, FP4_DIM), device="cuda", dtype=torch.uint8, generator=g
+    )
+    base = torch.randint(
+        100, 140, (num_rows, 1), device="cuda", dtype=torch.int32, generator=g
+    )
+    exps = base + torch.randint(
+        0, spread + 1, (num_rows, SCALE_GROUPS), device="cuda", generator=g
+    ).to(torch.int32)
+    exps[:, 0], exps[:, 1] = base[:, 0], base[:, 0] + spread
+    sf = sum(exps[:, b] << (8 * b) for b in range(SCALE_GROUPS))
+    return payload.view(torch.int8), sf.to(torch.int32)
+
+
+_needs_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="e4m3 conversion needs SM89+",
+)
+
+
+@_needs_fp8
+@pytest.mark.parametrize("num_rows", [1, 33, 4097])
+def test_fp4_index_k_fp8_gather_is_exact(num_rows: int) -> None:
+    """Quantized keys, gathered from the pool at shuffled slots, widen exactly."""
+    torch.manual_seed(num_rows)
+    num_pages = (num_rows + PAGE_SIZE - 1) // PAGE_SIZE + 2
+    x = torch.randn(num_rows, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    x[0, :GROUP_SIZE] *= 1e-6  # a block at the quantizer's scale floor
+    x[-1, GROUP_SIZE : 2 * GROUP_SIZE] = 0
+    cache = torch.zeros(
+        num_pages, PAGE_SIZE * (FP4_DIM + SCALE_BYTES), device="cuda", dtype=torch.uint8
+    )
+    loc = torch.randperm(num_pages * PAGE_SIZE, device="cuda")[:num_rows]
+    store_fp4_index_k_cache(x, cache, loc, page_size=PAGE_SIZE, rne=True)
+    slots = loc[torch.randperm(num_rows, device="cuda")]
+
+    k_fp8, k_scale = gather_fp4_index_k_fp8(cache, slots, page_size=PAGE_SIZE)
+
+    assert k_fp8.dtype == torch.float8_e4m3fn and k_fp8.shape == (num_rows, HEAD_DIM)
+    expected = _ref_dequant_fp4_rows(
+        *gather_fp4_index_k(cache, slots, page_size=PAGE_SIZE)
+    )
+    torch.testing.assert_close(
+        k_fp8.float() * k_scale[:, None], expected, rtol=0, atol=0
+    )
+    assert torch.equal(k_scale, torch.exp2(torch.log2(k_scale).round()))
+
+
+@_needs_fp8
+@pytest.mark.parametrize("spread", [0, 14, 15, 30])
+def test_fp4_index_rows_to_fp8_block_spread(spread: int) -> None:
+    """Exact while a row's block exponents are within 14 of each other; beyond, a
+    value rounds to the e4m3 grid, at most 2**-16 of the row's largest block scale."""
+    payload, sf = _fp4_rows_with_block_spread(512, spread, seed=spread)
+    rows = payload.shape[0]
+
+    values, scale = fp4_index_rows_to_fp8(
+        payload.view(2, rows // 2, FP4_DIM), sf.view(2, -1)
+    )
+
+    assert values.shape == (2, rows // 2, HEAD_DIM) and scale.shape == (2, rows // 2)
+    actual = values.float().view(rows, HEAD_DIM) * scale.view(rows, 1)
+    expected = _ref_dequant_fp4_rows(payload, sf)
+    largest_scale = torch.exp2(((sf >> 8) & 0xFF).float() - 127)  # block 1 is the max
+    error = (actual - expected).abs().amax(-1) / largest_scale
+    if spread <= 14:
+        assert error.max().item() == 0
+    else:
+        assert error.max().item() > 0
+        assert error.max().item() <= 2.0**-16
+
+
+@_needs_fp8
+def test_fp4_index_rows_to_fp8_scaled_logits_match() -> None:
+    """The q scale folded into the head weight reproduces the fp4 logits."""
+    torch.manual_seed(3)
+    rows, heads, keys = 64, 32, 300
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(
+        torch.randn(rows * heads, HEAD_DIM, device="cuda"), rne=True
+    )
+    k_fp4, k_sf = quantize_fp4_indexer_tensor(
+        torch.randn(keys, HEAD_DIM, device="cuda"), rne=True
+    )
+    weights = torch.rand(rows, heads, device="cuda")
+
+    q8, q_scale = fp4_index_rows_to_fp8(
+        q_fp4.view(rows, heads, FP4_DIM), q_sf.view(rows, heads)
+    )
+    k8, k_scale = fp4_index_rows_to_fp8(k_fp4, k_sf)
+
+    def logits(q, k, w):
+        return (torch.einsum("rhd,nd->rhn", q, k).relu() * w[..., None]).sum(1)
+
+    q_ref = _ref_dequant_fp4_rows(q_fp4, q_sf).view(rows, heads, HEAD_DIM)
+    expected = logits(q_ref, _ref_dequant_fp4_rows(k_fp4, k_sf), weights)
+    actual = logits(q8.float(), k8.float(), weights * q_scale) * k_scale
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens + 100)
@@ -325,28 +442,50 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
 
 
-def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):
-    """Use exact dyadic inputs to isolate logits/masking from FP32 dot order."""
+def _make_logits_case(
+    rows: int,
+    heads: int,
+    width: int,
+    seed: int = 719,
+    group: int = 6,
+    dyadic: bool = True,
+):
+    """Dyadic inputs (the default) make every score exact whatever the FP32 dot
+    order, which isolates logits/masking from it; ``dyadic=False`` draws Gaussian
+    q, head weights and keys instead, whose scores depend on that order."""
     torch.manual_seed(seed)
     device = get_device()
-    q = (
-        torch.randint(-8, 9, (rows, heads, HEAD_DIM), device=device).to(torch.bfloat16)
-        / 8
-    )
-    weights = torch.randint(-8, 9, (rows, heads), device=device).to(torch.bfloat16) / 8
-    # Six adjacent verify rows share one request, with shuffled physical pages.
-    groups = (rows + 5) // 6
+    if dyadic:
+        q = (
+            torch.randint(-8, 9, (rows, heads, HEAD_DIM), device=device).to(
+                torch.bfloat16
+            )
+            / 8
+        )
+        weights = (
+            torch.randint(-8, 9, (rows, heads), device=device).to(torch.bfloat16) / 8
+        )
+    else:
+        q = torch.randn(rows, heads, HEAD_DIM, device=device).to(torch.bfloat16)
+        weights = (torch.randn(rows, heads, device=device) / heads**0.5).to(
+            torch.bfloat16
+        )
+    # `group` adjacent verify rows share one request, with shuffled physical pages.
+    groups = (rows + group - 1) // group
     padded = max(PAGE_SIZE, (width + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE)
     pages = torch.randperm(groups * padded // PAGE_SIZE, device=device)
     locations = (
         pages[:, None] * PAGE_SIZE + torch.arange(PAGE_SIZE, device=device)
     ).flatten()
-    keys = (
-        torch.randint(-8, 9, (groups * padded, HEAD_DIM), device=device).to(
-            torch.bfloat16
+    if dyadic:
+        keys = (
+            torch.randint(-8, 9, (groups * padded, HEAD_DIM), device=device).to(
+                torch.bfloat16
+            )
+            / 8
         )
-        / 8
-    )
+    else:
+        keys = torch.randn(groups * padded, HEAD_DIM, device=device).to(torch.bfloat16)
     table = torch.zeros(
         groups * padded // PAGE_SIZE,
         PAGE_SIZE * 68,
@@ -355,7 +494,7 @@ def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):
     )
     store_fp4_index_k_cache(keys, table, locations, page_size=PAGE_SIZE, rne=True)
     slots = locations.reshape(groups, padded)[
-        torch.arange(rows, device=device) // 6, :width
+        torch.arange(rows, device=device) // group, :width
     ].contiguous()
     patterns = [0, 1, 63, 64, 65, max(0, width - 1), width]
     lens = torch.tensor(
@@ -590,6 +729,215 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "requests,ratio,width,masked",
+    [(2, 1, 193, False), (2, 2, 8193, True), (11, 1, 32769, True)],
+)
+def test_fp4_paged_logits_grouped_rows_replay(requests, ratio, width, masked):
+    batch = requests * 6
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+
+    def run():
+        return fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            candidate_mask,
+            rows_per_request=6,
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
+        # Rows of a request differ by one position, as verify draft tokens do.
+        row_lens = visible - torch.arange(batch, device=q.device) % 6
+        lens.copy_(
+            (row_lens - 3 * (torch.arange(batch, device=q.device) // 6)).clamp_min(0)
+        )
+        lengths.copy_(lens)
+        req.copy_(req.roll(6))
+        group_slots = slots[::6].roll(step, dims=1)
+        req_table[req[::6].long(), : width * ratio : ratio] = (group_slots * ratio).to(
+            torch.int32
+        )
+        q.neg_()
+        graph.replay()
+        row_slots = req_table[req.long(), : width * ratio : ratio].long() // ratio
+        expected = _reference_logits(q, weights, row_slots, lens, table)
+        if masked:
+            expected.masked_fill_(~candidate_mask[:, :width], -torch.inf)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
+        )
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("heads", [16, 32])
+@pytest.mark.parametrize(
+    "requests,group,ratio,width,masked",
+    [
+        (3, 6, 1, 193, False),
+        (5, 6, 2, 8193, True),
+        (7, 4, 1, 16385, True),
+        (9, 2, 2, 4097, False),
+        (13, 6, 1, 32769, True),
+    ],
+)
+def test_fp4_paged_logits_tensor_core_matches_per_row(
+    requests, group, ratio, width, masked, heads
+):
+    """On exact (dyadic) inputs the tensor-core verify kernel scores bit for bit
+    like the per-row kernel, under graph replay with changing lengths, request
+    order, page tables and masks. Every request has its own pages."""
+    from sglang.srt.environ import envs
+
+    batch = requests * group
+    q, weights, slots, lens, table = _make_logits_case(batch, heads, width, group=group)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::group] * ratio).int()
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def run():
+        return fp4_index_logits_paged(*args, candidate_mask, rows_per_request=group)
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, 129, width]):
+        lengths.copy_(
+            (visible - torch.arange(batch, device=q.device) % group).clamp_min(0)
+        )
+        req_table[:, : width * ratio : ratio] = (
+            slots[::group].roll(step, 1) * ratio
+        ).int()
+        req.copy_(req.roll(group))
+        q.neg_()
+        if masked:
+            candidate_mask.copy_(candidate_mask.roll(1, dims=1))
+        graph.replay()
+        with envs.SGLANG_DSV41_PAGED_INDEXER_NO_TC.override(True):
+            expected = run()
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lengths[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask],
+            expected[:, :width][visible_mask],
+            atol=0,
+            rtol=0,
+        )
+
+
+def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
+    """The bf16 spacing at |x| (8 significant bits)."""
+    exponent = torch.frexp(x.abs().clamp_min(2.0**-126))[1]
+    return torch.ldexp(torch.ones_like(x), exponent - 8)
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("heads", [16, 32])
+@pytest.mark.parametrize("group,ratio", [(6, 1), (4, 2), (2, 1)])
+def test_fp4_paged_logits_tensor_core_non_dyadic(heads, group, ratio):
+    """Gaussian inputs: the tensor-core kernel and the per-row kernel accumulate the
+    dot and the head sum in different, unspecified orders, so equality is not
+    guaranteed. What is guaranteed: the same rounding points, so every score is
+    within a few bf16 ulps of the per-row one, up to cancellation between signed
+    head terms (bounded by the row's score scale).
+    Only the visible scores are compared. The capacity bound is exercised (the
+    capacity equals the width, so the store mask cuts the last tile); candidate
+    masking is checked bit for bit by the dyadic test. On H200 with the image's
+    Triton the scores have matched bit for bit; that is measured, not asserted."""
+    from sglang.srt.environ import envs
+
+    requests, width = 7, 3000
+    batch = requests * group
+    q, weights, slots, lens, table = _make_logits_case(
+        batch, heads, width, group=group, dyadic=False
+    )
+    capacity = width
+    req = (torch.arange(batch, device=q.device, dtype=torch.int32) // group).roll(group)
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::group] * ratio).int()
+    lengths = (width - torch.arange(batch, device=q.device) % group).to(torch.int32)
+    lengths[:group] = torch.tensor([0, 1, 127, 128, 129, 1000][:group])
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+    scores = fp4_index_logits_paged(*args, rows_per_request=group)
+    with envs.SGLANG_DSV41_PAGED_INDEXER_NO_TC.override(True):
+        expected = fp4_index_logits_paged(*args, rows_per_request=group)
+    visible = torch.arange(width, device=q.device)[None, :] < lengths[:, None]
+    # A different dot order moves each head term by about a bf16 ulp of that term;
+    # signed head weights can cancel, so bound by the row's score scale as well.
+    row_scale = torch.where(visible, expected.abs(), 0).amax(1, keepdim=True)
+    bound = (4 * _bf16_ulp(expected) + row_scale * 2.0**-8)[visible]
+    got, ref = scores[visible], expected[visible]
+    assert torch.isfinite(got).all()
+    assert ((got - ref).abs() <= bound).all()
+    mismatch = (got != ref).float().mean().item()
+    print(f"heads={heads} group={group} ratio={ratio} bit mismatch={mismatch:.2e}")
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+def test_fp4_paged_logits_tensor_core_lengths_past_the_mapped_table():
+    """Padded graph rows can carry lengths past the request's mapped (-1) table
+    entries. The tensor-core kernel clamps those slots to 0 instead of reading out
+    of bounds; the mapped positions still score like the reference."""
+    group, requests, width, mapped = 6, 3, 1000, 600
+    batch = requests * group
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width, group=group)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.full((requests, width), -1, device=q.device, dtype=torch.int32)
+    req_table[:, :mapped] = slots[::group, :mapped].int()
+    lengths = torch.full((batch,), width, device=q.device, dtype=torch.int32)
+    scores = fp4_index_logits_paged(
+        q,
+        weights,
+        req,
+        req_table,
+        lengths,
+        table,
+        PAGE_SIZE,
+        width,
+        1,
+        rows_per_request=group,
+    )
+    torch.cuda.synchronize()
+    expected = _reference_logits(
+        q, weights, slots[:, :mapped], lengths.clamp(max=mapped).long(), table
+    )
+    torch.testing.assert_close(scores[:, :mapped], expected, atol=0, rtol=0)
+    assert torch.isfinite(scores[:, mapped:width]).all()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
@@ -636,6 +984,7 @@ def test_hopper_indexer_backends_replay(ratio):
         req_rows=req,
         paged_metadata=metadata,
         is_verify=True,
+        rows_per_request=1,
     )
     kwargs = dict(
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False

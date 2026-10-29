@@ -85,7 +85,7 @@ def make_case(rows, ctx, seed) -> Case:
         lens_per_request=[ctx],
         rows_per_request=[rows],
         compress_lens=lens,
-        q_fp4=q_fp4,
+        q=q_fp4,
         q_sf=q_sf,
         weights=weights,
     )
@@ -137,7 +137,7 @@ def make_multi_case(rows_per_request, ctx, seed) -> Case:
         lens_per_request=[ctx] * n_req,
         rows_per_request=list(rows_per_request),
         compress_lens=cat(lens, torch.int32),
-        q_fp4=q_fp4.view(rows, HEADS, 64),
+        q=q_fp4.view(rows, HEADS, 64),
         q_sf=q_sf.view(rows, HEADS),
         weights=torch.rand(rows, HEADS, device=dev),
     )
@@ -182,7 +182,7 @@ def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData
     """The operands of a subset of rows (one request)."""
     return msgspec.structs.replace(
         data,
-        q_fp4=data.q_fp4[idx],
+        q=data.q[idx],
         q_sf=data.q_sf[idx],
         weights=data.weights[idx],
         compress_lens=data.compress_lens[idx],
@@ -272,7 +272,7 @@ def logits_of(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
 
     rows, heads = data.q_sf.shape
     return sparse_logits(
-        data.q_fp4.view(rows, 1, heads, 64),
+        data.q.view(rows, 1, heads, 64),
         data.q_sf.view(rows, 1, heads),
         k_cache,
         data.weights.to(torch.bfloat16),

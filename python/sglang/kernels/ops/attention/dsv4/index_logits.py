@@ -4,7 +4,7 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 
 from __future__ import annotations
 
-from typing import Iterator, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
 
@@ -35,7 +35,7 @@ def flat_index_logits_rows_per_tile(
 
 def flat_index_logits_tiles(
     *,
-    q: tuple[torch.Tensor, torch.Tensor],
+    q: tuple[torch.Tensor, Optional[torch.Tensor]],
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     starts: torch.Tensor,
@@ -47,9 +47,19 @@ def flat_index_logits_tiles(
     """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
-    aligned to ``width_align``."""
-    from deep_gemm import fp8_fp4_mqa_logits
+    aligned to ``width_align``.
 
+    ``q`` and ``kv`` pick the DeepGEMM kernel. Packed fp4 queries (``[rows, heads,
+    64]`` int8, ``[rows, heads]`` int32 ue8m0 scales) and fp4 keys (``[n, 64]``
+    int8, ``[n]`` int32) take ``fp8_fp4_mqa_logits`` (SM100). e4m3 queries with no
+    scale (``[rows, heads, 128]``, ``None``; their scale is folded into
+    ``weights``) and e4m3 keys (``[n, 128]``, ``[n]`` fp32 scales) take
+    ``fp8_mqa_logits`` (SM90)."""
+    import deep_gemm
+
+    fp8 = q[1] is None
+    # Both take (q, kv, weights, starts, ends, clean_logits, max_seqlen_k).
+    mqa_logits = deep_gemm.fp8_mqa_logits if fp8 else deep_gemm.fp8_fp4_mqa_logits
     rows = q[0].shape[0]
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
@@ -62,8 +72,8 @@ def flat_index_logits_tiles(
         tile_starts = starts[tile]
         yield (
             tile,
-            fp8_fp4_mqa_logits(
-                (q[0][tile], q[1][tile]),
+            mqa_logits(
+                q[0][tile] if fp8 else (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
                 tile_starts,

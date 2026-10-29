@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SM100 (prefill and decode) and SM90 (prefill), torch elsewhere."""
 
 from __future__ import annotations
 
@@ -19,10 +19,13 @@ from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_m
 
 from .scoring import (
     decode_scores,
+    deep_gemm_row_shard,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_deep_gemm_prefill_kv,
     get_index_k_cache,
+    merge_row_shards,
     prefill_requests,
     quantize_index_q,
     select_decode,
@@ -75,10 +78,16 @@ class FullTopKIndexer:
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
+        kv = get_deep_gemm_prefill_kv(
+            data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        out = inputs.out_raw_indices[: data.num_rows]
+        shard, group = deep_gemm_row_shard(data.num_rows)
+        if shard is None:
+            dense_prefill_topk(data, kv, out=out)
+        else:
+            dense_prefill_topk(data.row_slice(shard), kv, out=out[shard])
+            merge_row_shards(group, out)
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:
