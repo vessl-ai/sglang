@@ -43,8 +43,9 @@ __all__ = [
 
 @functools.cache
 def is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
-    # take the torch indexer.
+    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+. Hopper's prefill uses
+    # fp8_mqa_logits on widened operands (_use_deep_gemm_prefill) and its decode the
+    # Triton paged kernel; non-CUDA devices take the torch indexer.
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -82,9 +83,15 @@ def _use_deep_gemm_prefill() -> bool:
         return has_dense_fp4_indexer() and (
             get_parallel().attn_cp_size > 1 or not torch_prefill
         )
-    # SM90 widens the fp4 operands to e4m3 for DeepGEMM's fp8 logits. Its torch
-    # path also serves CP rows, so the env selects it under CP too.
-    return prefill_index_logits_fp8() and has_dense_fp8_indexer() and not torch_prefill
+    # SM90 widens the fp4 operands to e4m3 for DeepGEMM's fp8 logits. Attention CP
+    # stays on the torch path, which serves CP rows (#45794): the DeepGEMM CP path
+    # has not been validated end to end on SM90.
+    return (
+        prefill_index_logits_fp8()
+        and has_dense_fp8_indexer()
+        and not torch_prefill
+        and get_parallel().attn_cp_size == 1
+    )
 
 
 def make_full_topk_indexer(
