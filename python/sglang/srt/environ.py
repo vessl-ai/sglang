@@ -1718,6 +1718,12 @@ class Envs:
     # less than triton_kernels at TP4). CUDA-graph safe. Takes precedence over the triton
     # switches (not over W4A8 prefill). Other shapes keep the configured path.
     SGLANG_OPT_DSV4_SM90_DECODE_MOE_KERNEL = EnvBool(False)
+    # INF-681, SM90: run the DeepSeek-V4 TP4 MXFP4 experts W4A8 with the persistent warp-specialized wgmma
+    # kernels (dsv4_mxfp4_decode_moe_ws): e4m3 activations with a power-of-2 row scale (as the W4A8
+    # prefill path), exact weights (fp32 promotion of every 32-k block). Changes numerics (~4.7% vs the
+    # BF16 experts, like the W4A8 prefill path): needs GSM8K. CUDA-graph safe. Takes precedence over the
+    # other decode switches (not over W4A8 prefill).
+    SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 = EnvBool(False)
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:
