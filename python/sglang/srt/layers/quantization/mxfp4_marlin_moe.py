@@ -49,6 +49,33 @@ def _warn_w4a8_ignored() -> None:
     logger.warning("SGLANG_OPT_DSV4_W4A8_PREFILL_MOE is set but needs SM90; ignored.")
 
 
+@functools.cache
+def _warn_late_w4a16_ignored() -> None:
+    logger.warning(
+        "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER is set but "
+        "--enable-decoder-swa-bounded-replay is off: the late layers see every row, "
+        "so they keep the W4A8 path."
+    )
+
+
+def _is_late_w4a16_layer(prefix: str) -> bool:
+    """Whether this W4A8 MoE layer runs W4A16 instead (bounded replay's late layers)."""
+    from sglang.srt.layers.utils.common import get_layer_id
+    from sglang.srt.runtime_context import get_exec
+
+    start = envs.SGLANG_OPT_DSV4_W4A8_LATE_W4A16_FROM_LAYER.get()
+    if start < 0:
+        return False
+    # DSpark draft stages have no "layers.<id>." in their prefix and stay W4A8.
+    layer_id = get_layer_id(prefix)
+    if layer_id is None or layer_id < start:
+        return False
+    if not get_exec().features.enable_decoder_swa_bounded_replay:
+        _warn_late_w4a16_ignored()
+        return False
+    return True
+
+
 class ExpertRouting(NamedTuple):
     """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
 
@@ -224,6 +251,8 @@ class Mxfp4MarlinMoEMethod:
         # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
         # we must *not* call ``reorder_w1w3_to_w3w1`` here.
 
+        if self._use_w4a8 and _is_late_w4a16_layer(self.prefix):
+            self._use_late_w4a16()
         if self._use_w4a8:
             self._prepare_w4a8_weights(layer)
             return
@@ -281,6 +310,25 @@ class Mxfp4MarlinMoEMethod:
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)
 
+    def _use_late_w4a16(self) -> None:
+        """Switch this layer from W4A8 to a W4A16 backend (before its weights are prepared)."""
+        backend = envs.SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND.get()
+        if backend not in ("triton", "marlin"):
+            raise ValueError(
+                "SGLANG_OPT_DSV4_W4A8_LATE_W4A16_BACKEND must be 'triton' or 'marlin', "
+                f"got {backend!r}"
+            )
+        log_info_on_rank0(
+            logger,
+            f"Bounded replay late layer: W4A16 {backend} MXFP4 experts instead of W4A8 "
+            f"(layer: {self.prefix})",
+        )
+        self._use_w4a8 = False
+        # The decode tiles cover the late layers' few rows per expert, and the triton
+        # path falls back to its default tiles above that (up to 64 x 128 rows).
+        self._triton_kernels_decode = backend == "triton"
+        self._use_triton_kernels = backend == "triton"
+
     def _prepare_w4a8_weights(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
             Mxfp4W4A8PrefillExperts,
@@ -308,6 +356,7 @@ class Mxfp4MarlinMoEMethod:
             layer.w2_weight_scale_inv.data,
             config.swiglu_limit,
             prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
+            prefetch_chunks=envs.SGLANG_DSV4_W4A8_PREFETCH_CHUNKS.get(),
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 
