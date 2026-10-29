@@ -233,9 +233,7 @@ class DenseBlocksBackend:
         # so it matches across ranks.
         _, shard_size, shard_group = _row_shard_topology()
         if shard_size > 1 and blocks.numel() > 0:
-            torch.distributed.all_reduce(
-                blocks, op=torch.distributed.ReduceOp.MAX, group=shard_group
-            )
+            merge_row_shards(shard_group, blocks)
         return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
 
     def _torch_consume_prefill(

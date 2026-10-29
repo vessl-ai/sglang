@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch.nn import Module
@@ -40,6 +40,44 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         w2_bias=getattr(layer, "w2_weight_bias", None),
         expert_map=expert_map,
         global_num_experts=global_num_experts,
+    )
+
+
+class ExpertRouting(NamedTuple):
+    """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
+
+    expert_counts: torch.Tensor  # [num_experts] int32 slots routed to each expert
+    combine_indx: torch.Tensor  # [slots] int32 slot (token * top_k + k) in sorted order
+    gather_indx: torch.Tensor  # [slots] int32 token of each sorted slot
+    sorted_weights: torch.Tensor  # [slots] top-k weight of each sorted slot
+
+
+def route_slots_by_expert(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int
+) -> ExpertRouting:
+    """Sort the top-k slots by expert without a host sync.
+
+    Masked slots (id -1) contribute nothing: they are routed to expert 0 with weight 0.
+    The sort is stable, so slots of one expert keep token order. Expert ids must be in
+    [-1, num_experts). The per-expert counts use a fixed-size scatter-add histogram:
+    torch.bincount reads its max on the host, which stalls the CPU's kernel launches at
+    every MoE layer and cannot be captured in a CUDA graph.
+    """
+    top_k = topk_ids.shape[1]
+    valid = topk_ids >= 0
+    expert_ids = torch.where(valid, topk_ids, 0).flatten().long()
+    weights = torch.where(valid, topk_weights, 0).flatten()
+    # triton_kernels' own topk needs a power-of-2 top_k, so sort here.
+    combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
+    expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=topk_ids.device)
+    expert_counts.scatter_add_(
+        0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+    )
+    return ExpertRouting(
+        expert_counts=expert_counts,
+        combine_indx=combine_indx,
+        gather_indx=combine_indx // top_k,
+        sorted_weights=weights[combine_indx.long()],
     )
 
 
@@ -260,11 +298,18 @@ class Mxfp4MarlinMoEMethod:
             (layer.w13_weight, layer.w13_weight_scale_inv),
             (layer.w2_weight, layer.w2_weight_scale_inv),
         ):
+            # Return the previous swizzle's cached scratch before the next swizzle, and
+            # this swizzle's scratch right after it. Otherwise a swizzle's output can be
+            # placed inside a cached scratch segment: the rest of that segment can then
+            # never be returned to the driver, and KV-cache sizing (which empties the
+            # cache and reads driver free memory) loses ~0.5 GB per TP4 layer on H200.
+            torch.cuda.empty_cache()
             tk_weight, flex, tk_scale = _swizzle_mxfp4(
                 weight.data.view(torch.uint8),
                 scale.data.view(torch.uint8),
                 swizzle_num_warps,
             )
+            torch.cuda.empty_cache()
             precision = PrecisionConfig(
                 b_mx_scale=tk_scale, flex_ctx=FlexCtx(rhs_data=flex), **mx_block
             )
@@ -272,8 +317,8 @@ class Mxfp4MarlinMoEMethod:
         self._tk_intermediate_size = layer.w2_weight.shape[-1] * 2
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        # The swizzle's scratch stays reserved otherwise, and KV-cache sizing
-        # counts reserved memory as used.
+        # Return the original MXFP4 weights' segments too, so later allocations do not
+        # mix into them.
         torch.cuda.empty_cache()
         layer._dsv4_mxfp4_backend = "triton_kernels"
 
@@ -288,10 +333,18 @@ class Mxfp4MarlinMoEMethod:
     # triton_kernels (only the warp count is fixed by the swizzled scales).
     _DECODE_MAX_ROWS_PER_EXPERT = 16
 
-    def _decode_tiles(self, num_slots: int):
+    def _uses_decode_tiles(self, num_slots: int) -> bool:
+        """Whether this call takes the decode routing and tiles: the decode switch is
+        on and the routed rows per expert stay small on average."""
+        return (
+            self._triton_kernels_decode
+            and num_slots <= self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts
+        )
+
+    def _decode_tiles(self, decode_tiles: bool):
         if not self._triton_kernels_decode:
             return {}, {}
-        if num_slots > self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts:
+        if not decode_tiles:
             return {"num_warps": 4}, {"num_warps": 4}
         return self._DECODE_TILES
 
@@ -304,52 +357,44 @@ class Mxfp4MarlinMoEMethod:
             swiglu_limit_func,
         )
 
+        if torch.cuda.is_current_stream_capturing() and not self._triton_kernels_decode:
+            raise RuntimeError(
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE is prefill-only and does not support "
+                "CUDA graphs; enable it only where the MoE runs eagerly (a PD prefill "
+                "server without a prefill CUDA graph), or use "
+                "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE for CUDA-graph decode."
+            )
         num_tokens, top_k = topk_output.topk_ids.shape
         output = torch.empty_like(hidden_states)
         if num_tokens == 0:
             return output
         num_slots = num_tokens * top_k
-        if (
-            self._triton_kernels_decode
-            and num_slots <= self._DECODE_MAX_ROWS_PER_EXPERT * self._tk_num_experts
-        ):
+        decode_tiles = self._uses_decode_tiles(num_slots)
+        if decode_tiles:
             from sglang.kernels.ops.moe.expert_sort_small import expert_sort_small
 
             # One launch instead of argsort + histogram + gathers (~45 us at decode).
-            expert_counts, combine_indx, gather_indx, sorted_weights = (
-                expert_sort_small(
+            routing = ExpertRouting(
+                *expert_sort_small(
                     topk_output.topk_ids,
                     topk_output.topk_weights,
                     self._tk_num_experts,
                 )
             )
         else:
-            # Masked slots (id -1) contribute nothing; route them to expert 0 with weight 0.
-            valid = topk_output.topk_ids >= 0
-            expert_ids = torch.where(valid, topk_output.topk_ids, 0).flatten().long()
-            weights = torch.where(valid, topk_output.topk_weights, 0).flatten()
-            # Slots sorted by expert; triton_kernels' own topk needs a power-of-2 top_k.
-            combine_indx = torch.argsort(expert_ids, stable=True).to(torch.int32)
-            # torch.bincount reads its max on the host, which breaks CUDA graph
-            # capture; a fixed-size scatter-add histogram stays on the device.
-            expert_counts = torch.zeros(
-                self._tk_num_experts, dtype=torch.int32, device=expert_ids.device
+            routing = route_slots_by_expert(
+                topk_output.topk_ids, topk_output.topk_weights, self._tk_num_experts
             )
-            expert_counts.scatter_add_(
-                0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
-            )
-            gather_indx = combine_indx // top_k
-            sorted_weights = weights[combine_indx.long()]
-        ragged_metadata = make_ragged_tensor_metadata(expert_counts, num_slots)
+        ragged_metadata = make_ragged_tensor_metadata(routing.expert_counts, num_slots)
         (w13, w13_precision), (w2, w2_precision) = self._tk_weights
-        w13_tiles, w2_tiles = self._decode_tiles(num_slots)
+        w13_tiles, w2_tiles = self._decode_tiles(decode_tiles)
         with scoped_opt_flags_constraints(w13_tiles):
             gate_up = matmul(
                 hidden_states,
                 w13,
                 None,
                 a_ragged_metadata=ragged_metadata,
-                gather_indx=gather_indx,
+                gather_indx=routing.gather_indx,
                 precision_config=w13_precision,
             )
         activated = gate_up.new_empty(gate_up.shape[0], self._tk_intermediate_size)
@@ -362,9 +407,9 @@ class Mxfp4MarlinMoEMethod:
                 w2,
                 None,
                 a_ragged_metadata=ragged_metadata,
-                scatter_indx=combine_indx,
+                scatter_indx=routing.combine_indx,
                 precision_config=w2_precision,
-                gammas=sorted_weights,
+                gammas=routing.sorted_weights,
             )
         moe_topk_sum(down.view(num_tokens, top_k, -1), output)
         return output
