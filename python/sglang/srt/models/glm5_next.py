@@ -1382,6 +1382,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "Shared experts fusion is not supported when Deepep MoE backend "
                     "is enabled."
                 )
+            if quant_config and quant_config.get_name() == "w4afp8":
+                return (
+                    "Shared experts fusion is not supported for W4AFP8: routed and "
+                    "shared experts use different quant methods."
+                )
         else:
             if not _use_aiter_gfx95:
                 return "HIP shared experts fusion requires AITER on a gfx950 device."

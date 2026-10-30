@@ -4,6 +4,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -14,6 +15,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     kpool_max_closed_pools,
     update_kpool_write_plan_cuda_graph,
 )
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
@@ -84,6 +86,14 @@ class KPoolCpInfo:
     local_write_mask: torch.Tensor
 
 
+class IndexerRowSplit(msgspec.Struct, frozen=True):
+    """This attention-TP rank scores indexer rows [lo, hi); rows_per_rank is in rank order."""
+
+    lo: int
+    hi: int
+    rows_per_rank: List[int]
+
+
 @dataclass(frozen=True)
 class KPoolExtendPlan:
     writes: PoolWriteRows
@@ -99,6 +109,7 @@ class KPoolExtendPlan:
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
     cp: Optional[KPoolCpInfo] = None
+    row_split: Optional[IndexerRowSplit] = None
 
 
 @dataclass(frozen=True)
@@ -534,7 +545,65 @@ def init_kpool_extend_metadata(
         index_page_size,
         topk_transform_method,
     )
+    if plan.cp is None and mode.is_extend_without_speculative():
+        plan = dataclasses.replace(
+            plan,
+            row_split=_indexer_row_split(
+                extend_lens=forward_batch.extend_seq_lens_cpu,
+                seq_lens=forward_batch.seq_lens_cpu.tolist(),
+            ),
+        )
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
+
+
+def _indexer_row_split(
+    extend_lens: List[int], seq_lens: List[int]
+) -> Optional[IndexerRowSplit]:
+    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+    if not envs.SGLANG_DSA_INDEXER_TP_SPLIT.get():
+        return None
+    group = get_attn_tp_group()
+    tp = group.world_size
+    n_rows = sum(extend_lens)
+    if tp <= 1 or n_rows < max(tp, envs.SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS.get()):
+        return None
+    # The all-gather must not enter a captured graph.
+    if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+        return None
+    bounds = _row_bounds_balanced_by_kv_len(
+        extend_lens=extend_lens, seq_lens=seq_lens, n_parts=tp
+    )
+    rank = group.rank_in_group
+    return IndexerRowSplit(
+        lo=bounds[rank],
+        hi=bounds[rank + 1],
+        rows_per_rank=[hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])],
+    )
+
+
+def _row_bounds_balanced_by_kv_len(
+    extend_lens: List[int], seq_lens: List[int], n_parts: int
+) -> List[int]:
+    # A row's logits and top-k cost grow with the keys it sees: its prefix plus its position.
+    ext = torch.tensor(extend_lens, dtype=torch.int64)
+    prefix = torch.tensor(seq_lens, dtype=torch.int64) - ext
+    n_rows = int(ext.sum())
+    row_req_start = torch.repeat_interleave(torch.cumsum(ext, 0) - ext, ext)
+    row_kv = (
+        torch.repeat_interleave(prefix, ext)
+        + torch.arange(n_rows, dtype=torch.int64)
+        - row_req_start
+        + 1
+    )
+    cum = torch.cumsum(row_kv, 0)
+    targets = cum[-1] * torch.arange(1, n_parts, dtype=torch.int64) // n_parts
+    cuts = torch.searchsorted(cum, targets, right=True).tolist()
+    bounds = [0]
+    for part, cut in enumerate(cuts, start=1):
+        bounds.append(min(max(cut, bounds[-1] + 1), n_rows - (n_parts - part)))
+    bounds.append(n_rows)
+    return bounds
 
 
 _DEEP_GEMM_MODULE = None
