@@ -1087,13 +1087,21 @@ def pre_permute_standard_to_deep_gemm(
     block_e = deep_gemm_wrapper.get_contiguous_layout_alignment(
         num_assignments, num_experts
     )
-    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
         topk_ids, num_experts, 1, expert_start=expert_start
     )
     dispose_tensor(unused_masked_dst)
     valid_tokens_per_expert = tokens_per_expert
+    if (
+        num_experts < runner_config.num_experts
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # DeepGEMM computes the -1 rows too, so the graph-static bound below
+        # would run every rank over all assignments, not just its experts'.
+        all_tokens = int((ceil_div(tokens_per_expert, block_e) * block_e).sum().item())
+    else:
+        all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
     if _is_cuda:
         tokens_per_expert = pad_expert_counts(tokens_per_expert, block_e, all_tokens)
     else:
