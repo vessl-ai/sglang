@@ -271,6 +271,10 @@ def block128_fp8_linear(
         # INF-681 SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS: same operands, cuBLASLt's
         # 1x128 x 128x128 block-scaled kernel (bit-identical to DeepGEMM's here).
         q, s = ue8m0_group_quant_fp8_mn(x2, _GROUP)
+        if s.stride(1) != m:
+            # cuBLASLt wants the activation scales outer-dim-major with stride exactly M;
+            # the TMA layout pads the M stride to a multiple of 4.
+            s = s.t().contiguous().t()
         out = torch._scaled_mm(
             q,
             weight.t(),
