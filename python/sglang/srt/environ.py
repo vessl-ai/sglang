@@ -744,6 +744,9 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Prefill-CP two-batch overlap skips extend batches below this many
+    # unsharded tokens. Arbitrary; no measurement behind the value.
+    SGLANG_TBO_PREFILL_CP_MIN_TOKENS = EnvInt(16384)
 
     # ===================================================================
     # Tool calling and native web search

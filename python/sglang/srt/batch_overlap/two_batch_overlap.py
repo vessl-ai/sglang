@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary import (
     Layout,
@@ -99,8 +100,38 @@ def compute_split_seq_index(
         raise NotImplementedError()
 
 
+def is_prefill_cp_tbo_enabled() -> bool:
+    """Whether TBO runs on prefill-CP extend batches: no a2a, CP-TP group sharing."""
+    return (
+        is_tbo_enabled()
+        and get_moe_a2a_backend().is_none()
+        and get_parallel().enable_cp_tp_group_sharing
+    )
+
+
+def compute_prefill_cp_split_seq_index(
+    *, extend_lens: Sequence[int], cp_size: int
+) -> Optional[int]:
+    """Sequence-boundary split for prefill-CP TBO; None runs the batch without TBO."""
+    overall_sum = sum(extend_lens)
+    if (
+        len(extend_lens) < 2
+        or overall_sum < envs.SGLANG_TBO_PREFILL_CP_MIN_TOKENS.get()
+    ):
+        return None
+    split_seq_index = _split_array_by_balanced_sum(extend_lens)
+    left_sum = sum(extend_lens[:split_seq_index])
+    threshold = get_tbo_token_distribution_threshold()
+    if not (overall_sum * threshold <= left_sum <= overall_sum * (1 - threshold)):
+        return None
+    if min(left_sum, overall_sum - left_sum) < cp_size:
+        return None
+    return split_seq_index
+
+
 def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
-    if extend_lens is None:
+    # A cut sequence would hand KDA recurrent and conv state between children.
+    if extend_lens is None or is_prefill_cp_tbo_enabled():
         return False
 
     vanilla_split_seq_index = _split_array_by_balanced_sum(extend_lens)
@@ -726,6 +757,11 @@ class TboForwardBatchPreparer:
             "extend_logprob_start_lens_cpu",
             "lora_ids",
             "rids",
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
+            "mamba_prefill_track_mask_cpu",
+            "mamba_track_seqlens_cpu",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -853,6 +889,14 @@ class TboForwardBatchPreparer:
                 # The aux packer runs in the parent model forward, not per child.
                 aux_hidden_states_buffer=None,
                 return_hidden_states_before_norm=False,
+                # The parent runs the mamba slot init and the dumper and canary reads.
+                mamba_cow_src_indices=None,
+                mamba_cow_dst_indices=None,
+                mamba_clear_indices=None,
+                rids_int=None,
+                bootstrap_room_ids_int=None,
+                req_all_ids_flat=None,
+                req_all_ids_lens=None,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.
                 forward_metadata_ready=False,

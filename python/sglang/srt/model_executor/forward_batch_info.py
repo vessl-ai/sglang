@@ -2029,6 +2029,39 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
+    def prepare_prefill_cp_tbo(self, *, is_draft_worker: bool):
+        """Split a prefill-CP extend batch into two TBO children at a sequence
+        boundary; leave it whole when TBO is off or the split is not worth it."""
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            TboForwardBatchPreparer,
+            compute_prefill_cp_split_seq_index,
+            is_prefill_cp_tbo_enabled,
+        )
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        if (
+            is_draft_worker
+            or not is_prefill_cp_tbo_enabled()
+            or self.forward_mode != ForwardMode.EXTEND
+            or not is_cp_active(self)
+        ):
+            return
+        split_seq_index = compute_prefill_cp_split_seq_index(
+            extend_lens=self.extend_seq_lens_cpu,
+            cp_size=get_parallel().attn_cp_size,
+        )
+        if split_seq_index is None:
+            return
+        self.tbo_split_seq_index = split_seq_index
+        self.global_forward_mode = self.forward_mode
+        TboForwardBatchPreparer.prepare(batch=self)
+        for child in self.tbo_children:
+            child.dp_padding_mode = DpPaddingMode.SUM_LEN
+            # Backends index each child's tokens from 0.
+            child.extend_start_loc = (
+                child.extend_start_loc - child.tbo_parent_token_range[0]
+            )
+
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
         if self._original_forward_mode is not None:
             self.forward_mode = self._original_forward_mode
