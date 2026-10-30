@@ -903,6 +903,9 @@ class Envs:
     # reads as fp8-e4m3 with power-of-two per-128 scales, unpacked to bf16 after
     # the gather. Lossy for bf16 readers of those rows, so accuracy-gated, OFF.
     SGLANG_ENABLE_SCATTERED_INPUT_GATHER_FP8 = EnvBool(False)
+    # Run the contiguous DeepGEMM MoE activation and its FP8 quantization as
+    # one kernel on every model, not only swizzled or FP32-intermediate ones.
+    SGLANG_DEEPGEMM_FUSED_CONTIG_ACT_QUANT = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated

@@ -359,6 +359,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.use_swizzle = (
             get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
         )
+        self.fuses_contig_act_quant = (
+            self.use_swizzle
+            or config.silu_mul_keep_fp32
+            or (envs.SGLANG_DEEPGEMM_FUSED_CONTIG_ACT_QUANT.get() and not _is_musa)
+        )
 
     def run(
         self,
@@ -522,7 +527,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        elif self.use_swizzle or self.config.silu_mul_keep_fp32:
+        elif self.fuses_contig_act_quant:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
                 "deepep_v2_disable_contig_swizzle", False
