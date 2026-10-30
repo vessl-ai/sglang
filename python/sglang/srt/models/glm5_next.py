@@ -692,10 +692,12 @@ class Glm5NextLinearAttention(nn.Module):
         norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
-
-        return cp_sequence_to_interleave_order(
-            self.o_proj(core_attn_out)[0], forward_batch, gathered_rows
+        # The per-rank head slice is narrower than the hidden size, so reorder
+        # before o_proj; padding rows stay zero through the bias-free projection.
+        core_attn_out = cp_sequence_to_interleave_order(
+            core_attn_out, forward_batch, gathered_rows
         )
+        return self.o_proj(core_attn_out)[0]
 
 
 class Glm5NextDecoderLayer(nn.Module):
