@@ -62,6 +62,11 @@ def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     budget = mqa_logits_static_budget_bytes(device_index=device_index)
     if allow_sync and not is_xpu():
         free_mem, _ = torch.cuda.mem_get_info(device_index)
+        # The caching allocator hands its unused reserved blocks to the logits
+        # buffer, or frees them and retries; the driver's free count misses them.
+        free_mem += torch.cuda.memory_reserved(
+            device_index
+        ) - torch.cuda.memory_allocated(device_index)
         budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
     if is_hip():
         budget = min(budget, MQA_LOGITS_MAX_BYTES_ROCM)
