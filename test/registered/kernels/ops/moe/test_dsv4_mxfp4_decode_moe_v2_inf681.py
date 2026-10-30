@@ -4,6 +4,7 @@ quantization, down, dynamically handed-out items) plus a one-launch prologue (ds
 Its output must be bit-identical to the W4A8 kernels it replaces (dsv4_mxfp4_decode_moe_ws, whose accuracy
 test_dsv4_mxfp4_decode_moe_w4a8_inf681.py checks against an fp32 W4A8 reference): on target and draft shapes
 (DSpark gamma 5 and 3), with masked slots and dp-attention pad rows, experts that need several 32-row passes,
+skewed routing with hot experts of hundreds of rows,
 repeated calls (no ordering race), CUDA graph replay with fresh inputs, capture as the first call after
 prepare() (also in a fresh process with JIT module builds forbidden during capture), batches above the prologue's
 limit, and through the engine's Mxfp4MarlinMoEMethod switch."""
@@ -100,6 +101,40 @@ def test_v2_bit_identical_to_w4a8(shape):
         for _ in range(3):  # dynamic scheduling: every call must give the same bits
             out = v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
             assert torch.equal(out, ref), bs
+
+
+def _skewed_routing(bs, rows_per_req, num_experts, top_k, seed, s=1.2):
+    """Heavy-tailed expert popularity (zipf exponent s over a random expert order): a few experts get hundreds
+    of rows (many 32-row passes), many get none, as real routing does on some layers."""
+    g = torch.Generator().manual_seed(seed)
+    w = (1.0 / torch.arange(1, num_experts + 1, dtype=torch.float64)) ** s
+    w = w[torch.randperm(num_experts, generator=g)]
+    rows = bs * rows_per_req
+    logits = torch.log(w).float().expand(rows, num_experts) + torch.distributions.Gumbel(0.0, 1.0).sample(
+        (rows, num_experts)
+    )
+    ids = torch.topk(logits, top_k, dim=-1).indices.int().cuda()
+    x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    wts = torch.softmax(torch.randn(rows, top_k, device="cuda"), -1).float()
+    return x, ids, wts
+
+
+@pytest.mark.parametrize("shape", ["target_g3", "draft_g3"])
+def test_v2_hot_experts(shape):
+    """Skewed routing: hot experts with many passes, quantized pass by pass by different helpers."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+
+    num_experts, top_k, rows_per_req = SHAPES[shape]
+    packed = _packed(num_experts)
+    for bs, s in ((16, 1.5), (260, 0.8), (260, 1.2), (320, 1.5)):
+        x, ids, wts = _skewed_routing(bs, rows_per_req, num_experts, top_k, bs, s)
+        counts = torch.bincount(ids.flatten().long(), minlength=num_experts)
+        if bs >= 260:
+            assert int(counts.max()) > 128, int(counts.max())  # at least one expert with 5+ passes
+        ref = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+        for _ in range(3):
+            assert torch.equal(v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT), ref), (bs, s)
 
 
 @pytest.mark.parametrize("shape", ["target_g3", "draft_g3"])

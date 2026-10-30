@@ -5,7 +5,7 @@
 // One persistent kernel per MoE call runs every routed expert's gate/up GEMM, the per-row e4m3 quantization of
 // its h and its down GEMM. Work items (one weight pass of up to 32 rows over one channel block) are handed out
 // dynamically from one global counter: first every gate/up item, then every down item. A down item starts once
-// its expert's h is quantized. Compared with dsv4_mxfp4_decode_moe_ws.cuh (#104: a gate/up kernel, a row-quant
+// the h rows of its pass (the expert's 32 rows it covers) are quantized. Compared with dsv4_mxfp4_decode_moe_ws.cuh (#104: a gate/up kernel, a row-quant
 // kernel and a down kernel, each with a static cost-balanced split) this removes two launches, the row-quant
 // pass over all slots and the per-kernel tails (with the static split the slowest of the 264 pipelines ended
 // 30-35 us after the median one at 1,024 rows), and it hides the per-item metadata loads.
@@ -22,10 +22,10 @@
 // repacked bytes) and the activation rows' 128-byte k chunk (cp.async into a 128B-swizzled atom); the consumer
 // converts its A fragments in registers and issues one wgmma.m64nNk32 per (MX block, tile) with B = the atom.
 // The producer claims the next item while it streams the current one and passes each item's descriptor and
-// per-row epilogue table through shared memory. The helper warp counts finished gate/up items per expert,
-// quantizes an expert's h when its last item is done and releases the expert's ready flag, and acquires that
-// flag (and fills the down epilogue table) for the producers' next down items, so that none of these global
-// round trips sits on a producer's or consumer's path.
+// per-row epilogue table through shared memory. The helper warp counts finished gate/up items per 32-row pass,
+// quantizes a pass's h rows when its last item is done and releases the pass's ready flag, and acquires that flag
+// (and fills the down epilogue table) for the producers' next down items, so that none of these global round
+// trips sits on a producer's or consumer's path, and a hot expert's h is quantized by many helpers in parallel.
 //
 // Also here: the call's prologue in one launch (stable expert sort, token row quantization, workspace zeroing).
 
@@ -60,17 +60,19 @@ struct Params {
   uint8_t* __restrict__ h8;            // [slots, 576] e4m3, sorted-slot order
   float* __restrict__ hscale;          // [slots]
   __nv_bfloat16* __restrict__ y;       // [slots, 5120] bf16, original-slot order
-  int32_t* __restrict__ ws;            // zeroed per call: [0] queue head, [kDoneBase + e], [kReadyBase(E) + e]
+  int32_t* __restrict__ ws;            // zeroed per call: [0] queue head, then per 32-row pass of an expert
+                                       // (index = gate/up items before it / 9 + pass): done items, h8 ready
   int num_experts;
+  int max_passes;                      // capacity of each per-pass array in ws
   float limit;
 };
 
 constexpr int kDoneBase = 32;
-SGL_DEVICE int ready_base(int num_experts) {
-  return kDoneBase + num_experts;
+SGL_DEVICE int ready_base(int max_passes) {
+  return kDoneBase + max_passes;
 }
-constexpr int kWorkspaceInts(int num_experts) {
-  return kDoneBase + 2 * num_experts;
+constexpr int kWorkspaceInts(int max_passes) {
+  return kDoneBase + 2 * max_passes;
 }
 
 template <bool kGateUp>
@@ -133,7 +135,7 @@ struct Meta {
   uint64_t done_free[kPipes][4];
   uint64_t req_full[kPipes];
   uint64_t req_ack[kPipes];
-  int32_t qlist[16];  // helper: experts whose h is waiting to be quantized
+  int32_t qlist[16];  // helper: passes (pass << 10 | expert) whose h rows are waiting to be quantized
 };
 constexpr int kRowSlots = 4;
 constexpr int kDoneSlots = 4;
@@ -744,9 +746,9 @@ SGL_DEVICE uint32_t e4m3x2(float lo, float hi, float inv_s) {
   return r;
 }
 
-// Quantize h rows [off + r0, off + min(r0 + 4, cnt)) of one expert to h8 / hscale (as _row_quant), one warp;
-// the four rows' loads are in flight together.
-constexpr int kQuantRows = 4;
+// Quantize h rows [off + r0, off + min(r0 + 8, cnt)) to h8 / hscale (as _row_quant), one warp; the eight rows'
+// loads are in flight together.
+constexpr int kQuantRows = 8;
 SGL_DEVICE void quant_batch(const Params& p, int off, int cnt, int r0, int lane) {
   constexpr int kVec = 576 / 8;  // 72 uint4 of 8 bf16 per row
   constexpr int kRows = kQuantRows;
@@ -820,9 +822,10 @@ SGL_DEVICE void gate_up_done(const Smem& sm, int pipe, uint32_t& ndone, int e, i
 }
 
 // One warp per CTA, off the producers' and consumers' paths:
-//  - counts each finished gate/up item for its expert; an expert whose last item it counts is queued, its h rows
-//    are quantized four at a time (between the other duties) and then its ready flag is released;
-//  - serves each producer's down request: once the expert's ready flag is set (acquire), writes the item's
+//  - counts each finished gate/up item for its 32-row pass; a pass whose last (9th) item it counts is queued, its
+//    h rows are quantized eight at a time (between the other duties) and then the pass's ready flag is released
+//    (so a hot expert's passes are quantized by many helpers, and its down items wait for their own pass only);
+//  - serves each producer's down request: once the pass's ready flag is set (acquire), writes the item's
 //    epilogue table (scale = hscale x routing weight, destination = original slot) and acknowledges.
 // It never waits on a flag: the gate/up item that completes an expert may sit in its own done FIFO.
 SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
@@ -830,13 +833,20 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   uint32_t ndone[kPipes] = {0, 0}, nreq[kPipes] = {0, 0};
   int open = kPipes;
   int qhead = 0, qtail = 0, qrow = 0;  // quantization jobs m->qlist[qhead..qtail), next row of the head job
-  int32_t* ready = p.ws + ready_base(p.num_experts);
+  int32_t* ready = p.ws + ready_base(p.max_passes);
+  // A pass's slot in the per-pass arrays: the expert's first pass (its gate/up items / 9) + pass.
+  auto pass_index = [&](int e, int pass) { return m->gstart[e] / Shape<true>::kNB + pass; };
   while (open > 0 || qhead != qtail) {
     bool idle = true;
 #pragma unroll
     for (int pipe = 0; pipe < kPipes; ++pipe) {
       if (mbar_test(smem_u32(&m->req_full[pipe]), nreq[pipe] & 1) &&
-          __shfl_sync(0xffffffffu, lane == 0 ? ld_acquire(ready + m->req[pipe].x) : 0, 0) != 0) {
+          __shfl_sync(
+              0xffffffffu,
+              lane == 0 ? ld_acquire(
+                              ready + pass_index(m->req[pipe].x, (m->req[pipe].z - m->off[m->req[pipe].x]) / 32))
+                        : 0,
+              0) != 0) {
         idle = false;
         __syncwarp();  // lane 0's acquire orders the other lanes' reads below
         const int4 rq = m->req[pipe];
@@ -853,8 +863,8 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
       if (ndone[pipe] != 0xffffffffu && qtail - qhead < kQuantJobs &&
           mbar_test(smem_u32(&m->done_full[pipe][k]), (ndone[pipe] / kDoneSlots) & 1)) {
         idle = false;
-        const int e = m->done_e[pipe][k];
-        if (e < 0) {
+        const int ep = m->done_e[pipe][k];
+        if (ep < 0) {
           ndone[pipe] = 0xffffffffu;  // this pipeline's consumer has finished
           --open;
           continue;
@@ -862,11 +872,13 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
         int last = 0;
         if (lane == 0) {
           fence_acq_rel_gpu();
-          const int total = Shape<true>::kNB * ((m->cnt[e] + 31) / 32);
-          last = atomicAdd(p.ws + kDoneBase + e, 1) == total - 1;
+          // A pass's h rows are complete once its 9 channel blocks are: quantize them then (a hot expert's
+          // passes become independent jobs on different helpers, and its down items of a pass wait for that pass
+          // only).
+          last = atomicAdd(p.ws + kDoneBase + pass_index(ep & 1023, ep >> 10), 1) == Shape<true>::kNB - 1;
           if (last) {
             fence_acq_rel_gpu();
-            m->qlist[qtail % kQuantJobs] = e;
+            m->qlist[qtail % kQuantJobs] = ep;
           }
           mbar_arrive(smem_u32(&m->done_free[pipe][k]));
         }
@@ -875,17 +887,18 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
         __syncwarp();
       }
     }
-    if (qhead != qtail) {  // one batch of the head job
+    if (qhead != qtail) {  // one batch of the head job (one pass: at most 32 rows)
       idle = false;
-      const int e = m->qlist[qhead % kQuantJobs];
-      const int cnt = m->cnt[e];
-      quant_batch(p, m->off[e], cnt, qrow, lane);
+      const int ep = m->qlist[qhead % kQuantJobs];
+      const int e = ep & 1023, pass = ep >> 10;
+      const int rows = min(m->cnt[e] - 32 * pass, 32);
+      quant_batch(p, m->off[e] + 32 * pass, rows, qrow, lane);
       qrow += kQuantRows;
-      if (qrow >= cnt) {
+      if (qrow >= rows) {
         __syncwarp();
         if (lane == 0) {
           fence_acq_rel_gpu();
-          st_release(ready + e, 1);
+          st_release(ready + pass_index(e, pass), 1);
         }
         ++qhead;
         qrow = 0;
@@ -924,7 +937,7 @@ SGL_DEVICE void consumer(const Params& p, const Smem& sm, int pipe, int cw, int 
       } else {
         consumer_pass<true, 4>(p, sm, g, it, cw, lane);
       }
-      gate_up_done(sm, pipe, ndone, it.e, cw, lane);
+      gate_up_done(sm, pipe, ndone, ((it.r0 / 32) << 10) | it.e, cw, lane);
     } else {
       if (it.nrows <= 16) {
         consumer_pass<false, 2>(p, sm, g, it, cw, lane);
@@ -1065,8 +1078,10 @@ inline void experts(
   prm.ws = static_cast<int32_t*>(ws.data_ptr());
   prm.num_experts = static_cast<int>(counts.size(0));
   prm.limit = static_cast<float>(limit);
+  // Passes of all experts <= experts + slots / 32 (each expert's last pass is the only partial one).
+  prm.max_passes = prm.num_experts + static_cast<int>(gather.size(0)) / 32 + 1;
   RuntimeCheck(prm.num_experts <= kMaxExperts, "v2: at most 512 local experts");
-  RuntimeCheck(ws.size(0) >= kWorkspaceInts(prm.num_experts), "v2: workspace too small");
+  RuntimeCheck(ws.size(0) >= kWorkspaceInts(prm.max_passes), "v2: workspace too small");
   const DLDevice device = x8.device();
   static const bool attr_set = [] {
     RuntimeDeviceCheck(
