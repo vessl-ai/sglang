@@ -1758,6 +1758,9 @@ class Envs:
     # Opt-in: quantize GLM-5 KDA q/k/v and o projections, which the checkpoint
     # ships in BF16, to 128x128 block FP8 at load. Changes numerics.
     SGLANG_GLM5_KDA_FP8_PROJ = EnvBool(False)
+    # Opt-in, needs SGLANG_GLM5_KDA_FP8_PROJ: interleave-CP prefill runs the KDA input
+    # projections on the gathered rank-major rows. b/f/g numerics may differ.
+    SGLANG_ENABLE_GLM5_KDA_RANK_MAJOR_PROJ = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.

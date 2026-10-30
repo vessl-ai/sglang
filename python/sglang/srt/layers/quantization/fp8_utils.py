@@ -1305,7 +1305,11 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # UE8M0 DeepGEMM needs packed int32 scales, never pre-quantized fp32 ones.
+        assert (
+            input_scale.dtype == torch.int32
+            or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        )
         assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 

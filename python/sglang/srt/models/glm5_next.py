@@ -1,6 +1,7 @@
 import logging
 from array import array
 from contextlib import nullcontext
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,10 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -22,10 +27,16 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.interleave import (
+    cp_interleave_to_sequence_order,
+    cp_sequence_to_interleave_order,
+    is_interleave_extend,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -58,7 +69,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
+    per_block_cast_to_fp8,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -155,6 +169,38 @@ def swiglu_clamped(y: torch.Tensor, limit: float):
     gate = torch.clamp(gate, max=limit)
     up = torch.clamp(up, min=-limit, max=limit)
     return F.silu(gate) * up
+
+
+def _quant_rank_major_to_sequence_order(
+    gathered: torch.Tensor, *, total_tokens: int, cp_size: int, group_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # gathered holds cp_size padded shards back to back; shard r's row t is
+    # sequence row t * cp_size + r, and its valid rows are a prefix of the shard.
+    rows = gathered.shape[0] // cp_size
+    quant_kwargs = dict(
+        column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True
+    )
+    x_q = gathered.new_empty(
+        (total_tokens, gathered.shape[1]), dtype=torch.float8_e4m3fn
+    )
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x_q.shape,
+        device=gathered.device,
+        group_size=group_size,
+        **quant_kwargs,
+    )
+    for rank in range(cp_size):
+        rank_tokens = len(range(rank, total_tokens, cp_size))
+        # The quant kernel needs scales with a unit token stride, so they land
+        # in a per-rank buffer first; the fp8 rows go straight to x_q.
+        _, rank_scale = sglang_per_token_group_quant_fp8(
+            gathered[rank * rows : rank * rows + rank_tokens],
+            group_size,
+            output_q=x_q[rank::cp_size],
+            **quant_kwargs,
+        )
+        x_s[rank::cp_size] = rank_scale
+    return x_q, x_s
 
 
 class Glm5NextVisionMLP(GlmOcrVisionMLP):
@@ -433,6 +479,8 @@ class Glm5NextLinearAttention(nn.Module):
         self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
             quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
         )
+        # Set by quantize_projections_to_fp8, the only place q/k/v becomes FP8.
+        self._rank_major_proj = False
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -612,15 +660,37 @@ class Glm5NextLinearAttention(nn.Module):
             proj.weight_scale_inv = nn.Parameter(scale, requires_grad=False)
             proj.orig_dtype = torch.bfloat16
             proj.quant_method = fp8_method
+        self._rank_major_proj = envs.SGLANG_ENABLE_GLM5_KDA_RANK_MAJOR_PROJ.get()
+        if self._rank_major_proj:
+            self._validate_rank_major_proj(fp8_method)
+
+    def _validate_rank_major_proj(self, fp8_method: Fp8LinearMethod) -> None:
+        # The rank-major q/k/v quant emits packed UE8M0 scales for DeepGEMM only.
+        linear = fp8_method.w8a8_block_fp8_linear
+        if isinstance(linear, partial):
+            linear = linear.func
+        assert (
+            self.fuse_bfg
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and linear is deepgemm_w8a8_block_fp8_linear_with_fallback
+        ), (
+            "SGLANG_ENABLE_GLM5_KDA_RANK_MAJOR_PROJ needs fused b/f/g projections "
+            "and the UE8M0 DeepGEMM block-FP8 linear"
+        )
+
+    def _split_fused_bfg(self, fused_states: torch.Tensor):
+        beta, fg_a_states = torch.split(fused_states, self.bfg_split_sizes, dim=-1)
+        forget_gate, g_proj_states = self.fused_fg_b_proj(
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+        )
+        return beta, forget_gate, g_proj_states
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.fuse_bfg:
-            fused_states = self.fused_bfg_a_proj(hidden_states)
-            beta, fg_a_states = torch.split(fused_states, self.bfg_split_sizes, dim=-1)
-            forget_gate, g_proj_states = self.fused_fg_b_proj(
-                fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+            beta, forget_gate, g_proj_states = self._split_fused_bfg(
+                self.fused_bfg_a_proj(hidden_states)
             )
         else:
             beta = self.b_proj(hidden_states)[0]
@@ -652,6 +722,33 @@ class Glm5NextLinearAttention(nn.Module):
             g_proj_states,
         )
 
+    def _forward_qkvbfg_rank_major(
+        self, gathered: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        metadata = forward_batch.attn_cp_metadata
+        assert metadata.gather_index is None
+        x_q, x_s = _quant_rank_major_to_sequence_order(
+            gathered,
+            total_tokens=metadata.total_seq_lens,
+            cp_size=get_parallel().attn_cp_size,
+            group_size=self.qkv_proj.quant_method.weight_block_size[1],
+        )
+        qkv, _ = self.qkv_proj((x_q, x_s))
+        # Only the narrow b/f/g output is reordered, not the full-width input.
+        fused_states = cp_interleave_to_sequence_order(
+            self.fused_bfg_a_proj(gathered), forward_batch
+        )
+        beta, forget_gate, g_proj_states = self._split_fused_bfg(fused_states)
+        return qkv, beta, forget_gate, g_proj_states
+
+    def _project_inputs(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        if self._rank_major_proj and is_interleave_extend(forward_batch):
+            return self._forward_qkvbfg_rank_major(hidden_states, forward_batch)
+        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+        if self.do_fuse_qkvbfg:
+            return self.forward_qkvbfg_fused(hidden_states, forward_batch)
+        return self.forward_qkvbfg(hidden_states, forward_batch)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -661,22 +758,10 @@ class Glm5NextLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        from sglang.srt.layers.cp.interleave import (
-            cp_interleave_to_sequence_order,
-            cp_sequence_to_interleave_order,
-        )
-
         gathered_rows = hidden_states.shape[0]
-        hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
-
-        if self.do_fuse_qkvbfg:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states, forward_batch
-            )
-        else:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
-                hidden_states, forward_batch
-            )
+        mixed_qkv, beta, forget_gate, g_proj_states = self._project_inputs(
+            hidden_states, forward_batch
+        )
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unsqueeze(0)
