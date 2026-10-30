@@ -95,6 +95,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    rank_local_allocation,
 )
 from sglang.srt.layers.engram import (
     Engram,
@@ -483,6 +484,14 @@ def _cp_shared_expert_sm_cap():
         yield
     finally:
         deep_gemm.set_num_sms(total)
+
+
+def _forward_shared_experts_rank_local(mlp, hidden_states: torch.Tensor):
+    """The replicated shared expert on this rank's own rows, allocating outside the TP
+    group's symmetric pool (see rank_local_allocation: growing that pool on some ranks
+    only deadlocks the TP group)."""
+    with rank_local_allocation():
+        return mlp._forward_shared_experts(hidden_states)
 
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -3717,10 +3726,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                         # side stream still reads it (no record_stream: KEEP-facts).
                         _cp_shared_input = hidden_states
                         _cp_shared_stream.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(_cp_shared_stream), _cp_shared_expert_sm_cap():
-                            _cp_shared = self.mlp._forward_shared_experts(hidden_states)
+                        with (
+                            torch.cuda.stream(_cp_shared_stream),
+                            _cp_shared_expert_sm_cap(),
+                        ):
+                            _cp_shared = _forward_shared_experts_rank_local(
+                                self.mlp, hidden_states
+                            )
                     else:
-                        _cp_shared = self.mlp._forward_shared_experts(hidden_states)
+                        _cp_shared = _forward_shared_experts_rank_local(
+                            self.mlp, hidden_states
+                        )
                 hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
@@ -3745,13 +3761,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _shared_stream.wait_stream(torch.cuda.current_stream())
                     local_hidden_states.record_stream(_shared_stream)
                     with torch.cuda.stream(_shared_stream), _dp_shared_expert_sm_cap():
-                        _shared_local = self.mlp._forward_shared_experts(
-                            local_hidden_states
+                        _shared_local = _forward_shared_experts_rank_local(
+                            self.mlp, local_hidden_states
                         )
                     _shared_local.record_stream(torch.cuda.current_stream())
                 else:
-                    _shared_local = self.mlp._forward_shared_experts(
-                        local_hidden_states
+                    _shared_local = _forward_shared_experts_rank_local(
+                        self.mlp, local_hidden_states
                     )
             # The gather ships the whole padded chunk and the MoE runs on it, but
             # graph replay never refreshes pad rows, so they hold stale pool
@@ -4034,7 +4050,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         state.do_shared_local = do_shared_local
         state.shared_local = (
-            self.mlp._forward_shared_experts(local)
+            _forward_shared_experts_rank_local(self.mlp, local)
             if (do_shared_local and local.shape[0] > 0)
             else None
         )
@@ -4556,9 +4572,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                     prefetched=(
-                        engram_prefetch.take(i)
-                        if engram_prefetch is not None
-                        else None
+                        engram_prefetch.take(i) if engram_prefetch is not None else None
                     ),
                 )
                 # Only multimodal placeholders become image_token_id, so a text-only

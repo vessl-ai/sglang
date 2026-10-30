@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from enum import IntEnum, auto
@@ -250,6 +251,8 @@ class _DpGatheredBufferWrapper:
     _global_dp_buffer_len: int = 0
     _local_dp_buffer_len: int = 0
     _dp_max_padding: bool = False
+    # Set inside rank_local_allocation(): see there.
+    _rank_local_allocation: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
 
@@ -566,7 +569,30 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 
 def is_allocation_symmetric() -> bool:
+    if _DpGatheredBufferWrapper._rank_local_allocation:
+        return False
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+@contextlib.contextmanager
+def rank_local_allocation():
+    """Keep the allocations of work on this rank's own rows (the DP- or CP-local
+    replicated shared expert) out of the TP group's NCCL symmetric pool.
+
+    That work is no TP collective's buffer, and its pool use is not the same on
+    every rank: the row counts are per rank, and on a side stream a freed block is
+    reusable only once the stream that used it has passed it, which depends on
+    GPU progress. The pool grows lazily, and the new segment is registered by a
+    TP-group collective (ncclCommWindowRegister at use_symmetric_memory exit), so
+    ranks that grow at different points deadlock: the INF-681 DP4 decoder hang in
+    graph capture (ranks 0/3 in the registration, ranks 1/2 in the next kernel).
+    """
+    prev = _DpGatheredBufferWrapper._rank_local_allocation
+    _DpGatheredBufferWrapper._rank_local_allocation = True
+    try:
+        yield
+    finally:
+        _DpGatheredBufferWrapper._rank_local_allocation = prev
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
