@@ -181,6 +181,8 @@ def mla_quantize_for_fp8_no_rope(
     k_rope: torch.Tensor,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    *,
+    fuse_q_cast: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     attn_dtype = torch.float8_e4m3fn
     q_len, num_heads = q_rope.shape[:2]
@@ -190,8 +192,13 @@ def mla_quantize_for_fp8_no_rope(
         kv_lora_rank + qk_rope_head_dim,
         dtype=attn_dtype,
     )
-    q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
-    q_out[..., kv_lora_rank:] = q_rope.to(attn_dtype)
+    if fuse_q_cast:
+        # The absorbed q_nope is a head-major [H, T, D] buffer seen as [T, H, D];
+        # the kernel reads it through its strides and writes q_out row-major.
+        concat_and_cast_q_fp8_pad(q_out, q_nope, q_rope, num_heads)
+    else:
+        q_out[..., :kv_lora_rank] = q_nope.to(attn_dtype)
+        q_out[..., kv_lora_rank:] = q_rope.to(attn_dtype)
     return q_out, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
 
 

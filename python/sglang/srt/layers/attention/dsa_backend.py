@@ -707,6 +707,9 @@ class DeepseekSparseAttnBackend(
         self._q8kv8_kv_cat_fusion: bool = (
             envs.SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION.get()
         )
+        self._trtllm_fused_q_cast: bool = (
+            envs.SGLANG_ENABLE_DSA_TRTLLM_FUSED_Q_CAST.get()
+        )
 
         # Born-fp8 q handshake (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q): when the
         # model's q-prep decides (via q8kv8_born_fp8_q_eligible) that this
@@ -3742,12 +3745,13 @@ class DeepseekSparseAttnBackend(
             assert k_rope is not None, "For FP8 path k_rope should not be None."
             if cos_sin_cache is None:
                 q, k, k_rope = mla_quantize_for_fp8_no_rope(
-                    q,
-                    q_rope,
-                    k.squeeze(1),
-                    k_rope.squeeze(1),
-                    self.kv_lora_rank,
-                    self.qk_rope_head_dim,
+                    q_nope=q,
+                    q_rope=q_rope,
+                    k_nope=k.squeeze(1),
+                    k_rope=k_rope.squeeze(1),
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    fuse_q_cast=self._trtllm_fused_q_cast,
                 )
             else:
                 rope_positions = forward_batch.positions

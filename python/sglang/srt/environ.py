@@ -1792,6 +1792,9 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+    # Opt-in: trtllm FP8 no-RoPE q-prep casts q into its fp8 buffer in one Triton pass;
+    # out-of-range values saturate to +-448 instead of the torch cast's NaN.
+    SGLANG_ENABLE_DSA_TRTLLM_FUSED_Q_CAST = EnvBool(False)
 
     # ===================================================================
     # MiniMax M3
