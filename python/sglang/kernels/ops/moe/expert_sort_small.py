@@ -25,16 +25,20 @@ def _expert_sort_small_kernel(
     sorted_tokens_ptr,
     sorted_weights_ptr,
     BLOCK: tl.constexpr,
+    DROP_MASKED: tl.constexpr,
 ):
     expert = tl.program_id(0)
+    # DROP_MASKED: masked slots (id -1) get the id num_experts, so no program counts or writes them.
+    masked_id = tl.num_programs(0) if DROP_MASKED else 0
     # Pass 1: this expert's output offset (slots routed to lower experts) and count.
     offset = 0
     count = 0
     for start in range(0, num_slots, BLOCK):
         slots = start + tl.arange(0, BLOCK)
         in_range = slots < num_slots
-        # Masked slots (id -1) go to expert 0 with weight 0.
-        ids = tl.maximum(tl.load(topk_ids_ptr + slots, mask=in_range, other=0), 0)
+        # Masked slots (id -1) go to expert 0 with weight 0 (or to no expert under DROP_MASKED).
+        raw = tl.load(topk_ids_ptr + slots, mask=in_range, other=0)
+        ids = tl.where(raw < 0, masked_id, raw)
         offset += tl.sum((in_range & (ids < expert)).to(tl.int32), 0)
         count += tl.sum((in_range & (ids == expert)).to(tl.int32), 0)
     tl.store(counts_ptr + expert, count)
@@ -44,7 +48,9 @@ def _expert_sort_small_kernel(
         slots = start + tl.arange(0, BLOCK)
         in_range = slots < num_slots
         raw_ids = tl.load(topk_ids_ptr + slots, mask=in_range, other=0)
-        hit = (in_range & (tl.maximum(raw_ids, 0) == expert)).to(tl.int32)
+        hit = (in_range & (tl.where(raw_ids < 0, masked_id, raw_ids) == expert)).to(
+            tl.int32
+        )
         pos = pos_base + tl.cumsum(hit, 0) - hit
         pos_base += tl.sum(hit, 0)
         keep = hit != 0
@@ -56,12 +62,17 @@ def _expert_sort_small_kernel(
 
 
 def expert_sort_small(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts: int
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    drop_masked: bool = False,
 ):
     """Return (counts[E] int32, sorted_slots[S] int32, sorted_tokens[S] int32,
     sorted_weights[S] float32) for ``topk_ids``/``topk_weights`` of shape [T, top_k].
 
-    ``sorted_slots`` equals ``argsort(ids, stable=True)`` with ids -1 mapped to 0.
+    ``sorted_slots`` equals ``argsort(ids, stable=True)`` with ids -1 mapped to 0. With
+    ``drop_masked``, slots with id -1 are counted for no expert and sort after all the others
+    (their entries are left unwritten).
     Ids must lie in [-1, num_experts): a larger id is counted for no expert and
     leaves output entries unwritten, without an error.
     """
@@ -82,6 +93,7 @@ def expert_sort_small(
         sorted_tokens,
         sorted_weights,
         BLOCK=1024,
+        DROP_MASKED=drop_masked,
         num_warps=4,
     )
     return counts, sorted_slots, sorted_tokens, sorted_weights
