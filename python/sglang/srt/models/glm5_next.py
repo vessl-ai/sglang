@@ -57,6 +57,8 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -421,8 +423,12 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = self._can_fuse_proj(
-            quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
+        # FP8 q/k/v needs qkv_proj apart from the BF16 b/f/g projections.
+        self.do_fuse_qkvbfg = (
+            not envs.SGLANG_GLM5_KDA_FP8_PROJ.get()
+            and self._can_fuse_proj(
+                quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
+            )
         )
         self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
             quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
@@ -596,6 +602,16 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+
+    def quantize_projections_to_fp8(self, fp8_method: Fp8LinearMethod) -> None:
+        # Must run before the loader's process_weights_after_loading pass,
+        # which prepares these weights for the FP8 GEMM backend.
+        for proj in (self.qkv_proj, self.o_proj):
+            weight, scale = per_block_cast_to_fp8(proj.weight.data)
+            proj.weight = nn.Parameter(weight, requires_grad=False)
+            proj.weight_scale_inv = nn.Parameter(scale, requires_grad=False)
+            proj.orig_dtype = torch.bfloat16
+            proj.quant_method = fp8_method
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1923,6 +1939,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        if not is_nextn and envs.SGLANG_GLM5_KDA_FP8_PROJ.get():
+            fp8_method = Fp8LinearMethod(self.quant_config)
+            for layer in self.model.layers:
+                if isinstance(layer.self_attn, Glm5NextLinearAttention):
+                    layer.self_attn.quantize_projections_to_fp8(fp8_method)
 
         if getattr(self, "encoder_only", False):
             run_post = False

@@ -1748,6 +1748,9 @@ class Envs:
     # indexer rows (logits + top-k) and the ranks all-gather the top-k indices.
     SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
     SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
+    # Opt-in: quantize GLM-5 KDA q/k/v and o projections, which the checkpoint
+    # ships in BF16, to 128x128 block FP8 at load. Changes numerics.
+    SGLANG_GLM5_KDA_FP8_PROJ = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
