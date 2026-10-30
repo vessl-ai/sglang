@@ -25,7 +25,7 @@ def _weight(n, k, seed):
 
 
 @pytest.mark.parametrize("n,k", [(5120, 8192), (4608, 5120)])
-@pytest.mark.parametrize("m", [257, 260, 288, 320])
+@pytest.mark.parametrize("m", [260, 288, 320])
 def test_cublaslt_matches_deepgemm_above_threshold(n, k, m):
     import deep_gemm
 
@@ -52,5 +52,6 @@ def test_gate_keeps_deepgemm():
 
     with envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.override(256):
         assert not g128.prefer_cublaslt_blockwise(256, 5120, 8192)  # at the threshold
+        assert not g128.prefer_cublaslt_blockwise(257, 5120, 8192)  # M % 4 != 0
         assert not g128.prefer_cublaslt_blockwise(288, 32768, 1280)  # wq_b: not listed
         assert not g128.prefer_cublaslt_blockwise(288, 1792, 5120)  # wqkv_a: not listed

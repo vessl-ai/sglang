@@ -241,7 +241,9 @@ def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
     from sglang.srt.environ import envs
 
     rows = envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.get()
-    if rows <= 0 or m <= rows or (n, k) not in _CUBLASLT_ABOVE_SHAPES:
+    # cuBLASLt's blockwise heuristic has no algorithm for M % 4 != 0 (CUBLAS_STATUS_NOT_SUPPORTED);
+    # DSpark verify rows are 4 per request, so the decoder's calls always qualify.
+    if rows <= 0 or m <= rows or m % 4 or (n, k) not in _CUBLASLT_ABOVE_SHAPES:
         return False
     import deep_gemm
 
