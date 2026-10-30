@@ -95,6 +95,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    rank_local_allocation,
 )
 from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -373,6 +374,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+
+
+def _forward_shared_experts_rank_local(mlp, hidden_states: torch.Tensor):
+    """The replicated shared expert on this rank's own rows, allocating outside the TP
+    group's symmetric pool (see rank_local_allocation: growing that pool on some ranks
+    only deadlocks the TP group)."""
+    with rank_local_allocation():
+        return mlp._forward_shared_experts(hidden_states)
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -3511,7 +3522,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                _shared_local = _forward_shared_experts_rank_local(
+                    self.mlp, local_hidden_states
+                )
             # The gather ships the whole padded chunk and the MoE runs on it, but
             # graph replay never refreshes pad rows, so they hold stale pool
             # memory (bf16-max scale) that overflows the MoE and the combine.
@@ -3790,7 +3803,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         state.do_shared_local = do_shared_local
         state.shared_local = (
-            self.mlp._forward_shared_experts(local)
+            _forward_shared_experts_rank_local(self.mlp, local)
             if (do_shared_local and local.shape[0] > 0)
             else None
         )
