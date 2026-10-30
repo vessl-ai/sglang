@@ -7,6 +7,7 @@ from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -71,6 +72,10 @@ class OperationsStrategy:
                     )
                     for layer in layers
                 ]
+            )
+        elif layer_name == "Glm5NextDecoderLayer":
+            return _compute_glm5_next_prefill_cp_strategy_tbo(
+                layers=layers, forward_mode=forward_mode
             )
         else:
             raise NotImplementedError
@@ -224,6 +229,53 @@ def _compute_moe_deepseek_v4_prefill(layer):
         tbo_delta_stages=0,
         operations=ops,
     )
+
+
+# -------------------------------- Strategy for GLM5 Next ---------------------------------------
+
+
+def _compute_glm5_next_prefill_cp_strategy_tbo(
+    *, layers: torch.nn.ModuleList, forward_mode: ForwardMode
+) -> OperationsStrategy:
+    from sglang.srt.batch_overlap.two_batch_overlap import is_prefill_cp_tbo_enabled
+
+    assert is_prefill_cp_tbo_enabled(), "GLM5 Next TBO runs only on prefill CP"
+    if forward_mode != ForwardMode.EXTEND:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+    assert get_exec().moe.expert_distribution_recorder_mode != "per_token"
+    next_is_kda = [layer.is_linear_attn for layer in layers[1:]] + [False]
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=[
+            op
+            for layer, next_kda in zip(layers, next_is_kda)
+            for op in _glm5_next_layer_operations(layer=layer, next_is_kda=next_kda)
+        ],
+    )
+
+
+def _glm5_next_layer_operations(*, layer, next_is_kda: bool) -> List[Operation]:
+    # A KDA layer's attention entry gathers over CP. When the next layer is KDA,
+    # this layer's exit and that entry share one comm region and one wait.
+    attn_entry = (
+        [layer.op_attn_entry_a, operations.YieldOperation(), layer.op_comm_b]
+        if layer.is_linear_attn
+        else []
+    )
+    exit_wait = [] if next_is_kda else [operations.YieldOperation(), layer.op_comm_b]
+    return [
+        layer.op_begin,
+        *attn_entry,
+        layer.op_attn,
+        layer.op_ffn_entry_a,
+        operations.YieldOperation(),
+        layer.op_comm_b,
+        layer.op_mlp,
+        layer.op_exit_a,
+        *exit_wait,
+        layer.op_end,
+    ]
 
 
 # -------------------------------- Strategy for Qwen3 ---------------------------------------

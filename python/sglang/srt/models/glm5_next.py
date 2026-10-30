@@ -12,6 +12,7 @@ from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
+    is_prefill_cp_tbo_enabled,
     model_forward_stages,
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
@@ -26,7 +27,11 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    _tbo_event,
+    get_dp_tbo_comm_stream,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
     MHCState,
@@ -814,9 +819,9 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         terminal = layer_id == (1 if is_nextn else config.num_hidden_layers) - 1
-        mhc = None
+        self.mhc_state = None
         if self.config.mhc:
-            mhc = MHCState(
+            self.mhc_state = MHCState(
                 hc_mult=config.hc_mult,
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
@@ -827,8 +832,13 @@ class Glm5NextDecoderLayer(nn.Module):
                     else None
                 ),
                 is_last_layer=terminal,
-            ).residual_ops()
-        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
+            )
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            is_nextn=is_nextn,
+            mhc=None if self.mhc_state is None else self.mhc_state.residual_ops(),
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 attn,
@@ -1027,6 +1037,151 @@ class Glm5NextDecoderLayer(nn.Module):
 
         return (hidden_states, topk_indices)
 
+    # Prefill-CP two-batch overlap ops. Each `_a` op runs its stage boundary,
+    # CP collectives included, on the comm stream; op_comm_b makes main wait.
+    def op_begin(
+        self,
+        state,
+        positions,
+        hidden_states,
+        forward_batch,
+        tbo_subbatch_index,
+        zero_allocator,
+        topk_indices=None,
+    ):
+        state.update(
+            dict(
+                positions=positions,
+                forward_batch=forward_batch,
+                tbo_subbatch_index=tbo_subbatch_index,
+                zero_allocator=zero_allocator,
+                topk_indices=topk_indices,
+            )
+        )
+        return dict(hidden_states=hidden_states)
+
+    def op_attn_entry_a(self, state, hidden_states):
+        hidden_states, state.hc_coefficients = self._on_comm_stream(
+            state,
+            hidden_states=hidden_states,
+            coefficients=None,
+            run=lambda h: self.attn_boundary.prepare(h, state.forward_batch),
+        )
+        return dict(hidden_states=hidden_states)
+
+    def op_attn(self, state, hidden_states):
+        forward_batch = state.forward_batch
+        if not self.is_linear_attn:
+            # DSA's prepare hands the attention its input through a global
+            # attention context, so it runs in the same op as the attention.
+            hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+            state.hc_coefficients = self._take_hc_coefficients()
+        output = self.self_attn(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=state.zero_allocator,
+            input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
+            prev_topk_indices=state.pop("topk_indices"),
+        )
+        hidden_states, state.topk_indices = (
+            output if isinstance(output, tuple) else (output, None)
+        )
+        get_attn_tp_context().clear_attn_inputs()
+        return dict(
+            hidden_states=self.attn_boundary.finish(hidden_states, forward_batch)
+        )
+
+    def op_ffn_entry_a(self, state, hidden_states):
+        hidden_states, state.hc_coefficients = self._on_comm_stream(
+            state,
+            hidden_states=hidden_states,
+            coefficients=state.pop("hc_coefficients"),
+            run=lambda h: self.ffn_boundary.prepare(h, state.forward_batch),
+        )
+        return dict(hidden_states=hidden_states)
+
+    def op_mlp(self, state, hidden_states):
+        recorder = get_global_expert_distribution_recorder()
+        with recorder.with_current_layer(self.layer_id):
+            hidden_states = self.mlp(hidden_states, state.forward_batch, None)
+        return dict(hidden_states=hidden_states)
+
+    def op_exit_a(self, state, hidden_states):
+        hidden_states, _ = self._on_comm_stream(
+            state,
+            hidden_states=hidden_states,
+            coefficients=state.pop("hc_coefficients"),
+            run=lambda h: self.ffn_boundary.finish(h, state.forward_batch),
+        )
+        return dict(hidden_states=hidden_states)
+
+    def op_comm_b(self, state, hidden_states):
+        torch.cuda.current_stream().wait_event(
+            _tbo_event(("glm5_cp", state.tbo_subbatch_index))
+        )
+        state.pop("comm_keepalive")
+        return dict(hidden_states=hidden_states)
+
+    def op_end(self, state, hidden_states):
+        return dict(
+            positions=state.pop("positions"),
+            hidden_states=hidden_states,
+            forward_batch=state.pop("forward_batch"),
+            tbo_subbatch_index=state.pop("tbo_subbatch_index"),
+            zero_allocator=state.pop("zero_allocator"),
+            topk_indices=state.pop("topk_indices"),
+        )
+
+    def _on_comm_stream(self, state, *, hidden_states, coefficients, run):
+        _keep_until_waited(
+            state=state,
+            tensors=(
+                hidden_states,
+                coefficients,
+                *_stream_tensors(state.forward_batch.residual_stream),
+            ),
+        )
+        comm = get_dp_tbo_comm_stream()
+        main = torch.cuda.current_stream()
+        with torch.cuda.stream(comm):
+            comm.wait_stream(main)
+            self._put_hc_coefficients(coefficients)
+            hidden_states = run(hidden_states)
+            coefficients = self._take_hc_coefficients()
+            _tbo_event(("glm5_cp", state.tbo_subbatch_index)).record(comm)
+        return hidden_states, coefficients
+
+    # The layer's MHCState is shared by both micro-batches, so it holds one
+    # micro-batch's hc coefficients only within a single op.
+    def _take_hc_coefficients(self):
+        if self.mhc_state is None:
+            return None
+        coefficients = (self.mhc_state.h_res, self.mhc_state.h_post)
+        self.mhc_state.clear_coefficients()
+        return coefficients
+
+    def _put_hc_coefficients(self, coefficients):
+        if coefficients is not None:
+            self.mhc_state.h_res, self.mhc_state.h_post = coefficients
+
+
+def _stream_tensors(stream):
+    pending = stream.pending
+    if pending is None:
+        return (stream.residual,)
+    # Consuming the contribution drops these, so they are held separately.
+    return (stream.residual, pending.value, pending.owed)
+
+
+def _keep_until_waited(*, state, tensors):
+    """Hold main-stream tensors a comm-stream region reads until op_comm_b,
+    so main cannot reuse their memory while the comm stream still reads it."""
+    kept = state.get("comm_keepalive")
+    if kept is not None:
+        del state.comm_keepalive
+    state.comm_keepalive = (kept or ()) + tensors
+
 
 class Glm5NextModel(nn.Module):
     fall_back_to_pt_during_load = False
@@ -1184,7 +1339,12 @@ class Glm5NextModel(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo and not self.dflash_capture:
+        if forward_batch.can_run_tbo and is_prefill_cp_tbo_enabled():
+            # Each child is sharded over CP on its own, so the local rows are
+            # the two children's shards back to back from the first layer on.
+            assert not self.dflash_capture and not self.layers_to_capture
+            normal_end_layer = normal_start_layer
+        elif forward_batch.can_run_tbo and not self.dflash_capture:
             if (
                 self.first_k_dense_replace > normal_start_layer
                 and self.first_k_dense_replace < normal_end_layer

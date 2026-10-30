@@ -1009,6 +1009,9 @@ def model_forward_stages(
 
     stream = residual_batch.stream_of(forward_batch)
     pending = stream.pending
+    # A stack not yet entered hands each child a fresh stream, so the first
+    # layer still starts its residual (e.g. MHC expansion).
+    enters_stack = stream.residual is None and pending is None
     hidden_states, residual = stream.export(hidden_states)
     inputs["hidden_states"] = hidden_states
     parts = _model_forward_tbo_split_inputs(
@@ -1017,11 +1020,15 @@ def model_forward_stages(
         layer_input_rows=layers[0].attn_boundary.incoming_residual_rows,
     )
     for part in parts:
-        part["hidden_states"], child_stream = ResidualStream.from_handoff(
-            part["hidden_states"],
-            part.pop("residual"),
-            pending.update if pending is not None else None,
-        )
+        residual = part.pop("residual")
+        if enters_stack:
+            child_stream = ResidualStream()
+        else:
+            part["hidden_states"], child_stream = ResidualStream.from_handoff(
+                part["hidden_states"],
+                residual,
+                pending.update if pending is not None else None,
+            )
         part["forward_batch"].residual_stream = child_stream
 
     original_len = hidden_states.shape[0]
