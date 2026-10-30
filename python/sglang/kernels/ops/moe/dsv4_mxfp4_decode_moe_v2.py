@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 HIDDEN = ws.HIDDEN
 INTER = ws.INTER
-WORKSPACE_BASE = 32  # queue head + padding; then done[E], ready[E]
+WORKSPACE_BASE = 32  # queue head + padding; then per 32-row pass: done[P], ready[P]
 PREP_MAX_SLOTS = 16384  # the prologue kernel's limit (routed slots per call)
 
 supports = ws.supports
@@ -92,7 +92,9 @@ def decode_moe(
     sorted_weights = torch.empty(num_slots, dtype=torch.float32, device=dev)
     x8 = torch.empty(num_tokens, HIDDEN, dtype=torch.uint8, device=dev)
     xs = torch.empty(num_tokens, dtype=torch.float32, device=dev)
-    work = torch.empty(WORKSPACE_BASE + 2 * num_experts, dtype=torch.int32, device=dev)
+    # per 32-row pass of an expert: done items and h8 ready (passes <= experts + slots / 32)
+    max_passes = num_experts + num_slots // 32 + 1
+    work = torch.empty(WORKSPACE_BASE + 2 * max_passes, dtype=torch.int32, device=dev)
     mod = _module()
     if num_slots <= PREP_MAX_SLOTS:
         # One launch: stable expert sort (as #104's), token row quantization (as _row_quant), zeroed workspace.
