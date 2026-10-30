@@ -198,6 +198,26 @@ def test_w4a8_cuda_graph_replay(shape):
         assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)), bs
 
 
+def test_w4a8_prepare_then_call():
+    """prepare() builds and loads everything decode_moe launches; a call after it matches one without."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+
+    ws.prepare(torch.cuda.current_device())
+    ws.prepare(torch.cuda.current_device())  # once per process and device
+    num_experts, top_k, rows_per_req = SHAPES["target_g3"]
+    w = _weights(num_experts)
+    packed = ws.pack_experts(
+        w["w13_weight"].cuda(),
+        w["w13_weight_scale_inv"].cuda(),
+        w["w2_weight"].cuda(),
+        w["w2_weight_scale_inv"].cuda(),
+    )
+    x, ids, wts = _routing(64, rows_per_req, num_experts, top_k, 11, masked_rows=5)
+    a = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+    b = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+    assert torch.equal(a, b)
+
+
 def test_w4a8_switch_wiring(monkeypatch):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig

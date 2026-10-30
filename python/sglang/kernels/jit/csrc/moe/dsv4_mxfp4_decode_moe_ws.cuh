@@ -925,5 +925,20 @@ inline void combine(tvm::ffi::TensorView y, tvm::ffi::TensorView topk_ids, tvm::
       top_k);
 }
 
+// Load every kernel of this module on the current device now (CUDA loads modules lazily, at a kernel's first
+// launch otherwise) and set their shared-memory limits, so that the first MoE call inside CUDA graph capture
+// loads nothing.
+inline void prepare_kernels() {
+  using namespace host;
+  RuntimeDeviceCheck(cudaFuncSetAttribute(
+      moe_ws_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Layout<true>::kSmem)));
+  RuntimeDeviceCheck(cudaFuncSetAttribute(
+      moe_ws_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Layout<false>::kSmem)));
+  RuntimeDeviceCheck(cudaFuncSetAttribute(
+      sort_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSortWarps * 1025 * 4 + kSortMaxSlots * 2));
+  cudaFuncAttributes attr;
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, combine_kernel));
+}
+
 }  // namespace dsv4_moe_ws
 }  // namespace sglang
