@@ -174,7 +174,7 @@ def _resolve_ffn(
         # its output back, so both stay on this rank's CP shard.
         return (
             StageContract(
-                InputContract(attention, read=read),
+                InputContract(attention, read=read, reduced_by_compute=True),
                 OutputContract(attention, update=update, transform=output_transform),
             ),
             attention,
@@ -310,7 +310,8 @@ class StageDeclaration:
             with a reduction its computation needs anyway.
         owns_cp_move: Whether, on a prefill CP batch, the FFN's compute gathers
             its input over attention CP and reduce-scatters its output itself,
-            so the boundary hands it and takes back this rank's CP shard.
+            so the boundary hands it and takes back this rank's CP shard. An
+            input owing its sum over attention CP is handed over unreduced.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's

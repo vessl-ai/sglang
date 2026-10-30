@@ -29,7 +29,7 @@ After all-gather, tokens are restored to the original order:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -109,34 +109,55 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
     )
 
 
-def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows):
+def shard_chunk_bounds(rows: int, chunks: int) -> List[Tuple[int, int]]:
+    """Equal row chunks of each rank's padded shard, the last one possibly
+    shorter. Every CP rank holds the same row count, so all cut the same."""
+    size = max(-(-rows // chunks), 1)
+    return [(start, min(start + size, rows)) for start in range(0, rows, size)]
+
+
+def cp_sequence_to_interleave_order(
+    hidden_states, forward_batch, gathered_rows, *, chunks=0
+):
     """Restore interleave order after linear attention and before CP attention.
 
     With CP2 and seven tokens, ``[t0, t1, t2, t3, t4, t5, t6]`` becomes
     ``[t0, t2, t4, t6, t1, t3, t5, 0]``. These padded rank-major rows match
     the boundary's reduce-scatter and the local residual/mHC rows. The reorder
-    itself performs no communication or reduction.
+    itself performs no communication or reduction. With ``chunks`` > 1 the
+    rows are rank-major within each of the shard's row chunks, chunk after
+    chunk, so each chunk reduce-scatters on its own.
     """
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
     if metadata.gather_index is not None:
+        if chunks > 1:
+            raise NotImplementedError("chunk-major interleave order with gather_index")
         padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
         return padded.index_copy_(0, metadata.gather_index, hidden_states)
     size = get_parallel().attn_cp_size
-    tokens = hidden_states.shape[0]
-    full = tokens // size
-    tail = tokens - full * size
-    out = hidden_states.new_empty(
-        (size, gathered_rows // size, *hidden_states.shape[1:])
-    )
-    out[:, :full] = (
-        hidden_states[: full * size].unflatten(0, (full, size)).transpose(0, 1)
-    )
-    out[:tail, full : full + 1] = hidden_states[full * size :].unsqueeze(1)
+    out = hidden_states.new_empty((gathered_rows, *hidden_states.shape[1:]))
+    for start, end in shard_chunk_bounds(gathered_rows // size, max(chunks, 1)):
+        _write_interleave_rows(
+            out[start * size : end * size].unflatten(0, (size, end - start)),
+            hidden_states,
+            start=start,
+        )
+    return out
+
+
+def _write_interleave_rows(out, hidden_states, *, start):
+    """Fill ``out``, the rank-major [size, rows] view of local rows from
+    ``start``, from sequence-order rows; rows past the sequence are zero."""
+    size, rows = out.shape[:2]
+    tokens = hidden_states[start * size : (start + rows) * size]
+    full = tokens.shape[0] // size
+    tail = tokens.shape[0] - full * size
+    out[:, :full] = tokens[: full * size].unflatten(0, (full, size)).transpose(0, 1)
+    out[:tail, full : full + 1] = tokens[full * size :].unsqueeze(1)
     out[tail:, full : full + 1].zero_()
     out[:, full + 1 :].zero_()
-    return out.flatten(0, 1)
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):

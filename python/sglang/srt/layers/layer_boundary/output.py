@@ -77,6 +77,22 @@ class DeferredFinalize(msgspec.Struct, frozen=True):
         raise NotImplementedError
 
 
+class UnreducedArrival(msgspec.Struct, frozen=True):
+    """A stage input still owing its producer's sum over attention CP, handed to
+    a compute that completes and reads it itself, one row chunk at a time.
+
+    Fields:
+        partial: This rank's contribution on the full rows, rank-major within
+            each row chunk of the CP shard.
+        read_rows: Callable(chunk, start=, end=) writing the complete chunk of
+            shard rows [start, end) into the residual and returning the
+            stage's input for those rows.
+    """
+
+    partial: torch.Tensor
+    read_rows: Callable[..., torch.Tensor]
+
+
 def complete_owed(
     hidden_states: Union[torch.Tensor, UnreducedOutput, DeferredFinalize, None],
 ) -> Optional[torch.Tensor]:

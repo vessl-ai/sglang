@@ -13,6 +13,7 @@
 # ==============================================================================
 """Complete pending output, update the residual, and read the consumer input."""
 
+from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -49,6 +50,7 @@ from sglang.srt.layers.layer_boundary.layout import (
 )
 from sglang.srt.layers.layer_boundary.output import (
     DeferredFinalize,
+    UnreducedArrival,
     UnreducedOutput,
     complete_owed,
 )
@@ -487,6 +489,21 @@ def _move_before_read(
     """Complete and place a producer contribution before its residual update."""
     hidden_states, residual = move(hidden_states, residual, forward_batch)
     return read(hidden_states, residual, forward_batch, norm, **call)
+
+
+def _hand_over_arrival(
+    hidden_states, residual, forward_batch, norm, *, read, update, cache=None
+):
+    """Hand the compute the producer's output still owing its CP sum, with the
+    read it runs on each row chunk once that chunk's sum is complete."""
+    read_rows = partial(read.update_and_read_rows, update, residual=residual, norm=norm)
+    return UnreducedArrival(partial=hidden_states, read_rows=read_rows), residual
+
+
+def _reject_completed_arrival(*args, **kwargs):
+    raise NotImplementedError(
+        "a compute that completes its input's CP sum was handed a completed input"
+    )
 
 
 def _then_moe_cp_gather(

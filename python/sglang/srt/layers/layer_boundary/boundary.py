@@ -57,9 +57,11 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_tp_reduce_scatter_update_read,
     _attn_tp_slice_update_read,
     _dp_gather_sum_read,
+    _hand_over_arrival,
     _move_before_read,
     _reduce_update_read,
     _reduce_update_read_dp_gather,
+    _reject_completed_arrival,
     _run_entry,
     _then_attn_cp_gather,
     _then_moe_cp_gather,
@@ -452,6 +454,12 @@ def _select_entry_step(
             or (owes is not None and cp_moves.reduce_scatter is None)
         ):
             raise NotImplementedError(f"{produced=} {residual=} {need=}")
+        if need.reduced_by_compute:
+            return EntryStep(
+                partial(_hand_over_arrival, read=read)
+                if owes is not None
+                else _reject_completed_arrival
+            )
         local = msgspec.structs.replace(
             produced, layout=residual_to, group=None, always_partial=False
         )

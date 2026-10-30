@@ -71,6 +71,9 @@ class InputContract(msgspec.Struct, frozen=True):
         gathered_by_compute: Token axes compute can gather internally; the boundary
             may hand it input still sharded over those axes.
         read: Operation that derives input from the updated residual.
+        reduced_by_compute: An input arriving on full rows and owing its sum
+            over attention CP is handed to compute as an UnreducedArrival,
+            which completes that sum and runs the read itself.
     """
 
     layout: Layout
@@ -79,6 +82,7 @@ class InputContract(msgspec.Struct, frozen=True):
     gathered_by_compute: FrozenSet[TokenAxis] = frozenset()
     # How the consumer reads its input from the residual.
     read: ResidualReadout = NORM_READOUT
+    reduced_by_compute: bool = False
 
 
 class OutputContract(msgspec.Struct, frozen=True):

@@ -93,6 +93,23 @@ class MHCState:
             hidden_states = out_norm(hidden_states)
         return hidden_states, residual
 
+    def update_and_read_ffn_rows(
+        self, hidden_states, residual, *, start, end, out_norm=None
+    ):
+        """update_and_read_ffn_input on residual rows [start, end): the updated
+        rows and their FFN coefficients are written back in place, so once
+        every row is read the state is what one read of all rows leaves."""
+        h_res, h_post = self.h_res, self.h_post
+        self.h_res, self.h_post = h_res[start:end], h_post[start:end]
+        hidden_states, rows = self.update_and_read_ffn_input(
+            hidden_states, residual[start:end], out_norm=out_norm
+        )
+        residual[start:end].copy_(rows)
+        h_res[start:end].copy_(self.h_res)
+        h_post[start:end].copy_(self.h_post)
+        self.h_res, self.h_post = h_res, h_post
+        return hidden_states
+
     def apply_post(self, hidden_states, residual):
         return self.hc_post(hidden_states, residual, self.h_res, self.h_post)
 
@@ -203,11 +220,24 @@ class _FfnReadout:
         raise NotImplementedError("an MHC FFN input read without its attention")
 
     def update_and_read(self, update, hidden_states, residual, norm, **kwargs):
-        if not isinstance(update, _AttnUpdate) or update.state is not self.state:
-            raise NotImplementedError(f"an MHC FFN input after {update=}")
+        self._check_update(update)
         return self.state.update_and_read_ffn_input(
             hidden_states, residual, out_norm=norm
         )
+
+    def update_and_read_rows(
+        self, update, hidden_states, residual, norm, *, start, end
+    ):
+        """update_and_read of residual rows [start, end) only, written back
+        into ``residual`` in place."""
+        self._check_update(update)
+        return self.state.update_and_read_ffn_rows(
+            hidden_states, residual, start=start, end=end, out_norm=norm
+        )
+
+    def _check_update(self, update):
+        if not isinstance(update, _AttnUpdate) or update.state is not self.state:
+            raise NotImplementedError(f"an MHC FFN input after {update=}")
 
 
 class _FfnUpdate:

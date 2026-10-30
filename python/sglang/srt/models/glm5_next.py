@@ -27,6 +27,10 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.base import (
+    ContextParallelStrategyKind,
+    get_cp_strategy_kind,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -402,6 +406,7 @@ class Glm5NextLinearAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         prefix: str = "",
         reduce_results: bool = False,
+        output_chunks: int = 0,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -423,6 +428,9 @@ class Glm5NextLinearAttention(nn.Module):
         self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
+        # The FFN reduce-scatters this output over attention CP in this many
+        # row chunks of each rank's shard.
+        self.output_chunks = output_chunks
         assert self.num_heads % head_shard_size == 0
         self.local_num_heads = divide(self.num_heads, head_shard_size)
 
@@ -701,7 +709,7 @@ class Glm5NextLinearAttention(nn.Module):
         # The per-rank head slice is narrower than the hidden size, so reorder
         # before o_proj; padding rows stay zero through the bias-free projection.
         core_attn_out = cp_sequence_to_interleave_order(
-            core_attn_out, forward_batch, gathered_rows
+            core_attn_out, forward_batch, gathered_rows, chunks=self.output_chunks
         )
         return self.o_proj(core_attn_out)[0]
 
@@ -729,6 +737,9 @@ class Glm5NextDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
+        self.ffn_cp_overlap_chunks = self._ffn_cp_overlap_chunks(
+            config, layer_id, is_nextn=is_nextn
+        )
 
         if self.is_linear_attn:
             self.self_attn = Glm5NextLinearAttention(
@@ -739,6 +750,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
                 rms_norm_eps=config.rms_norm_eps,
                 reduce_results=False,
+                output_chunks=self.ffn_cp_overlap_chunks,
             )
         else:
             self.self_attn = DeepseekV2AttentionMLA(
@@ -835,9 +847,6 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_last_layer=terminal,
             ).residual_ops()
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
-        self.ffn_cp_overlap_chunks = (
-            envs.SGLANG_GLM5_FFN_CP_OVERLAP_CHUNKS.get() if ffn.owns_cp_move else 0
-        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 attn,
@@ -885,6 +894,23 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
             ),
         )
+
+    def _ffn_cp_overlap_chunks(self, config, layer_id, *, is_nextn):
+        """Row chunks the FFN pipelines its prefill CP collectives over, 0 when
+        it does not; after a linear attention they include its reduce-scatter."""
+        chunks = envs.SGLANG_GLM5_FFN_CP_OVERLAP_CHUNKS.get()
+        sparse = self._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
+        if not ffn_owns_cp_move(chunks, sparse=sparse):
+            return 0
+        if self.is_linear_attn and (
+            not config.mhc
+            or get_cp_strategy_kind() is not ContextParallelStrategyKind.INTERLEAVE
+        ):
+            raise NotImplementedError(
+                "the FFN CP overlap after a linear attention needs mHC and the "
+                "interleave CP strategy"
+            )
+        return chunks
 
     def _hc_pre(
         self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
