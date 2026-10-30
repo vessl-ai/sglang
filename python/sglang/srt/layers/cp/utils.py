@@ -17,6 +17,8 @@
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
+import torch
+
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -181,6 +183,61 @@ def prepare_cp_forward(forward_batch) -> None:
     if getattr(forward_batch, "out_cache_loc", None) is not None:
         forward_batch.out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
 
+    children = _prefill_cp_tbo_children(forward_batch)
+    if children is not None:
+        _prepare_tbo_children_cp(children, strategy=strategy)
+
+
+def _prefill_cp_tbo_children(forward_batch) -> Optional[list]:
+    """TBO children of a prefill-CP batch, each sharded over CP on its own."""
+    from sglang.srt.batch_overlap.two_batch_overlap import is_prefill_cp_tbo_enabled
+
+    if not is_prefill_cp_tbo_enabled() or forward_batch.tbo_children is None:
+        return None
+    return forward_batch.tbo_children
+
+
+def _prepare_tbo_children_cp(children: list, *, strategy) -> None:
+    """Build each child's CP metadata and place its padded shard rows after the
+    previous child's in the parent's local rows."""
+    start = 0
+    for child in children:
+        extend_lens_cpu = _to_int_list(child.extend_seq_lens_cpu)
+        child.attn_cp_metadata = strategy.build_metadata(
+            num_tokens=sum(extend_lens_cpu),
+            seqs_len=_to_int_list(child.seq_lens_cpu),
+            extend_seqs_len=extend_lens_cpu,
+        )
+        pad_logical_token_to_physical(child.attn_cp_metadata)
+        rows = child.attn_cp_metadata.per_rank_actual_token[0]
+        child.tbo_parent_token_range = (start, start + rows)
+        child.tbo_padded_len = rows
+        start += rows
+
+
+def _shard_per_child(x: Any, children: list, shard) -> Any:
+    """Shard each child's unsharded token range with its own CP metadata."""
+    parts, start = [], 0
+    for child in children:
+        end = start + child.attn_cp_metadata.total_seq_lens
+        parts.append(shard(x[start:end], child))
+        start = end
+    return torch.cat(parts)
+
+
+def _gather_hidden_states(x: Any, forward_batch, *, strategy, stream) -> Any:
+    children = _prefill_cp_tbo_children(forward_batch)
+    if children is None:
+        return strategy.gather_hidden_states(x, forward_batch, stream)
+    return torch.cat(
+        [
+            strategy.gather_hidden_states(
+                x[slice(*child.tbo_parent_token_range)], child, stream
+            )
+            for child in children
+        ]
+    )
+
 
 def cp_split_before_forward(
     complete_hidden_states: Any,
@@ -203,6 +260,11 @@ def cp_shard_hidden_states(complete_hidden_states: Any, forward_batch):
     assert strategy is not None
     assert complete_hidden_states is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    children = _prefill_cp_tbo_children(forward_batch)
+    if children is not None:
+        return _shard_per_child(
+            complete_hidden_states, children, strategy.shard_hidden_states
+        )
     return strategy.shard_hidden_states(complete_hidden_states, forward_batch)
 
 
@@ -222,6 +284,11 @@ def cp_shard_position_ids(complete_position_ids: Any, forward_batch):
     assert strategy is not None
     assert complete_position_ids is not None
     assert getattr(forward_batch, "attn_cp_metadata", None) is not None
+    children = _prefill_cp_tbo_children(forward_batch)
+    if children is not None:
+        return _shard_per_child(
+            complete_position_ids, children, strategy.shard_position_ids
+        )
     return strategy.shard_position_ids(complete_position_ids, forward_batch)
 
 
@@ -245,7 +312,9 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     if isinstance(x, tuple):
         gathered = tuple(
             (
-                strategy.gather_hidden_states(item, forward_batch, stream)
+                _gather_hidden_states(
+                    item, forward_batch, strategy=strategy, stream=stream
+                )
                 if item is not None
                 else None
             )
@@ -256,7 +325,7 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
             return gathered[0]
         return gathered
 
-    return strategy.gather_hidden_states(x, forward_batch, stream)
+    return _gather_hidden_states(x, forward_batch, strategy=strategy, stream=stream)
 
 
 def cp_materialize_global_token_order(
