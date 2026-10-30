@@ -19,7 +19,12 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    get_platform,
+    moe_ep_size_of,
+    num_dp_ranks_of,
+)
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
@@ -689,19 +694,24 @@ def validate_sampling_mask_max_tokens(server_args: Any):
 
 
 def check_two_batch_overlap(server_args: Any):
-    # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
-    # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
-    # the other ubatch's compute), which requires DP attention. Enabling it
-    # there needs no extra opt-in env flag.
+    # With no EP a2a backend, TBO overlaps either the DP all_gatherv / reduce_scatterv
+    # (needs DP attention) or the prefill CP collectives (needs CP == TP == EP ranks).
     cfg = resolving_view(server_args)
 
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
         and not attn_dp_enabled_of(cfg)
+        and not _cp_tp_group_sharing_spans_ep(cfg)
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
             "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
-            "(DeepSeek-V4 non-EP DP TBO path)."
+            "(DeepSeek-V4 non-EP DP TBO path), or CP-TP group sharing with "
+            "--ep-size == --tp-size (GLM5 prefill CP TBO path)."
         )
+
+
+def _cp_tp_group_sharing_spans_ep(cfg: Any) -> bool:
+    # CP-TP group sharing already means CP == TP ranks, attn_tp 1, no attention DP.
+    return cfg.enable_cp_tp_group_sharing and moe_ep_size_of(cfg) == cfg.tp_size
