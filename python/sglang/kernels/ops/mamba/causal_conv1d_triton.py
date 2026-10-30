@@ -48,6 +48,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token: tl.constexpr,
+    stride_o_split,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -62,6 +63,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
+    OUT_SPLIT: tl.constexpr = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -347,6 +349,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
+    if OUT_SPLIT > 0:
+        o_feats = (idx_feats // OUT_SPLIT).to(tl.int64) * stride_o_split + (
+            idx_feats % OUT_SPLIT
+        ) * stride_o_dim
+    else:
+        o_feats = idx_feats * stride_o_dim
     for idx_token in range(segment_len):
         acc = acc_preload
 
@@ -399,7 +407,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             o_ptr
             + (sequence_start_index + token_offset + idx_token).to(tl.int64)
             * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + o_feats
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
@@ -418,6 +426,7 @@ def causal_conv1d_fn(
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
+    out_split_size: int = 0,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -462,15 +471,23 @@ def causal_conv1d_fn(
         in this case, the kernel will not process entries at
         indices 0 and 3
 
-    out: same shape as `x`
+    out_split_size: when > 0, out is (dim // out_split_size, cu_seq_len,
+        out_split_size) with each group of out_split_size channels contiguous
+
+    out: same shape as `x`, unless out_split_size is set
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    dim, cu_seqlen = x.shape
+    if out_split_size > 0:
+        # A 256-channel program block must not straddle two groups.
+        assert dim % out_split_size == 0 and out_split_size % 256 == 0
+        out = x.new_empty((dim // out_split_size, cu_seqlen, out_split_size))
+    else:
+        out = torch.empty_like(x)
 
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
-    dim, cu_seqlen = x.shape
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -500,7 +517,13 @@ def causal_conv1d_fn(
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
         # assert stride_istate_dim == 1
-    if out.dim() == 2:
+    stride_o_split = 0
+    if out_split_size > 0:
+        stride_o_seq = 0
+        stride_o_split = out.stride(0)
+        stride_o_dim = out.stride(2)
+        stride_o_token = out.stride(1)
+    elif out.dim() == 2:
         stride_o_seq = 0
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
@@ -568,6 +591,7 @@ def causal_conv1d_fn(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        stride_o_split,
         # others
         pad_slot_id,
         # META
@@ -583,6 +607,7 @@ def causal_conv1d_fn(
         BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
         BLOCK_N=256,
         USE_BLOCK_TABLE=block_table is not None,
+        OUT_SPLIT=out_split_size,
         num_stages=2,
     )
     return out
