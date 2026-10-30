@@ -320,6 +320,16 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        # Under CP-TP group sharing every rank holds the full KV and its own
+        # linear-attention head slice, so it transfers as a plain TP layout.
+        if (
+            parallel.enable_cp_tp_group_sharing
+            and disaggregation_mode == DisaggregationMode.PREFILL
+        ):
+            self.attn_tp_size = parallel.tp_size
+            self.attn_tp_rank = parallel.tp_rank
+            self.attn_cp_size = 1
+            self.attn_cp_rank = 0
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
