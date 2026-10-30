@@ -899,6 +899,10 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # Gather the rows an input-scattered stage (--enable-attn-tp-input-scattered)
+    # reads as fp8-e4m3 with power-of-two per-128 scales, unpacked to bf16 after
+    # the gather. Lossy for bf16 readers of those rows, so accuracy-gated, OFF.
+    SGLANG_ENABLE_SCATTERED_INPUT_GATHER_FP8 = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
