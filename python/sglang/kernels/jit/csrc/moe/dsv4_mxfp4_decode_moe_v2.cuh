@@ -60,7 +60,7 @@ struct Params {
   uint8_t* __restrict__ h8;            // [slots, 576] e4m3, sorted-slot order
   float* __restrict__ hscale;          // [slots]
   __nv_bfloat16* __restrict__ y;       // [slots, 5120] bf16, original-slot order
-  int32_t* __restrict__ ws;            // zeroed per call: [0] queue head, then per 32-row pass of an expert
+  int32_t* __restrict__ ws;            // zeroed per call: [0] queue head, [1] passes ready, then per 32-row pass
                                        // (index = gate/up items before it / 9 + pass): done items, h8 ready
   int num_experts;
   int max_passes;                      // capacity of each per-pass array in ws
@@ -136,6 +136,7 @@ struct Meta {
   uint64_t req_full[kPipes];
   uint64_t req_ack[kPipes];
   int32_t qlist[16];  // helper: passes (pass << 10 | expert) whose h rows are waiting to be quantized
+  int32_t all_ready;  // set by the helper once every pass's h8 is ready (then producers serve down items alone)
 };
 constexpr int kRowSlots = 4;
 constexpr int kDoneSlots = 4;
@@ -204,6 +205,14 @@ SGL_DEVICE int ld_acquire(const int32_t* p) {
   int v;
   asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
   return v;
+}
+SGL_DEVICE int ld_acquire_cta(const int32_t* p) {
+  int v;
+  asm volatile("ld.acquire.cta.shared.b32 %0, [%1];" : "=r"(v) : "r"(smem_u32(p)) : "memory");
+  return v;
+}
+SGL_DEVICE void st_release_cta(int32_t* p, int v) {
+  asm volatile("st.release.cta.shared.b32 [%0], %1;" ::"r"(smem_u32(p)), "r"(v) : "memory");
 }
 SGL_DEVICE void st_release(int32_t* p, int v) {
   asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -358,6 +367,7 @@ struct Work {
   float rscale;
   int rdst;
   bool scaled;  // gate/up: rscale already loaded
+  bool direct;  // down: epilogue table loaded by the producer (every pass was ready), no helper request
 };
 
 // Issue the loads that describe item index i: gate/up its x rows (the scale follows at stage 2 of the current
@@ -373,11 +383,21 @@ SGL_DEVICE void start_work(
   w.rscale = 0.f;
   w.rdst = 0;
   w.scaled = false;
+  w.direct = false;
   const int sorted = w.it.off + w.it.r0 + lane;
   if (w.it.kind == kGu) {
     if (lane < w.it.nrows) {
       w.src = p.gather[sorted];
       w.rdst = sorted;
+    }
+  } else if (uniform(lane == 0 ? ld_acquire_cta(&sm.meta->all_ready) : 0) != 0) {
+    // Every pass is ready (the helper acquired that): load the epilogue table here, as for gate/up. hscale was
+    // written in this kernel by another SM: read it from L2, never a stale L1 line.
+    w.direct = true;
+    if (lane < w.it.nrows) {
+      w.src = sorted;
+      w.rscale = __ldcg(p.hscale + sorted) * p.gammas[sorted];
+      w.rdst = p.combine[sorted];
     }
   } else {
     if (lane < w.it.nrows) w.src = sorted;
@@ -395,6 +415,7 @@ SGL_DEVICE void finish_work(const Params& p, const Smem& sm, int pipe, uint32_t&
     if (!w.scaled && lane < w.it.nrows) w.rscale = p.xscale[w.src];
     return;
   }
+  if (w.direct) return;
   mbar_wait(smem_u32(&sm.meta->req_ack[pipe]), nreq & 1);
   ++nreq;
 }
@@ -424,7 +445,7 @@ SGL_DEVICE void produce_item(
     const bool last = st == S::kStages - 1;
     const uint32_t bytes = last ? last_stage_bytes<kGateUp>() : kFullStage;
     const uint32_t full = sm.full + slot * 8;
-    if (kGateUp && st == 0) {  // published by the arrives below, read by the consumer's epilogue
+    if ((kGateUp || w.direct) && st == 0) {  // published by the arrives below, read by the consumer's epilogue
       sm.meta->rowmeta[pipe][seq % kRowSlots][lane] = make_float2(w.rscale, __int_as_float(w.rdst));
       __syncwarp();
     }
@@ -826,7 +847,10 @@ SGL_DEVICE void gate_up_done(const Smem& sm, int pipe, uint32_t& ndone, int e, i
 //    h rows are quantized eight at a time (between the other duties) and then the pass's ready flag is released
 //    (so a hot expert's passes are quantized by many helpers, and its down items wait for their own pass only);
 //  - serves each producer's down request: once the pass's ready flag is set (acquire), writes the item's
-//    epilogue table (scale = hscale x routing weight, destination = original slot) and acknowledges.
+//    epilogue table (scale = hscale x routing weight, destination = original slot) and acknowledges;
+//  - publishes to its CTA (all_ready) once every pass is ready; from then on the producers load down items'
+//    tables themselves, with no request (a request costs the helper two L2 round trips, and serving every down
+//    item that way made the helper a queue that the producers waited on: up to 100+ us per pipeline).
 // It never waits on a flag: the gate/up item that completes an expert may sit in its own done FIFO.
 SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   Meta* m = sm.meta;
@@ -836,8 +860,15 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   int32_t* ready = p.ws + ready_base(p.max_passes);
   // A pass's slot in the per-pass arrays: the expert's first pass (its gate/up items / 9) + pass.
   auto pass_index = [&](int e, int pass) { return m->gstart[e] / Shape<true>::kNB + pass; };
+  const int total_passes = m->gstart[p.num_experts] / Shape<true>::kNB;
+  bool all_ready = false;
   while (open > 0 || qhead != qtail) {
     bool idle = true;
+    if (!all_ready &&
+        __shfl_sync(0xffffffffu, lane == 0 ? ld_acquire(p.ws + 1) : 0, 0) == total_passes) {  // sticky
+      all_ready = true;
+      if (lane == 0) st_release_cta(&m->all_ready, 1);
+    }
 #pragma unroll
     for (int pipe = 0; pipe < kPipes; ++pipe) {
       if (mbar_test(smem_u32(&m->req_full[pipe]), nreq[pipe] & 1) &&
@@ -899,6 +930,7 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
         if (lane == 0) {
           fence_acq_rel_gpu();
           st_release(ready + pass_index(e, pass), 1);
+          atomicAdd(p.ws + 1, 1);  // passes ready, after the fence above (release pattern)
         }
         ++qhead;
         qrow = 0;
@@ -1030,6 +1062,7 @@ __global__ void __launch_bounds__(kThreads, 1) moe_v2_kernel(const __grid_consta
       mbar_init(smem_u32(&meta->req_full[k]), 1);
       mbar_init(smem_u32(&meta->req_ack[k]), 1);
     }
+    meta->all_ready = 0;
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
