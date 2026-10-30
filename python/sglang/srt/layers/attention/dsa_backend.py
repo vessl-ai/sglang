@@ -3544,25 +3544,39 @@ class DeepseekSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
-            kv_cache=kv,
-            workspace_buffer=self.workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=metadata.max_seq_len_k,
-            sparse_mla_top_k=sparse_mla_top_k,
-            bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
-            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
-        )
+        def run(rows: slice) -> torch.Tensor:
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q[rows],
+                kv_cache=kv,
+                workspace_buffer=self.workspace_buffer,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables[rows],
+                seq_lens=seq_lens[rows],
+                max_seq_len=metadata.max_seq_len_k,
+                sparse_mla_top_k=sparse_mla_top_k,
+                bmm1_scale=bmm1_scale,
+                backend="trtllm-gen",
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                sparse_mla_top_k_lens=(
+                    None
+                    if sparse_mla_top_k_lens is None
+                    else sparse_mla_top_k_lens[rows]
+                ),
+                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            )
 
-        return out
+        # The kernel fails to launch (CUDA_ERROR_INVALID_VALUE) at 65,536 rows.
+        max_rows = 32768
+        if batch_size <= max_rows:
+            return run(slice(None))
+        return torch.cat(
+            [
+                run(slice(start, start + max_rows))
+                for start in range(0, batch_size, max_rows)
+            ]
+        )
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
