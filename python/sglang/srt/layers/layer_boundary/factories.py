@@ -137,6 +137,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     output_complete=False,
+    owns_cp_move=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.attn_tp_size, parallel.tp_size):
@@ -160,6 +161,17 @@ def _resolve_ffn(
         # the attention's rows (an a2a MoE dispatches them from every
         # attention-TP rank) and its output is complete, as a2a's combine or
         # local compute leaves it.
+        return (
+            StageContract(
+                InputContract(attention, read=read),
+                OutputContract(attention, update=update, transform=output_transform),
+            ),
+            attention,
+            attention,
+        )
+    if variant is BatchVariant.CONTEXT_PARALLEL and owns_cp_move:
+        # The compute gathers its input over attention CP and reduce-scatters
+        # its output back, so both stay on this rank's CP shard.
         return (
             StageContract(
                 InputContract(attention, read=read),
@@ -296,6 +308,9 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        owns_cp_move: Whether, on a prefill CP batch, the FFN's compute gathers
+            its input over attention CP and reduce-scatters its output itself,
+            so the boundary hands it and takes back this rank's CP shard.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's
@@ -328,6 +343,7 @@ class StageDeclaration:
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
     output_complete: bool = False
+    owns_cp_move: bool = False
     attn_tp_gather: Optional[Callable] = None
     # Only declarations participate in construction, never executable stages.
     previous: Optional[StageDeclaration] = None
@@ -466,6 +482,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    owns_cp_move=False,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -482,6 +499,8 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        owns_cp_move: Whether the compute runs the prefill CP gather of its
+            input and reduce-scatter of its output (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -495,6 +514,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        owns_cp_move=owns_cp_move,
     )
 
 
@@ -576,6 +596,7 @@ def _resolve_stage(stage, variant, arrival, following=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            owns_cp_move=stage.owns_cp_move,
         )
         exit_rows = resolve_exit_rows(stage.exit_rows)
         if exit_rows is ExitRows.ATTENTION or (

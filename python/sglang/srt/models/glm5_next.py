@@ -1,6 +1,7 @@
 import logging
 from array import array
 from contextlib import nullcontext
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -29,6 +30,7 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
+    BatchVariant,
     MHCState,
     SumGroup,
     append_stages,
@@ -36,6 +38,10 @@ from sglang.srt.layers.layer_boundary import (
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
+)
+from sglang.srt.layers.layer_boundary.cp_overlap import (
+    ffn_owns_cp_move,
+    run_ffn_cp_overlap,
 )
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -829,6 +835,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 is_last_layer=terminal,
             ).residual_ops()
         attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
+        self.ffn_cp_overlap_chunks = (
+            envs.SGLANG_GLM5_FFN_CP_OVERLAP_CHUNKS.get() if ffn.owns_cp_move else 0
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 attn,
@@ -854,6 +863,7 @@ class Glm5NextDecoderLayer(nn.Module):
             residual = MHCState.facts() if mhc is None else mhc
         else:
             residual = PLAIN_RESIDUAL_OPS
+        sparse = cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
         return (
             declare_attn(
                 read=residual.attn_readout,
@@ -864,12 +874,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 else SumGroup.ATTN_TP,
             ),
             declare_ffn(
-                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                sparse=sparse,
                 next_layer_sparse=cls._is_layer_sparse(
                     config, layer_id + 1, is_nextn=False
                 ),
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
+                owns_cp_move=ffn_owns_cp_move(
+                    envs.SGLANG_GLM5_FFN_CP_OVERLAP_CHUNKS.get(), sparse=sparse
+                ),
             ),
         )
 
@@ -1001,7 +1014,41 @@ class Glm5NextDecoderLayer(nn.Module):
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if self._ffn_overlaps_cp(forward_batch):
+            hidden_states = run_ffn_cp_overlap(
+                partial(
+                    self.mlp,
+                    forward_batch=forward_batch,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                ),
+                hidden_states,
+                chunks=self.ffn_cp_overlap_chunks,
+            )
+        else:
+            hidden_states = self._mlp(
+                hidden_states,
+                hidden_states_orig,
+                forward_batch,
+                gemm_output_zero_allocator,
+            )
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
+        return (hidden_states, topk_indices)
+
+    def _ffn_overlaps_cp(self, forward_batch):
+        return (
+            self.ffn_cp_overlap_chunks > 1
+            and self.ffn_boundary.plan.variant_for(forward_batch)
+            is BatchVariant.CONTEXT_PARALLEL
+        )
+
+    def _mlp(
+        self,
+        hidden_states,
+        hidden_states_orig,
+        forward_batch,
+        gemm_output_zero_allocator,
+    ):
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
@@ -1018,14 +1065,11 @@ class Glm5NextDecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         with _mlp_ctx:
-            hidden_states = self.mlp(
+            return self.mlp(
                 hidden_states,
                 forward_batch,
                 gemm_output_zero_allocator,
             )
-        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
-
-        return (hidden_states, topk_indices)
 
 
 class Glm5NextModel(nn.Module):
