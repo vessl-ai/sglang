@@ -37,6 +37,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.batch_overlap.two_batch_overlap import is_graph_tbo_enabled
 from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
@@ -258,7 +259,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        self.enable_two_batch_overlap = is_graph_tbo_enabled()
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph

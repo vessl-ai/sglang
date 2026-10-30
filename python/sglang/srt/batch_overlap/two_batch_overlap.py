@@ -109,6 +109,12 @@ def is_prefill_cp_tbo_enabled() -> bool:
     )
 
 
+def is_graph_tbo_enabled() -> bool:
+    """Whether CUDA-graph batches are split for TBO. Prefill-CP TBO splits only
+    eager extend batches, so its graph batches run the plain layer loop."""
+    return is_tbo_enabled() and not is_prefill_cp_tbo_enabled()
+
+
 def compute_prefill_cp_split_seq_index(
     *, extend_lens: Sequence[int], cp_size: int
 ) -> Optional[int]:
@@ -376,7 +382,7 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if not is_graph_tbo_enabled():
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
