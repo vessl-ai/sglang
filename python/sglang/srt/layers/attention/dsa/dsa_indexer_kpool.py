@@ -9,12 +9,12 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
     rotate_activation,
 )
-from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
