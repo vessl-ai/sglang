@@ -537,6 +537,7 @@ def decode_scores(
             lmax,
             ratio,
             candidate_mask,
+            rows_per_request=inputs.rows_per_request,
         )
         return PagedDecodeScores(
             bs=bs,

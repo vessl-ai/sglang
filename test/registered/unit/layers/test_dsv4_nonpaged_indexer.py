@@ -942,6 +942,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             req_rows=torch.arange(num_rows),
             paged_metadata=metadata,
             is_verify=True,
+            rows_per_request=1,
             out_page_indices=torch.full((num_rows, 4), -1, dtype=torch.int32),
         )
         data = DeepGEMMDecodeData(
