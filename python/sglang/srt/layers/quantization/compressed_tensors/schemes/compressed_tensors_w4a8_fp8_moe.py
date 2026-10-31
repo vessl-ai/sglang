@@ -84,7 +84,7 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.group_size = config.group_size
@@ -205,7 +205,8 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         dtype = torch.bfloat16
         device = layer.w2_weight_packed.device
 
-        # TODO: currently only support per tensor quant.
+        # Activation scales stay dynamic: cutlass_w4a8_moe computes one scale
+        # per token when these are None.
         layer.a13_scale = None
         layer.a2_scale = None
 

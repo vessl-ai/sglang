@@ -299,8 +299,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
-        # Cumulative prefetch-outcome counters, exported through the
-        # log_storage_metrics flow.
+        # Cumulative prefetch-outcome counters. _count_prefetch_outcome also
+        # feeds the matching Prometheus series under --enable-metrics.
         self._prefetch_outcome_stats: dict[str, float] = {
             "attempts": 0,
             "issued": 0,
@@ -313,9 +313,15 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
+            "revoked_deadline": 0,
+            "revoked_stop_policy": 0,
+            "revoked_all_or_nothing": 0,
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
+            "deadline_tokens": 0,
+            "all_or_nothing_tokens": 0,
+            "redundant_tokens": 0,
         }
 
         self.reset()
@@ -2057,13 +2063,13 @@ class UnifiedRadixCache(BasePrefixCache):
             stats["attempts"] += 1
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
-                stats["declined_too_short"] += 1
+                self._count_prefetch_outcome("declined_too_short")
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
-            stats["declined_rate_limited"] += 1
+            self._count_prefetch_outcome("declined_rate_limited")
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
@@ -2132,7 +2138,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.append_host_mem_release(extra_pools=aux_xfers or None)
             return submission.decision
 
-        stats["issued"] += 1
+        self._count_prefetch_outcome("issued")
         if operation.assume_stored:
             stats["issued_assumed_stored"] += 1
         # Snapshot the requested span for L3 miss-token accounting at the
@@ -2265,18 +2271,42 @@ class UnifiedRadixCache(BasePrefixCache):
         operation = self.ongoing_prefetch[request].operation
 
         # Determine whether or not we should terminate this prefetch request.
-        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
-            operation
-        )
+        already_terminated = operation.is_terminated()
+        should_terminate = already_terminated or self._can_terminate_prefetch(operation)
 
         if not should_terminate:
             return False
 
+        # The stop policy (not a miss or an abort) is cutting this prefetch.
+        cut_reason = None
+        if not already_terminated:
+            cut_reason = (
+                "deadline" if self.prefetch_stop_policy == "timeout" else "stop_policy"
+            )
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
+            if cut_reason is not None:
+                # Cut before staging. If the lookup had not answered, the
+                # whole requested span is lost to this attempt. If it had
+                # (a buffer-mode hit parked for staging), its miss is already
+                # in l3_miss_tokens, so only the known hit is lost here.
+                if operation.stats_query_accounted:
+                    lost_tokens = max(
+                        0,
+                        min(
+                            operation.storage_hit_count,
+                            operation.stats_requested_tokens,
+                        ),
+                    )
+                else:
+                    lost_tokens = operation.stats_requested_tokens
+                self._count_prefetch_outcome(f"revoked_{cut_reason}")
+                self._count_prefetch_outcome("deadline_tokens", lost_tokens)
             self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
+            # Cut mid-transfer: the result handlers count what it lost.
+            operation.stats_cut_reason = cut_reason
             self._handle_prefetch_result(operation)
         return True
 
@@ -2316,6 +2346,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 allocated_tokens - completed_tokens,
                 reason="storage_transfer",
             )
+            cut_reason = operation.stats_cut_reason
+            if cut_reason is not None:
+                if completed_tokens == 0:
+                    self._count_prefetch_outcome(f"revoked_{cut_reason}")
+                self._count_prefetch_outcome(
+                    "deadline_tokens", allocated_tokens - completed_tokens
+                )
         if (
             completed_tokens > 0
             and self.enable_storage_metrics
@@ -2341,6 +2378,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Apply the host-insert walk's actions before the transfer commit.
         self._apply_cache_actions(insert_result.cache_actions)
 
+        # Pages another request's prefetch or write-through already put in
+        # L2 while this transfer ran: the request gets them as host hits.
+        self._count_prefetch_outcome("redundant_tokens", insert_result.prefix_len)
         if insert_result.host_insert_dropped:
             self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
@@ -2476,6 +2516,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._finish_storage_prefetch(
                 request, fulfilled_tokens=0, reason="storage_transfer"
             )
+            cut_reason = operation.stats_cut_reason
+            if cut_reason is not None:
+                self._count_prefetch_outcome(f"revoked_{cut_reason}")
+                self._count_prefetch_outcome("deadline_tokens", expected_tokens)
+            else:
+                self._count_prefetch_outcome("revoked_all_or_nothing")
+                self._count_prefetch_outcome("all_or_nothing_tokens", expected_tokens)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self._retire_ongoing_prefetch(
@@ -2732,17 +2779,24 @@ class UnifiedRadixCache(BasePrefixCache):
         requested = operation.stats_requested_tokens
         if requested <= 0:
             return
-        stats = self._prefetch_outcome_stats
+        operation.stats_query_accounted = True
         hit = max(0, min(operation.storage_hit_count, requested))
         if revoked:
             if hit > 0:
-                stats["revoked_insufficient"] += 1
+                self._count_prefetch_outcome("revoked_insufficient")
             else:
-                stats["revoked_full_miss"] += 1
+                self._count_prefetch_outcome("revoked_full_miss")
         miss = requested - hit
-        stats["l3_demand_requests"] += 1
-        stats["l1l2_miss_tokens"] += requested
-        stats["l3_miss_tokens"] += miss
+        self._prefetch_outcome_stats["l3_demand_requests"] += 1
+        self._count_prefetch_outcome("l1l2_miss_tokens", requested)
+        self._count_prefetch_outcome("l3_miss_tokens", miss)
+
+    def _count_prefetch_outcome(self, key: str, num: int = 1) -> None:
+        """Add to one cumulative prefetch-outcome counter and, when storage
+        metrics are on, to its Prometheus series (a pre-bound inc())."""
+        self._prefetch_outcome_stats[key] += num
+        if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            self.storage_metrics_collector.log_prefetch_outcome(key, num)
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         return self._prefetch_outcome_stats.copy()
@@ -2917,7 +2971,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     request, operation.storage_hit_count
                 )
                 if anchor == "anchor_lost":
-                    self._prefetch_outcome_stats["declined_anchor_lost"] += 1
+                    self._count_prefetch_outcome("declined_anchor_lost")
                     self._handle_storage_prefetch_anchor_loss(request)
                     return True
                 if anchor == "cap_busy":
@@ -2945,7 +2999,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 ):
                     # Live tree already covers the span: nothing left to
                     # splice, so skip the storage read.
-                    self._prefetch_outcome_stats["declined_device_covered"] += 1
+                    self._count_prefetch_outcome("declined_device_covered")
                     self._finish_storage_prefetch(
                         request, fulfilled_tokens=0, reason="device_covered"
                     )
@@ -3060,7 +3114,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 if parked_ahead or not _try_alloc_storage_hit(operation):
                     # Counted once at first parking, not per retry tick.
-                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
+                    self._count_prefetch_outcome("declined_rate_limited")
                     self.buffer_pipeline.pending_hit_allocs.append(operation)
 
         def _drain_ack_prefetch():

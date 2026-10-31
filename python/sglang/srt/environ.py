@@ -564,6 +564,8 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE = EnvBool(False)
+
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -766,6 +768,10 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Export the L3 prefetch outcome counters (issued, declined and revoked
+    # by reason, requested/miss/redundant tokens) under --enable-metrics.
+    # Off by default so /metrics stays exactly as before; set to 1 to export.
+    SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -1636,6 +1642,16 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
+    # TP ranks instead of scoring every row on every rank.
+    SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # Score the DeepSeek-V4.1 torch prefill indexer with one fused kernel (fp8 wgmma
+    # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
+    # and head-sum ops.
+    SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
+    # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
+    SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

@@ -10,6 +10,12 @@ This two-step approach avoids a strverscmp bug where
 `git tag --sort=-version:refname` sorts v0.5.10rc0 above v0.5.10,
 which would cause CI to build the wrong version.
 
+Only tags matching the strict release shape (`v<major>.<minor>.<patch>`,
+optionally `rc<n>` or `.post<n>`) count as version tags. Other `v*` tags
+(e.g. trunk-snapshot image tags like `v0.5.17-ourmain.<sha>-cu130-<date>-00`)
+are ignored everywhere a version tag is selected, so they can coexist with
+real release tags without confusing setuptools-scm.
+
 Strategy:
 1. If the current commit has an exact version tag, use it directly.
    This handles CI release builds (both stable and rc).
@@ -21,6 +27,17 @@ Strategy:
 import re
 import subprocess
 import sys
+
+# Matches exactly the release-tag shape parse_version_tuple() understands:
+# v<major>.<minor>.<patch>, optionally .rc<n> or .post<n>. Anything else
+# (e.g. a trunk-snapshot tag like v0.5.17-ourmain.<sha>-cu130-<date>-00)
+# is not a version tag.
+_RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:\.?(?:rc|post)\d+)?$")
+
+
+def is_release_tag(tag: str) -> bool:
+    """Return True if `tag` has the strict release-tag shape."""
+    return bool(_RELEASE_TAG_RE.match(tag))
 
 
 def parse_version_tuple(tag: str) -> tuple:
@@ -81,10 +98,21 @@ def run_git(*args: str, allow_failure: bool = False) -> str:
 
 
 def get_exact_version_tag() -> str:
-    """Return the version tag name if HEAD has an exact version tag, or empty string."""
-    return run_git(
-        "describe", "--tags", "--exact-match", "--match", "v*", allow_failure=True
-    )
+    """Return the version tag name if HEAD has an exact version tag, or empty string.
+
+    HEAD may carry several tags at once (e.g. a release tag alongside a
+    trunk-snapshot tag), so `git tag --points-at HEAD` is the source of
+    truth: list every tag at HEAD, keep only the ones with the strict
+    release shape, and pick the highest by PEP 440 ordering. A snapshot
+    tag alone (no release tag at HEAD) resolves to "no exact version tag".
+    """
+    tags_raw = run_git("tag", "--points-at", "HEAD")
+    if not tags_raw:
+        return ""
+    release_tags = [t for t in tags_raw.splitlines() if is_release_tag(t)]
+    if not release_tags:
+        return ""
+    return sorted(release_tags, key=parse_version_tuple, reverse=True)[0]
 
 
 def get_latest_version_tag_describe() -> str:
@@ -141,8 +169,11 @@ def get_latest_version_tag() -> str:
     tags_raw = run_git("tag", "--list", "v*.*.*")
     if not tags_raw:
         return ""
-    tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
-    return tag_list[0] if tag_list else ""
+    tag_list = [t for t in tags_raw.splitlines() if is_release_tag(t)]
+    if not tag_list:
+        return ""
+    tag_list.sort(key=parse_version_tuple, reverse=True)
+    return tag_list[0]
 
 
 def main() -> None:

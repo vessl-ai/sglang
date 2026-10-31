@@ -5,7 +5,16 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
+from functools import partial
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Generator,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -14,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_logits_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
@@ -250,8 +260,46 @@ def dense_prefill_topk(
 # ---------- torch ----------
 
 
+def _row_shard_topology():
+    """(attn_tp_rank, attn_tp_size, group) when the torch prefill indexer shards
+    query rows across the attention TP ranks, else (0, 1, None).
+
+    The indexer weights are replicated across TP, so every rank otherwise scores the
+    same rows against the same index K. Sharding assumes every rank sees identical
+    (req, pos) rows: attn DP and attn CP must both be off.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_parallel
+
+    if not envs.SGLANG_DSV41_INDEXER_ROW_SHARD.get():
+        return 0, 1, None
+
+    par = get_parallel()
+    if par.attn_dp_size != 1 or par.attn_cp_size != 1 or par.attn_tp_size <= 1:
+        return 0, 1, None
+    return par.attn_tp_rank, par.attn_tp_size, par.attn_tp_group.device_group
+
+
+def _merge_row_shards(inputs: PrefillInputs, group) -> None:
+    """Every rank wrote only its own rows of the selection (-1 elsewhere); max-merge
+    so each rank holds all rows. Selections are >= 0 or -1, so max is the union."""
+    n = inputs.positions.shape[0]
+    for out in (inputs.out_raw_indices, inputs.out_page_indices):
+        if out is None:
+            continue
+        view = out[:n]
+        buf = view if view.is_contiguous() else view.contiguous()
+        torch.distributed.all_reduce(
+            buf, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        if buf is not view:
+            view.copy_(buf)
+
+
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+# Arbitrary cap on one fp32 [rows, lc] chunk of fused-kernel scores.
+_FUSED_SCORE_BUDGET_BYTES = 1 << 30
 
 
 class RequestScores(msgspec.Struct, frozen=True):
@@ -285,6 +333,8 @@ def prefill_requests(
     req_to_token: torch.Tensor,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
+    from sglang.srt.environ import envs
+
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -296,44 +346,114 @@ def prefill_requests(
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk
+    shard_rank, shard_size, shard_group = _row_shard_topology()
+    fused = envs.SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER.get()
+    table = pool.get_index_k_with_scale_buffer(inputs.layer_id) if fused else None
+    kernel = _fused_prefill_kernel() if fused else None
+    sharded = False
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
         lens = compress_lens[tok]
         lc = int(lens.max().item())
         if lc == 0:
             continue
+        if shard_size > 1 and tok.numel() >= shard_size:
+            # lc / k / slots stay request-wide, so each row's top-k is bit-identical to
+            # the unsharded path. Fewer rows than ranks: every rank scores them all.
+            keep = torch.tensor_split(
+                torch.arange(tok.numel(), device=tok.device), shard_size
+            )[shard_rank]
+            tok, lens = tok[keep], lens[keep]
+            sharded = True
         j = torch.arange(lc, device=pos.device)
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
-        # Dequantize only this request's visible K rows; the table is pool-sized.
-        index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        if fused:
+            score = partial(
+                _fused_scores,
+                kernel=kernel,
+                q=q,
+                weights=weights,
+                table=table,
+                slots=slots,
+            )
+            rows_per_chunk = _FUSED_SCORE_BUDGET_BYTES // (lc * 4)
+        else:
+            # Dequantize only this request's visible K rows; the table is pool-sized.
+            index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+            score = partial(
+                _torch_scores,
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                columns=j,
+            )
+            rows_per_chunk = _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2)
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                score=score, rows_per_chunk=max(1, rows_per_chunk), request=request
             ),
         )
+    # Reached only once the caller has consumed every request. `sharded` is the same on
+    # all ranks (it depends on shared row counts), so the collective is uniform.
+    if sharded:
+        _merge_row_shards(inputs, shard_group)
 
 
 def _score_chunks(
+    *,
+    score: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    rows_per_chunk: int,
+    request: RequestScores,
+) -> Iterator[ChunkScores]:
+    for start in range(0, request.tok.numel(), rows_per_chunk):
+        rows = slice(start, start + rows_per_chunk)
+        tok_c, lens_c = request.tok[rows], request.lens[rows]
+        yield ChunkScores(
+            rows=rows, tok=tok_c, lens=lens_c, scores=score(tok_c, lens_c)
+        )
+
+
+def _torch_scores(
+    tok: torch.Tensor,
+    lens: torch.Tensor,
     *,
     indexer: DeepseekV41Indexer,
     q: torch.Tensor,
     weights: torch.Tensor,
     index_k: torch.Tensor,
-    request: RequestScores,
-) -> Iterator[ChunkScores]:
-    lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
-    for start in range(0, request.tok.numel(), rows_per_chunk):
-        rows = slice(start, start + rows_per_chunk)
-        tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+    columns: torch.Tensor,
+) -> torch.Tensor:
+    s = indexer.scores(q[tok], index_k, weights[tok])
+    return s.masked_fill(columns[None, :] >= lens[:, None], -torch.inf)
+
+
+def _fused_prefill_kernel() -> Callable[..., torch.Tensor]:
+    if get_platform().is_sm90:
+        # Imported here: the Gluon module needs a CUDA Triton build.
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_keys_major import (
+            fp4_index_logits_prefill_keys_major,
+        )
+
+        return fp4_index_logits_prefill_keys_major
+    return fp4_index_logits_prefill
+
+
+def _fused_scores(
+    tok: torch.Tensor,
+    lens: torch.Tensor,
+    *,
+    kernel: Callable[..., torch.Tensor],
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    table: torch.Tensor,
+    slots: torch.Tensor,
+) -> torch.Tensor:
+    return kernel(q[tok], weights[tok], slots, lens, table, table.shape[1] // 68)
 
 
 def write_prefill(

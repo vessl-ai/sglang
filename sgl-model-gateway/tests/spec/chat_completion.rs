@@ -568,3 +568,154 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
         err
     );
 }
+
+// [vessl] Regression tests for defect D-3: the vendored openai-protocol patch
+// (sgl-model-gateway/vendor/openai-protocol) drops the empty-user-content
+// rejection while keeping the empty-messages-array rejection.
+
+#[test]
+fn test_empty_user_content_is_valid() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": ""}],
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "Empty user content should be accepted: OpenAI's API and the engines \
+         this gateway fronts both accept it"
+    );
+}
+
+#[test]
+fn test_empty_messages_array_is_invalid() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "messages": [],
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_err(),
+        "An empty messages array should still be rejected"
+    );
+}
+
+// [vessl] Regression tests for vendored passthrough fields (INF-378): the
+// vendored openai-protocol patch (sgl-model-gateway/vendor/openai-protocol)
+// adds `repetition_detection` and `add_special_tokens` to
+// ChatCompletionRequest so the router forwards them verbatim instead of
+// silently dropping them on deserialize->serialize. The engine is the sole
+// validator of their contents.
+
+#[test]
+fn test_passthrough_fields_survive_round_trip() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "repetition_detection": {"min_pattern_size": 8, "max_pattern_size": 256, "min_count": 3},
+        "add_special_tokens": false,
+    }))
+    .unwrap();
+
+    let out = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        out["repetition_detection"],
+        json!({"min_pattern_size": 8, "max_pattern_size": 256, "min_count": 3}),
+        "repetition_detection should round-trip verbatim"
+    );
+    assert_eq!(
+        out["add_special_tokens"],
+        json!(false),
+        "add_special_tokens should round-trip verbatim"
+    );
+}
+
+#[test]
+fn test_passthrough_fields_absent_when_not_provided() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .unwrap();
+
+    let out = serde_json::to_value(&req).unwrap();
+    let obj = out.as_object().unwrap();
+    assert!(
+        obj.get("repetition_detection").is_none(),
+        "repetition_detection should be omitted when not provided"
+    );
+    assert!(
+        obj.get("add_special_tokens").is_none(),
+        "add_special_tokens should be omitted when not provided"
+    );
+}
+
+#[test]
+fn test_repetition_detection_engine_invalid_values_not_rejected_by_router() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "repetition_detection": {"min_pattern_size": 8, "max_pattern_size": 256, "min_count": 1},
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "The router must not validate repetition_detection contents; the \
+         engine is the sole validator"
+    );
+
+    let out = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        out["repetition_detection"],
+        json!({"min_pattern_size": 8, "max_pattern_size": 256, "min_count": 1}),
+        "An engine-invalid value should still survive re-serialization intact"
+    );
+}
+
+#[test]
+fn test_repetition_detection_non_object_value_round_trips_verbatim() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "repetition_detection": "bogus",
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "The router must accept non-object repetition_detection values too, \
+         so the engine can reject them with its own 400"
+    );
+
+    let out = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        out["repetition_detection"],
+        json!("bogus"),
+        "Non-object repetition_detection should round-trip verbatim"
+    );
+}
+
+#[test]
+fn test_add_special_tokens_non_bool_value_round_trips_verbatim() {
+    let req: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "add_special_tokens": "false",
+    }))
+    .unwrap();
+
+    assert!(
+        req.validate().is_ok(),
+        "The router must accept a wrongly-typed add_special_tokens value \
+         too, since injected fields are never rejected by the router \
+         (contract F2)"
+    );
+
+    let out = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        out["add_special_tokens"],
+        json!("false"),
+        "A stringified add_special_tokens value should round-trip verbatim"
+    );
+}

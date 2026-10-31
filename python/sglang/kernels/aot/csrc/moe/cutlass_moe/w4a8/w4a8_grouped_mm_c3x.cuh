@@ -25,6 +25,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
@@ -76,6 +77,27 @@ struct cutlass_3x_w4a8_group_gemm {
   static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
 
+  // Activation scale is applied in the epilogue. The default LinearCombination
+  // fusion can only broadcast a single alpha over the whole GEMM, which forces
+  // a per-tensor activation scale. Use an EVT with a row broadcast instead so
+  // the scale can vary per token.
+  //
+  // This kernel computes D^T = B^T * A^T (the mainloop receives B first), so the
+  // token axis is CUTLASS's N -- hence a Row, not Col, broadcast. Passing a
+  // pointer type as ElementInput_ selects the array-of-pointers form, which is
+  // what grouped GEMM needs: ptr_row[l] is the scale slice of expert l, already
+  // produced by run_int4_fp8_get_group_gemm_starts().
+  //
+  // The N stride is `bool` so the same kernel serves both layouts:
+  //   true  -> per-token, reads one scale per row
+  //   false -> scalar broadcast, preserving the static per-tensor path
+  using ScaleA = cutlass::epilogue::fusion::
+      Sm90RowBroadcast<0, TileShape, ElementAccumulator*, ElementAccumulator, cute::Stride<cute::_0, bool, cute::_0>>;
+  using AccFetch = cutlass::epilogue::fusion::Sm90AccFetch;
+  using ComputeMul = cutlass::epilogue::fusion::
+      Sm90Compute<cutlass::multiplies, ElementD, ElementAccumulator, cutlass::FloatRoundStyle::round_to_nearest>;
+  using FusionOp = cutlass::epilogue::fusion::Sm90EVT<ComputeMul, ScaleA, AccFetch>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
@@ -90,7 +112,8 @@ struct cutlass_3x_w4a8_group_gemm {
       ElementD,
       LayoutD_Transpose*,
       AlignmentD,
-      EpilogueSchedule>::CollectiveOp;
+      EpilogueSchedule,
+      FusionOp>::CollectiveOp;
 
   using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilderMixedInput<
       ArchTag,
@@ -177,7 +200,16 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
   TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
-  TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
+  TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D");
+  TORCH_CHECK(
+      a_scales.numel() == 1 || a_scales.numel() == a_tensors.size(0),
+      "A Scale tensor must hold either one scale (per-tensor) or one per A row "
+      "(per-token), got ",
+      a_scales.numel(),
+      " for ",
+      a_tensors.size(0),
+      " rows");
+  TORCH_CHECK(a_scales.scalar_type() == torch::kFloat32, "A Scale tensor must be float32");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
 
@@ -210,16 +242,15 @@ void cutlass_w4a8_group_gemm_caller(
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
   Args arguments;
-  decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 0;
-  fusion_args.beta = 0;
-  fusion_args.alpha_ptr = a_scales.data_ptr<float>();
-  ;
-  fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array = nullptr;
-  fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+  // EVT argument tree: { ScaleA, AccFetch, Compute }.
+  // ptr_row[l] = a_scales + expert_offsets[l] when per_act_token is set; the
+  // offsets are filled by run_int4_fp8_get_group_gemm_starts() below.
+  decltype(arguments.epilogue.thread) fusion_args{
+      {static_cast<ElementAccumulator const* const*>(a_scales_ptrs.data_ptr()),
+       ElementAccumulator(1),
+       {cute::_0{}, per_act_token, cute::_0{}}},
+      {},
+      {}};
 
   ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
       static_cast<ProblemShape::UnderlyingProblemShape*>(problem_sizes.data_ptr());
