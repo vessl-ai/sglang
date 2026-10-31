@@ -427,6 +427,17 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition = round_up(
                 self.intermediate_size_per_partition, 128
             )
+        # DeepGEMM's W4A4 MegaMoE needs a multiple of 512 here. The padding loads
+        # as zero gate/up rows and down columns, which leave the output unchanged.
+        self._pads_mega_moe_intermediate = (
+            self._mega_moe_w4a4
+            and get_moe_a2a_backend().is_megamoe()
+            and self.intermediate_size_per_partition % 512 != 0
+        )
+        if self._pads_mega_moe_intermediate:
+            self.intermediate_size_per_partition = round_up(
+                self.intermediate_size_per_partition, 512
+            )
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -653,7 +664,12 @@ class FusedMoE(torch.nn.Module):
             and getattr(self.w2_weight, "weight_padded", False)
         )
 
-        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+        return (
+            _is_cpu
+            or self.use_flashinfer_trtllm_moe
+            or aiter_padded
+            or self._pads_mega_moe_intermediate
+        )
 
     def _load_per_tensor_weight_scale(
         self,

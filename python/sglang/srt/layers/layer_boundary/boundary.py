@@ -20,6 +20,7 @@ from typing import Callable, NamedTuple, Optional, Tuple
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.contracts import (
     CpMoves,
     EdgeContract,
@@ -515,6 +516,7 @@ def _select_entry_step(
                     _tp_reduce_scatter_update_read_gather,
                     read=read,
                     reduces=owes is not None,
+                    gathers_fp8=envs.SGLANG_ENABLE_SCATTERED_INPUT_GATHER_FP8.get(),
                 )
             )
         # A reduce-scatter completes the TP sum onto each rank's slice, which

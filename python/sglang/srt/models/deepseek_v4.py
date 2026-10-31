@@ -485,37 +485,36 @@ def _apply_wo_a_bf16_matmul(
         )
         and _hip.wo_a_split_k_allowed()
     )
-    if (
-        (
-            fast_path
-            and _is_cuda
-            and (
-                (
-                    is_decode
-                    and o.shape[0] == 1
-                    and (get_platform().is_blackwell or get_platform().is_sm90)
-                )
-                or (
-                    is_target_verify
-                    and 0 < o.shape[0] <= 384
-                    and get_platform().is_blackwell
-                )
-                or (
-                    is_prefill
-                    and 4096 <= o.shape[0] <= 65536
-                    and get_platform().is_blackwell
-                )
+    fast_prefill = (
+        ((fast_path and _is_cuda and get_platform().is_blackwell) or hip_fast_path)
+        and is_prefill
+        and 4096 <= o.shape[0] <= 65536
+    )
+    small_batch = (
+        fast_path
+        and _is_cuda
+        and (
+            (
+                is_decode
+                and o.shape[0] == 1
+                and (get_platform().is_blackwell or get_platform().is_sm90)
+            )
+            or (
+                is_target_verify
+                and 0 < o.shape[0] <= 384
+                and get_platform().is_blackwell
             )
         )
-        or hip_decode_verify
-        or (hip_fast_path and is_prefill and 4096 <= o.shape[0] <= 65536)
-    ) and (
-        o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+    ) or hip_decode_verify
+    groups, group_dim = o.shape[1:]
+    # The decode and verify kernels exist for two 4096-wide groups only; the
+    # prefill bmm takes any group count.
+    if ((small_batch and (groups, group_dim) == (2, 4096)) or fast_prefill) and (
+        wo_a.shape == (groups, 1024, group_dim)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
-        and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(1) == group_dim
+        and o.stride(0) >= groups * group_dim
         and wo_a.is_contiguous()
     ):
         if is_decode and o.shape[0] == 1:
@@ -2293,7 +2292,6 @@ class MQALayer(MqaAttentionBase):
         k_nope, k_rope = None, None
         if (
             self.is_dsv41
-            and not self.q_head_norm
             and get_token_to_kv_pool().uniform_fp8
             and self.n_local_heads in (8, 16, 32, 64, 128)
         ):

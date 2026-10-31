@@ -990,6 +990,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             not self._unified_kv
         ) and get_exec().kernel.dsv4_attn_backend == "trtllm"
         if self.uniform_fp8:
+            self.kv_transfer_layout = KVLayout.UNIFORM_FP8.value
             assert self.kv_layout is KVLayout.V4, (
                 "--dsv4-attn-backend trtllm keeps its own uniform 512-byte pages; "
                 f"it cannot be combined with SGLANG_DSV4_KV_LAYOUT={self.kv_layout.value}"

@@ -131,3 +131,26 @@ def prefill_scores(
             )
             for chunk in chunks
         ]
+
+
+def prefill_kernel_args(
+    *,
+    inputs: PrefillInputs,
+    token_to_kv_pool: SimpleNamespace,
+    req_to_token: torch.Tensor,
+    request: int,
+) -> dict:
+    """Keyword arguments of the fused prefill kernels for every row of ``request``,
+    which must have a visible position."""
+    ratio = inputs.compress_ratio
+    tok = (inputs.req_rows == request).nonzero().squeeze(1)
+    lens = (inputs.positions[tok] + 1) // ratio
+    j = torch.arange(int(lens.max().item()), device=lens.device)
+    return dict(
+        q=inputs.q_lora[tok],
+        weights=inputs.x[tok],
+        slots=req_to_token[request, j * ratio].to(torch.int64) // ratio,
+        lens=lens,
+        table=token_to_kv_pool.get_index_k_with_scale_buffer(inputs.layer_id),
+        page_size=PAGE_SIZE,
+    )

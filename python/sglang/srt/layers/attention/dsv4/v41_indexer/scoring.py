@@ -349,6 +349,7 @@ def prefill_requests(
     shard_rank, shard_size, shard_group = _row_shard_topology()
     fused = envs.SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER.get()
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id) if fused else None
+    kernel = _fused_prefill_kernel() if fused else None
     sharded = False
     for r in torch.unique_consecutive(req).tolist():
         tok = (req == r).nonzero().squeeze(1)
@@ -368,7 +369,12 @@ def prefill_requests(
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         if fused:
             score = partial(
-                _fused_scores, q=q, weights=weights, table=table, slots=slots
+                _fused_scores,
+                kernel=kernel,
+                q=q,
+                weights=weights,
+                table=table,
+                slots=slots,
             )
             rows_per_chunk = _FUSED_SCORE_BUDGET_BYTES // (lc * 4)
         else:
@@ -426,18 +432,28 @@ def _torch_scores(
     return s.masked_fill(columns[None, :] >= lens[:, None], -torch.inf)
 
 
+def _fused_prefill_kernel() -> Callable[..., torch.Tensor]:
+    if get_platform().is_sm90:
+        # Imported here: the Gluon module needs a CUDA Triton build.
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_keys_major import (
+            fp4_index_logits_prefill_keys_major,
+        )
+
+        return fp4_index_logits_prefill_keys_major
+    return fp4_index_logits_prefill
+
+
 def _fused_scores(
     tok: torch.Tensor,
     lens: torch.Tensor,
     *,
+    kernel: Callable[..., torch.Tensor],
     q: torch.Tensor,
     weights: torch.Tensor,
     table: torch.Tensor,
     slots: torch.Tensor,
 ) -> torch.Tensor:
-    return fp4_index_logits_prefill(
-        q[tok], weights[tok], slots, lens, table, table.shape[1] // 68
-    )
+    return kernel(q[tok], weights[tok], slots, lens, table, table.shape[1] // 68)
 
 
 def write_prefill(

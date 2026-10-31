@@ -299,7 +299,7 @@ def _run_mega_routed(
         topk_ids,
         topk_weights,
         hidden_size=hidden_size,
-        intermediate_size=moe.config.moe_intermediate_size,
+        intermediate_size=moe.experts.intermediate_size_per_partition,
         top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         num_tokens=num_tokens,
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,

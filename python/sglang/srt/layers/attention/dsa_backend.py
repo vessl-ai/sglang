@@ -3884,7 +3884,6 @@ class DeepseekSparseAttnBackend(
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
@@ -3894,6 +3893,7 @@ class DeepseekSparseAttnBackend(
                 block_tables=block_tables,
                 seq_lens=seq_lens,
                 cu_seqlens_q=self.get_device_int32_arange(batch_size + 1),
+                sparse_mla_top_k_lens=sparse_mla_top_k_lens,
                 **attention_kwargs,
             )
             if num_decode_padding_rows:
@@ -3905,12 +3905,23 @@ class DeepseekSparseAttnBackend(
                 )
             return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows), lse
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            **attention_kwargs,
-        )
+        # The kernel fails to launch (CUDA_ERROR_INVALID_VALUE) at 65,536 rows.
+        max_rows = 32768
+        pieces = [
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q[start : start + max_rows],
+                block_tables=block_tables[start : start + max_rows],
+                seq_lens=seq_lens[start : start + max_rows],
+                sparse_mla_top_k_lens=(
+                    None
+                    if sparse_mla_top_k_lens is None
+                    else sparse_mla_top_k_lens[start : start + max_rows]
+                ),
+                **attention_kwargs,
+            )
+            for start in range(0, batch_size, max_rows)
+        ]
+        out = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 

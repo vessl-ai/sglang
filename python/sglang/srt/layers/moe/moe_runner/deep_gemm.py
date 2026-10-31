@@ -359,6 +359,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.use_swizzle = (
             get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
         )
+        self.fuses_contig_act_quant = (
+            self.use_swizzle
+            or config.silu_mul_keep_fp32
+            or (envs.SGLANG_DEEPGEMM_FUSED_CONTIG_ACT_QUANT.get() and not _is_musa)
+        )
 
     def run(
         self,
@@ -522,7 +527,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        elif self.use_swizzle or self.config.silu_mul_keep_fp32:
+        elif self.fuses_contig_act_quant:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
                 "deepep_v2_disable_contig_swizzle", False
@@ -1082,13 +1087,21 @@ def pre_permute_standard_to_deep_gemm(
     block_e = deep_gemm_wrapper.get_contiguous_layout_alignment(
         num_assignments, num_experts
     )
-    all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
         topk_ids, num_experts, 1, expert_start=expert_start
     )
     dispose_tensor(unused_masked_dst)
     valid_tokens_per_expert = tokens_per_expert
+    if (
+        num_experts < runner_config.num_experts
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # DeepGEMM computes the -1 rows too, so the graph-static bound below
+        # would run every rank over all assignments, not just its experts'.
+        all_tokens = int((ceil_div(tokens_per_expert, block_e) * block_e).sum().item())
+    else:
+        all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
     if _is_cuda:
         tokens_per_expert = pad_expert_counts(tokens_per_expert, block_e, all_tokens)
     else:

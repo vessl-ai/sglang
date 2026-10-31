@@ -58,7 +58,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
-        "disaggregation-mode": cfg.disaggregation_mode != "null",
+        "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
     }
     for flag, enabled in unsupported.items():
         if enabled:

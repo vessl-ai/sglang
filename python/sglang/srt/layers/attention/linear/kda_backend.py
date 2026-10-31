@@ -402,10 +402,16 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
-    def effective_extend_kernel(self, lower_bound: Optional[float], num_tokens: int):
-        """The packed FlashInfer prefill kernel requires more than one token."""
+    def effective_extend_kernel(
+        self, lower_bound: Optional[float], num_tokens: int, num_seqs: int = 1
+    ):
+        """The packed FlashInfer prefill kernel requires more than one token per
+        sequence. A batch where every sequence extends exactly one token (e.g.
+        retracted requests re-entering with a fully cached prefix) would fall to
+        FlashInfer's grouped recurrent kernel, which only accepts a bf16 state
+        pool; the KDA pool is fp32, so route those batches to Triton."""
         kernel = self.extend_kernel
-        if self.prefill_backend.is_flashinfer() and num_tokens <= 1:
+        if self.prefill_backend.is_flashinfer() and num_tokens <= max(num_seqs, 1):
             return self.triton_kernel
         if lower_bound is not None and not getattr(kernel, "supports_safe_gate", True):
             kernel = self.triton_kernel
@@ -424,7 +430,9 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        kernel = self.effective_extend_kernel(kwargs.get("lower_bound"), q.shape[1])
+        kernel = self.effective_extend_kernel(
+            kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
+        )
         return kernel.extend(
             q,
             k,
@@ -1005,10 +1013,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        return causal_conv1d_fn(
+        # Equal q/k/v widths come back as [3, tokens, width], so each of q/k/v
+        # is contiguous for the prefill kernel without a copy.
+        split = layer.q_dim if layer.q_dim == layer.k_dim == layer.v_dim else 0
+        out = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1018,7 +1029,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            out_split_size=split,
+        )
+        if split:
+            return out.unbind(0)
+        return out.transpose(0, 1).split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
 
     def forward_extend(
         self,
@@ -1082,10 +1099,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
+        q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1110,7 +1126,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Check the kernel the dispatcher will actually run (safe-gate
             # reroute included), not just the configured one.
             extend_kernel = self.kernel_dispatcher.effective_extend_kernel(
-                layer.lower_bound, q.shape[1]
+                layer.lower_bound, q.shape[1], query_start_loc.numel() - 1
             )
             assert extend_kernel.supports_track_state_snapshot, (
                 f"{type(extend_kernel).__name__} cannot write the fp32 track "

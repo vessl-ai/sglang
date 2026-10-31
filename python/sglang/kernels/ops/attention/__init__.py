@@ -412,3 +412,13 @@ for _fn in (
         )
     )
 del _fn
+register_kernel(
+    KernelSpec(
+        op="attention.fp4_index_logits_prefill_keys_major",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.fp4_indexer_keys_major:fp4_index_logits_prefill_keys_major",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)

@@ -17,6 +17,7 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_row_pack import pack_rows_fp8, unpack_rows_fp8
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
@@ -420,6 +421,7 @@ def _tp_reduce_scatter_update_read_gather(
     *,
     cache=None,
     reduces: bool = True,
+    gathers_fp8: bool = False,
     read: ResidualReadout,
     update: ResidualUpdate,
 ):
@@ -436,7 +438,13 @@ def _tp_reduce_scatter_update_read_gather(
     else:
         shard = shard.clone()
     shard, residual = read.update_and_read(update, shard, residual, norm)
-    attn_tp_all_gather_into_tensor(hidden_states, shard)
+    if gathers_fp8:
+        packed = pack_rows_fp8(shard)
+        gathered = packed.new_empty((hidden_states.shape[0], packed.shape[1]))
+        attn_tp_all_gather_into_tensor(gathered, packed)
+        unpack_rows_fp8(gathered, hidden_states)
+    else:
+        attn_tp_all_gather_into_tensor(hidden_states, shard)
     return hidden_states, residual
 
 
