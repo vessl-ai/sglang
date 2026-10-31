@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
@@ -15,7 +16,6 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     kpool_max_closed_pools,
     update_kpool_write_plan_cuda_graph,
 )
-from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel

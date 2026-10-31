@@ -80,9 +80,7 @@ def _kda_track_ssm_kernel(
     mask = offs < numel
     if mode == 1:
         src = tl.load(cache_indices + r).to(tl.int64)
-        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask).to(
-            tl.float32
-        )
+        val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask).to(tl.float32)
     else:
         val = tl.load(h_track + r.to(tl.int64) * stride_h_row + offs, mask=mask).to(
             tl.float32

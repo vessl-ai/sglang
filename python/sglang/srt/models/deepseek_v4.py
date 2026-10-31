@@ -486,8 +486,10 @@ def _apply_wo_a_bf16_matmul(
         and _hip.wo_a_split_k_allowed()
     )
     fast_prefill = (
-        (fast_path and _is_cuda and get_platform().is_blackwell) or hip_fast_path
-    ) and is_prefill and 4096 <= o.shape[0] <= 65536
+        ((fast_path and _is_cuda and get_platform().is_blackwell) or hip_fast_path)
+        and is_prefill
+        and 4096 <= o.shape[0] <= 65536
+    )
     small_batch = (
         fast_path
         and _is_cuda
@@ -507,9 +509,7 @@ def _apply_wo_a_bf16_matmul(
     groups, group_dim = o.shape[1:]
     # The decode and verify kernels exist for two 4096-wide groups only; the
     # prefill bmm takes any group count.
-    if (
-        (small_batch and (groups, group_dim) == (2, 4096)) or fast_prefill
-    ) and (
+    if ((small_batch and (groups, group_dim) == (2, 4096)) or fast_prefill) and (
         wo_a.shape == (groups, 1024, group_dim)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
