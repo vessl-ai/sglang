@@ -120,17 +120,23 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
-    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
     if metadata.gather_index is not None:
+        padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
         return padded.index_copy_(0, metadata.gather_index, hidden_states)
-    padded[: hidden_states.shape[0]] = hidden_states
     size = get_parallel().attn_cp_size
-    return (
-        padded.reshape(-1, size, *hidden_states.shape[1:])
-        .transpose(0, 1)
-        .flatten(0, 1)
-        .contiguous()
+    tokens = hidden_states.shape[0]
+    full = tokens // size
+    tail = tokens - full * size
+    out = hidden_states.new_empty(
+        (size, gathered_rows // size, *hidden_states.shape[1:])
     )
+    out[:, :full] = (
+        hidden_states[: full * size].unflatten(0, (full, size)).transpose(0, 1)
+    )
+    out[:tail, full : full + 1] = hidden_states[full * size :].unsqueeze(1)
+    out[tail:, full : full + 1].zero_()
+    out[:, full + 1 :].zero_()
+    return out.flatten(0, 1)
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):

@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     rotate_activation,
 )
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
@@ -1211,23 +1212,63 @@ class IndexerKPool(MultiPlatformOp):
         # The plan's table is req_to_token, indexed by request-pool ID.
         assert page_table_all is None or page_table_row_index_all is not None
 
-        return self._kpool_topk_by_row_chunks(
-            q_fp8=q_fp8,
-            weights=weights,
+        row_split = plan.row_split
+        if row_split is None:
+            return self._kpool_topk_by_row_chunks(
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=kv_fp8,
+                logits_starts=ks_per_q,
+                logits_ends=ke_per_q,
+                pool_lens=pool_lens,
+                seq_lens=seq_lens_expanded,
+                page_table=page_table_all,
+                page_table_row_index=page_table_row_index_all,
+                topk_offsets=topk_offsets_all,
+                topk_row_starts=ks_per_q,
+                row_chunks=_mqa_logits_row_chunks(
+                    num_rows=n_real, num_cols=total_k_rows, device=device
+                ),
+                out_rows=total_q,
+            )
+        local = slice(row_split.lo, row_split.hi)
+        local_topk = self._kpool_topk_by_row_chunks(
+            q_fp8=q_fp8[local],
+            weights=weights[local],
             kv_fp8=kv_fp8,
-            logits_starts=ks_per_q,
-            logits_ends=ke_per_q,
-            pool_lens=pool_lens,
-            seq_lens=seq_lens_expanded,
-            page_table=page_table_all,
-            page_table_row_index=page_table_row_index_all,
-            topk_offsets=topk_offsets_all,
-            topk_row_starts=ks_per_q,
-            row_chunks=_mqa_logits_row_chunks(
-                num_rows=n_real, num_cols=total_k_rows, device=device
+            logits_starts=ks_per_q[local],
+            logits_ends=ke_per_q[local],
+            pool_lens=pool_lens[local],
+            seq_lens=seq_lens_expanded[local],
+            # Addressed by request-pool ID through the row index, so never sliced.
+            page_table=(
+                page_table_all
+                if page_table_row_index_all is not None
+                else _slice_rows(tensor=page_table_all, rows=local)
             ),
-            out_rows=total_q,
+            page_table_row_index=_slice_rows(
+                tensor=page_table_row_index_all, rows=local
+            ),
+            topk_offsets=_slice_rows(tensor=topk_offsets_all, rows=local),
+            topk_row_starts=ks_per_q[local],
+            row_chunks=_mqa_logits_row_chunks(
+                num_rows=row_split.hi - row_split.lo,
+                num_cols=total_k_rows,
+                device=device,
+            ),
+            out_rows=None,
         )
+        # Rows past n_real are padding, as on the unsplit path.
+        topk_result = torch.full(
+            (total_q, local_topk.shape[1]),
+            -1,
+            dtype=local_topk.dtype,
+            device=local_topk.device,
+        )
+        get_attn_tp_group().all_gatherv(
+            local_topk, sizes=row_split.rows_per_rank, output=topk_result[:n_real]
+        )
+        return topk_result
 
     def _get_topk_ragged_kpool(
         self,

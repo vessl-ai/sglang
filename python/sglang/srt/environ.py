@@ -899,6 +899,13 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # Gather the rows an input-scattered stage (--enable-attn-tp-input-scattered)
+    # reads as fp8-e4m3 with power-of-two per-128 scales, unpacked to bf16 after
+    # the gather. Lossy for bf16 readers of those rows, so accuracy-gated, OFF.
+    SGLANG_ENABLE_SCATTERED_INPUT_GATHER_FP8 = EnvBool(False)
+    # Run the contiguous DeepGEMM MoE activation and its FP8 quantization as
+    # one kernel on every model, not only swizzled or FP32-intermediate ones.
+    SGLANG_DEEPGEMM_FUSED_CONTIG_ACT_QUANT = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -1744,6 +1751,13 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Opt-in: each attention-TP rank scores a contiguous share of the prefill
+    # indexer rows (logits + top-k) and the ranks all-gather the top-k indices.
+    SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
+    SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
+    # Opt-in: quantize GLM-5 KDA q/k/v and o projections, which the checkpoint
+    # ships in BF16, to 128x128 block FP8 at load. Changes numerics.
+    SGLANG_GLM5_KDA_FP8_PROJ = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
