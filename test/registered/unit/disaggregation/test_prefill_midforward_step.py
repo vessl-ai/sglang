@@ -268,6 +268,10 @@ class TestPrefillMidForwardStep(CustomTestCase):
         # loop still drained once more before building the next batch.
         in_hook = [d for d in prepped.hicache_drains if d[1] == 4]
         self.assertEqual(sorted(f for f, _ in in_hook), [1, 2, 3, 4])
+        # Only there: the first hook (layer 1) does not prepare.
+        self.assertEqual(
+            [d for d in prepped.hicache_drains if d[0] is not None and d[1] != 4], []
+        )
         self.assertEqual(
             len([d for d in prepped.hicache_drains if d[0] is None]),
             len([d for d in before.hicache_drains if d[0] is None]),
