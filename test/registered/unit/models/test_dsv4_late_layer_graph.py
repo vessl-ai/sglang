@@ -222,6 +222,10 @@ CP_SIZE = 4
 class _FakeAttn:
     """The two window-KV stores of MqaAttention, writing the toy pool."""
 
+    # MqaAttentionBase sets layer_id; the late-layer stores read it to fire the prefill
+    # mid-forward hooks (vessl-ai/sglang#121). Any late-layer id: no hook is armed here.
+    layer_id = 30
+
     def _cp_store_window_kv(self, kv, forward_batch, attn_backend):
         # The real gather: asserts the batch runs prefill CP.
         kv = cp_utils.cp_materialize_global_token_order(kv.contiguous(), forward_batch)
