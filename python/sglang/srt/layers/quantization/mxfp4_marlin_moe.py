@@ -384,6 +384,18 @@ class Mxfp4MarlinMoEMethod:
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
         hidden_states = dispatch_output.hidden_states
+        # INF-681 k-pfp8: the W4A8 input quantized before the prefill-CP all-gather.
+        row_quant = getattr(dispatch_output, "hidden_states_pre_quant", None)
+        if row_quant is not None:
+            from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import W4A8RowQuant
+
+            if not isinstance(row_quant, W4A8RowQuant):
+                row_quant = None
+            elif not self._use_w4a8:
+                raise RuntimeError(
+                    f"{self.prefix}: a W4A8 row-quantized MoE input reached a "
+                    "non-W4A8 path"
+                )
         if self._use_w4a8:
             add_to, self._pending_shared_add = self._pending_shared_add, None
             return StandardCombineInput(
@@ -392,6 +404,7 @@ class Mxfp4MarlinMoEMethod:
                     topk_output.topk_ids,
                     topk_output.topk_weights,
                     add_to=add_to,
+                    row_quant=row_quant,
                 )
             )
         if self._sm90_decode_w4a8:

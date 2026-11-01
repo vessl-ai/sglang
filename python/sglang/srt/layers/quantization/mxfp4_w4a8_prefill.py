@@ -296,6 +296,16 @@ def _row_quant(x: torch.Tensor):
     return y, s
 
 
+class W4A8RowQuant(NamedTuple):
+    """The experts' input already quantized the way _row_quant does it: q [T, hidden]
+    e4m3 and s [T] fp32 powers of two (INF-681 k-pfp8: quantized per CP shard before
+    the all-gather). The bf16 hidden_states handed along with it then only carry the
+    shape and are never read."""
+
+    q: torch.Tensor
+    s: torch.Tensor
+
+
 @triton.jit
 def _swiglu_quant_kernel(
     GU, Y, S, I: tl.constexpr, LIMIT: tl.constexpr, BLOCK: tl.constexpr
@@ -1138,12 +1148,19 @@ class Mxfp4W4A8PrefillExperts:
         sc.holder = nxt
 
     def __call__(
-        self, hidden_states, topk_ids, topk_weights, add_to: torch.Tensor | None = None
+        self,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        add_to: torch.Tensor | None = None,
+        row_quant: W4A8RowQuant | None = None,
     ) -> torch.Tensor:
         """Routed experts' output [tokens, hidden] bf16. add_to (the shared expert's
         output, same shape): return add_to after add_to += routed output, the same bits
         as a separate shared.add_(routed); fused into the top-k sum when
-        fused_shared_add is on and the call takes the sorted-sum path."""
+        fused_shared_add is on and the call takes the sorted-sum path.
+        row_quant: the input's _row_quant, computed by the caller; hidden_states then
+        only give the shape (the FP8-copy path below is the only one that can take it)."""
         import triton_kernels.matmul_details.opt_flags as opt_flags
         from triton_kernels.matmul import PrecisionConfig, matmul
         from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -1157,6 +1174,11 @@ class Mxfp4W4A8PrefillExperts:
         )
 
         num_tokens = topk_ids.shape[0]
+        if row_quant is not None and not (num_tokens > self.small_step_rows):
+            raise RuntimeError(
+                "a pre-quantized W4A8 input needs the FP8-copy path "
+                f"({num_tokens} rows <= SGLANG_OPT_DSV4_W4A8_SMALL_STEP_ROWS)"
+            )
         if 0 < num_tokens <= self.small_step_rows:
             # No scratch, no events, no host sync: safe inside a CUDA graph.
             if add_to is not None and self.fused_shared_add:
@@ -1179,7 +1201,12 @@ class Mxfp4W4A8PrefillExperts:
             and self.fused_shared_add
             and (self.sorted_sum or self.counting_route)
         )
-        output = add_to if fuse_add else torch.empty_like(hidden_states)
+        if fuse_add:
+            output = add_to
+        elif row_quant is not None:  # hidden_states may be a stride-0 shape carrier
+            output = hidden_states.new_empty(hidden_states.shape)
+        else:
+            output = torch.empty_like(hidden_states)
         pos = None
         if self.counting_route:
             routing = _count_route(topk_ids, topk_weights, self.num_experts)
@@ -1190,8 +1217,13 @@ class Mxfp4W4A8PrefillExperts:
             routing.expert_counts, num_tokens * top_k
         )
 
-        row = _qcp.take_row_quant(self, hidden_states)  # INF-681 k-qcp dual quant
-        x_fp8, x_scale = row if row is not None else _row_quant(hidden_states.contiguous())
+        if row_quant is not None:  # INF-681 k-pfp8: quantized per CP shard, gathered
+            x_fp8, x_scale = row_quant
+        else:
+            row = _qcp.take_row_quant(self, hidden_states)  # INF-681 k-qcp dual quant
+            x_fp8, x_scale = (
+                row if row is not None else _row_quant(hidden_states.contiguous())
+            )
         self._acquire()
         # Use triton_kernels' own tile heuristics with no constraint at all: constraints
         # set by others (the W4A16 path's num_stages pin, the MXFP4 swizzle's split_k=1)

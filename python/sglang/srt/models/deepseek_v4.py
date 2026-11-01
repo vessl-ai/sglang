@@ -2874,6 +2874,19 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+# INF-681 k-pfp8 (layers/quantization/dsv4_cp_moe_fp8ag.py), imported only when used.
+_CP_MOE_FP8AG_ANY = (
+    envs.SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER.get()
+    or envs.SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER.get()
+)
+
+
+def _cp_moe_fp8ag():
+    from sglang.srt.layers.quantization import dsv4_cp_moe_fp8ag
+
+    return dsv4_cp_moe_fp8ag
+
+
 def _cp_moe_combine_reduce_scatters() -> bool:
     """Whether the V4.1 prefill-CP MoE exit reduce-scatters its output.
 
@@ -3715,6 +3728,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         _cp_shared = None
         _cp_shared_stream = None
         _cp_shared_input = None
+        # INF-681 k-pfp8: the shard's top-k (and FP8 rows) gathered instead of BF16 rows.
+        _cp_prerouted = None
+        _cp_local_rows = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
@@ -3737,7 +3753,25 @@ class DeepseekV4DecoderLayer(nn.Module):
                         _cp_shared = _forward_shared_experts_rank_local(
                             self.mlp, hidden_states
                         )
-                hidden_states = attn_cp_interleave_gather(hidden_states)
+                _cp_mode = (
+                    _cp_moe_fp8ag().plan(
+                        self.mlp, hidden_states, shared_local=_cp_shared is not None
+                    )
+                    if _CP_MOE_FP8AG_ANY
+                    else None
+                )
+                if _cp_mode is not None:
+                    _cp_local_rows = hidden_states
+                    with _every_row_routed(forward_batch, hidden_states.shape[0]):
+                        hidden_states, _cp_prerouted = _cp_moe_fp8ag().gather(
+                            self.mlp,
+                            hidden_states,
+                            fp8=_cp_mode == "fp8",
+                            num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                            input_ids_global=input_ids_global,
+                        )
+                else:
+                    hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3806,6 +3840,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and not _use_tp_moe_gather
                 and not _use_tp_attn_a2a_scatter
             )
+            moe_kwargs = {} if _cp_prerouted is None else {"prerouted": _cp_prerouted}
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -3813,7 +3848,27 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local or _cp_shared is not None,
                 return_moe_output=return_moe_output,
+                **moe_kwargs,
             )
+            if _cp_prerouted is not None:
+                if envs.SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY.get():
+                    _cp_moe_fp8ag().verify(
+                        self.mlp,
+                        _cp_local_rows,
+                        _cp_prerouted,
+                        hidden_states,
+                        num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                        input_ids_global=input_ids_global,
+                        run_moe=lambda rows: self.mlp(
+                            rows,
+                            forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            skip_shared_experts=True,
+                        ),
+                    )
+                # Free the gathered FP8 rows before the reduce-scatter.
+                _cp_prerouted = _cp_local_rows = None
 
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = _cp_moe_return_shard(

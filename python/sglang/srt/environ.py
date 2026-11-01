@@ -1994,6 +1994,21 @@ class Envs:
     #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
     #   (NCCL's ring all-gather / reduce-scatter hold 24 SMs at the CP4 sizes); 0 = no cap.
     SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
+    # INF-681 k-pfp8: the prefill-CP MoE gathers less than the BF16 input of all rows.
+    # Both default off; layers/quantization/dsv4_cp_moe_fp8ag.py has the conditions.
+    # - CP_MOE_LOCAL_ROUTER: the router GEMM and top-k run on this rank's own CP shard
+    #   (T/cp rows) and only the top-k ids and weights are all-gathered (48 B/row),
+    #   instead of every rank routing all T gathered rows. Same per-row math.
+    # - CP_MOE_FP8_ALLGATHER: also quantize the shard for the W4A8 prefill experts
+    #   (their per-row power-of-2 FP8 quantization) before the all-gather and gather the
+    #   FP8 rows and their scales (about half the bytes of BF16). Implies the local
+    #   router (no BF16 rows are left to route on); needs the CP-local shared expert
+    #   (SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL). Same bits as the BF16 path.
+    # - CP_MOE_FP8AG_VERIFY (debug, doubles the MoE): also run the BF16 path and count
+    #   layers whose top-k ids/weights, FP8 input or MoE output differ (logged).
+    SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER = EnvBool(False)
+    SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER = EnvBool(False)
+    SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
