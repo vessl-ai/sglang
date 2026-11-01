@@ -172,7 +172,11 @@ class TestPrefillMidForwardStep(CustomTestCase):
         self.assertEqual(hook_tests._launches(sliced), hook_tests._launches(whole))
         # Same per-request work, same sends, same order.
         self.assertEqual(_order(sliced), _order(whole))
-        self.assertEqual(sliced.disagg_prefill_inflight_queue, whole.disagg_prefill_inflight_queue)
+        self.assertEqual(
+            [r.rid for r in sliced.disagg_prefill_inflight_queue],
+            [r.rid for r in whole.disagg_prefill_inflight_queue],
+        )
+        self.assertEqual(len(whole.disagg_prefill_inflight_queue), 4 * REQS_PER_BATCH)
         self.assertEqual(sliced.result_processes, {1: 1, 2: 1, 3: 1, 4: 1})
         # Whole: batch 1's five requests all in forward 2's first hook (layer 1).
         w = _where(whole, "result_req")
