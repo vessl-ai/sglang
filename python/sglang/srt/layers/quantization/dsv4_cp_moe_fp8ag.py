@@ -16,9 +16,10 @@ results are gathered instead:
 
 Same bits as the BF16 path, by construction, when each per-row function gives the same
 bits for a row whatever the number of rows in the call: _row_quant and the top-k kernels
-(one row per program) do; the router GEMM (cuBLAS bf16 x bf16 -> fp32) must be checked on
-the target GPU (test_dsv4_cp_moe_fp8ag_inf681.py); the gate takes the same branch on both
-sides only above its tiny-GEMM row limit (checked in plan()).
+(one row per program) do; the router GEMM (cuBLAS bf16 x bf16 -> fp32) does on H200 only
+for shards above ~800 rows (below, cuBLAS picks other split-K kernels for R and 4R rows),
+hence SGLANG_OPT_DSV4_CP_MOE_LOCAL_MIN_ROWS (1024) and the check on the target GPU in
+test_dsv4_cp_moe_fp8ag_inf681.py; the gate's tiny-GEMM branch (<= 16 rows) is excluded too.
 SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY also runs the BF16 path on every such layer and logs
 the layers whose top-k, FP8 input or MoE output differ (debug only, doubles the MoE).
 
@@ -94,8 +95,10 @@ def plan(mlp, x_local: torch.Tensor, *, shared_local: bool) -> Optional[str]:
         and not getattr(mlp, "_enable_a2a_moe", True)
         and gate is not None
         and getattr(gate, "e_score_correction_bias_vl", None) is None  # no vision top-k
-        # The shard and the gathered rows both take the gate's cuBLAS branch.
+        # The shard and the gathered rows both take the gate's cuBLAS branch, and cuBLAS
+        # picks a kernel whose rows do not depend on the row count (see the env).
         and rows > getattr(gate, "tiny_router_gemm_max_tokens", 1 << 30)
+        and rows >= envs.SGLANG_OPT_DSV4_CP_MOE_LOCAL_MIN_ROWS.get()
         and not get_exec().moe.enable_eplb
         and x_local.dim() == 2
         and x_local.dtype == torch.bfloat16

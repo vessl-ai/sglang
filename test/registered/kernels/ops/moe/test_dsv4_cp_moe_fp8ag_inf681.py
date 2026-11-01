@@ -19,8 +19,10 @@ pytestmark = pytest.mark.skipif(
 
 CP = 4
 # Rows per CP4 shard at the verdict load: 1 request (6,912 rows), 3 and 10 requests
-# (the full 65,280-row step), plus an odd count.
-SHARD_ROWS = [1728, 5184, 16320, 4099]
+# (the full 65,280-row step), an odd count, and the low end that k-pfp8 still takes
+# (SGLANG_OPT_DSV4_CP_MOE_LOCAL_MIN_ROWS = 1024; on H200 some shards of <= 792 rows give
+# the router GEMM other bits than the gathered call, k-pfp8 sweep 2026-11-01).
+SHARD_ROWS = [1728, 5184, 16320, 4099, 1024, 1025, 1100, 2047, 3001]
 
 
 def _gathered(shards):
