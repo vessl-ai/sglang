@@ -2009,10 +2009,13 @@ class Envs:
     SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER = EnvBool(False)
     SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER = EnvBool(False)
     SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY = EnvBool(False)
-    #   Shards below this many rows keep the BF16 path: on H200 (the image's cuBLAS) the
-    #   router GEMM of an R-row shard and of the 4R gathered rows differ in the last bits
-    #   for some R <= 792 (split-K choice), never above (swept R 1..16320).
-    SGLANG_OPT_DSV4_CP_MOE_LOCAL_MIN_ROWS = EnvInt(1024)
+    #   Shards below this many rows keep the BF16 path. Two reasons: (1) on H200 (the
+    #   image's cuBLAS) the router GEMM of an R-row shard and of the 4R gathered rows
+    #   differ in the last bits for some R <= 792 (split-K choice), never above (swept
+    #   R 1..16320), so never set it below 1024; (2) small CP steps are host-bound and the
+    #   extra launches cost more than the smaller gather saves (CP4 rig, 1-request step
+    #   of 6,912 rows: +5 ms; full 65,208-row step: -20 ms).
+    SGLANG_OPT_DSV4_CP_MOE_LOCAL_MIN_ROWS = EnvInt(8192)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
