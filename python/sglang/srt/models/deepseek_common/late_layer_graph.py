@@ -138,11 +138,27 @@ def _noop(*args, **kwargs) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _fire_midforward_hook(layer) -> None:
+    """The late layers' point for the scheduler's mid-forward hooks.
+
+    The layer loop fires ``midforward_hook.maybe_fire(i)`` at the top of every layer
+    it runs, but it hands the late layers to this runner, so a hook armed for a late
+    layer fires here instead: at the layer's window-KV store, which runs eagerly both
+    in the bucket's first (eager) run and in every replay, and never during capture
+    (the capture stub runs then). Every rank reaches each late layer's store in the
+    same order, as the CPU collectives inside a hook require.
+    """
+    from sglang.srt.managers.scheduler_components import midforward_hook
+
+    midforward_hook.maybe_fire(layer.layer_id)
+
+
 @eager_on_graph(capture_stub=_noop)
 def store_window_kv(layer, x, positions, qkv_a, q_rope) -> None:
     """MqaAttention._compute_kv_to_cache on the live rows (no prefill CP)."""
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
+    _fire_midforward_hook(layer)
     step = _live()
     n = step.rows
     layer._compute_kv_to_cache(
@@ -160,6 +176,7 @@ def cp_store_window_kv(layer, kv) -> None:
     """MqaAttention._cp_store_window_kv on the live rows (prefill CP gathers them)."""
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
+    _fire_midforward_hook(layer)
     step = _live()
     layer._cp_store_window_kv(kv[: step.rows], step.forward_batch, get_attn_backend())
 
