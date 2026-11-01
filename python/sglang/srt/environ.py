@@ -1974,6 +1974,22 @@ class Envs:
     SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS = EnvStr("")
     # Only arm the hooks for extend batches with at least this many new tokens.
     SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS = EnvInt(0)
+    # INF-681 k-phost, all default off, all need SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS.
+    # - RESULT_SLICE: process the previous batch's result in slices of at most this many
+    #   requests per hook (first hook first, the rest at the following hooks, anything
+    #   left after the forward), instead of all of it in the first hook. 0 = all at once.
+    #   A count, not a time budget: every rank must process the same requests before the
+    #   transfer poll (a CPU collective over the in-flight queue).
+    SGLANG_OPT_PREFILL_MIDFORWARD_RESULT_SLICE = EnvInt(0)
+    # - EARLY_SEND_IN_HOOK: when the hooks are armed, the cached-prefix early sends that
+    #   run_batch issues before the launch (one blocking page-index copy per request, on
+    #   the schedule stream that waits for the previous forward) are decided there as
+    #   before but sent from the first hook, where a wait no longer idles the GPU.
+    SGLANG_OPT_PREFILL_EARLY_SEND_IN_HOOK = EnvBool(False)
+    # - NEXT_BATCH_IN_FORWARD: the last armed hook also runs the batch-independent part
+    #   of the next batch's preparation (HiCache event drain, waiting-queue bootstrap
+    #   resolution); the next get_next_disagg_prefill_batch_to_run skips them once.
+    SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD = EnvBool(False)
     # INF-681 k-pcomm levers for the prefill-CP (attention CP x MoE TP) MoE collectives.
     # All default off.
     # - CP_SHARED_EXPERT_LOCAL: with SGLANG_SHARED_EXPERT_TP1=1 (replicated shared
