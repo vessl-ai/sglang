@@ -270,6 +270,7 @@ def gather(
 # --- SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY ------------------------------------------------
 
 _VERIFY = {"layers": 0, "ids": 0, "weights": 0, "q": 0, "s": 0, "out": 0}
+_VERIFY_ROWS: dict = {}  # gathered row count -> layers verified with it
 
 
 def verify(
@@ -306,6 +307,9 @@ def verify(
         diff["s"] = not torch.equal(s_ref, prerouted.row_quant.s)
     ref_out = run_moe(ref_rows)
     diff["out"] = not torch.equal(ref_out, out)
+    rows = ref_rows.shape[0]
+    new_rows = rows not in _VERIFY_ROWS
+    _VERIFY_ROWS[rows] = _VERIFY_ROWS.get(rows, 0) + 1
     _VERIFY["layers"] += 1
     for key, bad in diff.items():
         _VERIFY[key] += int(bad)
@@ -315,15 +319,16 @@ def verify(
             "k-pfp8 verify MISMATCH rank %d %s rows %d: %s; totals %s",
             get_parallel().attn_cp_rank,
             prefix,
-            ref_rows.shape[0],
+            rows,
             [key for key, bad in diff.items() if bad],
             _VERIFY,
         )
-    elif _VERIFY["layers"] % 64 == 0 or _VERIFY["layers"] <= 2:
+    elif new_rows or _VERIFY["layers"] % 64 == 0:
         logger.info(
-            "k-pfp8 verify rank %d: %s (last %s, rows %d)",
+            "k-pfp8 verify rank %d: %s rows_seen %s (last %s, rows %d)",
             get_parallel().attn_cp_rank,
             _VERIFY,
+            _VERIFY_ROWS,
             prefix,
-            ref_rows.shape[0],
+            rows,
         )
