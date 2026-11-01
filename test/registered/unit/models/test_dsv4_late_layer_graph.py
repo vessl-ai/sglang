@@ -319,3 +319,119 @@ def test_cp_inactive_batches_run_eagerly_between_cp_batches(_prefill_cp4):
     assert runner.stats["capture"] == 1
     assert runner.stats["replay"] == 2
     assert [k[1][-1] for k in runner._entries] == [True]
+
+
+# ---------------------------------------------------------------------------
+# SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES (INF-681 k-phost): the CP layers'
+# all-gather and reduce-scatter (dp_attention.attn_cp_*) run as eager breaks between the
+# segments instead of being captured into them (graphs holding NCCL kernels cap how many
+# of their launches can be in flight). Replay must stay bit-identical to eager, CP-off
+# batches between CP batches must keep running eagerly, and the collective must run once
+# per layer per replay (switch on) or be part of the graph (switch off).
+# ---------------------------------------------------------------------------
+
+from sglang.srt.layers import dp_attention  # noqa: E402
+
+
+class _FakeCPGroup:
+    """A deterministic stand-in for the CP group's NCCL collectives (capturable ops)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def all_gather_into_tensor(self, output, input):
+        self.calls += 1
+        output.copy_(torch.cat([input * (r + 1) for r in range(CP_SIZE)]))
+
+    def reduce_scatter_tensor(self, output, input):
+        self.calls += 1
+        total = input.view(CP_SIZE, -1, *input.shape[1:]).float().sum(0)
+        output.copy_(total.to(input.dtype))
+
+
+class _ToyCPCollModel(_ToyCPModel):
+    def _forward_late_layers(
+        self, *, state, positions, input_ids, input_ids_global, forward_batch,
+        capture_dspark,
+    ):  # fmt: skip
+        cp = cp_utils.is_cp_active(forward_batch)
+        r, pre = state.residual, state.pre
+        for layer in range(L):
+            h = (r.float() * pre[..., None]).sum(1).to(torch.bfloat16) * self.w[layer]
+            if cp:
+                # The CP MoE: gather every rank's rows, a row-local "expert", sum back.
+                gathered = h.new_empty((h.shape[0] * CP_SIZE, H))
+                dp_attention.attn_cp_all_gather_into_tensor(gathered, h)
+                y = gathered * self.w[(layer + 1) % L]
+                shard = y.tensor_split(CP_SIZE)[0]
+                dp_attention.attn_cp_reduce_scatter_tensor(shard, y)
+                h = shard
+            if lg.active():
+                if cp:
+                    lg.cp_store_window_kv(self.attn, h)
+                else:
+                    lg.store_window_kv(self.attn, h, positions, None, None)
+            elif cp:
+                self.attn._cp_store_window_kv(h, forward_batch, None)
+            else:
+                self.attn._compute_kv_to_cache(h, positions, forward_batch, None)
+            out = torch.empty_like(h)
+            if lg.active():
+                _attend_break(h, out)
+            else:
+                _attend(h, out, forward_batch, h.shape[0])
+            r = r + out[:, None, :] * 0.25
+        return mhc.HcState(r, pre), []
+
+
+@pytest.mark.parametrize("eager_collectives", [False, True])
+def test_cp_collectives_as_eager_breaks(_prefill_cp4, monkeypatch, eager_collectives):
+    group = _FakeCPGroup()
+    monkeypatch.setattr(
+        dp_attention,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_cp_group=group, attn_cp_size=CP_SIZE, attn_cp_rank=0),
+    )
+    monkeypatch.setenv(
+        "SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES", "1" if eager_collectives else "0"
+    )
+    _pool["kv"] = torch.randn((POOL_ROWS, H), device="cuda").to(torch.bfloat16)
+    model = _ToyCPCollModel()
+    with mock.patch(
+        "sglang.srt.distributed.parallel_state.graph_capture", _graph_capture
+    ):
+        runner = lg.LateLayerGraphRunner(model)
+        # CP capture of bucket 32, CP-off steps between CP replays, a second bucket.
+        steps = [(4, True), (1, False), (8, True), (2, False), (20, True), (40, True), (3, False), (12, True)]
+        per_run = []
+        for i, (rows, cp_active) in enumerate(steps):
+            fb, residual, pre, positions = _batch(rows, 200 + i)
+            fb.cp_active = cp_active
+            before = _pool["kv"].clone()
+            want = _eager(model, fb, residual, pre, positions, False)
+            want_pool = _pool["kv"].clone()
+            _pool["kv"].copy_(before)
+            calls = group.calls
+            stats = dict(runner.stats)
+            got = _run(runner, fb, residual, pre, positions, False)
+            per_run.append((group.calls - calls, {k: runner.stats[k] - stats.get(k, 0) for k in runner.stats}))
+            if not cp_active:
+                assert got is None, (rows, cp_active)
+                got = _eager(model, fb, residual, pre, positions, False)
+            assert torch.equal(got[0], want[0]), (rows, cp_active, (got[0].float() - want[0].float()).abs().max())
+            assert torch.equal(got[1], want[1]), (rows, cp_active)
+            assert torch.equal(_pool["kv"], want_pool), (rows, cp_active)
+    assert runner.stats["capture"] == 2  # buckets 32 and 64
+    assert runner.stats["replay"] == 3
+    for (calls, d), (rows, cp_active) in zip(per_run, steps):
+        if not cp_active:
+            assert calls == 0
+        elif d.get("capture", 0):
+            # Eager warm-up run (2 per layer); the capture records them only when
+            # they stay inside the graph.
+            assert calls == (2 * L if eager_collectives else 4 * L), (rows, calls, d)
+        else:
+            assert d.get("replay", 0) == 1
+            # Replay: eager breaks call the collective once each; captured ones do not
+            # run Python at all.
+            assert calls == (2 * L if eager_collectives else 0), (rows, calls, d)

@@ -1281,8 +1281,32 @@ def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
 
 
-def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+def _attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.reduce_scatter_tensor(output, input)
+
+
+def _attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+
+
+def _late_layer_graph_eager_collective(op, output: torch.Tensor, input: torch.Tensor) -> bool:
+    """SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES: inside a late-layer graph
+    block, run the CP collective as an eager break (models/deepseek_common/
+    late_layer_graph.py ``eager_collective``). Returns whether it did."""
+    if not envs.SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES.get():
+        return False
+    from sglang.srt.models.deepseek_common import late_layer_graph
+
+    if not late_layer_graph.eager_collectives():
+        return False
+    late_layer_graph.eager_collective(op, output, input)
+    return True
+
+
+def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if _late_layer_graph_eager_collective(_attn_cp_reduce_scatter_tensor, output, input):
+        return None
+    return _attn_cp_reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
@@ -1294,7 +1318,9 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+    if _late_layer_graph_eager_collective(_attn_cp_all_gather_into_tensor, output, input):
+        return None
+    return _attn_cp_all_gather_into_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

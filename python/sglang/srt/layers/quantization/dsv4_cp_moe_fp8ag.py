@@ -280,7 +280,10 @@ def gather(
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
-    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.dp_attention import (
+        attn_cp_all_gather_into_tensor,
+        is_allocation_symmetric,
+    )
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.runtime_context import get_parallel
 
@@ -314,8 +317,11 @@ def gather(
             )
         else:
             rows_all = x_local.new_empty((total, hidden))
-    group.all_gather_into_tensor(rows_all, q.view(torch.uint8) if fp8 else x_local)
-    group.all_gather_into_tensor(meta_all, meta)
+    # The CP group's gathers (attn_cp_all_gather_into_tensor: group is attn_cp_group),
+    # so the late-layer graph can take them out of its segments
+    # (SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES).
+    attn_cp_all_gather_into_tensor(rows_all, q.view(torch.uint8) if fp8 else x_local)
+    attn_cp_all_gather_into_tensor(meta_all, meta)
     s_all, ids_all, w_all = unpack_meta(meta_all, k, fp8)
     topk_output = StandardTopKOutput(w_all, ids_all, None)
     if not fp8:

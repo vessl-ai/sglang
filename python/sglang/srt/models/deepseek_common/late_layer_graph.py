@@ -153,6 +153,22 @@ def _fire_midforward_hook(layer) -> None:
     midforward_hook.maybe_fire(layer.layer_id)
 
 
+def eager_collectives() -> bool:
+    """SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES inside a late-layer block."""
+    return _LIVE is not None and envs.SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES.get()
+
+
+@eager_on_graph(capture_stub=_noop)
+def eager_collective(op, output, input) -> None:
+    """A prefill-CP collective of the late layers (``op(output, input)``, an in-place
+    NCCL all-gather or reduce-scatter) between two graph segments instead of inside
+    one: the eager first run and every replay call it here, the capture skips it (the
+    stub), so no captured segment holds an NCCL kernel. ``output`` and ``input`` are
+    the capture-time buffers, so the segments read and write the same addresses.
+    Every rank reaches each late-layer collective in the same order, as NCCL needs."""
+    op(output, input)
+
+
 @eager_on_graph(capture_stub=_noop)
 def store_window_kv(layer, x, positions, qkv_a, q_rope) -> None:
     """MqaAttention._compute_kv_to_cache on the live rows (no prefill CP)."""

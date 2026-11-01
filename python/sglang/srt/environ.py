@@ -1965,6 +1965,15 @@ class Envs:
     # Debug: after each replay also run the same block eagerly (twice) and the unpadded
     # late layers eagerly, log the differences, and serve the unpadded eager result.
     SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_VERIFY = EnvBool(False)
+    # INF-681 k-phost: the prefill-CP collectives of the late layers (the MoE's CP
+    # all-gather and reduce-scatter, the FP8 all-gather of SGLANG_OPT_DSV4_CP_MOE_FP8_
+    # ALLGATHER) run as eager breaks between the graph segments instead of inside them.
+    # Same NCCL calls on the same buffers. Why: graphs that hold NCCL kernels cap how many
+    # of their launches can be in flight (a 2-GPU repro blocks the host at the 6th such
+    # launch, 18th with eager NCCL between them; graphs without NCCL do not block), and the
+    # cell B prefill's last late-layer segment launch blocked the host 94-250 ms per step
+    # until the late layers started on the GPU. Default off.
+    SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES = EnvBool(False)
     # INF-681 k-gap. PD prefill overlap loop: run the scheduler's between-step work
     # from inside the next forward, at the top of these layers (comma-separated, empty =
     # off), while the host thread would otherwise sit blocked on the full launch queue.
