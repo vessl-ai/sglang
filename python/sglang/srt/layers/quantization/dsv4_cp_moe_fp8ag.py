@@ -132,43 +132,75 @@ def _route(mlp, x: torch.Tensor, num_token_non_padded, input_ids):
 
 
 @triton.jit
+def _meta_columns(
+    R,
+    K: tl.constexpr,
+    HAS_S: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    # A [BLOCK_R, BLOCK_C] tile of meta rows [scale (if HAS_S), K ids, K weights].
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    c = tl.arange(0, BLOCK_C)
+    m = (rows < R)[:, None] & (c < HAS_S + 2 * K)[None, :]
+    is_s = (c < HAS_S)[None, :]
+    is_id = ((c >= HAS_S) & (c < HAS_S + K))[None, :]
+    is_w = (c >= HAS_S + K)[None, :]
+    r = rows.to(tl.int64)[:, None]
+    meta_off = r * (HAS_S + 2 * K) + c[None, :]
+    id_off = r * K + (c - HAS_S)[None, :]
+    w_off = r * K + (c - HAS_S - K)[None, :]
+    return m, is_s, is_id, is_w, r, meta_off, id_off, w_off
+
+
+@triton.jit
 def _pack_kernel(
-    S, IDS, W, META, R, K: tl.constexpr, HAS_S: tl.constexpr, BLOCK_R: tl.constexpr
+    S,
+    IDS,
+    W,
+    META,
+    R,
+    K: tl.constexpr,
+    HAS_S: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
 ):
     # META[r] = [bits(S[r]) if HAS_S] + IDS[r, :K] + bits(W[r, :K]), int32
-    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
-    rm = rows < R
-    r64 = rows.to(tl.int64)
-    base = r64 * (HAS_S + 2 * K)
+    m, is_s, is_id, is_w, r, meta_off, id_off, w_off = _meta_columns(
+        R, K, HAS_S, BLOCK_R, BLOCK_C
+    )
+    v = tl.load(IDS + id_off, mask=m & is_id, other=0)
+    w = tl.load(W + w_off, mask=m & is_w, other=0.0).to(tl.int32, bitcast=True)
+    v = tl.where(is_w, w, v)
     if HAS_S:
-        s = tl.load(S + r64, mask=rm, other=0.0)
-        tl.store(META + base, s.to(tl.int32, bitcast=True), mask=rm)
-    for k in tl.static_range(K):
-        ids = tl.load(IDS + r64 * K + k, mask=rm, other=0)
-        tl.store(META + base + HAS_S + k, ids, mask=rm)
-        w = tl.load(W + r64 * K + k, mask=rm, other=0.0)
-        tl.store(META + base + HAS_S + K + k, w.to(tl.int32, bitcast=True), mask=rm)
+        s = tl.load(S + r + 0 * meta_off, mask=m & is_s, other=0.0)
+        v = tl.where(is_s, s.to(tl.int32, bitcast=True), v)
+    tl.store(META + meta_off, v, mask=m)
 
 
 @triton.jit
 def _unpack_kernel(
-    META, S, IDS, W, R, K: tl.constexpr, HAS_S: tl.constexpr, BLOCK_R: tl.constexpr
+    META,
+    S,
+    IDS,
+    W,
+    R,
+    K: tl.constexpr,
+    HAS_S: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_C: tl.constexpr,
 ):
-    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
-    rm = rows < R
-    r64 = rows.to(tl.int64)
-    base = r64 * (HAS_S + 2 * K)
+    m, is_s, is_id, is_w, r, meta_off, id_off, w_off = _meta_columns(
+        R, K, HAS_S, BLOCK_R, BLOCK_C
+    )
+    v = tl.load(META + meta_off, mask=m, other=0)
+    tl.store(IDS + id_off, v, mask=m & is_id)
+    tl.store(W + w_off, v.to(tl.float32, bitcast=True), mask=m & is_w)
     if HAS_S:
-        s = tl.load(META + base, mask=rm, other=0)
-        tl.store(S + r64, s.to(tl.float32, bitcast=True), mask=rm)
-    for k in tl.static_range(K):
-        ids = tl.load(META + base + HAS_S + k, mask=rm, other=0)
-        tl.store(IDS + r64 * K + k, ids, mask=rm)
-        w = tl.load(META + base + HAS_S + K + k, mask=rm, other=0)
-        tl.store(W + r64 * K + k, w.to(tl.float32, bitcast=True), mask=rm)
+        tl.store(S + r + 0 * meta_off, v.to(tl.float32, bitcast=True), mask=m & is_s)
 
 
-_BLOCK_R = 256
+_BLOCK_R = 64
 
 
 def pack_meta(
@@ -186,7 +218,16 @@ def pack_meta(
     if rows > 0:
         ids, w = ids.contiguous(), w.contiguous()
         _pack_kernel[(triton.cdiv(rows, _BLOCK_R),)](
-            s if s is not None else w, ids, w, meta, rows, k, has_s, _BLOCK_R
+            s if s is not None else w,
+            ids,
+            w,
+            meta,
+            rows,
+            k,
+            has_s,
+            _BLOCK_R,
+            triton.next_power_of_2(meta.shape[1]),
+            num_warps=4,
         )
     return meta
 
@@ -201,7 +242,16 @@ def unpack_meta(
     w = torch.empty((rows, k), dtype=torch.float32, device=meta.device)
     if rows > 0:
         _unpack_kernel[(triton.cdiv(rows, _BLOCK_R),)](
-            meta, s if s is not None else w, ids, w, rows, k, int(has_s), _BLOCK_R
+            meta,
+            s if s is not None else w,
+            ids,
+            w,
+            rows,
+            k,
+            int(has_s),
+            _BLOCK_R,
+            triton.next_power_of_2(meta.shape[1]),
+            num_warps=4,
         )
     return s, ids, w
 
