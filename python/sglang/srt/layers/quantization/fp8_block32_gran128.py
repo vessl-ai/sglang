@@ -225,6 +225,31 @@ def prefer_gran32_kernel(m: int, n: int, k: int) -> bool:
     return any(lo <= m <= hi for lo, hi in windows)
 
 
+# INF-681 k-dnm: (N, K) where DeepGEMM 0.2.2's SM90 heuristic falls off a cliff above 256
+# rows (its config switch at M > 256) and cuBLASLt's blockwise FP8 kernel (torch._scaled_mm,
+# 1x128 activation x 128x128 weight scales) is faster and gives the same bits. H200, M 260-320:
+#   wo_b                (5120, 8192): DeepGEMM 42.2-42.7 us -> cuBLASLt 26.5-27.2 us
+#   shared gate_up, TP1 (4608, 5120): DeepGEMM 21.3-24.8 us -> cuBLASLt 18.0-18.2 us
+# At <= 256 rows DeepGEMM is faster (wo_b 22.7 vs 26.3 us). Shapes with K/128 not a multiple
+# of 4 (wq_b, shared down) give wrong cuBLASLt results with these scale layouts and are not
+# listed; wqkv_a is slower on cuBLASLt (17.3 vs 12.1 us).
+_CUBLASLT_ABOVE_SHAPES = {(5120, 8192), (4608, 5120)}
+_CUBLASLT_NUM_SMS = 132
+
+
+def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
+    from sglang.srt.environ import envs
+
+    rows = envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.get()
+    # cuBLASLt's blockwise heuristic has no algorithm for M % 4 != 0 (CUBLAS_STATUS_NOT_SUPPORTED);
+    # DSpark verify rows are 4 per request, so the decoder's calls always qualify.
+    if rows <= 0 or m <= rows or m % 4 or (n, k) not in _CUBLASLT_ABOVE_SHAPES:
+        return False
+    import deep_gemm
+
+    return deep_gemm.get_num_sms() == _CUBLASLT_NUM_SMS
+
+
 def block128_fp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -244,6 +269,24 @@ def block128_fp8_linear(
     if x2.stride(-1) != 1:
         x2 = x2.contiguous()
     m = x2.shape[0]
+    if m > 0 and prefer_cublaslt_blockwise(m, n, k):
+        # INF-681 SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS: same operands, cuBLASLt's
+        # 1x128 x 128x128 block-scaled kernel (bit-identical to DeepGEMM's here).
+        q, s = ue8m0_group_quant_fp8_mn(x2, _GROUP)
+        if s.stride(1) != m:
+            # cuBLASLt wants the activation scales outer-dim-major with stride exactly M;
+            # the TMA layout pads the M stride to a multiple of 4.
+            s = s.t().contiguous().t()
+        out = torch._scaled_mm(
+            q,
+            weight.t(),
+            scale_a=s,
+            scale_b=weight_scale.t(),
+            out_dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            out += bias
+        return out.view(*x.shape[:-1], n)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if m > 0:
         if weight_scale_32x is not None and prefer_gran32_kernel(m, n, k):

@@ -76,6 +76,27 @@ def _is_late_w4a16_layer(prefix: str) -> bool:
     return True
 
 
+
+def _moe_output_like(hidden_states: torch.Tensor) -> torch.Tensor:
+    """The routed-expert output buffer. INF-681 SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT: under
+    attention DP with MAX_LEN padding the DP reduce-scatter reads this buffer, and from the
+    NCCL symmetric pool (with --enable-symm-mem) NCCL takes its symmetric kernel (FusedMoE
+    allocates its combine output the same way). Every TP rank allocates the same shape (the
+    gathered rows) in the same order, so the pool grows identically on all ranks. A no-op
+    without symmetric memory or MAX_LEN padding."""
+    if not envs.SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT.get():
+        return torch.empty_like(hidden_states)
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.runtime_context import get_parallel
+
+    with use_symmetric_memory(
+        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+    ):
+        return torch.empty_like(hidden_states)
+
 class ExpertRouting(NamedTuple):
     """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
 
@@ -390,6 +411,7 @@ class Mxfp4MarlinMoEMethod:
                     topk_output.topk_weights,
                     self._sm90_packed,
                     self.runner.config.swiglu_limit,
+                    output=_moe_output_like(hidden_states),
                 )
             )
         if self._sm90_decode_kernel:
@@ -688,22 +710,7 @@ class Mxfp4MarlinMoEMethod:
                 "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE for CUDA-graph decode."
             )
         num_tokens, top_k = topk_output.topk_ids.shape
-        if envs.SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT.get():
-            # INF-681: the DP-attention reduce-scatter reads this buffer; from the
-            # NCCL symmetric pool (with --enable-symm-mem) NCCL takes its symmetric
-            # kernel. A no-op context without symmetric memory or MAX_LEN padding.
-            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-                use_symmetric_memory,
-            )
-            from sglang.srt.layers.dp_attention import is_allocation_symmetric
-            from sglang.srt.runtime_context import get_parallel
-
-            with use_symmetric_memory(
-                get_parallel().tp_group, disabled=not is_allocation_symmetric()
-            ):
-                output = torch.empty_like(hidden_states)
-        else:
-            output = torch.empty_like(hidden_states)
+        output = _moe_output_like(hidden_states)
         if num_tokens == 0:
             return output
         num_slots = num_tokens * top_k
