@@ -1770,8 +1770,9 @@ class Envs:
     # INF-681 k-dnm iteration 3: with SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128, run the listed
     # 128x128-requantized linears (wo_b, the TP1 shared expert gate_up) through cuBLASLt's
     # blockwise FP8 kernel instead of DeepGEMM when the call has more than this many rows
-    # (0 = off). DeepGEMM's SM90 heuristic slows them 1.2-1.6x above 256 rows, which a DP4
-    # decoder reaches as soon as a rank runs more than 64 requests (4 verify rows each).
+    # (0 = off), up to each shape's measured last winning row count (wo_b 320, gate_up 384).
+    # DeepGEMM's SM90 heuristic slows them 1.2-1.6x just above 256 rows, which a DP4 decoder
+    # reaches as soon as a rank runs more than 64 requests (4 verify rows each).
     # Bit-identical on the listed shapes. See layers/quantization/fp8_block32_gran128.py.
     SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS = EnvInt(0)
     # Hopper DeepGEMM linears with UE8M0 activation scales: quantize activations of

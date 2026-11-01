@@ -233,7 +233,11 @@ def prefer_gran32_kernel(m: int, n: int, k: int) -> bool:
 # At <= 256 rows DeepGEMM is faster (wo_b 22.7 vs 26.3 us). Shapes with K/128 not a multiple
 # of 4 (wq_b, shared down) give wrong cuBLASLt results with these scale layouts and are not
 # listed; wqkv_a is slower on cuBLASLt (17.3 vs 12.1 us).
-_CUBLASLT_ABOVE_SHAPES = {(5120, 8192), (4608, 5120)}
+# The value is the last M where cuBLASLt still wins: DeepGEMM is fast again from M 328 (wo_b
+# ~35 us either way) and cuBLASLt is slower from M 392 (wo_b 54-56 vs 41-43 us, gate_up 35 vs
+# 28-29 us), which a DP4 decoder reaches above 96 requests per rank (INF-681 int8 bench: whole
+# op incl. activation quant, CUDA-graph replay, 4 alternating checkpoint layers, H200 132 SMs).
+_CUBLASLT_ABOVE_SHAPES = {(5120, 8192): 320, (4608, 5120): 384}
 _CUBLASLT_NUM_SMS = 132
 
 
@@ -243,7 +247,8 @@ def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
     rows = envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.get()
     # cuBLASLt's blockwise heuristic has no algorithm for M % 4 != 0 (CUBLAS_STATUS_NOT_SUPPORTED);
     # DSpark verify rows are 4 per request, so the decoder's calls always qualify.
-    if rows <= 0 or m <= rows or m % 4 or (n, k) not in _CUBLASLT_ABOVE_SHAPES:
+    max_rows = _CUBLASLT_ABOVE_SHAPES.get((n, k))
+    if rows <= 0 or max_rows is None or m <= rows or m > max_rows or m % 4:
         return False
     import deep_gemm
 

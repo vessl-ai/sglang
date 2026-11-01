@@ -1,6 +1,6 @@
-"""INF-681 SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS: above the row threshold the listed 128x128-requantized
-linears run cuBLASLt's blockwise FP8 kernel and give exactly DeepGEMM's bits; at or below it, and for shapes not in
-the list, DeepGEMM keeps running."""
+"""INF-681 SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS: above the row threshold (and up to each shape's last winning row
+count) the listed 128x128-requantized linears run cuBLASLt's blockwise FP8 kernel and give exactly DeepGEMM's bits;
+outside that window, and for shapes not in the list, DeepGEMM keeps running."""
 
 import pytest
 import torch
@@ -55,3 +55,19 @@ def test_gate_keeps_deepgemm():
         assert not g128.prefer_cublaslt_blockwise(257, 5120, 8192)  # M % 4 != 0
         assert not g128.prefer_cublaslt_blockwise(288, 32768, 1280)  # wq_b: not listed
         assert not g128.prefer_cublaslt_blockwise(288, 1792, 5120)  # wqkv_a: not listed
+
+
+def test_gate_upper_bound_keeps_deepgemm():
+    import deep_gemm
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization import fp8_block32_gran128 as g128
+
+    if deep_gemm.get_num_sms() != 132:
+        pytest.skip("rows/shape table measured on 132-SM H200")
+    with envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.override(256):
+        assert g128.prefer_cublaslt_blockwise(320, 5120, 8192)  # wo_b: last winning M
+        assert not g128.prefer_cublaslt_blockwise(324, 5120, 8192)  # DeepGEMM fast again
+        assert not g128.prefer_cublaslt_blockwise(400, 5120, 8192)  # cuBLASLt slower
+        assert g128.prefer_cublaslt_blockwise(384, 4608, 5120)  # gate_up: last winning M
+        assert not g128.prefer_cublaslt_blockwise(388, 4608, 5120)
