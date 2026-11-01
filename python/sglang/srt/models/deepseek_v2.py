@@ -987,10 +987,20 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
+        prerouted=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
-        the V2/V3 layer-boundary handoff."""
+        the V2/V3 layer-boundary handoff.
+
+        ``prerouted`` (INF-681 k-pfp8): see `forward_prerouted`."""
+        if prerouted is not None:
+            return self.forward_prerouted(
+                hidden_states,
+                prerouted,
+                skip_shared_experts=skip_shared_experts,
+                return_moe_output=return_moe_output,
+            )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -1235,6 +1245,51 @@ class DeepseekV2MoE(nn.Module):
         # all-reduce, or on TP rank 0 only when the stage boundary sums.
         if self._shared_expert_tp1 and self._adds_replicated_output():
             final_hidden_states += shared_output
+        return final_hidden_states
+
+    def forward_prerouted(
+        self,
+        hidden_states: torch.Tensor,
+        prerouted,
+        *,
+        skip_shared_experts: bool,
+        return_moe_output: bool = False,
+    ) -> Union[torch.Tensor, MoEOutput]:
+        """INF-681 k-pfp8 (layers/quantization/dsv4_cp_moe_fp8ag.py): forward_normal
+        with skip_shared_experts for rows whose top-k (``prerouted.topk_output``) and,
+        optionally, W4A8 row quantization (``prerouted.row_quant``; hidden_states then
+        only carry the shape) the prefill-CP caller computed on its own shard before the
+        all-gather. The caller adds the shared expert (CP-local shared expert)."""
+        assert skip_shared_experts and not self._enable_a2a_moe
+        if prerouted.row_quant is not None:
+            final_hidden_states = self.experts(
+                hidden_states,
+                prerouted.topk_output,
+                pre_quant_input=prerouted.row_quant,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, prerouted.topk_output)
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _is_xpu
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+        if return_moe_output:
+            return MoEOutput(
+                routed=final_hidden_states,
+                shared=None,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts, final_hidden_states, None, self.routed_scaling_factor
+        )
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
