@@ -50,6 +50,9 @@ class TestDSV4PrefillCPBCG(unittest.TestCase):
                         envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get.return_value = (
                             forced
                         )
+                        # The opt-in CP sparse prefill (INF-681) is tested in
+                        # attention/unittests/dsv4/test_cp_sparse_prefill.py.
+                        envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL.get.return_value = False
                         selected = DeepseekV4AttnBackend._use_sparse_prefill(
                             None, batch, num_qo_tokens=num_tokens
                         )

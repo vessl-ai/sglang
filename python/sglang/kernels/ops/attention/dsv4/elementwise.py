@@ -33,6 +33,35 @@ def _jit_fused_rope_module():
 
 
 @cache_once
+def _jit_fused_rope_wide_module():
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("fused_rope_wide"),
+        *args,
+        cuda_files=["deepseek_v4/rope_wide.cuh"],
+        cuda_wrappers=[("forward", f"FusedRopeWideKernel<{args}>::forward")],
+    )
+
+
+def _rope_wide_applies(x: torch.Tensor) -> bool:
+    """SGLANG_OPT_DSV4_ROPE_WIDE: one CTA per row, 16-byte accesses (same bits)."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSV4_ROPE_WIDE.get():
+        return False
+    elem = x.element_size()
+    return (
+        x.dtype == torch.bfloat16
+        and x.dim() == 3
+        and x.shape[1] <= 128
+        and x.stride(2) == 1
+        and x.data_ptr() % 16 == 0
+        and (x.stride(0) * elem) % 16 == 0
+        and (x.stride(1) * elem) % 16 == 0
+    )
+
+
+@cache_once
 def _jit_main_q_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
@@ -164,6 +193,9 @@ def fused_rope_inplace(
         return
 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+    if k is None and _rope_wide_applies(q):
+        _jit_fused_rope_wide_module().forward(q, freqs_real, positions, inverse)
+        return
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 

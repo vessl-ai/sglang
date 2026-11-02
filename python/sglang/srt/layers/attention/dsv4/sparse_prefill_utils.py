@@ -34,12 +34,13 @@ compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_align
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
@@ -87,12 +88,33 @@ class SparsePrefillWorkspace:
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        # SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT (backport of upstream
+        # #45909): what the head rows hold, or None when nothing reusable is there.
+        self._head_source: Optional[tuple] = None
 
     def get(
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
+        self._head_source = None
+        return self._reserve(num_tokens, dtype)
+
+    def get_with_head(
+        self, num_tokens: int, head_source: tuple
+    ) -> Tuple[torch.Tensor, bool]:
+        """The rows, and whether the head rows already hold ``head_source``'s
+        dequant (the caller then skips rewriting them)."""
+        buffer = self._reserve(num_tokens, torch.bfloat16)
+        head_filled = head_source == self._head_source
+        self._head_source = head_source
+        return buffer, head_filled
+
+    def forget_head(self) -> None:
+        """Per forward: the next forward's tensors may reuse freed addresses."""
+        self._head_source = None
+
+    def _reserve(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
@@ -102,6 +124,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self._head_source = None
         return self._buffer[:num_tokens]
 
 
@@ -563,7 +586,14 @@ class SparsePrefillChunkCache:
             seq_lens_cpu = self.seq_lens.tolist()
         lengths_cpu = [int(length) // compress_ratio for length in seq_lens_cpu]
         total_compressed = sum(lengths_cpu)
-        lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
+        if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_ASYNC_LENGTHS.get():
+            # A pageable host->device copy synchronizes the stream; a pinned one
+            # does not, and the caching host allocator keeps the buffer until the
+            # copy has run.
+            host_lengths = torch.tensor(lengths_cpu, dtype=torch.int32, pin_memory=True)
+            lengths = host_lengths.to(device, non_blocking=True)
+        else:
+            lengths = torch.tensor(lengths_cpu, dtype=torch.int32, device=device)
         ends = lengths.cumsum(0, dtype=torch.int32)
         compressed_base = ends - lengths
         swa_base = total_compressed + self.swa_offsets[:-1]

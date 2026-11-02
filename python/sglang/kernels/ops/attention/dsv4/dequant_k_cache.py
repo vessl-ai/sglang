@@ -75,6 +75,31 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
+    if num_tokens > 0 and _fast_dequant_enabled():
+        # INF-681 k-attnp: several tokens per program, the whole row at once.
+        block_t = 8
+        _dequantize_k_cache_paged_rows_kernel[(triton.cdiv(num_tokens, block_t),)](
+            out,
+            buf_fp8,
+            buf_bf16,
+            buf_uint8,
+            page_table_1_flattened,
+            num_tokens,
+            out.stride(0),
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            TILE_SIZE=TILE_SIZE,
+            NUM_SCALE_TILES=NUM_SCALE_TILES,
+            NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+            PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+            S_OFFSET_BYTES=s_offset_bytes,
+            BLOCK_T=block_t,
+            num_warps=4,
+        )
+        return out
+
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -346,6 +371,83 @@ def _dequantize_k_cache_paged_kernel(
     bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
     rope_data = tl.load(buf_bf16_ptr + bf16_off)
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+def _fast_dequant_enabled() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_FAST_DEQUANT.get()
+
+
+@triton.jit
+def _dequantize_k_cache_paged_rows_kernel(
+    output_ptr,
+    buf_fp8_ptr,
+    buf_bf16_ptr,
+    buf_uint8_ptr,
+    page_table_ptr,
+    num_tokens,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    # SGLANG_OPT_DSV4_SPARSE_PREFILL_FAST_DEQUANT: BLOCK_T tokens per program and all
+    # NUM_SCALE_TILES tiles of a row in one [BLOCK_T, tiles, TILE_SIZE] block, so each
+    # program keeps whole rows in flight. The per-value arithmetic is the same as
+    # _dequantize_k_cache_paged_kernel (fp8 -> fp32, times exp2(scale - 127), -> bf16).
+    tok = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    tmask = tok < num_tokens
+    loc = tl.load(page_table_ptr + tok, mask=tmask, other=0).to(tl.int64)
+    page_byte_base = (loc // PAGE_SIZE) * BYTES_PER_PAGE
+    in_page = loc % PAGE_SIZE
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+    )
+    out_row_base = tok * output_stride_0
+
+    tiles = tl.arange(0, PADDED_SCALE_PER_TOKEN)  # NUM_SCALE_TILES + 1 = 8, power of 2
+    cols = tl.arange(0, TILE_SIZE)
+    tile_mask = tmask[:, None] & (tiles < NUM_SCALE_TILES)[None, :]
+    scale_u8 = tl.load(
+        buf_uint8_ptr + token_scale_base[:, None] + tiles[None, :],
+        mask=tile_mask,
+        other=127,
+    ).to(tl.int32)
+    scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+    val_off = tiles[None, :, None] * TILE_SIZE + cols[None, None, :]
+    val_mask = tile_mask[:, :, None]
+    fp8_vals = tl.load(
+        buf_fp8_ptr + token_data_base[:, None, None] + val_off,
+        mask=val_mask,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        output_ptr + out_row_base[:, None, None] + val_off,
+        (fp8_vals * scale_pow2[:, :, None]).to(output_ptr.dtype.element_ty),
+        mask=val_mask,
+    )
+
+    rope_offs = tl.arange(0, DIM_ROPE)
+    rope_data = tl.load(
+        buf_bf16_ptr
+        + ((token_data_base + DIM_NOPE) // 2)[:, None]
+        + rope_offs[None, :],
+        mask=tmask[:, None],
+    )
+    tl.store(
+        output_ptr + out_row_base[:, None] + DIM_NOPE + rope_offs[None, :],
+        rope_data,
+        mask=tmask[:, None],
+    )
 
 
 @triton.jit

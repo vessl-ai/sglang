@@ -3,6 +3,10 @@
 // Replaces sgl_kernel's moe_sum_reduce_kernel_general (~5.7us at decode
 // shapes [1, 16, 3584]) with a straightforward vectorized pass (~1.5us):
 // one thread per 8-element vector of K, looping the topk rows in fp32.
+//
+// Rows stride over gridDim.y (capped at 65535, the CUDA limit), so M > 65535
+// (a 65536-row prefill chunk) no longer fails the launch with "invalid
+// argument". For M <= 65535 every block still handles exactly one row.
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
@@ -20,9 +24,12 @@ namespace sglang {
 struct TopkSumParams {
   const bf16_t* __restrict__ in;  // [M, topk, K] contiguous
   bf16_t* __restrict__ out;       // [M, K] contiguous
+  uint32_t M;
   uint32_t K;
   uint32_t topk;
 };
+
+inline constexpr uint32_t kTopkSumMaxGridY = 65535;
 
 template <int kThreads, bool kUsePDL>
 __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
@@ -31,35 +38,36 @@ __global__ void topk_sum_kernel(const TopkSumParams __grid_constant__ params) {
   constexpr int kVecN = 8;  // 8 bf16 = 128 bits
   using vec_bf16_t = AlignedVector<bf16_t, kVecN>;
 
-  const uint32_t m = blockIdx.y;
   const uint32_t v = blockIdx.x * kThreads + threadIdx.x;
   const uint32_t n_vecs = params.K / kVecN;
   if (v >= n_vecs) return;
 
-  const bf16_t* base = params.in + static_cast<int64_t>(m) * params.topk * params.K;
-
   PDLWaitPrimary<kUsePDL>();
 
-  float acc[kVecN];
-#pragma unroll
-  for (int i = 0; i < kVecN; ++i) {
-    acc[i] = 0.0f;
-  }
-  for (uint32_t j = 0; j < params.topk; ++j) {
-    vec_bf16_t x;
-    x.load(base + static_cast<int64_t>(j) * params.K, v);
+  for (uint32_t m = blockIdx.y; m < params.M; m += gridDim.y) {
+    const bf16_t* base = params.in + static_cast<int64_t>(m) * params.topk * params.K;
+
+    float acc[kVecN];
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      acc[i] += cast<fp32_t>(x[i]);
+      acc[i] = 0.0f;
     }
-  }
-
-  vec_bf16_t o;
+    for (uint32_t j = 0; j < params.topk; ++j) {
+      vec_bf16_t x;
+      x.load(base + static_cast<int64_t>(j) * params.K, v);
 #pragma unroll
-  for (int i = 0; i < kVecN; ++i) {
-    o[i] = cast<bf16_t>(acc[i]);
+      for (int i = 0; i < kVecN; ++i) {
+        acc[i] += cast<fp32_t>(x[i]);
+      }
+    }
+
+    vec_bf16_t o;
+#pragma unroll
+    for (int i = 0; i < kVecN; ++i) {
+      o[i] = cast<bf16_t>(acc[i]);
+    }
+    o.store(params.out + static_cast<int64_t>(m) * params.K, v);
   }
-  o.store(params.out + static_cast<int64_t>(m) * params.K, v);
 
   PDLTriggerSecondary<kUsePDL>();
 }
@@ -90,12 +98,13 @@ struct TopkSumKernel {
     const auto params = TopkSumParams{
         .in = static_cast<const bf16_t*>(in.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .M = M,
         .K = K,
         .topk = topk,
     };
 
     const uint32_t n_vecs = K / 8;
-    dim3 grid((n_vecs + kThreads - 1) / kThreads, M);
+    dim3 grid((n_vecs + kThreads - 1) / kThreads, M < kTopkSumMaxGridY ? M : kTopkSumMaxGridY);
     LaunchKernel(grid, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };

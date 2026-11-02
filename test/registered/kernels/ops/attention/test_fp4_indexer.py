@@ -856,6 +856,126 @@ def test_fp4_paged_logits_tensor_core_matches_per_row(
         )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("dyadic", [True, False])
+@pytest.mark.parametrize(
+    "requests,group,ratio,width,mask",
+    [
+        (3, 6, 1, 193, "none"),
+        (5, 6, 2, 8193, "position"),
+        (7, 4, 1, 16385, "block"),
+        (9, 2, 2, 4097, "block_skip"),
+        (13, 6, 1, 32769, "block_skip"),
+    ],
+)
+def test_fp4_paged_logits_prmt_dequant_and_block_mask_bit_identical(
+    requests, group, ratio, width, mask, dyadic
+):
+    """SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT (byte-table dequant) and the
+    per-block candidate flags (+ TILE_SKIP) score bit for bit like the engine path
+    (integer dequant, per-position mask), Gaussian inputs included: the dequantized
+    K is identical, so the dot and its rounding are the same kernel. Under graph
+    replay with changing lengths, request order, page tables and candidate blocks."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+        candidate_block_keep,
+        candidate_block_mask,
+    )
+    from sglang.srt.environ import envs
+
+    heads, block = 32, 8
+    batch = requests * group
+    q, weights, slots, lens, table = _make_logits_case(
+        batch, heads, width, group=group, dyadic=dyadic
+    )
+    capacity = 1048580 // ratio // block * block
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::group] * ratio).int()
+    lengths = lens.to(torch.int32)
+    num_blocks = -(-width // block)
+    blocks = torch.full((batch, 64), -1, device=q.device, dtype=torch.int32)
+    blocks[:, :48] = torch.randint(0, num_blocks, (batch, 48), device=q.device)
+    args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
+
+    def run(new: bool):
+        if mask == "none":
+            cand, mask_block = None, 1
+        elif mask == "position" or not new:
+            cand, mask_block = candidate_block_mask(blocks, capacity, block), 1
+        else:
+            cand, mask_block = candidate_block_keep(blocks, capacity, block), block
+        with (
+            envs.SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT.override(new),
+            envs.SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP.override(
+                new and mask == "block_skip"
+            ),
+        ):
+            return fp4_index_logits_paged(
+                *args, cand, rows_per_request=group, mask_block=mask_block
+            )
+
+    for _ in range(3):
+        run(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run(True)
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, 129, width]):
+        lengths.copy_(
+            (visible - torch.arange(batch, device=q.device) % group).clamp_min(0)
+        )
+        req_table[:, : width * ratio : ratio] = (
+            slots[::group].roll(step, 1) * ratio
+        ).int()
+        req.copy_(req.roll(group))
+        q.neg_()
+        blocks.copy_((blocks + 3 * step) % num_blocks)
+        graph.replay()
+        expected = run(False)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lengths[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask],
+            expected[:, :width][visible_mask],
+            atol=0,
+            rtol=0,
+        )
+
+
+def test_candidate_block_keep_matches_mask():
+    """The per-block flags expand to exactly the per-position candidate mask."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+        candidate_block_keep,
+        candidate_block_mask,
+    )
+
+    device = get_device()
+    torch.manual_seed(5)
+    width, block = 1000, 8
+    blocks = torch.randint(-1, 125, (17, 40), device=device, dtype=torch.int32)
+    keep = candidate_block_keep(blocks, width, block)
+    assert keep.shape == (17, 126)
+    expanded = keep[:, :-1].repeat_interleave(block, dim=1)[:, :width]
+    assert torch.equal(expanded, candidate_block_mask(blocks, width, block))
+
+
+@pytest.mark.parametrize("requests,size", [(32, 4), (29, 4), (3, 4), (0, 4), (7, 2)])
+def test_decode_row_shard_plan_covers_every_request_once(requests, size):
+    from sglang.srt.layers.attention.dsv4.v41_indexer.decode_shard import (
+        plan_row_shard,
+    )
+
+    group = 6
+    covered = []
+    for rank in range(size):
+        shard = plan_row_shard(requests * group, group, rank, size)
+        assert shard.rows.start % group == 0 and shard.rows.stop % group == 0
+        assert shard.rows.stop - shard.rows.start <= shard.rows_per_rank
+        assert shard.rows_per_rank == -(-requests // size) * group
+        covered.extend(range(shard.rows.start, shard.rows.stop))
+    assert covered == list(range(requests * group))
+
+
 def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
     """The bf16 spacing at |x| (8 significant bits)."""
     exponent = torch.frexp(x.abs().clamp_min(2.0**-126))[1]

@@ -352,6 +352,84 @@ class TestDensePrefillIndexer(CustomTestCase):
                     actual.sort(-1).values, expected.sort(-1).values, rtol=0, atol=0
                 )
 
+    def test_cp_interleaved_rows_match_the_whole_batch(self):
+        # What a prefill-CP rank scores: the batch's rows whose flattened index is
+        # congruent to its rank, still grouped by request, against the same
+        # flattened K. Its top-k, published blocks and candidate top-k must be the
+        # whole batch's on those rows.
+        from sglang.srt.layers.cp.interleave import interleave_rows_per_request
+
+        for ratio in (1, 2):
+            inputs = make_inputs(
+                [(5, 300), (2, 7), (41, 1031), (90, 4097)], ratio=ratio
+            )
+            inputs["candidate_topk_blocks"] = 64
+            queries = [q for q, _ in inputs["request_lengths"]]
+            rows, topk = sum(queries), inputs["topk"]
+
+            def data_for(index, rows_per_request):
+                return scoring.DeepGEMMPrefillData(
+                    k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
+                    request_starts=inputs["starts"][index],
+                    lens_per_request=[n for _, n in inputs["request_lengths"]],
+                    rows_per_request=rows_per_request,
+                    compress_lens=inputs["lengths"][index],
+                    q=inputs["q"][0][index],
+                    q_sf=None if inputs["q"][1] is None else inputs["q"][1][index],
+                    weights=inputs["weights"][index],
+                )
+
+            whole = data_for(torch.arange(rows, device="cuda"), queries)
+            whole_topk = torch.full((rows, topk), -1, dtype=torch.int32, device="cuda")
+            scoring.dense_prefill_topk(whole, inputs["kv"], out=whole_topk)
+            whole_sel, whole_blocks = dense_blocks._publish_prefill_blocks(
+                data=whole, kv=inputs["kv"], topk=topk, topk_blocks=64, block_size=8
+            )
+            whole_consumed = dense_blocks._consume_prefill_blocks(
+                data=whole,
+                kv=inputs["kv"],
+                topk=topk,
+                blocks=whole_blocks,
+                block_size=8,
+            )
+            for cp_size in (2, 4):
+                for rank in range(cp_size):
+                    with self.subTest(ratio=ratio, cp_size=cp_size, rank=rank):
+                        index = torch.arange(rank, rows, cp_size, device="cuda")
+                        counts = interleave_rows_per_request(queries, rank, cp_size)
+                        self.assertEqual(sum(counts), index.numel())
+                        part = data_for(index, counts)
+                        part_topk = torch.full(
+                            (index.numel(), topk), -1, dtype=torch.int32, device="cuda"
+                        )
+                        scoring.dense_prefill_topk(part, inputs["kv"], out=part_topk)
+                        sel, blocks = dense_blocks._publish_prefill_blocks(
+                            data=part,
+                            kv=inputs["kv"],
+                            topk=topk,
+                            topk_blocks=64,
+                            block_size=8,
+                        )
+                        consumed = dense_blocks._consume_prefill_blocks(
+                            data=part,
+                            kv=inputs["kv"],
+                            topk=topk,
+                            blocks=blocks,
+                            block_size=8,
+                        )
+                        for actual, expected in (
+                            (part_topk, whole_topk[index]),
+                            (sel, whole_sel[index]),
+                            (blocks, whole_blocks[index]),
+                            (consumed, whole_consumed[index]),
+                        ):
+                            torch.testing.assert_close(
+                                actual.sort(-1).values,
+                                expected.sort(-1).values,
+                                rtol=0,
+                                atol=0,
+                            )
+
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
             for publish in (False, True):

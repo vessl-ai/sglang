@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -611,6 +611,11 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         send_kv_chunk=Mock(),
         metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
         maybe_send_health_check_signal=Mock(),
+    )
+    # The result body lives in the generator helper; bind the real one as a
+    # Scheduler would have it.
+    scheduler._disagg_prefill_result_steps = MethodType(
+        SchedulerDisaggregationPrefillMixin._disagg_prefill_result_steps, scheduler
     )
 
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(

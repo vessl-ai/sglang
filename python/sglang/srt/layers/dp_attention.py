@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from enum import IntEnum, auto
@@ -250,6 +251,8 @@ class _DpGatheredBufferWrapper:
     _global_dp_buffer_len: int = 0
     _local_dp_buffer_len: int = 0
     _dp_max_padding: bool = False
+    # Set inside rank_local_allocation(): see there.
+    _rank_local_allocation: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
 
@@ -566,7 +569,30 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 
 def is_allocation_symmetric() -> bool:
+    if _DpGatheredBufferWrapper._rank_local_allocation:
+        return False
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+@contextlib.contextmanager
+def rank_local_allocation():
+    """Keep the allocations of work on this rank's own rows (the DP- or CP-local
+    replicated shared expert) out of the TP group's NCCL symmetric pool.
+
+    That work is no TP collective's buffer, and its pool use is not the same on
+    every rank: the row counts are per rank, and on a side stream a freed block is
+    reusable only once the stream that used it has passed it, which depends on
+    GPU progress. The pool grows lazily, and the new segment is registered by a
+    TP-group collective (ncclCommWindowRegister at use_symmetric_memory exit), so
+    ranks that grow at different points deadlock: the INF-681 DP4 decoder hang in
+    graph capture (ranks 0/3 in the registration, ranks 1/2 in the next kernel).
+    """
+    prev = _DpGatheredBufferWrapper._rank_local_allocation
+    _DpGatheredBufferWrapper._rank_local_allocation = True
+    try:
+        yield
+    finally:
+        _DpGatheredBufferWrapper._rank_local_allocation = prev
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1255,8 +1281,36 @@ def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_tp_group.reduce_scatter_tensor(output, input)
 
 
-def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+def _attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.reduce_scatter_tensor(output, input)
+
+
+def _attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+
+
+def _late_layer_graph_eager_collective(
+    op, output: torch.Tensor, input: torch.Tensor
+) -> bool:
+    """SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES: inside a late-layer graph
+    block, run the CP collective as an eager break (models/deepseek_common/
+    late_layer_graph.py ``eager_collective``). Returns whether it did."""
+    if not envs.SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES.get():
+        return False
+    from sglang.srt.models.deepseek_common import late_layer_graph
+
+    if not late_layer_graph.eager_collectives():
+        return False
+    late_layer_graph.eager_collective(op, output, input)
+    return True
+
+
+def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if _late_layer_graph_eager_collective(
+        _attn_cp_reduce_scatter_tensor, output, input
+    ):
+        return None
+    return _attn_cp_reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
@@ -1268,7 +1322,11 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
+    if _late_layer_graph_eager_collective(
+        _attn_cp_all_gather_into_tensor, output, input
+    ):
+        return None
+    return _attn_cp_all_gather_into_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

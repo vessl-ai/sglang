@@ -1897,6 +1897,16 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+        if envs.SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT.get() and is_cuda():
+            # Everything allocated so far keeps its classic segments; activations
+            # from here on grow expandable ones.
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+            logger.info(
+                "SGLANG_OPT_EXPANDABLE_SEGMENTS_AFTER_INIT: expandable segments on "
+                "for serving-time allocations (reserved %.2f GiB, allocated %.2f GiB)",
+                torch.cuda.memory_reserved() / (1 << 30),
+                torch.cuda.memory_allocated() / (1 << 30),
+            )
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,

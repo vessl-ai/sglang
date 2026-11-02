@@ -24,6 +24,22 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="embeddings.engram_gather_raw",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.engram_gather:engram_gather_raw",
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="embeddings.engram_dequant_raw",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.embeddings.engram_gather:engram_dequant_raw",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="embeddings.engram_hash_ids",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.embeddings.engram_hash:engram_hash_ids",

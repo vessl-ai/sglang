@@ -1836,6 +1836,33 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def dsv41_dspark_attn_tp_compatible(
+    *,
+    prefill_attn_tp: int,
+    prefill_attn_cp: int,
+    decode_attn_tp: int,
+    decode_attn_cp: int,
+    mla_backend: bool,
+    allow_tp_prefill_dp_decode: bool,
+) -> bool:
+    """Whether a DeepSeek-V4.1 DSpark PD pair may use these attention layouts.
+
+    Always allowed: equal attention TP, or (MLA) a CP prefill whose TP x CP equals the
+    decode attention TP. With ``allow_tp_prefill_dp_decode`` (default-off switch
+    SGLANG_OPT_DSV4_PD_TP_PREFILL_DP_DECODE), also a CP-1 prefill with attention TP > 1
+    feeding an attention-TP-1 (DP attention) decode: the MLA KV and the SWA states are
+    replicated across the prefill's attention TP ranks, so one of them sends each
+    request whole and the others are dummy senders.
+    """
+    if prefill_attn_tp == decode_attn_tp:
+        return True
+    if not mla_backend or decode_attn_cp != 1:
+        return False
+    if prefill_attn_cp > 1:
+        return prefill_attn_tp * prefill_attn_cp == decode_attn_tp
+    return allow_tp_prefill_dp_decode and decode_attn_tp == 1 and prefill_attn_tp > 1
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

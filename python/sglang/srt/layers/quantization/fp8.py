@@ -877,6 +877,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)
+        if envs.SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128.get():
+            from sglang.srt.layers.quantization import fp8_block32_gran128
+
+            if fp8_block32_gran128.layer_is_eligible(self, layer, use_deepgemm_runner):
+                fp8_block32_gran128.convert_layer(layer)
 
         # The preshuffle rewrites the weight into a layout only
         # aiter_w8a8_block_fp8_linear can read, so it is correct exactly when
@@ -1302,6 +1307,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            if getattr(layer, "dense_gran128", False):
+                from sglang.srt.layers.quantization import fp8_block32_gran128
+
+                return fp8_block32_gran128.apply(layer, x, bias)
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (

@@ -52,6 +52,10 @@ _is_xpu = is_xpu()
 HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
+# INF-681 k-dnm: last row count where the split-H post beats the TileLang post on H200.
+_DP_DECODE_SPLIT_H_POST_MAX_ROWS = 200
+
+
 class HcConfig(NamedTuple):
     """Everything about a layer's mHC that is fixed for the model's lifetime."""
 
@@ -228,6 +232,14 @@ def make_boundary(
 # ---------------------------------------------------------------------------
 
 
+def _dp_decode_rows_ok(num_rows: int) -> bool:
+    """INF-681: a DP-attention rank's own decode / verify rows, within the DP gates' bound."""
+    return (
+        0 < num_rows <= envs.SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS.get()
+        and get_parallel().attn_dp_size > 1
+    )
+
+
 def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor):
     if not cfg.pre_from_prev:
         return False
@@ -238,6 +250,10 @@ def use_stats_stream(cfg: HcConfig, forward_batch: ForwardBatch, x: torch.Tensor
         not get_platform().is_sm90
         or x.shape[0] == 1
         or (forward_batch.forward_mode.is_decode() and 1 < x.shape[0] <= 64)
+        or (
+            envs.SGLANG_OPT_DSV4_DP_DECODE_STATS_STREAM.get()
+            and _dp_decode_rows_ok(x.shape[0])
+        )
     )
 
 
@@ -411,7 +427,14 @@ def _combine(
     hopper_fused = (
         get_platform().is_sm90
         and not quantize
-        and (0 < x.shape[0] <= 96 or 4096 <= x.shape[0] <= 65536)
+        and (
+            0 < x.shape[0] <= 96
+            or 4096 <= x.shape[0] <= 65536
+            or (
+                envs.SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED.get()
+                and _dp_decode_rows_ok(x.shape[0])
+            )
+        )
         and not is_batch_invariant_mode_enabled()
     )
     if (
@@ -506,7 +529,16 @@ def post(
             and get_platform().is_sm90
             and cfg.mult == 4
             and cfg.hidden == 5120
-            and 1 <= x.shape[0] <= 64
+            and (
+                1 <= x.shape[0] <= 64
+                # INF-681: the split-H post is bit-identical to the TileLang post and
+                # faster up to 200 rows on H200 (192 rows: 5.32 vs 5.92 us).
+                or (
+                    envs.SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED.get()
+                    and x.shape[0] <= _DP_DECODE_SPLIT_H_POST_MAX_ROWS
+                    and _dp_decode_rows_ok(x.shape[0])
+                )
+            )
         ):
             return mhc_post_split_h(x, residual, post_mix, comb)
 
@@ -602,6 +634,12 @@ def _sm90_fused_post_combine() -> bool:
     )
 
 
+def _fused_post_combine_min_rows() -> int:
+    """The fused post + combine + norm kernel's lower row bound: 4096, or what
+    SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS sets for small prefill steps."""
+    return max(1, min(4096, envs.SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS.get()))
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -642,17 +680,24 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and 4096 <= y.shape[0] <= 65536
+        and _fused_post_combine_min_rows() <= y.shape[0] <= 65536
         and (get_platform().is_blackwell or _sm90_fused_post_combine())
         and cfg.hidden == 5120
         and cfg.mult == 4
         and get_parallel().attn_dp_size == 1
-        and not cfg.cp_prefill
+        and (not cfg.cp_prefill or envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.get())
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
             mhc_post_combine_norm_prefill,
         )
 
+        if cfg.cp_prefill:
+            # The kernel indexes dense rows; mhc_post makes the same guarantee under CP.
+            from sglang.srt.layers.utils.common import strict_contiguous
+
+            y, residual = strict_contiguous(y), strict_contiguous(residual)
+            post_mix, comb = strict_contiguous(post_mix), strict_contiguous(comb)
+            pre = strict_contiguous(pre)
         updated, normalized = mhc_post_combine_norm_prefill(
             y,
             residual,

@@ -16,6 +16,7 @@ from typing import (
 )
 
 import msgspec
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -207,6 +208,59 @@ def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
     return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
 
 
+def _maybe_precompute_sm90_flashmla_sched_meta(
+    flashmla_metadata,
+    *,
+    q: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+) -> bool:
+    """SGLANG_OPT_DSV4_SM90_MLA_SCHED_META: fill the schedule with the parallel
+    large-batch kernel. True when it did. The 64-head sparse FP8 decode kernel on SM90
+    schedules with block_size_n 64, fixed overhead 5 and one part per SM (s_q 1), the
+    same constants as SM100 (checked against FlashMLA's own metadata for 1-30,000
+    rows). Skipped under CUDA graph capture, so a captured region keeps FlashMLA's own
+    in-graph schedule."""
+    if not (
+        envs.SGLANG_OPT_DSV4_SM90_MLA_SCHED_META.get()
+        and q.is_cuda
+        and get_platform().is_sm90
+        and q.ndim == 4
+        and q.shape[1] == 1
+        and q.shape[-2] == 64
+        and indices is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return False
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta_large import (
+        META_INTS,
+        fits,
+        flashmla_sched_meta_large,
+    )
+
+    b = q.shape[0]
+    num_sm_parts = _num_sms(q.device.index)
+    if b < 1 or not fits(b, num_sm_parts, q.device.index):
+        return False
+    meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
+    num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
+    flashmla_sched_meta_large(
+        meta,
+        num_splits,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
+        block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
+        topk=indices.shape[-1],
+        extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+    )
+    flashmla_metadata.tile_scheduler_metadata = meta
+    flashmla_metadata.num_splits = num_splits
+    return True
+
+
 def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata,
     *,
@@ -222,6 +276,15 @@ def _maybe_precompute_flashmla_sched_meta(
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
+        return
+    if _maybe_precompute_sm90_flashmla_sched_meta(
+        flashmla_metadata,
+        q=q,
+        indices=indices,
+        topk_length=topk_length,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+    ):
         return
     if not _fast_flashmla_sched_shape(q):
         return
@@ -920,6 +983,9 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    # prefill CP: the tail rows' indices into the whole extend, in the order the
+    # tail's CP gather returns them
+    global_token_indices: Optional[torch.Tensor] = None
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1689,12 +1755,24 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
-        cp_tail = (
-            self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
-            if is_cp_active(forward_batch)
-            else None
-        )
+        no_sync = envs.SGLANG_OPT_DSV4_TAIL_LAYOUT_NO_SYNC.get()
+        if no_sync:
+            tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
+        else:
+            tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        cp_tail = None
+        if is_cp_active(forward_batch):
+            cp_tail = (
+                self._late_layer_tail_cp_layout_host(
+                    forward_batch, token_indices, tail_lens_cpu, contiguous_start
+                )
+                if no_sync
+                else self._late_layer_tail_cp_layout(
+                    forward_batch, token_indices, tail_lens
+                )
+            )
+        # Known on the host, so repeat_interleave does not read the total back.
+        tail_rows_total = sum(tail_lens_cpu) if no_sync else None
 
         metadata = self.init_forward_metadata_prefill(
             max_seq_len=(
@@ -1729,6 +1807,7 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
+                output_size=tail_rows_total,
             )
             positions = _tail_rows(
                 forward_batch.positions,
@@ -1748,6 +1827,7 @@ class DeepseekV4AttnBackend(
                 req = torch.repeat_interleave(
                     forward_batch.req_pool_indices.to(torch.int64),
                     tail_lens.to(torch.int64),
+                    output_size=tail_rows_total,
                 )
                 metadata.low_ratio_req_indices = torch.cat(
                     [req, req[-1:].expand(cap - real_rows)]
@@ -1785,6 +1865,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
@@ -1849,6 +1930,83 @@ class DeepseekV4AttnBackend(
             local_positions=local_positions,
             local_lens_cpu=torch.bincount(
                 tail_request_ids[local_tail_rows], minlength=forward_batch.batch_size
+            ).tolist(),
+            pad_rows=pad_rows,
+        )
+
+    def _late_layer_tail_cp_layout_host(
+        self,
+        forward_batch: ForwardBatch,
+        token_indices: torch.Tensor,
+        tail_lens_cpu: List[int],
+        contiguous_start: Optional[int],
+    ) -> dict:
+        """`_late_layer_tail_cp_layout` with every value that needs a host read
+        computed from the host extend lengths (SGLANG_OPT_DSV4_TAIL_LAYOUT_NO_SYNC):
+        the owner-rank counts, the rank starts, this rank's tail rows and its
+        per-request lengths. The device tensors it returns hold the same values and
+        dtypes."""
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        device = token_indices.device
+        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+        # Host copy of `token_indices` (late_layer_tail_layout's layout): the last
+        # tail_len rows of each request's extend.
+        ends = np.cumsum(np.asarray(extend_lens_cpu, dtype=np.int64))
+        tails = np.asarray(tail_lens_cpu, dtype=np.int64)
+        host_tokens = np.concatenate(
+            [np.arange(e - t, e, dtype=np.int64) for e, t in zip(ends, tails)]
+        )
+        assert contiguous_start is None or host_tokens[0] == contiguous_start
+        total = int(host_tokens.shape[0])
+        owner_host = host_tokens % cp_size
+        counts = np.bincount(owner_host, minlength=cp_size).tolist()
+        max_local = max(counts)
+        owner_rank = token_indices % cp_size
+        order = torch.argsort(owner_rank, stable=True)
+        rank_starts = async_h2d(
+            [sum(counts[:r]) for r in range(cp_size)], dtype=torch.int64, device=device
+        )
+        slot = torch.empty_like(owner_rank)
+        slot[order] = (
+            torch.arange(total, device=device) - rank_starts[owner_rank[order]]
+        )
+        gather_index = owner_rank * max_local + slot
+
+        local_host = np.nonzero(owner_host == cp_rank)[0]
+        local_tail_rows = async_h2d(
+            local_host.tolist(), dtype=torch.int64, device=device
+        )
+        pad_rows = max_local - counts[cp_rank]
+        pad_start = total + sum(max_local - c for c in counts[:cp_rank])
+        local_metadata_rows = torch.cat(
+            [
+                local_tail_rows,
+                torch.arange(pad_start, pad_start + pad_rows, device=device),
+            ]
+        )
+        request_of_row = np.repeat(np.arange(len(tail_lens_cpu), dtype=np.int64), tails)
+        local_positions = torch.cat(
+            [
+                forward_batch.positions[token_indices[local_tail_rows]],
+                forward_batch.positions.new_zeros(pad_rows),
+            ]
+        )
+        cp_metadata = InterleaveContextParallelMetadata(
+            per_rank_actual_token=[max_local] * cp_size,
+            max_rank_len=[max_local] * cp_size,
+            total_seq_lens=total,
+            bs=forward_batch.batch_size,
+            per_rank_logical_token=counts,
+            gather_index=gather_index,
+            local_index=local_metadata_rows,
+        )
+        return dict(
+            cp_metadata=cp_metadata,
+            local_token_indices=(token_indices[local_tail_rows] - cp_rank) // cp_size,
+            local_positions=local_positions,
+            local_lens_cpu=np.bincount(
+                request_of_row[local_host], minlength=forward_batch.batch_size
             ).tolist(),
             pad_rows=pad_rows,
         )
@@ -2558,9 +2716,19 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
+        # Under CP only with SGLANG_OPT_DSV4_CP_SPARSE_PREFILL: num_qo_tokens is then
+        # this rank's query rows (0 from the page-index gate, which errs to True).
         return (
             forward_batch.forward_mode.is_extend_without_speculative()
-            and not is_cp_active(forward_batch)
+            and (
+                not is_cp_active(forward_batch)
+                or (
+                    envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL.get()
+                    and num_qo_tokens > 0
+                    and num_qo_tokens
+                    >= envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL_MIN_ROWS.get()
+                )
+            )
             and not get_platform().is_sm120
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -2607,6 +2775,9 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT.get():
+            # A new forward: its tensors may reuse the last forward's addresses.
+            self.sparse_prefill_workspace.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -2617,11 +2788,23 @@ class DeepseekV4AttnBackend(
             extend_seq_lens = tail.extend_seq_lens
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
+        cp_active = is_cp_active(forward_batch)
+        if cp_active:
+            # SGLANG_OPT_DSV4_CP_SPARSE_PREFILL: the query rows are this rank's
+            # interleaved share of each request (padding rows follow them).
+            assert envs.SGLANG_OPT_DSV4_CP_SPARSE_PREFILL.get()
+            cp_query_lens_cpu = interleave_rows_per_request(
+                _as_int_list(extend_seq_lens_cpu),
+                get_parallel().attn_cp_rank,
+                get_parallel().attn_cp_size,
+            )
+            num_needed_queries = sum(cp_query_lens_cpu)
+        else:
+            num_needed_queries = sum(extend_seq_lens_cpu)
+        assert num_qo_tokens >= num_needed_queries, (
+            "DSV4 sparse prefill requires the query rows of every request: "
+            f"allocated {num_qo_tokens}, but request offsets cover {num_needed_queries}. "
+            "CP-local queries use paged attention unless SGLANG_OPT_DSV4_CP_SPARSE_PREFILL is set."
         )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
@@ -2633,15 +2816,10 @@ class DeepseekV4AttnBackend(
                 seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
             )
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+        if cp_active:
+            # Pinned: a pageable copy would wait for the stream to drain.
+            query_lens = async_h2d(
+                cp_query_lens_cpu, dtype=torch.int32, device=extend_seq_lens.device
             )
         else:
             query_lens = extend_seq_lens.to(torch.int32)
@@ -3914,10 +4092,26 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
-            )
-            compressed_slice = workspace[:n_compressed]
+            if envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_SHARED_SOURCE_DEQUANT.get():
+                # Layers sharing a kv_source reuse its dequant: no later layer
+                # writes that cache within the forward (upstream #45909).
+                workspace, compressed_filled = (
+                    self.sparse_prefill_workspace.get_with_head(
+                        n_compressed + cache.swa_token_ids.shape[0],
+                        head_source=(
+                            extra_k_cache.data_ptr(),
+                            flat_token_ids.data_ptr(),
+                            n_compressed,
+                        ),
+                    )
+                )
+            else:
+                workspace = self.sparse_prefill_workspace.get(
+                    n_compressed + cache.swa_token_ids.shape[0]
+                )
+                compressed_filled = False
+            if not compressed_filled:
+                compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:

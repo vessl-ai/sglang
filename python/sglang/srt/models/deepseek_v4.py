@@ -95,8 +95,14 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    rank_local_allocation,
 )
-from sglang.srt.layers.engram import Engram, EngramHasher, EngramLayout
+from sglang.srt.layers.engram import (
+    Engram,
+    EngramHasher,
+    EngramLayout,
+    EngramPrefetch,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.layer_boundary.ops import attn_cp_interleave_reduce_scatter
 from sglang.srt.layers.layernorm import RMSNorm
@@ -126,6 +132,7 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
 )
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.managers.scheduler_components import midforward_hook
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -160,6 +167,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common import late_layer_graph
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
@@ -373,6 +381,119 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+_DP_SHARED_EXPERT_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _dp_shared_expert_stream() -> Optional[torch.cuda.Stream]:
+    """INF-681: the side stream the DP-local shared expert runs on, or None (inline).
+
+    One stream for all layers, created on first use; only with
+    SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP on CUDA."""
+    global _DP_SHARED_EXPERT_STREAM
+    if not (_is_cuda and envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP.get()):
+        return None
+    if _DP_SHARED_EXPERT_STREAM is None:
+        _DP_SHARED_EXPERT_STREAM = torch.cuda.Stream()
+    return _DP_SHARED_EXPERT_STREAM
+
+
+@contextmanager
+def _dp_shared_expert_sm_cap():
+    """Leave SMs free for the NCCL all-gather the side-stream shared expert overlaps.
+
+    DeepGEMM's SM90 kernels are persistent on every SM (132 CTAs, ~170 KB smem each)
+    and NCCL's ring kernels hold ~23 SMs (~119 KB smem each), so the two cannot share an
+    SM: uncapped, the GEMM's last CTAs wait for the collective and both slow down
+    (rig: all-gather 45 -> 70 us, gate_up 15 -> 37 us). The cap is a host-side DeepGEMM
+    launch setting, restored right after the shared expert's GEMMs are issued."""
+    reserve = envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.get()
+    if reserve <= 0:
+        yield
+        return
+    import deep_gemm
+
+    total = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(max(1, total - reserve))
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(total)
+
+
+_CP_SHARED_EXPERT_STREAM: Optional[torch.cuda.Stream] = None
+_CP_SHARED_EXPERT_LOGGED = False
+
+
+def _cp_shared_expert_local_on(mlp) -> bool:
+    """INF-681 k-pcomm SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL: the prefill-CP MoE takes
+    its shared expert from this rank's own shard (needs the replicated TP1 shared
+    expert, SGLANG_SHARED_EXPERT_TP1=1)."""
+    global _CP_SHARED_EXPERT_LOGGED
+    if not envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL.get():
+        return False
+    if getattr(mlp, "shared_experts", None) is None:
+        return False
+    ok = getattr(mlp, "_shared_expert_tp1", False)
+    if not _CP_SHARED_EXPERT_LOGGED:
+        _CP_SHARED_EXPERT_LOGGED = True
+        if ok:
+            logger.info(
+                "k-pcomm CP local shared expert on: overlap=%s min_rows=%d reserve_sms=%d",
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP.get(),
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS.get(),
+                envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS.get(),
+            )
+        else:
+            logger.warning(
+                "SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL needs SGLANG_SHARED_EXPERT_TP1=1 "
+                "(replicated shared expert); ignored"
+            )
+    return ok
+
+
+def _cp_shared_expert_stream(num_rows: int) -> Optional[torch.cuda.Stream]:
+    """The side stream the CP-local shared expert runs on, or None (inline): only with
+    SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP on CUDA, in eager steps (a CUDA graph would
+    freeze the fork/join), and for shards of at least _MIN_ROWS rows."""
+    global _CP_SHARED_EXPERT_STREAM
+    if not (_is_cuda and envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP.get()):
+        return None
+    if num_rows < envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_OVERLAP_MIN_ROWS.get():
+        return None
+    if torch.cuda.is_current_stream_capturing() or get_is_capture_mode():
+        return None
+    if _CP_SHARED_EXPERT_STREAM is None:
+        _CP_SHARED_EXPERT_STREAM = torch.cuda.Stream()
+    return _CP_SHARED_EXPERT_STREAM
+
+
+@contextmanager
+def _cp_shared_expert_sm_cap():
+    """Leave SMs free for the NCCL collective the side-stream shared expert overlaps
+    (same reason as _dp_shared_expert_sm_cap: DeepGEMM's persistent SM90 kernels take
+    every SM and NCCL's ring CTAs cannot share one)."""
+    reserve = envs.SGLANG_OPT_DSV4_CP_SHARED_EXPERT_RESERVE_SMS.get()
+    if reserve <= 0:
+        yield
+        return
+    import deep_gemm
+
+    total = deep_gemm.get_num_sms()
+    deep_gemm.set_num_sms(max(1, total - reserve))
+    try:
+        yield
+    finally:
+        deep_gemm.set_num_sms(total)
+
+
+def _forward_shared_experts_rank_local(mlp, hidden_states: torch.Tensor):
+    """The replicated shared expert on this rank's own rows, allocating outside the TP
+    group's symmetric pool (see rank_local_allocation: growing that pool on some ranks
+    only deadlocks the TP group)."""
+    with rank_local_allocation():
+        return mlp._forward_shared_experts(hidden_states)
+
+
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -558,6 +679,28 @@ def _apply_wo_a_bf16_matmul(
                 "falling back to einsum for the rest of this process: %s",
                 err,
             )
+    if (
+        envs.SGLANG_OPT_DSV4_WO_A_STRIDED_BMM.get()
+        and fast_path
+        and _is_cuda
+        and (is_decode or is_target_verify)
+        and o.shape[0] > 0
+        and o.shape[1:] == (wo_a.shape[0], wo_a.shape[2])
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.stride(2) == 1
+        and wo_a.is_contiguous()
+    ):
+        # INF-681: the einsum below runs the same bmm into [G, T, R] and wo_b's
+        # flatten(1) then copies it to [T, G * R]; writing token-major directly
+        # skips that copy (DP-attention decoder: 8 groups, 5.2 us per layer at 192 rows).
+        result = torch.empty(
+            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+        )
+        with torch.no_grad():
+            torch.bmm(
+                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
+            )
+        return result
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
@@ -1461,6 +1604,32 @@ class MQALayer(MqaAttentionBase):
             **({} if q_rope is None else {"q": q_rope}),
         )
 
+    def _cp_store_window_kv(
+        self, kv: torch.Tensor, forward_batch: ForwardBatch, attn_backend
+    ) -> None:
+        """Prefill CP (V4.1): gather every rank's window KV into the global token
+        order and write it with the fused fp32 norm + RoPE store."""
+        kv = cp_materialize_global_token_order(
+            kv.contiguous(),
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        tail = attn_backend.forward_metadata.late_layer_tail
+        global_positions = (
+            tail.pos_global
+            if tail is not None
+            else forward_batch.positions[: kv.shape[0]]
+        )
+        get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=global_positions,
+        )
+
     def _compute_kv_bf16(
         self,
         x: torch.Tensor,
@@ -2097,25 +2266,18 @@ class MQALayer(MqaAttentionBase):
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:
                     kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
-                get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
-                    layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
-                    kv=kv,
-                    kv_weight=self.kv_norm.weight.data,
-                    eps=self.eps,
-                    freqs_cis=self.freqs_cis,
-                    positions=global_positions,
+                if late_layer_graph.active():
+                    late_layer_graph.cp_store_window_kv(self, kv)
+                else:
+                    self._cp_store_window_kv(kv, forward_batch, attn_backend)
+                kv = None
+            elif late_layer_graph.active():
+                late_layer_graph.store_window_kv(
+                    self,
+                    None if qkv_a is not None else x_linear,
+                    positions,
+                    qkv_a,
+                    q if fuse_q_rope else None,
                 )
                 kv = None
             else:
@@ -2140,6 +2302,8 @@ class MQALayer(MqaAttentionBase):
                 and not getattr(attn_backend, "low_ratio_prefill_graph", False)
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
+            elif late_layer_graph.active():
+                late_layer_graph.low_ratio_sources(self, x, q_lora, positions)
             else:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
@@ -2476,6 +2640,19 @@ class MQALayer(MqaAttentionBase):
                     attn_sink,
                     save_kv_cache,
                 )
+            elif late_layer_graph.active():
+                o = attn_q.new_empty(
+                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                )
+                late_layer_graph.attention_core(
+                    self.attn_mqa,
+                    attn_q,
+                    attn_k,
+                    o,
+                    self.compress_ratio,
+                    attn_sink,
+                    save_kv_cache,
+                )
             else:
                 o = attn_backend.forward(
                     q=attn_q,
@@ -2658,6 +2835,19 @@ class MQALayer(MqaAttentionBase):
             and not self.wo_b.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
+        if (
+            envs.SGLANG_OPT_DSV4_WO_B_FUSED_ACT_QUANT.get()
+            and not defer_all_reduce
+            and self.attn_tp_size == 1
+        ):
+            # INF-681 k-qcp: quantize wo_a's grouped output in place of flatten(1)'s copy.
+            from sglang.srt.layers.quantization.dsv4_prefill_qcp import (
+                wo_b_from_grouped,
+            )
+
+            out = wo_b_from_grouped(o, self.wo_b)
+            if out is not None:
+                return out
         o, _ = self.wo_b(
             o.flatten(1) if isinstance(o, torch.Tensor) else o,
             skip_all_reduce=defer_all_reduce,
@@ -2682,6 +2872,46 @@ class MQALayer(MqaAttentionBase):
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
         )
+
+
+# INF-681 k-pfp8 (layers/quantization/dsv4_cp_moe_fp8ag.py), imported only when used.
+_CP_MOE_FP8AG_ANY = (
+    envs.SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER.get()
+    or envs.SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER.get()
+)
+
+
+def _cp_moe_fp8ag():
+    from sglang.srt.layers.quantization import dsv4_cp_moe_fp8ag
+
+    return dsv4_cp_moe_fp8ag
+
+
+def _cp_moe_combine_reduce_scatters() -> bool:
+    """Whether the V4.1 prefill-CP MoE exit reduce-scatters its output.
+
+    The expert partial sums span the TP group. A reduce-scatter over the
+    attention-CP group completes them only when that group is the TP group
+    (attention TP 1); its rank-major chunk is then the same CP shard that the
+    all-reduce + split returns.
+    """
+    parallel = get_parallel()
+    return (
+        envs.SGLANG_DSV41_CP_MOE_REDUCE_SCATTER.get()
+        and parallel.attn_cp_size == parallel.tp_size
+    )
+
+
+def _cp_moe_return_shard(hidden_states: torch.Tensor, *, dsv41: bool) -> torch.Tensor:
+    """Sum the MoE partials of the rank-major gathered CP batch and keep this
+    rank's equal, padded interleave shard."""
+    if dsv41 and not _cp_moe_combine_reduce_scatters():
+        parallel = get_parallel()
+        hidden_states = parallel.tp_group.all_reduce(hidden_states)
+        return hidden_states.tensor_split(parallel.attn_cp_size)[
+            parallel.attn_cp_rank
+        ].contiguous()
+    return attn_cp_interleave_reduce_scatter(hidden_states)
 
 
 @contextmanager
@@ -3486,16 +3716,62 @@ class DeepseekV4DecoderLayer(nn.Module):
         # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
         # M_global * dim/tp), so decode no longer pays the ~attn_dp_size x penalty.
         _shared_local = None
+        _shared_stream = None
         _do_shared_local = (
             _SHARED_EXPERT_LOCAL
             and _use_tp_moe_gather
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        # INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL): the replicated shared
+        # expert on this rank's own CP shard, before (or beside) the MoE all-gather.
+        _cp_shared = None
+        _cp_shared_stream = None
+        _cp_shared_input = None
+        # INF-681 k-pfp8: the shard's top-k (and FP8 rows) gathered instead of BF16 rows.
+        _cp_prerouted = None
+        _cp_local_rows = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = attn_cp_interleave_gather(hidden_states)
+                if hidden_states.shape[0] > 0 and _cp_shared_expert_local_on(self.mlp):
+                    _cp_shared_stream = _cp_shared_expert_stream(hidden_states.shape[0])
+                    if _cp_shared_stream is not None:
+                        # The input stays referenced until the join below, so the
+                        # allocator cannot hand its block to the main stream while the
+                        # side stream still reads it (no record_stream: KEEP-facts).
+                        _cp_shared_input = hidden_states
+                        _cp_shared_stream.wait_stream(torch.cuda.current_stream())
+                        with (
+                            torch.cuda.stream(_cp_shared_stream),
+                            _cp_shared_expert_sm_cap(),
+                        ):
+                            _cp_shared = _forward_shared_experts_rank_local(
+                                self.mlp, hidden_states
+                            )
+                    else:
+                        _cp_shared = _forward_shared_experts_rank_local(
+                            self.mlp, hidden_states
+                        )
+                _cp_mode = (
+                    _cp_moe_fp8ag().plan(
+                        self.mlp, hidden_states, shared_local=_cp_shared is not None
+                    )
+                    if _CP_MOE_FP8AG_ANY
+                    else None
+                )
+                if _cp_mode is not None:
+                    _cp_local_rows = hidden_states
+                    with _every_row_routed(forward_batch, hidden_states.shape[0]):
+                        hidden_states, _cp_prerouted = _cp_moe_fp8ag().gather(
+                            self.mlp,
+                            hidden_states,
+                            fp8=_cp_mode == "fp8",
+                            num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                            input_ids_global=input_ids_global,
+                        )
+                else:
+                    hidden_states = attn_cp_interleave_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3511,7 +3787,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                _shared_stream = _dp_shared_expert_stream()
+                if _shared_stream is not None:
+                    # INF-681 SGLANG_OPT_DSV4_DP_SHARED_EXPERT_OVERLAP: the shared
+                    # expert only needs this rank's rows, so it runs beside the
+                    # gather and the routed MoE and is joined before its add below.
+                    _shared_stream.wait_stream(torch.cuda.current_stream())
+                    local_hidden_states.record_stream(_shared_stream)
+                    with torch.cuda.stream(_shared_stream), _dp_shared_expert_sm_cap():
+                        _shared_local = _forward_shared_experts_rank_local(
+                            self.mlp, local_hidden_states
+                        )
+                    _shared_local.record_stream(torch.cuda.current_stream())
+                else:
+                    _shared_local = _forward_shared_experts_rank_local(
+                        self.mlp, local_hidden_states
+                    )
             # The gather ships the whole padded chunk and the MoE runs on it, but
             # graph replay never refreshes pad rows, so they hold stale pool
             # memory (bf16-max scale) that overflows the MoE and the combine.
@@ -3549,24 +3840,46 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and not _use_tp_moe_gather
                 and not _use_tp_attn_a2a_scatter
             )
+            moe_kwargs = {} if _cp_prerouted is None else {"prerouted": _cp_prerouted}
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
+                skip_shared_experts=_do_shared_local or _cp_shared is not None,
                 return_moe_output=return_moe_output,
+                **moe_kwargs,
             )
+            if _cp_prerouted is not None:
+                if envs.SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY.get():
+                    _cp_moe_fp8ag().verify(
+                        self.mlp,
+                        _cp_local_rows,
+                        _cp_prerouted,
+                        hidden_states,
+                        num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+                        input_ids_global=input_ids_global,
+                        run_moe=lambda rows: self.mlp(
+                            rows,
+                            forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            skip_shared_experts=True,
+                        ),
+                    )
+                # Free the gathered FP8 rows before the reduce-scatter.
+                _cp_prerouted = _cp_local_rows = None
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            if self.config.model_type == "deepseek_v41":
-                parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
-            else:
-                hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
+            hidden_states = _cp_moe_return_shard(
+                hidden_states, dsv41=self.config.model_type == "deepseek_v41"
+            )
+            if _cp_shared is not None:
+                if _cp_shared_stream is not None:
+                    torch.cuda.current_stream().wait_stream(_cp_shared_stream)
+                    _cp_shared_input = None
+                hidden_states.add_(_cp_shared)
+                _cp_shared = None
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -3599,6 +3912,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
             if _shared_local is not None:
+                if _shared_stream is not None:
+                    torch.cuda.current_stream().wait_stream(_shared_stream)
                 n = hidden_states.shape[0]
                 hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
@@ -3790,7 +4105,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         state.do_shared_local = do_shared_local
         state.shared_local = (
-            self.mlp._forward_shared_experts(local)
+            _forward_shared_experts_rank_local(self.mlp, local)
             if (do_shared_local and local.shape[0] > 0)
             else None
         )
@@ -4046,6 +4361,50 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
+        # SGLANG_OPT_DSV4_LATE_LAYER_GRAPH: built at the first late-layer entry.
+        self._late_layer_graph: Optional[late_layer_graph.LateLayerGraphRunner] = None
+        self._late_layer_graph_built = False
+
+    def _get_late_layer_graph(
+        self,
+    ) -> Optional[late_layer_graph.LateLayerGraphRunner]:
+        if not self._late_layer_graph_built:
+            self._late_layer_graph = late_layer_graph.make_runner(self)
+            self._late_layer_graph_built = True
+        return self._late_layer_graph
+
+    def _forward_late_layers(
+        self,
+        *,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        input_ids_global: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+    ) -> Tuple[mhc.HcState, List[torch.Tensor]]:
+        """Layers late_layer_start..end_layer on the tail rows: the late part of
+        _forward_layers_hc_pre_from_prev's loop, which the late-layer graph runs on
+        its row block (no Engram, no HIP fused boundary there)."""
+        aux: List[torch.Tensor] = []
+        for i in range(self.late_layer_start, self.end_layer):
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                aux.append(state.residual.mean(dim=1))
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
+                state = self.layers[i].forward_hc_pre_from_prev(
+                    positions=positions,
+                    state=state,
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    input_ids_global=input_ids_global,
+                )
+        state = state.materialized(self.layers[self.end_layer - 1].hc_cfg)
+        return state, aux
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -4086,6 +4445,17 @@ class DeepseekV4Model(nn.Module):
             hc_eps=self.hc_eps,
         )
 
+    def _engram_layers(self) -> List[Tuple[int, Engram]]:
+        layers = getattr(self, "_engram_layer_list", None)
+        if layers is None:
+            layers = [
+                (i, self.layers[i].engram)
+                for i in range(self.start_layer, self.end_layer)
+                if getattr(self.layers[i], "engram", None) is not None
+            ]
+            self._engram_layer_list = layers
+        return layers
+
     def _check_late_layer_tail_readers(self, forward_batch: ForwardBatch) -> None:
         # Rows outside the tail are never computed past the last kv_source layer.
         if (
@@ -4123,20 +4493,29 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        engram_prefetch = None
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
+                hash_full = self.engram_hasher(
                     forward_batch.input_ids[:total], forward_batch
                 )
                 parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                hash_ids = hash_full[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                 if pad_rows > 0:
                     hash_ids = torch.cat(
                         [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                     )
+                engram_prefetch = EngramPrefetch.maybe_start(
+                    self._engram_layers(),
+                    hash_full,
+                    forward_batch,
+                    cp=True,
+                    local_rows=hidden_states.shape[0],
+                    late_layer_start=self.late_layer_start,
+                )
             elif (
                 forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
             ):
@@ -4145,6 +4524,14 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+                engram_prefetch = EngramPrefetch.maybe_start(
+                    self._engram_layers(),
+                    hash_ids,
+                    forward_batch,
+                    cp=False,
+                    local_rows=hash_ids.shape[0],
+                    late_layer_start=self.late_layer_start,
+                )
         tail = None
         if (
             self.late_layer_start is not None
@@ -4181,6 +4568,7 @@ class DeepseekV4Model(nn.Module):
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
         for i in range(self.start_layer, self.end_layer):
+            midforward_hook.maybe_fire(i)
             if tail is not None and i == self.late_layer_start:
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
@@ -4209,6 +4597,27 @@ class DeepseekV4Model(nn.Module):
                         if self.late_layer_vl_routing
                         else None
                     )
+            if (
+                i == self.late_layer_start
+                and tail is not None
+                and late_dp_counts is None
+                and not tail_in_graph
+                and self._get_late_layer_graph() is not None
+            ):
+                late_state = self._late_layer_graph.run(
+                    state=state,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
+                    capture_dspark=capture_dspark,
+                    aux_out=dspark_aux_hidden_states,
+                )
+                if late_state is not None:
+                    state = late_state
+                    break
+            if engram_prefetch is not None:
+                engram_prefetch.reduce_due(i)
             engram = self.layers[i].engram
             if engram is not None:
                 before_engram = state.residual
@@ -4217,6 +4626,9 @@ class DeepseekV4Model(nn.Module):
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
                     cp_all_tokens=cp_extend,
+                    prefetched=(
+                        engram_prefetch.take(i) if engram_prefetch is not None else None
+                    ),
                 )
                 # Only multimodal placeholders become image_token_id, so a text-only
                 # batch skips this full-residual where.
@@ -4490,6 +4902,7 @@ class DeepseekV4Model(nn.Module):
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
             for i in range(self.start_layer, self.end_layer):
+                midforward_hook.maybe_fire(i)
                 layer = self.layers[i]
                 last_layer = layer
                 ctx = (
@@ -4916,6 +5329,38 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if tail.real_rows_count is not None
                 else tail.token_indices
             )
+        return output
+
+    def cp_logits_late_layer_tail(self, forward_batch: ForwardBatch):
+        """Under prefill CP with DSpark capture, the decoder-replay tail whose rows
+        the model body returned (the eager CP runner gathers with its layout)."""
+        if (
+            not self.capture_aux_hidden_states
+            or self.model.late_layer_start is None
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        assert tail is None or tail.global_token_indices is not None
+        return tail
+
+    def cp_logits_on_late_layer_tail(
+        self, tail, forward_batch: ForwardBatch, hidden_states, aux_hidden_states
+    ):
+        """Logits over the gathered tail rows, as forward() does without CP."""
+        indices = tail.global_token_indices
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = self.logits_processor(
+            forward_batch.input_ids[indices],
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+        )
+        output.hidden_states_token_indices = indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

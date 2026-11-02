@@ -24,8 +24,10 @@ import logging
 import time
 from array import array
 from collections import deque
+from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -65,6 +67,10 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import (
+    BatchTokenizedGenerateReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -72,6 +78,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.scheduler_components import midforward_hook
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -110,6 +117,33 @@ logger = logging.getLogger(__name__)
 PREFILL_INPUT_POLL_INTERVAL_S = 0.0001
 
 _is_npu = is_npu()
+
+
+@dataclass
+class _MidForwardState:
+    # Set by the first mid-forward hook that fires in a forward (SGLANG_OPT_PREFILL_
+    # MIDFORWARD_LAYERS); that hook processed the previous batch's result if any.
+    processed_previous: bool = False
+    # SGLANG_OPT_PREFILL_MIDFORWARD_RESULT_SLICE: the rest of the previous batch's
+    # result, one step per request (see process_batch_result_disagg_prefill).
+    result_steps: Optional[Iterator[None]] = None
+    # SGLANG_OPT_PREFILL_EARLY_SEND_IN_HOOK: cached-prefix early sends decided in
+    # run_batch, as (req, end_idx, wait_event); sent by the first hook.
+    early_sends: Optional[List[Tuple[Req, int, Optional[torch.cuda.Event]]]] = None
+    # The last armed layer (SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD runs there).
+    last_layer: int = -1
+
+
+def _is_plain_generate_req(recv_req) -> bool:
+    """A text generate request whose intake touches no GPU state."""
+    if isinstance(recv_req, BatchTokenizedGenerateReqInput):
+        return all(_is_plain_generate_req(sub_req) for sub_req in recv_req)
+    return (
+        isinstance(recv_req, TokenizedGenerateReqInput)
+        and recv_req.mm_inputs is None
+        and recv_req.positional_embed_overrides is None
+        and recv_req.input_embeds is None
+    )
 
 
 def should_force_retry(req: Req) -> bool:
@@ -581,15 +615,33 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
+    def resolve_waiting_queue_bootstrap(
+        self: Scheduler,
+        mark_checked_in_forward: bool = False,
+        skip_checked_in_forward: bool = False,
+    ) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
         Covers the window between leaving the bootstrap queue and being admitted
         into a running batch: aborts requests whose decode peer died, and
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
+
+        SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD: the forward's last mid-forward
+        hook marks the requests it checked, and the next batch's preparation
+        leaves them out. The waiting queue is the same on every rank, so is the
+        candidate list of the collective poll.
         """
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        if skip_checked_in_forward:
+            candidates = [
+                req
+                for req in candidates
+                if getattr(req, "bootstrap_checked_at_forward", None) != self.forward_ct
+            ]
+        elif mark_checked_in_forward:
+            for req in candidates:
+                req.bootstrap_checked_at_forward = self.forward_ct
         if not candidates:
             return
         polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -630,6 +682,8 @@ class SchedulerDisaggregationPrefillMixin:
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        # After SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD's last hook this drain has
+        # only the events that completed since that hook.
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
         )
@@ -638,7 +692,11 @@ class SchedulerDisaggregationPrefillMixin:
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
 
-        self.resolve_waiting_queue_bootstrap()
+        if getattr(self, "_next_batch_prepared_in_forward", False):
+            self._next_batch_prepared_in_forward = False
+            self.resolve_waiting_queue_bootstrap(skip_checked_in_forward=True)
+        else:
+            self.resolve_waiting_queue_bootstrap()
 
         # Skip repeated chunk processing while polling a pending batch.
         if last_batch is None or not last_batch.prefill_chunk_processed:
@@ -746,6 +804,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        midforward_layers = self._midforward_hook_layers()
 
         while True:
             if self.gracefully_exit:
@@ -792,13 +851,34 @@ class SchedulerDisaggregationPrefillMixin:
                 if batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
-                    batch_result = self.run_batch(batch)
+                    midforward = self._arm_midforward_hooks(midforward_layers, batch)
+                    try:
+                        batch_result = self.run_batch(batch)
+                    finally:
+                        midforward_fired = (
+                            midforward_hook.disarm() if midforward else []
+                        )
+                        self._midforward_early_send_sink = None
+                    if midforward is not None:
+                        # Before the WAR barrier: a page-index copy queued behind it
+                        # would wait for this whole forward.
+                        self._finish_midforward_leftovers(midforward)
                     self._apply_war_barrier()
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
+                    midforward = None
+                    midforward_fired = []
+            else:
+                midforward = None
+                midforward_fired = []
 
-            if self.last_batch:
+            if midforward_fired:
+                # The first hook that fired inside this forward already processed
+                # the previous batch's result (the one popped below otherwise) and
+                # polled the transfers.
+                assert midforward.processed_previous or not self.last_batch
+            elif self.last_batch:
                 if self.enable_continuous_input_polling:
                     # Resume intake until the oldest result is ready on all TP ranks.
                     oldest_batch_result = self.result_queue[0][1]
@@ -818,7 +898,8 @@ class SchedulerDisaggregationPrefillMixin:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
 
-            self.process_disagg_prefill_inflight_queue()
+            if not midforward_fired:
+                self.process_disagg_prefill_inflight_queue()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -828,6 +909,162 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+
+    def _midforward_hook_layers(self: Scheduler) -> List[int]:
+        """Layers for SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS, or [] when it cannot apply."""
+        layers = midforward_hook.parse_layers(
+            envs.SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS.get()
+        )
+        if not layers:
+            return []
+        parallel = get_parallel()
+        if (
+            self.enable_continuous_input_polling
+            or parallel.pp_size > 1
+            or parallel.attn_dp_size > 1
+        ):
+            logger.warning(
+                "SGLANG_OPT_PREFILL_MIDFORWARD_LAYERS needs the regular overlap loop, "
+                "PP=1 and attention DP=1; running the bookkeeping after the forward "
+                "as before."
+            )
+            return []
+        logger.info("Prefill mid-forward bookkeeping at layers %s", layers)
+        return layers
+
+    def _arm_midforward_hooks(
+        self: Scheduler, layers: List[int], batch: ScheduleBatch
+    ) -> Optional[_MidForwardState]:
+        """Arm the hooks for this batch's forward; the same decision on every rank."""
+        if not layers or not batch.forward_mode.is_extend():
+            return None
+        if (
+            batch.extend_num_tokens or 0
+        ) < envs.SGLANG_OPT_PREFILL_MIDFORWARD_MIN_TOKENS.get():
+            return None
+        state = _MidForwardState(last_layer=layers[-1])
+        if envs.SGLANG_OPT_PREFILL_EARLY_SEND_IN_HOOK.get():
+            # run_batch's maybe_send_cached_prefix_chunk appends here instead of sending.
+            state.early_sends = []
+            self._midforward_early_send_sink = state.early_sends
+        slice_reqs = envs.SGLANG_OPT_PREFILL_MIDFORWARD_RESULT_SLICE.get()
+        prepare_next = envs.SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD.get()
+
+        def run(layer_id: int) -> None:
+            with (
+                torch.profiler.record_function(f"scheduler.midforward[L{layer_id}]"),
+                self.device_module.stream(self.schedule_stream),
+            ):
+                # Off the forward stream: nothing here may queue behind this forward.
+                if state.early_sends is not None:
+                    # This batch's early sends first, the order run_batch had.
+                    self._send_deferred_early_sends(state)
+                if not state.processed_previous:
+                    state.processed_previous = True
+                    if self.last_batch and self.result_queue:
+                        # Same pop as the loop's: the previous batch's result. Its
+                        # forward finished before this one started on the GPU.
+                        oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                        if slice_reqs > 0:
+                            state.result_steps = self._begin_sliced_batch_result(
+                                oldest_batch, oldest_batch_result
+                            )
+                        else:
+                            self.process_batch_result(oldest_batch, oldest_batch_result)
+                if state.result_steps is not None:
+                    self._advance_result_steps(state, slice_reqs)
+                self.process_disagg_prefill_inflight_queue()
+                self._ingest_generate_requests_midforward()
+                if prepare_next and layer_id == state.last_layer:
+                    self._prepare_next_batch_midforward()
+
+        midforward_hook.arm({layer: partial(run, layer) for layer in layers})
+        return state
+
+    def _send_deferred_early_sends(self: Scheduler, state: _MidForwardState) -> None:
+        """Send the cached-prefix chunks run_batch decided (EARLY_SEND_IN_HOOK)."""
+        early_sends, state.early_sends = state.early_sends, None
+        self._midforward_early_send_sink = None
+        for req, end_idx, wait_event in early_sends:
+            self._send_cached_prefix_chunk(req, end_idx, wait_event)
+
+    def _begin_sliced_batch_result(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> Optional[Iterator[None]]:
+        """process_batch_result whose per-request part stays pending as steps.
+
+        The batch-level work of process_batch_result runs now; the per-request
+        work of process_batch_result_disagg_prefill is returned unstarted, one
+        step per request (the first step also runs its batch-level preamble, the
+        last one its epilogue).
+        """
+        steps: List[Iterator[None]] = []
+        self._prefill_result_steps_sink = steps.append
+        try:
+            self.process_batch_result(batch, result)
+        finally:
+            self._prefill_result_steps_sink = None
+        return steps[0] if steps else None
+
+    def _advance_result_steps(self: Scheduler, state: _MidForwardState, n: int) -> None:
+        for _ in range(n):
+            try:
+                next(state.result_steps)
+            except StopIteration:
+                state.result_steps = None
+                break
+        # Submit the host backups the processed requests queued, as
+        # process_batch_result does after a whole batch.
+        self.tree_cache.flush_pending_backups()
+
+    def _finish_midforward_leftovers(self: Scheduler, state: _MidForwardState) -> None:
+        """After the forward: whatever the hooks left (none fired, or too few)."""
+        with self.device_module.stream(self.schedule_stream):
+            if state.early_sends is not None:
+                self._send_deferred_early_sends(state)
+            if state.result_steps is not None:
+                for _ in state.result_steps:
+                    pass
+                state.result_steps = None
+                self.tree_cache.flush_pending_backups()
+                self.process_disagg_prefill_inflight_queue()
+
+    def _prepare_next_batch_midforward(self: Scheduler) -> None:
+        """The next batch's batch-independent preparation (NEXT_BATCH_IN_FORWARD).
+
+        Building the batch itself here is not safe: it checkpoints the chunked
+        request whose KV this forward is still writing (a HiCache write-through
+        would start before the forward ends, since the schedule stream has not
+        waited for it yet) and may free that request's out-of-window SWA slots,
+        which this forward still reads. Only work that touches neither runs here.
+        """
+        self._process_hicache_events(should_retry_storage_prefetch=True)
+        self.resolve_waiting_queue_bootstrap(mark_checked_in_forward=True)
+        self._next_batch_prepared_in_forward = True
+
+    def _ingest_generate_requests_midforward(self: Scheduler) -> None:
+        """Receive input and dispatch only its leading run of plain generate requests.
+
+        Everything from the first other message on (aborts, pause, control, flush,
+        multimodal input) stays queued in order for the loop's own intake after the
+        forward. The broadcast inside recv_requests is collective; every rank calls
+        this at the same layer, and all ranks keep the same suffix.
+        """
+        self._deferred_input_requests.extend(
+            self.request_receiver.recv_requests(local_reqs=None)
+        )
+        num_plain = 0
+        for recv_req in self._deferred_input_requests:
+            if not _is_plain_generate_req(recv_req):
+                break
+            num_plain += 1
+        if num_plain:
+            recv_reqs = self._deferred_input_requests[:num_plain]
+            del self._deferred_input_requests[:num_plain]
+            self.process_input_requests(recv_reqs)
+        self.waiting_queue.extend(
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        )
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
@@ -864,6 +1101,23 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
         """
+        steps = self._disagg_prefill_result_steps(batch, result)
+        sink = getattr(self, "_prefill_result_steps_sink", None)
+        if sink is not None:
+            # SGLANG_OPT_PREFILL_MIDFORWARD_RESULT_SLICE: the mid-forward hooks run
+            # the steps a few requests at a time.
+            sink(steps)
+            return
+        for _ in steps:
+            pass
+
+    def _disagg_prefill_result_steps(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> Iterator[None]:
+        """process_batch_result_disagg_prefill's body, pausing before each request
+        after the first (one step per request; the last step runs the epilogue)."""
         (
             logits_output,
             next_token_ids,
@@ -928,6 +1182,8 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if i > 0:
+                yield
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -1445,11 +1701,28 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
+        ev = None
         if self.enable_overlap:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+        sink = getattr(self, "_midforward_early_send_sink", None)
+        if sink is not None:
+            # SGLANG_OPT_PREFILL_EARLY_SEND_IN_HOOK: the page-index copy in the
+            # send waits for the prior forward; the first mid-forward hook sends
+            # it, with this forward already queued behind the wait.
+            sink.append((req, cached_end, ev))
+            return
+        self._send_cached_prefix_chunk(req, cached_end, ev)
+
+    def _send_cached_prefix_chunk(
+        self: Scheduler,
+        req: Req,
+        end_idx: int,
+        wait_event: Optional[torch.cuda.Event],
+    ) -> None:
+        if wait_event is not None:
+            req.disagg_kv_sender._early_send_wait_event = wait_event
+        self.send_kv_chunk(req, last_chunk=False, end_idx=end_idx)
 
     def send_kv_chunk(
         self,

@@ -603,6 +603,39 @@ class TestLinearParallelGroups(CustomTestCase):
                         layer(self.x)[0], F.linear(self.x, self.weight)
                     )
 
+    def test_rank_local_allocation_keeps_rows_out_of_symmetric_pool(self):
+        """Under MAX_LEN padding a TP row linear allocates from the symmetric pool,
+        except inside rank_local_allocation() (the DP-local shared expert): a pool
+        that grows on some ranks only registers its segment with a TP collective
+        the other ranks never join (INF-681)."""
+        from sglang.srt.layers import dp_attention
+
+        wrapper = dp_attention._DpGatheredBufferWrapper
+        tp = SimpleNamespace(world_size=4, all_reduce=Mock())
+        layer = RowParallelLinear(
+            8, 8, bias=False, input_is_parallel=False, reduce_results=False
+        )
+        saved = wrapper._dp_max_padding
+        self.addCleanup(setattr, wrapper, "_dp_max_padding", saved)
+        wrapper._dp_max_padding = True
+        with (
+            parallel_scope(tp_group=tp),
+            patch(
+                "sglang.srt.layers.linear.use_symmetric_memory",
+                return_value=nullcontext(),
+            ) as allocator,
+        ):
+            layer(self.x)
+            allocator.assert_called_once_with(tp, disabled=False)
+            allocator.reset_mock()
+            with dp_attention.rank_local_allocation():
+                with dp_attention.rank_local_allocation():
+                    layer(self.x)
+                self.assertFalse(dp_attention.is_allocation_symmetric())
+            allocator.assert_called_once_with(tp, disabled=True)
+            self.assertTrue(dp_attention.is_allocation_symmetric())
+        tp.all_reduce.assert_not_called()
+
     def test_lora_slicing_reads_retained_query_and_kv_groups(self):
         from sglang.srt.lora.layers import (
             ColumnParallelLinearWithLoRA,

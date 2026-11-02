@@ -987,10 +987,20 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
+        prerouted=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
-        the V2/V3 layer-boundary handoff."""
+        the V2/V3 layer-boundary handoff.
+
+        ``prerouted`` (INF-681 k-pfp8): see `forward_prerouted`."""
+        if prerouted is not None:
+            return self.forward_prerouted(
+                hidden_states,
+                prerouted,
+                skip_shared_experts=skip_shared_experts,
+                return_moe_output=return_moe_output,
+            )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -1023,6 +1033,10 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
                 and not is_in_breakable_cuda_graph()
+                # The dual-stream path always runs the shared expert; a caller that
+                # computed it elsewhere (SGLANG_DP_SHARED_EXPERT_LOCAL) would get it
+                # twice on the TP rank that adds the replicated output.
+                and not skip_shared_experts
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1233,6 +1247,51 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def forward_prerouted(
+        self,
+        hidden_states: torch.Tensor,
+        prerouted,
+        *,
+        skip_shared_experts: bool,
+        return_moe_output: bool = False,
+    ) -> Union[torch.Tensor, MoEOutput]:
+        """INF-681 k-pfp8 (layers/quantization/dsv4_cp_moe_fp8ag.py): forward_normal
+        with skip_shared_experts for rows whose top-k (``prerouted.topk_output``) and,
+        optionally, W4A8 row quantization (``prerouted.row_quant``; hidden_states then
+        only carry the shape) the prefill-CP caller computed on its own shard before the
+        all-gather. The caller adds the shared expert (CP-local shared expert)."""
+        assert skip_shared_experts and not self._enable_a2a_moe
+        if prerouted.row_quant is not None:
+            final_hidden_states = self.experts(
+                hidden_states,
+                prerouted.topk_output,
+                pre_quant_input=prerouted.row_quant,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states, prerouted.topk_output)
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _is_xpu
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+        if return_moe_output:
+            return MoEOutput(
+                routed=final_hidden_states,
+                shared=None,
+                experts=self.experts,
+                routed_scaling_factor=self.routed_scaling_factor,
+                shared_is_replicated=self._shared_expert_tp1,
+            )
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts, final_hidden_states, None, self.routed_scaling_factor
+        )
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        return final_hidden_states
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1271,10 +1330,22 @@ class DeepseekV2MoE(nn.Module):
                 and not self._fuse_shared_experts_inside_sbo
                 and not skip_shared_experts
             ):
+                shared_pre_quant = pre_quant_input
+                if (
+                    shared_pre_quant is None
+                    and envs.SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT.get()
+                ):
+                    # INF-681 k-qcp: one pass quantizes the input for both the shared
+                    # expert (returned) and the W4A8 routed experts (handed to them).
+                    from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+                    shared_pre_quant = dsv4_prefill_qcp.offer_dual_quant(
+                        self, hidden_states
+                    )
                 shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    pre_quant_input=pre_quant_input,
+                    pre_quant_input=shared_pre_quant,
                 )
             # router_logits: (num_tokens, n_experts)
             if _is_hip:
@@ -1345,6 +1416,31 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+        # INF-681 k-qcp (SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM): offer the shared
+        # output to the W4A8 prefill experts' top-k sum, which then adds it in place.
+        qcp_armed = False
+        if (
+            shared_output is not None
+            and not return_moe_output
+            and not self._shared_expert_tp1
+            and envs.SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM.get()
+        ):
+            from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+            qcp_armed = dsv4_prefill_qcp.arm_shared_add(
+                self.experts, shared_output, self.routed_scaling_factor
+            )
+        # INF-681 k-pmoe (SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD): the W4A8 prefill experts
+        # add the shared expert's output inside their top-k sum and return shared + routed.
+        fused_shared_add = (
+            shared_output is not None
+            and not self._shared_expert_tp1
+            and not return_moe_output
+            and hasattr(self.experts.quant_method, "accepts_shared_add")
+            and self.experts.quant_method.accepts_shared_add(self.experts)
+        )
+        if fused_shared_add:
+            self.experts.quant_method.set_pending_shared_add(shared_output)
         if pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
@@ -1356,6 +1452,22 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
+        if envs.SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT.get():
+            from sglang.srt.layers.quantization import dsv4_prefill_qcp
+
+            dsv4_prefill_qcp.withdraw_row_quant(
+                self
+            )  # an offer the experts did not take
+        if qcp_armed and dsv4_prefill_qcp.disarm_shared_add(self.experts):
+            if self.reduce_results:
+                return post_experts_all_reduce(shared_output)
+            return shared_output
+        if (
+            fused_shared_add
+            and self.experts.quant_method.take_unconsumed_shared_add() is not None
+        ):
+            # No apply() took it (another expert path ran): add it the usual way below.
+            fused_shared_add = False
         if (
             not _is_cuda
             and not _is_musa
@@ -1390,7 +1502,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
+            None if (self._shared_expert_tp1 or fused_shared_add) else shared_output,
             self.routed_scaling_factor,
         )
         if self.reduce_results:
