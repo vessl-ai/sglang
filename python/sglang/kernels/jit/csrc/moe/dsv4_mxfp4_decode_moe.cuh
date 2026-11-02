@@ -31,9 +31,8 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_bf16.h>
-
 #include <cstdint>
+#include <cuda_bf16.h>
 #include <type_traits>
 
 namespace sglang {
@@ -69,7 +68,9 @@ SGL_DEVICE void cp_async16(uint32_t smem_addr, const void* gmem) {
 SGL_DEVICE void cp_async4(uint32_t smem_addr, const void* gmem) {
   asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(smem_addr), "l"(gmem));
 }
-SGL_DEVICE void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+SGL_DEVICE void cp_async_commit() {
+  asm volatile("cp.async.commit_group;");
+}
 template <int N>
 SGL_DEVICE void cp_async_wait() {
   asm volatile("cp.async.wait_group %0;" ::"n"(N));
@@ -114,7 +115,9 @@ SGL_DEVICE void dequant8(uint32_t q, uint32_t m_lo, uint32_t m_hi, uint32_t (&a)
   a[3] = bf16x2_mul(a3, m_hi);  // channel g+8, k 2c+8..2c+9
 }
 
-SGL_DEVICE float bf16_round(float v) { return __bfloat162float(__float2bfloat16_rn(v)); }
+SGL_DEVICE float bf16_round(float v) {
+  return __bfloat162float(__float2bfloat16_rn(v));
+}
 
 // ---------------------------------------------------------------------------------------------
 // kWarps warps per CTA, kTiles 16-channel tiles per warp, kK reduction length, kKC elements of K
@@ -124,12 +127,22 @@ SGL_DEVICE float bf16_round(float v) { return __bfloat162float(__float2bfloat16_
 // each reduce one contiguous K range of the same channels (partial sums added through shared memory
 // at the end; same per-element k order inside a group, so the gate/up split changes rounding only
 // in the final fp32 add of the two halves).
-template <int kWarps, int kTiles, int kK, int kKC, int kStages, int kMaxCh, int kRing, int kMinBlocks, bool kGateUp, int kKSplit>
+template <
+    int kWarps,
+    int kTiles,
+    int kK,
+    int kKC,
+    int kStages,
+    int kMaxCh,
+    int kRing,
+    int kMinBlocks,
+    bool kGateUp,
+    int kKSplit>
 struct Config {
   static constexpr int kWarpsTotal = kWarps * kKSplit;
   static constexpr int kThreads = kWarpsTotal * 32;
   static constexpr int kRows = 8 * kMaxCh;
-  static constexpr int kUnits = kKC / 8;  // 16-byte units per staged X row
+  static constexpr int kUnits = kKC / 8;            // 16-byte units per staged X row
   static constexpr int kSteps = kK / 64 / kKSplit;  // k64 steps per K group
   static constexpr int kStepsPerChunk = kKC / 64;
   static constexpr int kChunks = kK / kKC / kKSplit;  // X chunks per K group
@@ -154,8 +167,19 @@ struct Config {
   static_assert(kChunks == 1 || kRing - 1 <= (kStages - 1) * kStepsPerChunk, "X chunk lead");
 };
 
-template <int kWarps, int kTiles, int kK, int kKC, int kStages, int kMaxCh, int kRing, int kMinBlocks, bool kGateUp, int kKSplit>
-__global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_kernel(const __grid_constant__ Params p) {
+template <
+    int kWarps,
+    int kTiles,
+    int kK,
+    int kKC,
+    int kStages,
+    int kMaxCh,
+    int kRing,
+    int kMinBlocks,
+    bool kGateUp,
+    int kKSplit>
+__global__ void __launch_bounds__(kWarps* kKSplit * 32, kMinBlocks)
+    decode_moe_kernel(const __grid_constant__ Params p) {
   using C = Config<kWarps, kTiles, kK, kKC, kStages, kMaxCh, kRing, kMinBlocks, kGateUp, kKSplit>;
   constexpr int kThreads = C::kThreads;
   constexpr int kRows = C::kRows;
@@ -175,7 +199,7 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
   const int block = blockIdx.y;
   const int tid = threadIdx.x;
   const int warp_all = tid / 32;
-  const int warp = warp_all % kWarps;  // channel warp
+  const int warp = warp_all % kWarps;    // channel warp
   const int kgroup = warp_all / kWarps;  // K range of this warp
   const int lane = tid % 32;
   const int g = lane / 4;
@@ -187,9 +211,11 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
   // Offset of this expert's slots in sorted order = sum of counts of lower experts.
   if (warp_all == 0) {
     int acc = 0;
-    for (int e = lane; e < expert; e += 32) acc += p.counts[e];
+    for (int e = lane; e < expert; e += 32)
+      acc += p.counts[e];
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    for (int o = 16; o > 0; o >>= 1)
+      acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (lane == 0) s_offset = acc;
   }
   __syncthreads();
@@ -229,37 +255,39 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
           const int src = row_src[r];
           if (src >= 0) {
             const __nv_bfloat16* gsrc = p.x + static_cast<size_t>(src) * kK + (grp * kChunks + chunk) * kKC + u * 8;
-            cp_async16(xs_base + 2u * ((grp * kSmemStages + stage) * kStageElems + r * kKC + ((u ^ (r & 7)) * 8)), gsrc);
+            cp_async16(
+                xs_base + 2u * ((grp * kSmemStages + stage) * kStageElems + r * kKC + ((u ^ (r & 7)) * 8)), gsrc);
           }
         }
       };
       auto issue_weights = [&](int step) {
         const int slot = step % kRing;
-  #pragma unroll
+#pragma unroll
         for (int f = 0; f < kTiles; ++f)
           cp_async16(ring_base + ((slot * kFrags + f) * kThreads) * 16, wq + (step * kTiles + f) * 32);
         cp_async4(sring_base + slot * (C::kWarpsTotal * 128), ws + step * 128);
       };
 
       // Prologue: X chunks 0..kStages-2 in the first group, then one group per weight step.
-  #pragma unroll
+#pragma unroll
       for (int i = 0; i < kStages - 1; ++i)
         if (i < kChunks) issue_chunk(i);
-  #pragma unroll
+#pragma unroll
       for (int i = 0; i < kRing - 1; ++i) {
         if (i < kSteps) issue_weights(i);
         cp_async_commit();
       }
 
       float acc[kTiles][kNch][4];
-  #pragma unroll
+#pragma unroll
       for (int t = 0; t < kTiles; ++t)
-  #pragma unroll
+#pragma unroll
         for (int ch = 0; ch < kNch; ++ch)
-  #pragma unroll
-          for (int i = 0; i < 4; ++i) acc[t][ch][i] = 0.f;
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            acc[t][ch][i] = 0.f;
 
-  #pragma unroll 1
+#pragma unroll 1
       for (int s = 0; s < kSteps; ++s) {
         cp_async_wait<kRing - 2>();  // this thread's step-s weights (and X chunk) have landed
         if (s % kStepsPerChunk == 0) {
@@ -276,31 +304,35 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
         const uint4 scur = sring_ptr[slot * (C::kWarpsTotal * 8)];  // this lane's group record (broadcast)
         const uint32_t sw[4] = {scur.x, scur.y, scur.z, scur.w};
 
-  #pragma unroll
+#pragma unroll
         for (int half = 0; half < 2; ++half) {
           // B fragments of k16 sub-steps 2*half and 2*half+1 for every row chunk.
           uint32_t bfrag[kNch][2][2];
-  #pragma unroll
+#pragma unroll
           for (int ch = 0; ch < kNch; ++ch) {
             {
               const int r = ch * 8 + (lane % 8);
               const int unit = (kin + half * 32) / 8 + lane / 8;
-              ldmatrix_x4(xs_base + 2u * (stage * kStageElems + r * kKC + ((unit ^ (r & 7)) * 8)), bfrag[ch][0][0],
-                          bfrag[ch][0][1], bfrag[ch][1][0], bfrag[ch][1][1]);
+              ldmatrix_x4(
+                  xs_base + 2u * (stage * kStageElems + r * kKC + ((unit ^ (r & 7)) * 8)),
+                  bfrag[ch][0][0],
+                  bfrag[ch][0][1],
+                  bfrag[ch][1][0],
+                  bfrag[ch][1][1]);
             }
           }
-  #pragma unroll
+#pragma unroll
           for (int t = 0; t < kTiles; ++t) {
             const uint4 wt = ring_ptr[(slot * kFrags + t) * kThreads];
             const uint32_t q2[2] = {half == 0 ? wt.x : wt.z, half == 0 ? wt.y : wt.w};
             // scale bytes of tile t: [blk0 ch g, blk0 ch g+8, blk1 ch g, blk1 ch g+8]; half == k32 block.
             const uint32_t m_lo = half == 0 ? scale_mult<0>(sw[t]) : scale_mult<2>(sw[t]);
             const uint32_t m_hi = half == 0 ? scale_mult<1>(sw[t]) : scale_mult<3>(sw[t]);
-  #pragma unroll
+#pragma unroll
             for (int jj = 0; jj < 2; ++jj) {
               uint32_t a[4];
               dequant8(q2[jj], m_lo, m_hi, a);
-  #pragma unroll
+#pragma unroll
               for (int ch = 0; ch < kNch; ++ch) {
                 mma_bf16(acc[t][ch], a, bfrag[ch][jj][0], bfrag[ch][jj][1]);
               }
@@ -319,7 +351,8 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
 #pragma unroll
             for (int ch = 0; ch < kNch; ++ch)
 #pragma unroll
-              for (int i = 0; i < 4; ++i) red[(((warp * kTiles + t) * kNch + ch) * 4 + i) * 32 + lane] = acc[t][ch][i];
+              for (int i = 0; i < 4; ++i)
+                red[(((warp * kTiles + t) * kNch + ch) * 4 + i) * 32 + lane] = acc[t][ch][i];
         }
         __syncthreads();
         if (kgroup == 0) {
@@ -328,54 +361,55 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
 #pragma unroll
             for (int ch = 0; ch < kNch; ++ch)
 #pragma unroll
-              for (int i = 0; i < 4; ++i) acc[t][ch][i] += red[(((warp * kTiles + t) * kNch + ch) * 4 + i) * 32 + lane];
+              for (int i = 0; i < 4; ++i)
+                acc[t][ch][i] += red[(((warp * kTiles + t) * kNch + ch) * 4 + i) * 32 + lane];
         }
       }
       if (kgroup == 0) {
-      // Epilogue. Thread holds D[channel g / g+8][row 2c / 2c+1] of each (tile, chunk).
-      if constexpr (kGateUp) {
-  #pragma unroll
-        for (int tp = 0; tp < 2; ++tp) {
-  #pragma unroll
-          for (int ch = 0; ch < kNch; ++ch) {
-            {
-  #pragma unroll
-              for (int i = 0; i < 4; ++i) {
-                const int r = ch * 8 + 2 * c + (i & 1);
-                if (r < nrows) {
-                  const int chan = (block * kWarps + warp) * 32 + tp * 16 + g + 8 * (i >> 1);
-                  float gate = bf16_round(acc[tp][ch][i]);
-                  float up = bf16_round(acc[tp + 2][ch][i]);
-                  const float lim = p.limit;
-                  gate = gate > lim ? lim : gate;
-                  up = up > lim ? lim : (up < -lim ? -lim : up);
-                  const float act = bf16_round(gate / (1.0f + expf(-gate)));
-                  p.out[static_cast<size_t>(offset + r0 + r) * p.out_ld + chan] = __float2bfloat16_rn(act * up);
+        // Epilogue. Thread holds D[channel g / g+8][row 2c / 2c+1] of each (tile, chunk).
+        if constexpr (kGateUp) {
+#pragma unroll
+          for (int tp = 0; tp < 2; ++tp) {
+#pragma unroll
+            for (int ch = 0; ch < kNch; ++ch) {
+              {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                  const int r = ch * 8 + 2 * c + (i & 1);
+                  if (r < nrows) {
+                    const int chan = (block * kWarps + warp) * 32 + tp * 16 + g + 8 * (i >> 1);
+                    float gate = bf16_round(acc[tp][ch][i]);
+                    float up = bf16_round(acc[tp + 2][ch][i]);
+                    const float lim = p.limit;
+                    gate = gate > lim ? lim : gate;
+                    up = up > lim ? lim : (up < -lim ? -lim : up);
+                    const float act = bf16_round(gate / (1.0f + expf(-gate)));
+                    p.out[static_cast<size_t>(offset + r0 + r) * p.out_ld + chan] = __float2bfloat16_rn(act * up);
+                  }
+                }
+              }
+            }
+          }
+        } else {
+#pragma unroll
+          for (int t = 0; t < kTiles; ++t) {
+#pragma unroll
+            for (int ch = 0; ch < kNch; ++ch) {
+              {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                  const int r = ch * 8 + 2 * c + (i & 1);
+                  if (r < nrows) {
+                    const int sorted = offset + r0 + r;
+                    const int chan = ((block * kWarps + warp) * kTiles + t) * 16 + g + 8 * (i >> 1);
+                    const float v = acc[t][ch][i] * p.gammas[sorted];
+                    p.out[static_cast<size_t>(p.combine[sorted]) * p.out_ld + chan] = __float2bfloat16_rn(v);
+                  }
                 }
               }
             }
           }
         }
-      } else {
-  #pragma unroll
-        for (int t = 0; t < kTiles; ++t) {
-  #pragma unroll
-          for (int ch = 0; ch < kNch; ++ch) {
-            {
-  #pragma unroll
-              for (int i = 0; i < 4; ++i) {
-                const int r = ch * 8 + 2 * c + (i & 1);
-                if (r < nrows) {
-                  const int sorted = offset + r0 + r;
-                  const int chan = ((block * kWarps + warp) * kTiles + t) * 16 + g + 8 * (i >> 1);
-                  const float v = acc[t][ch][i] * p.gammas[sorted];
-                  p.out[static_cast<size_t>(p.combine[sorted]) * p.out_ld + chan] = __float2bfloat16_rn(v);
-                }
-              }
-            }
-          }
-        }
-      }
       }  // kgroup == 0
       cp_async_wait<0>();
       __syncthreads();  // smem stages and row_src are reused by the next row pass
@@ -399,10 +433,19 @@ __global__ void __launch_bounds__(kWarps * kKSplit * 32, kMinBlocks) decode_moe_
   }
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Host entry points
-template <int kWarps, int kTiles, int kK, int kKC, int kStages, int kMaxCh, int kRing, int kMinBlocks, bool kGateUp, int kKSplit>
+template <
+    int kWarps,
+    int kTiles,
+    int kK,
+    int kKC,
+    int kStages,
+    int kMaxCh,
+    int kRing,
+    int kMinBlocks,
+    bool kGateUp,
+    int kKSplit>
 void launch(const Params& prm, int num_blocks, DLDevice device) {
   using namespace host;
   using C = Config<kWarps, kTiles, kK, kKC, kStages, kMaxCh, kRing, kMinBlocks, kGateUp, kKSplit>;
@@ -463,7 +506,6 @@ inline void down(
   prm.out_ld = static_cast<int>(out.size(1));
   launch<4, 4, 576, 576, 2, 4, 3, 3, false, 1>(prm, 20, h.device());
 }
-
 
 }  // namespace dsv4_decode_moe
 }  // namespace sglang

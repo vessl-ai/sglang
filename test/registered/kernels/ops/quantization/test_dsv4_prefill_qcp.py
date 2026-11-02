@@ -71,8 +71,10 @@ def test_wo_b_from_grouped_matches_block128_linear(rows):
 
     g = torch.Generator(device="cuda").manual_seed(7)
     n, k = 5120, 8192
-    weight = (torch.randn(n, k, device="cuda", generator=g) * 100).clamp(-448, 448).to(
-        torch.float8_e4m3fn
+    weight = (
+        (torch.randn(n, k, device="cuda", generator=g) * 100)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
     )
     scale = torch.exp2(
         torch.randint(-12, -6, (n // 128, k // 128), device="cuda", generator=g).float()
@@ -86,7 +88,9 @@ def test_wo_b_from_grouped_matches_block128_linear(rows):
     assert got is not None
     assert torch.equal(got, ref)
     # A TP-reduced wo_b keeps the regular path.
-    assert wo_b_from_grouped(y, SimpleNamespace(**{**vars(layer), "tp_size": 4})) is None
+    assert (
+        wo_b_from_grouped(y, SimpleNamespace(**{**vars(layer), "tp_size": 4})) is None
+    )
 
 
 def _sum_inputs(tokens, top_k, hidden, seed):
@@ -119,7 +123,9 @@ def test_topk_sum_add_matches_sum_then_add(tokens, alpha):
     pos = torch.randint(-1, down.shape[0], (tokens * top_k,), device="cuda").int()
     routed = _topk_sum_by_pos(down, pos, torch.empty_like(shared), top_k)
     ref = shared.clone().add_(routed, alpha=alpha)
-    assert torch.equal(topk_sum_by_pos_add(down, pos, shared.clone(), top_k, alpha), ref)
+    assert torch.equal(
+        topk_sum_by_pos_add(down, pos, shared.clone(), top_k, alpha), ref
+    )
 
 
 def _experts_and_method(small_step_rows: int):
@@ -207,8 +213,10 @@ def test_gran128_linear_takes_prequantized_activation(rows):
 
     g = torch.Generator(device="cuda").manual_seed(11)
     n, k = 1152, 5120
-    weight = (torch.randn(n, k, device="cuda", generator=g) * 100).clamp(-448, 448).to(
-        torch.float8_e4m3fn
+    weight = (
+        (torch.randn(n, k, device="cuda", generator=g) * 100)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
     )
     scale = torch.exp2(
         torch.randint(-12, -6, (n // 128, k // 128), device="cuda", generator=g).float()
@@ -222,7 +230,9 @@ def test_gran128_linear_takes_prequantized_activation(rows):
         fp8_block32_gran128.apply(layer, (x, x), None)
 
 
-@pytest.mark.parametrize("small_step_rows,rows,offered", [(0, 300, True), (512, 300, False)])
+@pytest.mark.parametrize(
+    "small_step_rows,rows,offered", [(0, 300, True), (512, 300, False)]
+)
 def test_experts_take_the_offered_row_quant(small_step_rows, rows, offered):
     from sglang.srt.layers.quantization import dsv4_prefill_qcp as qcp
 
@@ -232,7 +242,8 @@ def test_experts_take_the_offered_row_quant(small_step_rows, rows, offered):
     moe = SimpleNamespace(
         shared_experts=SimpleNamespace(
             gate_up_proj=SimpleNamespace(
-                dense_gran128=True, weight=torch.empty(2 * 128, helpers.H, device="cuda")
+                dense_gran128=True,
+                weight=torch.empty(2 * 128, helpers.H, device="cuda"),
             )
         ),
         experts=SimpleNamespace(quant_method=method),

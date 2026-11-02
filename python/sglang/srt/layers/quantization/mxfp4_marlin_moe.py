@@ -76,7 +76,6 @@ def _is_late_w4a16_layer(prefix: str) -> bool:
     return True
 
 
-
 def _moe_output_like(hidden_states: torch.Tensor) -> torch.Tensor:
     """The routed-expert output buffer. INF-681 SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT: under
     attention DP with MAX_LEN padding the DP reduce-scatter reads this buffer, and from the
@@ -96,6 +95,7 @@ def _moe_output_like(hidden_states: torch.Tensor) -> torch.Tensor:
         get_parallel().tp_group, disabled=not is_allocation_symmetric()
     ):
         return torch.empty_like(hidden_states)
+
 
 class ExpertRouting(NamedTuple):
     """Top-k slots sorted by expert, for triton_kernels' ragged expert matmuls."""
@@ -581,7 +581,9 @@ class Mxfp4MarlinMoEMethod:
         if w4a8:
             # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
             dk.prepare(self._sm90_packed.w13.device.index)
-            if self._sm90_decode_w4a8_v2:  # INF-681 k-dmoe2: the same for the v2 kernels
+            if (
+                self._sm90_decode_w4a8_v2
+            ):  # INF-681 k-dmoe2: the same for the v2 kernels
                 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2
 
                 dsv4_mxfp4_decode_moe_v2.prepare(self._sm90_packed.w13.device.index)

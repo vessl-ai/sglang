@@ -23,7 +23,10 @@ pytestmark = pytest.mark.skipif(
 
 HIDDEN, INTERMEDIATE = 5120, 576  # TP4 shard of 2304
 SWIGLU_LIMIT = 10.0
-SHAPES = {"target": (384, 6, 6), "draft": (128, 3, 5)}  # (experts, top_k, rows per request)
+SHAPES = {
+    "target": (384, 6, 6),
+    "draft": (128, 3, 5),
+}  # (experts, top_k, rows per request)
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
 
@@ -53,7 +56,8 @@ def _layer(cpu_weights, num_experts, top_k, mode, monkeypatch):
 
     monkeypatch.setenv("SGLANG_OPT_DSV4_TRITON_KERNELS_MOE", "0")
     monkeypatch.setenv(
-        "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE", "1" if mode in ("tk", "rows") else "0"
+        "SGLANG_OPT_DSV4_TRITON_KERNELS_MOE_DECODE",
+        "1" if mode in ("tk", "rows") else "0",
     )
     monkeypatch.setenv(
         "SGLANG_OPT_DSV4_DECODE_MOE_ROWS_AWARE_TILES", "1" if mode == "rows" else "0"
@@ -104,7 +108,10 @@ def _dispatch(rows, num_experts, top_k, seed, rows_per_req=1, masked_rows=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
     req_logits = torch.randn(
-        (rows + rows_per_req - 1) // rows_per_req, num_experts, device="cuda", generator=g
+        (rows + rows_per_req - 1) // rows_per_req,
+        num_experts,
+        device="cuda",
+        generator=g,
     )
     logits = req_logits.repeat_interleave(rows_per_req, 0)[:rows]
     logits = logits + 0.5 * torch.randn(rows, num_experts, device="cuda", generator=g)
@@ -114,7 +121,9 @@ def _dispatch(rows, num_experts, top_k, seed, rows_per_req=1, masked_rows=0):
     if masked_rows:
         ids[-masked_rows:] = -1
     topk = StandardTopKOutput(topk_weights=weights, topk_ids=ids, router_logits=logits)
-    return StandardDispatchOutput(hidden_states=x, hidden_states_scale=None, topk_output=topk)
+    return StandardDispatchOutput(
+        hidden_states=x, hidden_states_scale=None, topk_output=topk
+    )
 
 
 def _dequant(weight, scale):
@@ -136,7 +145,9 @@ def test_rows_aware_tiles_bit_identical(shape, monkeypatch):
     tk = _layer(w, num_experts, top_k, "tk", monkeypatch)
     rows = _layer(w, num_experts, top_k, "rows", monkeypatch)
     for bs in (8, 64, 125, 160, 192):
-        d = _dispatch(bs * rows_per_req, num_experts, top_k, bs, rows_per_req, masked_rows=3)
+        d = _dispatch(
+            bs * rows_per_req, num_experts, top_k, bs, rows_per_req, masked_rows=3
+        )
         assert torch.equal(_apply(*rows, d), _apply(*tk, d)), bs
     if shape == "target":  # prefill-sized batches take the 32- and 64-row tiles
         for n in (1536, 4096):
@@ -159,8 +170,18 @@ def test_sm90_down_dequant_exact():
     h[torch.arange(n, device="cuda"), col[order]] = 1.0
     y = torch.empty(n, HIDDEN, device="cuda", dtype=torch.bfloat16)
     counts = torch.bincount(expert, minlength=8).int()
-    dk._module().down(h, packed.w2_q, packed.w2_s, counts, order.int(), torch.ones(n, device="cuda"), y)
-    ref = torch.stack([_dequant(w2[expert[o]], s2[expert[o]])[:, col[o]] for o in range(n)])
+    dk._module().down(
+        h,
+        packed.w2_q,
+        packed.w2_s,
+        counts,
+        order.int(),
+        torch.ones(n, device="cuda"),
+        y,
+    )
+    ref = torch.stack(
+        [_dequant(w2[expert[o]], s2[expert[o]])[:, col[o]] for o in range(n)]
+    )
     assert torch.equal(y.float(), ref)
 
 
@@ -172,8 +193,12 @@ def test_sm90_kernel_matches_triton_decode(shape, monkeypatch):
     sm90 = _layer(w, num_experts, top_k, "sm90", monkeypatch)
     w13 = _dequant(w["w13_weight"], w["w13_weight_scale_inv"])
     for bs in (1, 8, 48, 125, 192):
-        d = _dispatch(bs * rows_per_req, num_experts, top_k, bs, rows_per_req, masked_rows=2)
-        counts = torch.bincount(d.topk_output.topk_ids.clamp_min(0).flatten().long(), minlength=num_experts)
+        d = _dispatch(
+            bs * rows_per_req, num_experts, top_k, bs, rows_per_req, masked_rows=2
+        )
+        counts = torch.bincount(
+            d.topk_output.topk_ids.clamp_min(0).flatten().long(), minlength=num_experts
+        )
         out = _apply(*sm90, d)
         assert not torch.isnan(out).any()
         assert torch.equal(out, _apply(*tk, d)), (bs, int(counts.max()))
@@ -196,7 +221,9 @@ def test_sm90_kernel_cuda_graph_replay(shape, monkeypatch):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = _apply(method, layer, static)
-        fresh = _dispatch(rows, num_experts, top_k, 2000 + bs, rows_per_req, masked_rows=1)
+        fresh = _dispatch(
+            rows, num_experts, top_k, 2000 + bs, rows_per_req, masked_rows=1
+        )
         static.hidden_states.copy_(fresh.hidden_states)
         static.topk_output.topk_ids.copy_(fresh.topk_output.topk_ids)
         static.topk_output.topk_weights.copy_(fresh.topk_output.topk_weights)

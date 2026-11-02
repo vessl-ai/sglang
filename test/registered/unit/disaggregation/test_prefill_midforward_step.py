@@ -99,7 +99,9 @@ class _StepScheduler(hook_tests._HookScheduler):
         self.events.append(("send", req.rid, self.in_forward, self.cur_layer, detail))
 
     def checkpoint_disagg_prefill(self, req):
-        self.events.append(("result_req", req.rid, self.in_forward, self.cur_layer, None))
+        self.events.append(
+            ("result_req", req.rid, self.in_forward, self.cur_layer, None)
+        )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
         self.hicache_drains.append((self.in_forward, self.cur_layer))
@@ -183,8 +185,12 @@ class TestPrefillMidForwardStep(CustomTestCase):
         self.assertEqual({w[f"1.{j}"] for j in range(5)}, {(2, 1)})
         # Sliced: two at layer 1, two at layer 3, the last at layer 5.
         s = _where(sliced, "result_req")
-        self.assertEqual([s[f"1.{j}"] for j in range(5)], [(2, 1), (2, 1), (2, 3), (2, 3), (2, 5)])
-        self.assertEqual([s[f"2.{j}"] for j in range(5)], [(3, 1), (3, 1), (3, 3), (3, 3), (3, 5)])
+        self.assertEqual(
+            [s[f"1.{j}"] for j in range(5)], [(2, 1), (2, 1), (2, 3), (2, 3), (2, 5)]
+        )
+        self.assertEqual(
+            [s[f"2.{j}"] for j in range(5)], [(3, 1), (3, 1), (3, 3), (3, 3), (3, 5)]
+        )
         # Batch 3's successor came two iterations later: after the forward, as before.
         self.assertEqual({s[f"3.{j}"] for j in range(5)}, {(None, None)})
         # Host backups submitted after every slice.
@@ -199,7 +205,10 @@ class TestPrefillMidForwardStep(CustomTestCase):
         self.assertEqual(_order(sliced), _order(whole))
         s = _where(sliced, "result_req")
         # Two in forward 2's only hook, the other three right after that forward.
-        self.assertEqual([s[f"1.{j}"] for j in range(5)], [(2, 6), (2, 6), (None, None), (None, None), (None, None)])
+        self.assertEqual(
+            [s[f"1.{j}"] for j in range(5)],
+            [(2, 6), (2, 6), (None, None), (None, None), (None, None)],
+        )
         # Every request of batch 1 was done before batch 3 was launched.
         launches = [a for a in sliced.actions if a[1] == "launch"]
         self.assertEqual([a[2] for a in launches], [1, 2, 3, 4])
@@ -223,8 +232,16 @@ class TestPrefillMidForwardStep(CustomTestCase):
         self.assertEqual(hook_tests._launches(moved), hook_tests._launches(before))
         # The same sends with the same end index and wait event, in the same order.
         self.assertEqual(_order(moved, "send"), _order(before, "send"))
-        early_before = {e[1]: (e[2], e[3]) for e in before.events if e[0] == "send" and e[4] != "last"}
-        early_moved = {e[1]: (e[2], e[3]) for e in moved.events if e[0] == "send" and e[4] != "last"}
+        early_before = {
+            e[1]: (e[2], e[3])
+            for e in before.events
+            if e[0] == "send" and e[4] != "last"
+        }
+        early_moved = {
+            e[1]: (e[2], e[3])
+            for e in moved.events
+            if e[0] == "send" and e[4] != "last"
+        }
         # Today: before the launch. Moved: in the first hook of the batch's own forward.
         self.assertEqual(set(early_before.values()), {(None, None)})
         for rid, where in early_moved.items():
@@ -290,7 +307,9 @@ class TestPrefillMidForwardStep(CustomTestCase):
             req.disagg_kv_sender = f"sender-{req.rid}"
         scheduler.waiting_queue = list(old)
         scheduler.forward_ct = 7
-        with patch.object(prefill_mod, "poll_and_all_reduce_attn_cp_tp_group", fake_poll):
+        with patch.object(
+            prefill_mod, "poll_and_all_reduce_attn_cp_tp_group", fake_poll
+        ):
             # The last hook of forward 7: all three checked.
             scheduler._prepare_next_batch_midforward()
             # A request popped from the bootstrap queue after that hook.

@@ -562,15 +562,19 @@ def _row_quant_perm(x: torch.Tensor, bk: int):
     M, N = x.shape
     y = torch.empty(M, N, device=x.device, dtype=torch.float8_e4m3fn)
     s = torch.empty(M, device=x.device, dtype=torch.float32)
-    _row_quant_perm_kernel[(M,)](
-        x, y, s, N, bk, triton.next_power_of_2(N), num_warps=8
-    )
+    _row_quant_perm_kernel[(M,)](x, y, s, N, bk, triton.next_power_of_2(N), num_warps=8)
     return y, s
 
 
 @triton.jit
 def _swiglu_quant_perm_kernel(
-    GU, Y, S, I: tl.constexpr, LIMIT: tl.constexpr, BK: tl.constexpr, BLOCK: tl.constexpr
+    GU,
+    Y,
+    S,
+    I: tl.constexpr,
+    LIMIT: tl.constexpr,
+    BK: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     r = tl.program_id(0).to(tl.int64)
     o = tl.arange(0, BLOCK)
@@ -606,7 +610,9 @@ def _direct_hist_kernel(IDS, COUNTS, n_slots, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _direct_items(SCHED, c, ex, em, e, max_items, BR: tl.constexpr, BLOCK_J: tl.constexpr):
+def _direct_items(
+    SCHED, c, ex, em, e, max_items, BR: tl.constexpr, BLOCK_J: tl.constexpr
+):
     # Expert e's row blocks of BR rows go to SCHED[first block of e + j] = e << 16 | j;
     # program 0 also writes -1 from the last block to max_items.
     blocks = (c + BR - 1) // BR
@@ -861,7 +867,9 @@ def _w4a8_direct_kernel(
                 ).to(tl.int32)
                 dd = ((s - smax[:, None] + 6) * 8 + 128).to(tl.uint8)
             x_lo = tl.load(
-                X + src[:, None] * K + (k0 + jb)[None, :], mask=rmask[:, None], other=0.0
+                X + src[:, None] * K + (k0 + jb)[None, :],
+                mask=rmask[:, None],
+                other=0.0,
             )
             x_hi = tl.load(
                 X + src[:, None] * K + (k0 + BK // 2 + jb)[None, :],
@@ -1098,11 +1106,15 @@ class Mxfp4W4A8PrefillExperts:
         if fold is not None:  # INF-681 k-qcp: shared-expert add in the top-k sum
             # int4: the k-pmoe hand-over (add_to) is off whenever the k-qcp one is armed
             # (Mxfp4MarlinMoEMethod._prepare_w4a8_weights), so the add happens once.
-            assert add_to is None, "both shared-add fusions armed: the add would run twice"
+            assert add_to is None, (
+                "both shared-add fusions armed: the add would run twice"
+            )
             return _qcp.topk_sum_by_pos_add(down, routing.pos, fold[0], top_k, fold[1])
         if add_to is not None:  # add_to += sum, rounded like a separate bf16 add
             return _topk_sum_by_pos(down, routing.pos, add_to, top_k, True)
-        return _topk_sum_by_pos(down, routing.pos, torch.empty_like(hidden_states), top_k)
+        return _topk_sum_by_pos(
+            down, routing.pos, torch.empty_like(hidden_states), top_k
+        )
 
     def _single_launch(self) -> int:
         """num_launches for a conversion that is not sliced: the word kernel when the
@@ -1298,8 +1310,12 @@ class Mxfp4W4A8PrefillExperts:
         # counting_route implies sorted_sum, so pos is set only on sorted-sum calls.
         fold = _qcp_take_shared_add(self, hidden_states) if self.sorted_sum else None
         if fold is not None:  # INF-681 k-qcp: shared-expert add in the top-k sum
-            assert add_to is None, "both shared-add fusions armed: the add would run twice"
-            if pos is not None:  # k-pmoe counting route: its routing has no combine_indx
+            assert add_to is None, (
+                "both shared-add fusions armed: the add would run twice"
+            )
+            if (
+                pos is not None
+            ):  # k-pmoe counting route: its routing has no combine_indx
                 output = _qcp.topk_sum_by_pos_add(down, pos, fold[0], top_k, fold[1])
             else:
                 output = _qcp.gather_topk_sum_add(

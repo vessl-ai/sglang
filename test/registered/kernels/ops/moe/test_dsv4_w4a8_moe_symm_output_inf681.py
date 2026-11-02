@@ -132,7 +132,10 @@ def test_output_from_symmetric_pool(v2, symmetric, monkeypatch):
     import sglang.srt.distributed.device_communicators.pynccl_allocator as pynccl_allocator
     import sglang.srt.layers.dp_attention as dp_attention
     import sglang.srt.runtime_context as runtime_context
-    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2, dsv4_mxfp4_decode_moe_ws
+    from sglang.kernels.ops.moe import (
+        dsv4_mxfp4_decode_moe_v2,
+        dsv4_mxfp4_decode_moe_ws,
+    )
     from sglang.srt.environ import envs
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -167,7 +170,9 @@ def test_output_from_symmetric_pool(v2, symmetric, monkeypatch):
     dispatch = StandardDispatchOutput(
         hidden_states=x,
         hidden_states_scale=None,
-        topk_output=StandardTopKOutput(topk_weights=wts, topk_ids=ids, router_logits=None),
+        topk_output=StandardTopKOutput(
+            topk_weights=wts, topk_ids=ids, router_logits=None
+        ),
     )
     with envs.SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT.override(True):
         out = method.apply(layer, dispatch).hidden_states

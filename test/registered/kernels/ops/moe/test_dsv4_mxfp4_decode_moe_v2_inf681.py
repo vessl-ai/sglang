@@ -110,9 +110,9 @@ def _skewed_routing(bs, rows_per_req, num_experts, top_k, seed, s=1.2):
     w = (1.0 / torch.arange(1, num_experts + 1, dtype=torch.float64)) ** s
     w = w[torch.randperm(num_experts, generator=g)]
     rows = bs * rows_per_req
-    logits = torch.log(w).float().expand(rows, num_experts) + torch.distributions.Gumbel(0.0, 1.0).sample(
-        (rows, num_experts)
-    )
+    logits = torch.log(w).float().expand(
+        rows, num_experts
+    ) + torch.distributions.Gumbel(0.0, 1.0).sample((rows, num_experts))
     ids = torch.topk(logits, top_k, dim=-1).indices.int().cuda()
     x = torch.randn(rows, HIDDEN, device="cuda", dtype=torch.bfloat16)
     wts = torch.softmax(torch.randn(rows, top_k, device="cuda"), -1).float()
@@ -131,10 +131,15 @@ def test_v2_hot_experts(shape):
         x, ids, wts = _skewed_routing(bs, rows_per_req, num_experts, top_k, bs, s)
         counts = torch.bincount(ids.flatten().long(), minlength=num_experts)
         if bs >= 260:
-            assert int(counts.max()) > 128, int(counts.max())  # at least one expert with 5+ passes
+            assert int(counts.max()) > 128, int(
+                counts.max()
+            )  # at least one expert with 5+ passes
         ref = ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
         for _ in range(3):
-            assert torch.equal(v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT), ref), (bs, s)
+            assert torch.equal(v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT), ref), (
+                bs,
+                s,
+            )
 
 
 @pytest.mark.parametrize("shape", ["target_g3", "draft_g3"])
@@ -156,7 +161,9 @@ def test_v2_dp_pad_rows(shape):
         wtsp = torch.cat([wts, torch.rand(pad, top_k, device="cuda")])
         out = v2.decode_moe(xp, idsp, wtsp, packed, SWIGLU_LIMIT)
         assert torch.equal(out[len(ids) :], torch.zeros_like(out[len(ids) :])), bs
-        assert torch.equal(out[: len(ids)], ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)), bs
+        assert torch.equal(
+            out[: len(ids)], ws.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+        ), bs
     # every slot masked: zeros, no expert work
     x, ids, wts = _routing(4, rows_per_req, num_experts, top_k, 5)
     out = v2.decode_moe(x, torch.full_like(ids, -1), wts, packed, SWIGLU_LIMIT)
@@ -177,26 +184,37 @@ def test_v2_prologue_matches_w4a8_prologue():
         ("target", 450, 0),
     ):
         num_experts, top_k, rows_per_req = SHAPES[shape]
-        x, ids, wts = _routing(bs, rows_per_req, num_experts, top_k, bs, masked_rows=masked)
+        x, ids, wts = _routing(
+            bs, rows_per_req, num_experts, top_k, bs, masked_rows=masked
+        )
         if bs > 1:
             x[0] = 0  # an all-zero row (amax clamps to 1e-4)
         counts, slots, toks, sw = ws._sort_slots(ids, wts, num_experts)
         x8, xs = ws._row_quant(x)
         n = ids.numel()
         c2 = torch.empty_like(counts)
-        s2, t2 = torch.empty(n, dtype=torch.int32, device="cuda"), torch.empty(
-            n, dtype=torch.int32, device="cuda"
+        s2, t2 = (
+            torch.empty(n, dtype=torch.int32, device="cuda"),
+            torch.empty(n, dtype=torch.int32, device="cuda"),
         )
         w2 = torch.empty(n, dtype=torch.float32, device="cuda")
         x82 = torch.empty(x.shape, dtype=torch.uint8, device="cuda")
         xs2 = torch.empty(x.shape[0], dtype=torch.float32, device="cuda")
-        work = torch.full((v2.WORKSPACE_BASE + 2 * num_experts,), 7, dtype=torch.int32, device="cuda")
+        work = torch.full(
+            (v2.WORKSPACE_BASE + 2 * num_experts,), 7, dtype=torch.int32, device="cuda"
+        )
         mod.prep(ids, wts, x, c2, s2, t2, w2, x82, xs2, work)
         k = int(counts.sum())
         assert torch.equal(c2, counts), (shape, bs)
-        assert torch.equal(s2[:k], slots[:k]) and torch.equal(t2[:k], toks[:k]), (shape, bs)
+        assert torch.equal(s2[:k], slots[:k]) and torch.equal(t2[:k], toks[:k]), (
+            shape,
+            bs,
+        )
         assert torch.equal(w2[:k], sw[:k]), (shape, bs)
-        assert torch.equal(x82, x8.view(torch.uint8)) and torch.equal(xs2, xs), (shape, bs)
+        assert torch.equal(x82, x8.view(torch.uint8)) and torch.equal(xs2, xs), (
+            shape,
+            bs,
+        )
         assert torch.equal(work, torch.zeros_like(work)), (shape, bs)
 
 
@@ -217,7 +235,9 @@ def test_v2_cuda_graph_replay(shape):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
-        for rep in range(2):  # the workspace is re-zeroed inside the graph on every replay
+        for rep in range(
+            2
+        ):  # the workspace is re-zeroed inside the graph on every replay
             x2, ids2, wts2 = _routing(
                 bs, rows_per_req, num_experts, top_k, 2000 + 7 * rep + bs, masked_rows=1
             )
@@ -226,7 +246,9 @@ def test_v2_cuda_graph_replay(shape):
             wts.copy_(wts2)
             graph.replay()
             torch.cuda.synchronize()
-            assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)), (bs, rep)
+            assert torch.equal(
+                out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)
+            ), (bs, rep)
 
 
 def test_v2_large_batch_fallback():
@@ -259,13 +281,17 @@ def test_v2_prepare_then_capture():
     with torch.cuda.graph(graph):
         out = v2.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
     for rep in range(2):
-        x2, ids2, wts2 = _routing(64, rows_per_req, num_experts, top_k, 30 + rep, masked_rows=6)
+        x2, ids2, wts2 = _routing(
+            64, rows_per_req, num_experts, top_k, 30 + rep, masked_rows=6
+        )
         x.copy_(x2)
         ids.copy_(ids2)
         wts.copy_(wts2)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)), rep
+        assert torch.equal(out, ws.decode_moe(x2, ids2, wts2, packed, SWIGLU_LIMIT)), (
+            rep
+        )
 
 
 _FRESH = r"""
@@ -351,10 +377,14 @@ def test_v2_switch_wiring(monkeypatch):
     method.create_moe_runner(layer, config)
     prepared = []
     real_prepare = v2.prepare
-    monkeypatch.setattr(v2, "prepare", lambda dev: (prepared.append(dev), real_prepare(dev)))
+    monkeypatch.setattr(
+        v2, "prepare", lambda dev: (prepared.append(dev), real_prepare(dev))
+    )
     method.process_weights_after_loading(layer)
     assert layer._dsv4_mxfp4_backend == "sm90_decode_w4a8"
-    assert prepared == [torch.cuda.current_device()]  # the v2 kernels were built at weight processing
+    assert prepared == [
+        torch.cuda.current_device()
+    ]  # the v2 kernels were built at weight processing
     calls = []
     real = v2.decode_moe
 
@@ -367,7 +397,9 @@ def test_v2_switch_wiring(monkeypatch):
     tk = StandardTopKOutput(topk_weights=wts, topk_ids=ids, router_logits=None)
     out = method.apply(
         layer,
-        StandardDispatchOutput(hidden_states=x, hidden_states_scale=None, topk_output=tk),
+        StandardDispatchOutput(
+            hidden_states=x, hidden_states_scale=None, topk_output=tk
+        ),
     )
     assert calls == [1]  # the v2 kernels ran
     assert torch.equal(

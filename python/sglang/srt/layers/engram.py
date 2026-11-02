@@ -1134,14 +1134,14 @@ class EngramPrefetch:
 
     @staticmethod
     def maybe_start(
-        engrams: list[tuple[int, "Engram"]],
+        engrams: list[tuple[int, Engram]],
         hash_ids: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
         *,
         cp: bool,
         local_rows: int,
         late_layer_start: Optional[int],
-    ) -> Optional["EngramPrefetch"]:
+    ) -> Optional[EngramPrefetch]:
         """``hash_ids`` [rows, n_engram_layers, n_hash_cols]: under CP the hashes of
         the whole prompt (rank-strided as in the interleave split, ``local_rows``
         per CP rank after padding), else the rows of this forward."""

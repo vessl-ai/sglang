@@ -128,7 +128,9 @@ def _repack(weight, scale, layout, chan_base, expert_chunk=16):
         for ii, bits in enumerate(_PLACE):
             word |= _place(lo[..., ii], bits) | (_place(hi[..., ii], bits) << 16)
         word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
-        out_q[e0:e1] = word.contiguous().view(torch.uint8).view(ne, nb, nw, steps, nt, 32, 16)
+        out_q[e0:e1] = (
+            word.contiguous().view(torch.uint8).view(ne, nb, nw, steps, nt, 32, 16)
+        )
         sv = scale[e0:e1].reshape(ne, -1)[:, sflat].to(torch.int32) + SCALE_BIAS
         out_s[e0:e1] = sv.to(torch.uint8).view(ne, nb, nw, steps, 8, 16)
     return out_q, out_s
@@ -164,7 +166,12 @@ def _sort_slots(topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_experts:
     order = torch.argsort(ids, stable=True)
     counts = torch.zeros(num_experts, dtype=torch.int32, device=ids.device)
     counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
-    return counts, order.to(torch.int32), (order // top_k).to(torch.int32), weights[order]
+    return (
+        counts,
+        order.to(torch.int32),
+        (order // top_k).to(torch.int32),
+        weights[order],
+    )
 
 
 def decode_moe(

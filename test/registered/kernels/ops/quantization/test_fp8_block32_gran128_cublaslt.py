@@ -67,9 +67,13 @@ def test_gate_upper_bound_keeps_deepgemm():
         pytest.skip("rows/shape table measured on 132-SM H200")
     with envs.SGLANG_OPT_DSV4_GRAN128_CUBLAS_ABOVE_ROWS.override(256):
         assert g128.prefer_cublaslt_blockwise(320, 5120, 8192)  # wo_b: last winning M
-        assert not g128.prefer_cublaslt_blockwise(324, 5120, 8192)  # DeepGEMM fast again
+        assert not g128.prefer_cublaslt_blockwise(
+            324, 5120, 8192
+        )  # DeepGEMM fast again
         assert not g128.prefer_cublaslt_blockwise(400, 5120, 8192)  # cuBLASLt slower
-        assert g128.prefer_cublaslt_blockwise(384, 4608, 5120)  # gate_up: last winning M
+        assert g128.prefer_cublaslt_blockwise(
+            384, 4608, 5120
+        )  # gate_up: last winning M
         assert not g128.prefer_cublaslt_blockwise(388, 4608, 5120)
 
 

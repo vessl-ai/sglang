@@ -95,9 +95,7 @@ def _batch(rows, seed):
         read_idx=read_idx,
         scale=torch.rand((rows,), generator=g, device="cuda").to(torch.bfloat16),
     )
-    residual = torch.randn((rows, HC, H), generator=g, device="cuda").to(
-        torch.bfloat16
-    )
+    residual = torch.randn((rows, HC, H), generator=g, device="cuda").to(torch.bfloat16)
     pre = torch.rand((rows, HC), generator=g, device="cuda")
     positions = torch.randint(0, 75000, (rows,), generator=g, device="cuda")
     return fb, residual, pre, positions
@@ -390,10 +388,13 @@ def test_cp_collectives_as_eager_breaks(_prefill_cp4, monkeypatch, eager_collect
     monkeypatch.setattr(
         dp_attention,
         "get_parallel",
-        lambda: SimpleNamespace(attn_cp_group=group, attn_cp_size=CP_SIZE, attn_cp_rank=0),
+        lambda: SimpleNamespace(
+            attn_cp_group=group, attn_cp_size=CP_SIZE, attn_cp_rank=0
+        ),
     )
     monkeypatch.setenv(
-        "SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES", "1" if eager_collectives else "0"
+        "SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES",
+        "1" if eager_collectives else "0",
     )
     _pool["kv"] = torch.randn((POOL_ROWS, H), device="cuda").to(torch.bfloat16)
     model = _ToyCPCollModel()
@@ -402,7 +403,16 @@ def test_cp_collectives_as_eager_breaks(_prefill_cp4, monkeypatch, eager_collect
     ):
         runner = lg.LateLayerGraphRunner(model)
         # CP capture of bucket 32, CP-off steps between CP replays, a second bucket.
-        steps = [(4, True), (1, False), (8, True), (2, False), (20, True), (40, True), (3, False), (12, True)]
+        steps = [
+            (4, True),
+            (1, False),
+            (8, True),
+            (2, False),
+            (20, True),
+            (40, True),
+            (3, False),
+            (12, True),
+        ]
         per_run = []
         for i, (rows, cp_active) in enumerate(steps):
             fb, residual, pre, positions = _batch(rows, 200 + i)
@@ -414,11 +424,20 @@ def test_cp_collectives_as_eager_breaks(_prefill_cp4, monkeypatch, eager_collect
             calls = group.calls
             stats = dict(runner.stats)
             got = _run(runner, fb, residual, pre, positions, False)
-            per_run.append((group.calls - calls, {k: runner.stats[k] - stats.get(k, 0) for k in runner.stats}))
+            per_run.append(
+                (
+                    group.calls - calls,
+                    {k: runner.stats[k] - stats.get(k, 0) for k in runner.stats},
+                )
+            )
             if not cp_active:
                 assert got is None, (rows, cp_active)
                 got = _eager(model, fb, residual, pre, positions, False)
-            assert torch.equal(got[0], want[0]), (rows, cp_active, (got[0].float() - want[0].float()).abs().max())
+            assert torch.equal(got[0], want[0]), (
+                rows,
+                cp_active,
+                (got[0].float() - want[0].float()).abs().max(),
+            )
             assert torch.equal(got[1], want[1]), (rows, cp_active)
             assert torch.equal(_pool["kv"], want_pool), (rows, cp_active)
     assert runner.stats["capture"] == 2  # buckets 32 and 64

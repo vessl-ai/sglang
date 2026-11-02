@@ -33,7 +33,9 @@ class TestDsparkAttnTpRuleUnchanged(CustomTestCase):
 
     def test_equal_attention_tp(self):
         self.assertTrue(_rule(4, 1, 4))  # e3: prefill TP4 -> decode TP4
-        self.assertTrue(_rule(1, 4, 1))  # prefill CP4 -> decode DP4 (upstream B200 pair)
+        self.assertTrue(
+            _rule(1, 4, 1)
+        )  # prefill CP4 -> decode DP4 (upstream B200 pair)
         self.assertTrue(_rule(1, 1, 1))  # prefill DP4 -> decode DP4
 
     def test_cp_prefill_world_matches_decode_tp(self):

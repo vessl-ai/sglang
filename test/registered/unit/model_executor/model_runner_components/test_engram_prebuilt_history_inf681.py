@@ -55,7 +55,9 @@ class _Hasher:
 
 
 def _manager(hasher):
-    return nem.NgramEmbeddingManager(enabled=False, table=None, n=0, engram_hasher=hasher)
+    return nem.NgramEmbeddingManager(
+        enabled=False, table=None, n=0, engram_hasher=hasher
+    )
 
 
 class TestEngramPrebuiltHistory(CustomTestCase):
@@ -77,7 +79,11 @@ class TestEngramPrebuiltHistory(CustomTestCase):
             got = hasher.history[[r.kv.req_pool_idx for r in reqs]]
             self.assertTrue(torch.equal(got, want), f"max_ngram={max_ngram}")
             # rows not in the batch stay untouched
-            self.assertTrue(torch.equal(hasher.history[slot:], torch.full((3, n1), -1, dtype=torch.int64)))
+            self.assertTrue(
+                torch.equal(
+                    hasher.history[slot:], torch.full((3, n1), -1, dtype=torch.int64)
+                )
+            )
 
     def test_prebuilt_copies_are_staged(self):
         hasher = _Hasher(3, 8)
@@ -86,7 +92,9 @@ class TestEngramPrebuiltHistory(CustomTestCase):
         with mock.patch.object(nem, "async_h2d", wraps=nem.async_h2d) as staged:
             _manager(hasher)._prepare_engram_history(batch)
         self.assertEqual(staged.call_count, 2)
-        self.assertTrue(torch.equal(hasher.history[[2, 5]], torch.tensor(_old_rows(reqs, 2))))
+        self.assertTrue(
+            torch.equal(hasher.history[[2, 5]], torch.tensor(_old_rows(reqs, 2)))
+        )
 
 
 if __name__ == "__main__":

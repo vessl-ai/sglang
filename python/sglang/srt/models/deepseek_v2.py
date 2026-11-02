@@ -1455,7 +1455,9 @@ class DeepseekV2MoE(nn.Module):
         if envs.SGLANG_OPT_DSV4_MOE_INPUT_DUAL_QUANT.get():
             from sglang.srt.layers.quantization import dsv4_prefill_qcp
 
-            dsv4_prefill_qcp.withdraw_row_quant(self)  # an offer the experts did not take
+            dsv4_prefill_qcp.withdraw_row_quant(
+                self
+            )  # an offer the experts did not take
         if qcp_armed and dsv4_prefill_qcp.disarm_shared_add(self.experts):
             if self.reduce_results:
                 return post_experts_all_reduce(shared_output)

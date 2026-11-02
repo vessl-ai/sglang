@@ -50,7 +50,9 @@ def test_wo_a_strided_bmm_bit_identical(groups, tokens, monkeypatch):
     g = torch.Generator(device="cuda").manual_seed(tokens * 31 + groups)
     o = torch.randn(tokens, groups * 4096, device="cuda", generator=g).bfloat16()
     o = o.view(tokens, groups, 4096)
-    wo_a = (torch.randn(groups, 1024, 4096, device="cuda", generator=g) * 0.02).bfloat16()
+    wo_a = (
+        torch.randn(groups, 1024, 4096, device="cuda", generator=g) * 0.02
+    ).bfloat16()
     kwargs = dict(is_decode=False, is_target_verify=True, fast_path=True)
     with envs.SGLANG_OPT_DSV4_WO_A_STRIDED_BMM.override(False):
         ref = _apply_wo_a_bf16_matmul(o, wo_a, **kwargs)
@@ -70,8 +72,13 @@ def test_split_h_post_bit_identical_at_dp_rows(m, dp4, monkeypatch):
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     cfg = dp4.HcConfig(
-        mult=MULT, sinkhorn_iters=20, eps=1e-6, rms_eps=1e-20, hidden=HIDDEN,
-        pre_from_prev=True, cp_prefill=False,
+        mult=MULT,
+        sinkhorn_iters=20,
+        eps=1e-6,
+        rms_eps=1e-20,
+        hidden=HIDDEN,
+        pre_from_prev=True,
+        cp_prefill=False,
     )
     g = torch.Generator(device="cuda").manual_seed(m)
     residual = (torch.randn(m, MULT, HIDDEN, device="cuda", generator=g) * 3).bfloat16()
@@ -80,7 +87,9 @@ def test_split_h_post_bit_identical_at_dp_rows(m, dp4, monkeypatch):
     comb = torch.softmax(torch.randn(m, MULT, MULT, device="cuda", generator=g), -1)
     calls = []
     real = dp4.mhc_post_split_h
-    monkeypatch.setattr(dp4, "mhc_post_split_h", lambda *a, **k: calls.append(1) or real(*a, **k))
+    monkeypatch.setattr(
+        dp4, "mhc_post_split_h", lambda *a, **k: calls.append(1) or real(*a, **k)
+    )
     with envs.SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED.override(False):
         ref = dp4.post(cfg, x, residual, post, comb)
     assert not calls
@@ -96,8 +105,13 @@ def test_split_h_post_gate_bounds(dp4, monkeypatch):
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
     cfg = dp4.HcConfig(
-        mult=MULT, sinkhorn_iters=20, eps=1e-6, rms_eps=1e-20, hidden=HIDDEN,
-        pre_from_prev=True, cp_prefill=False,
+        mult=MULT,
+        sinkhorn_iters=20,
+        eps=1e-6,
+        rms_eps=1e-20,
+        hidden=HIDDEN,
+        pre_from_prev=True,
+        cp_prefill=False,
     )
     calls = []
     monkeypatch.setattr(dp4, "mhc_post_split_h", lambda *a, **k: calls.append(1))
@@ -123,7 +137,9 @@ def test_fused_combine_norm_at_dp_rows(m, dp4, monkeypatch):
 
     g = torch.Generator(device="cuda").manual_seed(m)
     norm = RMSNorm(HIDDEN, eps=1e-20).cuda()
-    norm.weight.data = (1 + 0.1 * torch.randn(HIDDEN, device="cuda", generator=g)).bfloat16()
+    norm.weight.data = (
+        1 + 0.1 * torch.randn(HIDDEN, device="cuda", generator=g)
+    ).bfloat16()
     hc = SimpleNamespace(cfg=SimpleNamespace(mult=MULT, hidden=HIDDEN), norm=norm)
     residual = (torch.randn(m, MULT, HIDDEN, device="cuda", generator=g) * 3).bfloat16()
     pre = torch.rand(m, MULT, device="cuda", generator=g)
@@ -132,7 +148,9 @@ def test_fused_combine_norm_at_dp_rows(m, dp4, monkeypatch):
     import sglang.kernels.ops.layernorm.hc_combine_norm as hcn
 
     real = hcn.hc_combine_norm
-    monkeypatch.setattr(hcn, "hc_combine_norm", lambda *a, **k: fused.append(1) or real(*a, **k))
+    monkeypatch.setattr(
+        hcn, "hc_combine_norm", lambda *a, **k: fused.append(1) or real(*a, **k)
+    )
     with envs.SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED.override(False):
         ref = dp4._combine(hc, state, None)
     assert not fused
@@ -147,8 +165,16 @@ def test_stats_stream_gate(dp4):
     from sglang.srt.environ import envs
 
     cfg = SimpleNamespace(pre_from_prev=True)
-    verify = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: True))
-    extend = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False, is_target_verify=lambda: False))
+    verify = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False, is_target_verify=lambda: True
+        )
+    )
+    extend = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False, is_target_verify=lambda: False
+        )
+    )
     x = torch.empty(192, MULT, HIDDEN, device="cuda", dtype=torch.bfloat16)
     with envs.SGLANG_OPT_DSV4_DP_DECODE_STATS_STREAM.override(False):
         assert not dp4.use_stats_stream(cfg, verify, x)

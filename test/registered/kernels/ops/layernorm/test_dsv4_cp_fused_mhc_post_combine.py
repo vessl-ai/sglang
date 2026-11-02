@@ -115,7 +115,9 @@ def test_cp_takes_fused_kernel_and_matches(monkeypatch, m):
 @pytest.mark.parametrize("m", [1728, 16302])
 def test_cp_without_switch_or_below_4096_stays_unfused(monkeypatch, m):
     switch = m < 4096  # below the kernel's range even the switch keeps the unfused path
-    fused, residual, normed, ref_residual, ref_normed = _run(monkeypatch, m, True, switch)
+    fused, residual, normed, ref_residual, ref_normed = _run(
+        monkeypatch, m, True, switch
+    )
     assert not fused
     assert torch.equal(residual, ref_residual) and torch.equal(normed, ref_normed)
 

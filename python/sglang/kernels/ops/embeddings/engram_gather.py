@@ -155,9 +155,7 @@ def _engram_gather_raw_kernel(
             mask=valid[:, None],
         )
         sbase = base + j * SCALE_WORDS + rows_per_chunk * DIM_WORDS
-        tl.store(
-            out_ptr + sbase[:, None] + swords[None, :], svals, mask=valid[:, None]
-        )
+        tl.store(out_ptr + sbase[:, None] + swords[None, :], svals, mask=valid[:, None])
 
 
 def engram_gather_raw(

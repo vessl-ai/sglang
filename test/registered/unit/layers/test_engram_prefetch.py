@@ -219,9 +219,10 @@ def test_prefetch_matches_in_layer_lookup(tp, cp, total):
         got = {}
         for r in range(tp):
             ar = world.inplace_all_reduce
-            with mock.patch.object(
-                E, "get_parallel", return_value=world.parallel(r)
-            ), mock.patch.object(E, "inplace_all_reduce", ar):
+            with (
+                mock.patch.object(E, "get_parallel", return_value=world.parallel(r)),
+                mock.patch.object(E, "inplace_all_reduce", ar),
+            ):
                 for i in range(0, 22):
                     prefetches[r].reduce_due(i)
                     if i in world.layers:

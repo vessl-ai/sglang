@@ -52,7 +52,10 @@ def _grouped_ue8m0_quant_mn_kernel(
     row_mask = rows < M
     mask = row_mask[:, None]
     x = tl.load(
-        Y + rows[:, None].to(tl.int64) * stride_ym + g.to(tl.int64) * stride_yg + r[None, :],
+        Y
+        + rows[:, None].to(tl.int64) * stride_ym
+        + g.to(tl.int64) * stride_yg
+        + r[None, :],
         mask,
         other=0.0,
     ).to(tl.float32)

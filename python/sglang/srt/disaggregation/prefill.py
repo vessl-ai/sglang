@@ -637,8 +637,7 @@ class SchedulerDisaggregationPrefillMixin:
             candidates = [
                 req
                 for req in candidates
-                if getattr(req, "bootstrap_checked_at_forward", None)
-                != self.forward_ct
+                if getattr(req, "bootstrap_checked_at_forward", None) != self.forward_ct
             ]
         elif mark_checked_in_forward:
             for req in candidates:
@@ -856,7 +855,9 @@ class SchedulerDisaggregationPrefillMixin:
                     try:
                         batch_result = self.run_batch(batch)
                     finally:
-                        midforward_fired = midforward_hook.disarm() if midforward else []
+                        midforward_fired = (
+                            midforward_hook.disarm() if midforward else []
+                        )
                         self._midforward_early_send_sink = None
                     if midforward is not None:
                         # Before the WAR barrier: a page-index copy queued behind it
@@ -950,9 +951,10 @@ class SchedulerDisaggregationPrefillMixin:
         prepare_next = envs.SGLANG_OPT_PREFILL_NEXT_BATCH_IN_FORWARD.get()
 
         def run(layer_id: int) -> None:
-            with torch.profiler.record_function(
-                f"scheduler.midforward[L{layer_id}]"
-            ), self.device_module.stream(self.schedule_stream):
+            with (
+                torch.profiler.record_function(f"scheduler.midforward[L{layer_id}]"),
+                self.device_module.stream(self.schedule_stream),
+            ):
                 # Off the forward stream: nothing here may queue behind this forward.
                 if state.early_sends is not None:
                     # This batch's early sends first, the order run_batch had.
@@ -1060,7 +1062,9 @@ class SchedulerDisaggregationPrefillMixin:
             recv_reqs = self._deferred_input_requests[:num_plain]
             del self._deferred_input_requests[:num_plain]
             self.process_input_requests(recv_reqs)
-        self.waiting_queue.extend(self.disagg_prefill_bootstrap_queue.pop_bootstrapped())
+        self.waiting_queue.extend(
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        )
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,

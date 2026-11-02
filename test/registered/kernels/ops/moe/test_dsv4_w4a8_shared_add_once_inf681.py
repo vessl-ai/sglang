@@ -83,7 +83,9 @@ def test_qcp_fold_equals_one_separate_add(kw, rows):
     assert torch.equal(got, want)
 
 
-@pytest.mark.parametrize("kw", [dict(), dict(counting_route=True), dict(small_step_rows=4096)])
+@pytest.mark.parametrize(
+    "kw", [dict(), dict(counting_route=True), dict(small_step_rows=4096)]
+)
 def test_both_fusions_on_one_call_refuse(kw):
     w = _weights(71)
     x, ids, wts, shared = _inputs(256, 72)

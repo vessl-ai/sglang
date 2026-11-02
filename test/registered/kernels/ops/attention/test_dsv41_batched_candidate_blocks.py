@@ -11,7 +11,6 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_block_keys,
-    select_candidate_block_ids,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci

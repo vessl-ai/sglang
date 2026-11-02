@@ -167,6 +167,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common import late_layer_graph
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
@@ -176,7 +177,6 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
     late_layer_dp_counts,
 )
-from sglang.srt.models.deepseek_common import late_layer_graph
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,

@@ -368,7 +368,9 @@ def test_direct_route(br):
     assert torch.equal(pos[~valid], torch.full_like(pos[~valid], -1))
     p = pos[valid]
     # Every valid slot has its own row inside its expert's range.
-    assert torch.equal(torch.sort(p).values, torch.arange(int(valid.sum()), device="cuda"))
+    assert torch.equal(
+        torch.sort(p).values, torch.arange(int(valid.sum()), device="cuda")
+    )
     assert bool(((p >= offs[flat[valid]]) & (p < offs[flat[valid] + 1])).all())
     slots = torch.nonzero(valid).flatten()
     assert torch.equal(r.gather_indx[p].long(), slots // TOPK)

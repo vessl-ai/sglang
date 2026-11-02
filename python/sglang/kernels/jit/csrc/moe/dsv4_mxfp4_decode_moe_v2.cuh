@@ -5,10 +5,10 @@
 // One persistent kernel per MoE call runs every routed expert's gate/up GEMM, the per-row e4m3 quantization of
 // its h and its down GEMM. Work items (one weight pass of up to 32 rows over one channel block) are handed out
 // dynamically from one global counter: first every gate/up item, then every down item. A down item starts once
-// the h rows of its pass (the expert's 32 rows it covers) are quantized. Compared with dsv4_mxfp4_decode_moe_ws.cuh (#104: a gate/up kernel, a row-quant
-// kernel and a down kernel, each with a static cost-balanced split) this removes two launches, the row-quant
-// pass over all slots and the per-kernel tails (with the static split the slowest of the 264 pipelines ended
-// 30-35 us after the median one at 1,024 rows), and it hides the per-item metadata loads.
+// the h rows of its pass (the expert's 32 rows it covers) are quantized. Compared with dsv4_mxfp4_decode_moe_ws.cuh
+// (#104: a gate/up kernel, a row-quant kernel and a down kernel, each with a static cost-balanced split) this removes
+// two launches, the row-quant pass over all slots and the per-kernel tails (with the static split the slowest of the
+// 264 pipelines ended 30-35 us after the median one at 1,024 rows), and it hides the per-item metadata loads.
 //
 // Numerics are #104's, bit for bit: the per-pass math (e2m1 -> e4m3 expansion, one wgmma per MX block, fp32
 // promotion with the block scale in the same order, SwiGLU, bf16 h) is the same code; h is quantized as the
@@ -46,24 +46,23 @@
 namespace sglang {
 namespace dsv4_moe_v2 {
 
-
 struct Params {
-  const uint8_t* __restrict__ x8;      // e4m3 token rows [tokens, 5120]
-  const float* __restrict__ xscale;    // power-of-2 scale per token row
-  const uint8_t* __restrict__ w13;     // stage-ordered gate/up weights + scales [E][9][348160]
-  const uint8_t* __restrict__ w2;      // stage-ordered down weights + scales [E][40][39168]
-  const int32_t* __restrict__ counts;  // [E]
-  const int32_t* __restrict__ gather;  // token of each sorted slot
-  const int32_t* __restrict__ combine; // original slot of each sorted slot
-  const float* __restrict__ gammas;    // routing weight of each sorted slot
-  __nv_bfloat16* __restrict__ h;       // [slots, 576] bf16, sorted-slot order
-  uint8_t* __restrict__ h8;            // [slots, 576] e4m3, sorted-slot order
-  float* __restrict__ hscale;          // [slots]
-  __nv_bfloat16* __restrict__ y;       // [slots, 5120] bf16, original-slot order
-  int32_t* __restrict__ ws;            // zeroed per call: [0] queue head, [1] passes ready, then per 32-row pass
-                                       // (index = gate/up items before it / 9 + pass): done items, h8 ready
+  const uint8_t* __restrict__ x8;       // e4m3 token rows [tokens, 5120]
+  const float* __restrict__ xscale;     // power-of-2 scale per token row
+  const uint8_t* __restrict__ w13;      // stage-ordered gate/up weights + scales [E][9][348160]
+  const uint8_t* __restrict__ w2;       // stage-ordered down weights + scales [E][40][39168]
+  const int32_t* __restrict__ counts;   // [E]
+  const int32_t* __restrict__ gather;   // token of each sorted slot
+  const int32_t* __restrict__ combine;  // original slot of each sorted slot
+  const float* __restrict__ gammas;     // routing weight of each sorted slot
+  __nv_bfloat16* __restrict__ h;        // [slots, 576] bf16, sorted-slot order
+  uint8_t* __restrict__ h8;             // [slots, 576] e4m3, sorted-slot order
+  float* __restrict__ hscale;           // [slots]
+  __nv_bfloat16* __restrict__ y;        // [slots, 5120] bf16, original-slot order
+  int32_t* __restrict__ ws;             // zeroed per call: [0] queue head, [1] passes ready, then per 32-row pass
+                                        // (index = gate/up items before it / 9 + pass): done items, h8 ready
   int num_experts;
-  int max_passes;                      // capacity of each per-pass array in ws
+  int max_passes;  // capacity of each per-pass array in ws
   float limit;
 };
 
@@ -333,7 +332,7 @@ SGL_DEVICE int find_expert(const int32_t* start, int num_experts, int i) {
 
 struct Item {
   int kind, e, j, r0, nrows, off;
-  int pipe;      // consumer side: pipeline and item sequence number (row table slot)
+  int pipe;  // consumer side: pipeline and item sequence number (row table slot)
   uint32_t seq;
 };
 
@@ -436,8 +435,7 @@ SGL_DEVICE void produce_item(
     Work& nw) {
   using S = Shape<kGateUp>;
   const Item& it = w.it;
-  const uint8_t* item =
-      (kGateUp ? p.w13 : p.w2) + (static_cast<size_t>(it.e) * S::kNB + it.j) * item_bytes<kGateUp>();
+  const uint8_t* item = (kGateUp ? p.w13 : p.w2) + (static_cast<size_t>(it.e) * S::kNB + it.j) * item_bytes<kGateUp>();
   const uint8_t* xrow = w.src >= 0 ? (kGateUp ? p.x8 : p.h8) + static_cast<size_t>(w.src) * S::kK : nullptr;
   for (int st = 0; st < S::kStages; ++st, ++g) {
     const uint32_t slot = g % kRing;
@@ -470,7 +468,6 @@ SGL_DEVICE void produce_item(
     }
   }
 }
-
 
 SGL_DEVICE void producer(const Params& p, const Smem& sm, int pipe, int lane) {
   const Meta* m = sm.meta;
@@ -604,7 +601,8 @@ SGL_DEVICE void consumer_pass(const Params& p, const Smem& sm, uint32_t& g, cons
       if (step < nsteps) {
 #pragma unroll
         for (int t = 0; t < kT; ++t)
-          wt[step][t] = *reinterpret_cast<const uint4*>(wslot + ((step * kConsumerWarps + cw) * kT + t) * 512 + lane * 16);
+          wt[step][t] =
+              *reinterpret_cast<const uint4*>(wslot + ((step * kConsumerWarps + cw) * kT + t) * 512 + lane * 16);
         const uint8_t* srec = sslot + (step * kConsumerWarps + cw) * (32 * kT) + grp * (4 * kT);
         const uint2 v = *reinterpret_cast<const uint2*>(srec);
         swt[step][0] = v.x;
@@ -864,8 +862,7 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   bool all_ready = false;
   while (open > 0 || qhead != qtail) {
     bool idle = true;
-    if (!all_ready &&
-        __shfl_sync(0xffffffffu, lane == 0 ? ld_acquire(p.ws + 1) : 0, 0) == total_passes) {  // sticky
+    if (!all_ready && __shfl_sync(0xffffffffu, lane == 0 ? ld_acquire(p.ws + 1) : 0, 0) == total_passes) {  // sticky
       all_ready = true;
       if (lane == 0) st_release_cta(&m->all_ready, 1);
     }
@@ -874,8 +871,7 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
       if (mbar_test(smem_u32(&m->req_full[pipe]), nreq[pipe] & 1) &&
           __shfl_sync(
               0xffffffffu,
-              lane == 0 ? ld_acquire(
-                              ready + pass_index(m->req[pipe].x, (m->req[pipe].z - m->off[m->req[pipe].x]) / 32))
+              lane == 0 ? ld_acquire(ready + pass_index(m->req[pipe].x, (m->req[pipe].z - m->off[m->req[pipe].x]) / 32))
                         : 0,
               0) != 0) {
         idle = false;
@@ -1005,7 +1001,7 @@ __global__ void __launch_bounds__(kThreads, 1) moe_v2_kernel(const __grid_consta
   sm.empty = sm.full + kRing * 8;
   sm.meta = meta;
 
-  if (warp == 0) {  // exclusive prefixes of row counts (sorted offsets) and of item counts
+  if (warp == 0) {             // exclusive prefixes of row counts (sorted offsets) and of item counts
     int cl[kMaxExperts / 32];  // every count loaded up front: one memory latency instead of one per 32 experts
 #pragma unroll
     for (int k = 0; k < kMaxExperts / 32; ++k) {
@@ -1052,8 +1048,8 @@ __global__ void __launch_bounds__(kThreads, 1) moe_v2_kernel(const __grid_consta
     for (int k = 0; k < kPipes; ++k) {
       const uint32_t fb = base + k * kPipeStride + kXRing + kWRing;
       for (int i = 0; i < kRing; ++i) {
-        mbar_init(fb + i * 8, 33);                                // expect_tx + 32 cp.async arrivals
-        mbar_init(fb + (kRing + i) * 8, 32 * kConsumerWarps);    // every consumer thread arrives
+        mbar_init(fb + i * 8, 33);                             // expect_tx + 32 cp.async arrivals
+        mbar_init(fb + (kRing + i) * 8, 32 * kConsumerWarps);  // every consumer thread arrives
       }
       for (int i = 0; i < kDoneSlots; ++i) {
         mbar_init(smem_u32(&meta->done_full[k][i]), 32 * kConsumerWarps);
@@ -1093,8 +1089,9 @@ inline void experts(
     tvm::ffi::TensorView ws,
     double limit) {
   using namespace host;
-  RuntimeCheck(x8.size(1) == 5120 && h.size(1) == 576 && h8.size(1) == 576 && y.size(1) == 5120,
-               "v2: TP4 DeepSeek-V4 shapes only");
+  RuntimeCheck(
+      x8.size(1) == 5120 && h.size(1) == 576 && h8.size(1) == 576 && y.size(1) == 5120,
+      "v2: TP4 DeepSeek-V4 shapes only");
   Params prm{};
   prm.x8 = static_cast<const uint8_t*>(x8.data_ptr());
   prm.xscale = static_cast<const float*>(xscale.data_ptr());
@@ -1126,7 +1123,6 @@ inline void experts(
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device.device_id));
   LaunchKernel(dim3(sms), dim3(kThreads), device, kSmem)(moe_v2_kernel, prm);
 }
-
 
 // ---------------------------------------------------------------------------------------------
 // Prologue of a call, one launch: the stable expert sort of the routed slots (as the sorts of #104), the e4m3
@@ -1238,7 +1234,7 @@ __global__ void __launch_bounds__(kPrepThreads) prep_kernel(
   // Token rows (as _row_quant: amax over the row, power-of-2 scale, e4m3): kPrepRows rows per CTA, each split
   // over kPrepWarps / kPrepRows warps.
   constexpr int kPart = 5120 / (kPrepWarps / kPrepRows);  // values per warp
-  constexpr int kVec = kPart / 8 / 32;                     // uint4 per lane
+  constexpr int kVec = kPart / 8 / 32;                    // uint4 per lane
   __shared__ float amax_s[kPrepWarps];
   const int r = (blockIdx.x - sort_ctas) * kPrepRows + warp / (kPrepWarps / kPrepRows);
   const int part = warp % (kPrepWarps / kPrepRows);

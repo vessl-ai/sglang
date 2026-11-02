@@ -28,7 +28,6 @@ import test_prefill_result_polling as base  # noqa: E402
 
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
-    ContinueGenerationReqInput,
     PauseGenerationReqInput,
     TokenizedGenerateReqInput,
 )
@@ -201,9 +200,7 @@ class TestPrefillMidForwardHook(CustomTestCase):
         # The pause arrived at layer 6 with request 3 behind it: the layer-7 hook
         # leaves both, and the loop's own intake dispatches them in order.
         names = [n for n, _ in dispatch]
-        self.assertLess(
-            names.index("PauseGenerationReqInput"), names.index("3"), names
-        )
+        self.assertLess(names.index("PauseGenerationReqInput"), names.index("3"), names)
         self.assertIn(("PauseGenerationReqInput", None), dispatch)
         self.assertIn(("3", None), dispatch)
         self.assertIn(("ContinueGenerationReqInput", None), dispatch)

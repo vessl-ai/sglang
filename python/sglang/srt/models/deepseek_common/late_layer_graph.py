@@ -30,7 +30,7 @@ import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -155,7 +155,10 @@ def _fire_midforward_hook(layer) -> None:
 
 def eager_collectives() -> bool:
     """SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES inside a late-layer block."""
-    return _LIVE is not None and envs.SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES.get()
+    return (
+        _LIVE is not None
+        and envs.SGLANG_OPT_DSV4_LATE_LAYER_GRAPH_EAGER_COLLECTIVES.get()
+    )
 
 
 @eager_on_graph(capture_stub=_noop)
@@ -260,9 +263,7 @@ def _flatten_state(state: mhc.HcState) -> Tuple[tuple, List[torch.Tensor]]:
         for j, t in enumerate(state.stats):
             names.append(f"stats{j}")
             tensors.append(t)
-    sig = tuple(
-        (name, tuple(t.shape[1:]), t.dtype) for name, t in zip(names, tensors)
-    )
+    sig = tuple((name, tuple(t.shape[1:]), t.dtype) for name, t in zip(names, tensors))
     return sig, tensors
 
 
