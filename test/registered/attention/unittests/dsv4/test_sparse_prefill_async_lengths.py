@@ -93,3 +93,11 @@ def test_no_stream_wait(monkeypatch):
         assert g.flat_token_ids.numel() == sum(s // 2 for s in seq)
     assert waits[False] > 0.3, waits
     assert waits[True] < 0.05, waits
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

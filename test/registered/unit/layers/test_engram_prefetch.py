@@ -260,3 +260,11 @@ def test_prefetch_off_by_default():
         [(1, None)], torch.zeros(1, 2, COLS, dtype=torch.int64, device="cuda"), _fb(),
         cp=True, local_rows=1, late_layer_start=None,
     ) is None  # fmt: skip
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

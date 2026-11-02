@@ -435,3 +435,11 @@ def test_cp_collectives_as_eager_breaks(_prefill_cp4, monkeypatch, eager_collect
             # Replay: eager breaks call the collective once each; captured ones do not
             # run Python at all.
             assert calls == (2 * L if eager_collectives else 0), (rows, calls, d)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

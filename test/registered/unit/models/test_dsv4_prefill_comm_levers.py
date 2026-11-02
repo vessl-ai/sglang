@@ -82,3 +82,11 @@ def test_local_shared_sum_equals_gathered_rows():
     full = mlp(gathered)
     for r in range(cp):
         torch.testing.assert_close(mlp(shards[r]), full[r * rows:(r + 1) * rows], rtol=1e-5, atol=1e-5)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

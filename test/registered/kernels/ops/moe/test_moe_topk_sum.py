@@ -50,3 +50,11 @@ def test_topk_sum_empty():
     x = torch.empty(0, 6, 5120, dtype=torch.bfloat16, device="cuda")
     out = torch.empty(0, 5120, dtype=torch.bfloat16, device="cuda")
     moe_topk_sum(x, out)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -71,3 +71,11 @@ def test_gate_upper_bound_keeps_deepgemm():
         assert not g128.prefer_cublaslt_blockwise(400, 5120, 8192)  # cuBLASLt slower
         assert g128.prefer_cublaslt_blockwise(384, 4608, 5120)  # gate_up: last winning M
         assert not g128.prefer_cublaslt_blockwise(388, 4608, 5120)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

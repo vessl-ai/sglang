@@ -125,3 +125,11 @@ def test_no_stream_wait(monkeypatch):
         torch.cuda.synchronize()
     assert waits[False] > 0.3, waits
     assert waits[True] < 0.05, waits
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

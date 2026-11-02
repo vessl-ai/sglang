@@ -109,3 +109,11 @@ def test_method_hands_over_only_without_qcp(monkeypatch):
     monkeypatch.setenv("SGLANG_OPT_DSV4_MOE_SHARED_ADD_IN_TOPK_SUM", "1")
     assert not m._w4a8_fused_shared_add()  # the runner is built without k-pmoe's add
     assert not method.accepts_shared_add(experts)  # and the model never hands it over
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

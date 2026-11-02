@@ -227,3 +227,11 @@ def test_plan_is_off_by_default(monkeypatch):
     monkeypatch.delenv("SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER", raising=False)
     x = torch.empty(4096, 5120, device="cuda", dtype=torch.bfloat16)
     assert m.plan(object(), x, shared_local=True) is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

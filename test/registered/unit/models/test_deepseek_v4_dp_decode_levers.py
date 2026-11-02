@@ -179,3 +179,11 @@ def test_shared_expert_sm_cap_restores():
     with envs.SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS.override(0):
         with _dp_shared_expert_sm_cap():
             assert deep_gemm.get_num_sms() == total
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

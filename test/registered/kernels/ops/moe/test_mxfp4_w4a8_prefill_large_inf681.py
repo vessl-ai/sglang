@@ -197,3 +197,11 @@ def test_late_layer_sm90_w4a8_backend(monkeypatch):
         method._sm90_decode_w4a8,
     )
     assert got == (False, False, False, False, True)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
