@@ -272,3 +272,5 @@ fallback_version = "0.0.0.dev0"
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1
+
+# INF-681 throwaway CI probe of the fork base 38a7def2 (no-op comment; this PR is closed unmerged)
