@@ -367,6 +367,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.sched_uclamp import maybe_set_scheduler_uclamp_min
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -6112,6 +6113,8 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Foundry CUDA graph persistence (--cuda-graph-persistence) for this rank.
+    activate_foundry(server_args)
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.
