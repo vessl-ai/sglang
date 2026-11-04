@@ -89,6 +89,7 @@ struct Params {
   uint8_t* __restrict__ h8;             // [slots, 576] e4m3, sorted-slot order
   float* __restrict__ hscale;           // [slots]
   __nv_bfloat16* __restrict__ y;        // [slots, 5120] bf16, original-slot order
+  __nv_bfloat16* __restrict__ y_rows;   // gather mode: a destination code d < 0 writes row ~d of this (token rows)
   int32_t* __restrict__ ws;             // zeroed per call: [0] queue head, [1] passes ready, then per 32-row pass
                                         // (index = gate/up items before it / 9 + pass): done items, h8 ready
   int num_experts;
@@ -1081,7 +1082,9 @@ SGL_DEVICE void consumer_pass(const Params& p, const Smem& sm, uint32_t& g, cons
         if (r < nrows) {
           const float2 rm = rowmeta[r];
           const float sc = rm.x;
-          __nv_bfloat16* orow = p.y + static_cast<size_t>(__float_as_int(rm.y)) * S::kOutLd;
+          const int dst = __float_as_int(rm.y);
+          __nv_bfloat16* orow = dst >= 0 ? p.y + static_cast<size_t>(dst) * S::kOutLd
+                                         : p.y_rows + static_cast<size_t>(~dst) * S::kOutLd;
 #pragma unroll
           for (int t = 0; t < kT; ++t)
 #pragma unroll
@@ -1657,7 +1660,8 @@ inline void experts(
     tvm::ffi::TensorView hscale,
     tvm::ffi::TensorView y,
     tvm::ffi::TensorView ws,
-    double limit) {
+    double limit,
+    tvm::ffi::TensorView y_rows) {  // gather mode's token-row output (any tensor otherwise)
   using namespace host;
   RuntimeCheck(
       x8.size(1) == 5120 && h.size(1) == kInter && h8.size(1) == kInter && y.size(1) == 5120,
@@ -1675,6 +1679,7 @@ inline void experts(
   prm.h8 = static_cast<uint8_t*>(h8.data_ptr());
   prm.hscale = static_cast<float*>(hscale.data_ptr());
   prm.y = static_cast<__nv_bfloat16*>(y.data_ptr());
+  prm.y_rows = static_cast<__nv_bfloat16*>(y_rows.data_ptr());
   prm.ws = static_cast<int32_t*>(ws.data_ptr());
   prm.num_experts = static_cast<int>(counts.size(0));
   prm.limit = static_cast<float>(limit);
@@ -1702,7 +1707,10 @@ inline void experts(
 // of slots routed to lower experts, and its slots keep their order. Masked slots (id < 0) belong to no expert.
 constexpr int kPrepThreads = 512;
 constexpr int kPrepWarps = kPrepThreads / 32;
-constexpr int kSortExperts = 4;
+#ifndef DSV4_SORT_EXPERTS  // whole experts: few local experts, one per sort CTA (n 128, capacity-padded: -48 us)
+#define DSV4_SORT_EXPERTS (DSV4_MOE_INTER >= 2304 ? 1 : 4)
+#endif
+constexpr int kSortExperts = DSV4_SORT_EXPERTS;  // experts per sort CTA (v2: 4)
 constexpr int kPrepMaxSlots = 32768;  // v2: 16384
 constexpr int kPrepRows = 4;  // token rows per quantization CTA
 
@@ -1739,8 +1747,12 @@ __global__ void __launch_bounds__(kPrepThreads) prep_kernel(
     uint8_t* __restrict__ x8,
     float* __restrict__ xscale,
     int32_t* __restrict__ ws,
-    int ws_ints) {
+    int ws_ints,
+    const int32_t* __restrict__ slot_token,  // gather mode: x row of each slot (else slot / top_k)
+    int direct_rows,  // gather mode: a slot that is its row's only valid slot gets destination ~row (y_rows)
+    const int32_t* __restrict__ valid_slots) {  // gather mode, optional: only the first *valid_slots slots are used
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  if (valid_slots != nullptr) num_slots = min(num_slots, max(0, *valid_slots));
   if (blockIdx.x == 0) {
     for (int i = threadIdx.x; i < ws_ints; i += kPrepThreads)
       ws[i] = 0;
@@ -1760,7 +1772,7 @@ __global__ void __launch_bounds__(kPrepThreads) prep_kernel(
       idv[i] = sl < end ? ids[sl] : -1;
     }
     // Pass 1: per warp, slots below this CTA's experts and per expert.
-    int below = 0, cnt[kSortExperts] = {0, 0, 0, 0};
+    int below = 0, cnt[kSortExperts] = {};
 #pragma unroll
     for (int i = 0; i < kMaxGroups; ++i) {
       if (begin + 32 * i >= end) break;  // warp-uniform
@@ -1793,8 +1805,23 @@ __global__ void __launch_bounds__(kPrepThreads) prep_kernel(
         const unsigned m = __ballot_sync(0xffffffffu, id == e_lo + k);
         if (id == e_lo + k) {
           const int pos = base[k] + run[k] + __popc(m & lt);
-          sorted_slots[pos] = sl;
-          sorted_tokens[pos] = sl / top_k;
+          int dst = sl;
+          if (direct_rows) {
+            bool single;
+            if (slot_token != nullptr) {  // pairs grouped by token row: alone if no neighbour has its row
+              const int t = slot_token[sl];
+              single = (sl == 0 || slot_token[sl - 1] != t) && (sl + 1 >= num_slots || slot_token[sl + 1] != t);
+              if (single) dst = ~t;
+            } else {  // [rows, top_k] local ids: alone if the row has one valid id
+              const int t = sl / top_k;
+              int valid = 0;
+              for (int k = 0; k < top_k; ++k)
+                valid += ids[t * top_k + k] >= 0;
+              if (valid == 1) dst = ~t;
+            }
+          }
+          sorted_slots[pos] = dst;
+          sorted_tokens[pos] = slot_token != nullptr ? slot_token[sl] : sl / top_k;
           sorted_weights[pos] = weights[sl];
         }
         run[k] += __popc(m);
@@ -1890,7 +1917,194 @@ inline void prep(
       static_cast<uint8_t*>(x8.data_ptr()),
       static_cast<float*>(xscale.data_ptr()),
       static_cast<int32_t*>(ws.data_ptr()),
-      static_cast<int>(ws.size(0)));
+      static_cast<int>(ws.size(0)),
+      static_cast<const int32_t*>(nullptr),
+      0,
+      static_cast<const int32_t*>(nullptr));
+}
+
+// Gather mode (INF-730, expert-parallel receive side): the x rows are the received TOKEN rows, already e4m3 with a
+// power-of-2 row scale (quantized exactly as this prologue would: same code in the dispatch), and the routed slots
+// are either the token rows' local top-k (ids [T, K], -1 = expert of another rank or a pad row; slot = t * K + k)
+// or a compact list of (token row, local expert, weight) pairs (ids [P, 1], slot_token [P] = token row; slot = p).
+// The experts kernel gathers each slot's x row by index (sorted_tokens = its token row), so no row is copied.
+// quant_rows > 0: also quantize x [quant_rows, 5120] bf16 into x8 / xscale (inputs not yet quantized).
+inline void prep_gather(
+    tvm::ffi::TensorView ids,
+    tvm::ffi::TensorView weights,
+    tvm::ffi::TensorView slot_token,
+    int64_t use_slot_token,
+    tvm::ffi::TensorView x,
+    int64_t quant_rows,
+    int64_t direct_rows,
+    tvm::ffi::TensorView counts,
+    tvm::ffi::TensorView sorted_slots,
+    tvm::ffi::TensorView sorted_tokens,
+    tvm::ffi::TensorView sorted_weights,
+    tvm::ffi::TensorView x8,
+    tvm::ffi::TensorView xscale,
+    tvm::ffi::TensorView ws,
+    tvm::ffi::TensorView valid_slots,  // int32 [1] on the device (pair lists), or any tensor when unused
+    int64_t use_valid_slots) {
+  using namespace host;
+  const int rows = static_cast<int>(ids.size(0));
+  const int top_k = static_cast<int>(ids.size(1));
+  const int num_experts = static_cast<int>(counts.size(0));
+  const int tokens = static_cast<int>(quant_rows);
+  RuntimeCheck(rows * top_k <= kPrepMaxSlots, "v2w prep_gather: at most 32768 routed slots");
+  RuntimeCheck(!use_slot_token || (top_k == 1 && slot_token.size(0) == rows), "v2w prep_gather: pairs need [P, 1] ids");
+  RuntimeCheck(tokens == 0 || (x.size(1) == 5120 && x.size(0) >= tokens), "v2w prep_gather: x [rows, 5120]");
+  const int sort_ctas = (num_experts + kSortExperts - 1) / kSortExperts;
+  const int quant_ctas = (tokens + kPrepRows - 1) / kPrepRows;
+  LaunchKernel(dim3(sort_ctas + (quant_ctas > 0 ? quant_ctas : 1)), dim3(kPrepThreads), ids.device())(
+      prep_kernel,
+      static_cast<const int32_t*>(ids.data_ptr()),
+      static_cast<const float*>(weights.data_ptr()),
+      rows * top_k,
+      top_k,
+      num_experts,
+      sort_ctas,
+      static_cast<int32_t*>(counts.data_ptr()),
+      static_cast<int32_t*>(sorted_slots.data_ptr()),
+      static_cast<int32_t*>(sorted_tokens.data_ptr()),
+      static_cast<float*>(sorted_weights.data_ptr()),
+      static_cast<const __nv_bfloat16*>(x.data_ptr()),
+      tokens,
+      static_cast<uint8_t*>(x8.data_ptr()),
+      static_cast<float*>(xscale.data_ptr()),
+      static_cast<int32_t*>(ws.data_ptr()),
+      static_cast<int>(ws.size(0)),
+      use_slot_token ? static_cast<const int32_t*>(slot_token.data_ptr()) : nullptr,
+      static_cast<int>(direct_rows),
+      use_valid_slots ? static_cast<const int32_t*>(valid_slots.data_ptr()) : nullptr);
+}
+
+// Per token row: out[t] = sum over k ascending of y[t * K + k] for ids[t, k] >= 0, in fp32, rounded once to bf16
+// (the arithmetic of dsv4_mxfp4_decode_moe_ws::combine). Rows whose ids are all masked are NOT written (on the expert
+// side of an EP dispatch these are pad rows or tokens with no local expert; the combine never reads them).
+constexpr int kRowCombineMaxK = 8;
+__global__ void row_combine_kernel(
+    const __nv_bfloat16* __restrict__ y,
+    const int32_t* __restrict__ ids,
+    __nv_bfloat16* __restrict__ out,
+    int top_k,
+    int min_valid) {
+  constexpr int kVecs = 5120 / 8;
+  const int t = blockIdx.y;
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  bool use[kRowCombineMaxK];
+  int valid = 0;
+#pragma unroll
+  for (int k = 0; k < kRowCombineMaxK; ++k) {
+    use[k] = k < top_k && ids[t * top_k + k] >= 0;
+    valid += use[k];
+  }
+  if (valid < min_valid || valid == 0 || v >= kVecs) return;  // min_valid 2: single-slot rows were written directly
+  uint4 w[kRowCombineMaxK];
+#pragma unroll
+  for (int k = 0; k < kRowCombineMaxK; ++k)
+    if (use[k]) w[k] = reinterpret_cast<const uint4*>(y + (static_cast<size_t>(t) * top_k + k) * 5120)[v];
+  float acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    acc[i] = 0.f;
+#pragma unroll
+  for (int k = 0; k < kRowCombineMaxK; ++k) {
+    if (!use[k]) continue;
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&w[k]);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __bfloat1622float2(b[i]);
+      acc[2 * i] += f.x;
+      acc[2 * i + 1] += f.y;
+    }
+  }
+  uint4 o;
+  __nv_bfloat162* ob = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    ob[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+  reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * 5120)[v] = o;
+}
+inline void row_combine(tvm::ffi::TensorView y, tvm::ffi::TensorView ids, tvm::ffi::TensorView out, int64_t min_valid) {
+  using namespace host;
+  const int rows = static_cast<int>(ids.size(0));
+  const int top_k = static_cast<int>(ids.size(1));
+  RuntimeCheck(top_k <= kRowCombineMaxK && y.size(1) == 5120 && out.size(1) == 5120 && out.size(0) >= rows &&
+                   y.size(0) == static_cast<int64_t>(rows) * top_k,
+               "v2w row_combine: shapes");
+  if (rows == 0) return;
+  LaunchKernel(dim3((5120 / 8 + 127) / 128, rows), dim3(128), ids.device())(
+      row_combine_kernel,
+      static_cast<const __nv_bfloat16*>(y.data_ptr()),
+      static_cast<const int32_t*>(ids.data_ptr()),
+      static_cast<__nv_bfloat16*>(out.data_ptr()),
+      top_k,
+      static_cast<int>(min_valid));
+}
+
+// Pair-list reduce: pairs sorted by token row (pair_tok non-decreasing; masked pairs have id < 0 and any token).
+// out[t] = sum over the valid pairs of row t in pair order, fp32, rounded once to bf16; rows without a valid pair
+// are not written.
+__global__ void pair_reduce_kernel(
+    const __nv_bfloat16* __restrict__ y,
+    const int32_t* __restrict__ pair_tok,
+    const int32_t* __restrict__ pair_eid,
+    int num_pairs,
+    int rows,
+    __nv_bfloat16* __restrict__ out,
+    const int32_t* __restrict__ valid_pairs) {
+  // Blocks stride over the pairs; only the first pair of a row with several pairs works: it sums the row's pairs
+  // (contiguous) in pair order. A row's only pair was written to out by the experts kernel.
+  constexpr int kVecs = 5120 / 8;
+  if (valid_pairs != nullptr) num_pairs = min(num_pairs, max(0, *valid_pairs));
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= kVecs) return;
+  for (int q0 = blockIdx.y; q0 < num_pairs; q0 += gridDim.y) {
+    const int t = pair_tok[q0];
+    if (t >= rows || (q0 > 0 && pair_tok[q0 - 1] == t) || q0 + 1 >= num_pairs || pair_tok[q0 + 1] != t) continue;
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      acc[i] = 0.f;
+    bool any = false;
+    for (int q = q0; q < num_pairs && pair_tok[q] == t; ++q) {
+      if (pair_eid[q] < 0) continue;
+      any = true;
+      const uint4 w = reinterpret_cast<const uint4*>(y + static_cast<size_t>(q) * 5120)[v];
+      const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&w);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float2 f = __bfloat1622float2(b[i]);
+        acc[2 * i] += f.x;
+        acc[2 * i + 1] += f.y;
+      }
+    }
+    if (!any) continue;
+    uint4 o;
+    __nv_bfloat162* ob = reinterpret_cast<__nv_bfloat162*>(&o);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      ob[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+    reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * 5120)[v] = o;
+  }
+}
+inline void pair_reduce(tvm::ffi::TensorView y, tvm::ffi::TensorView pair_tok, tvm::ffi::TensorView pair_eid,
+                        tvm::ffi::TensorView out, tvm::ffi::TensorView valid_pairs, int64_t use_valid_pairs) {
+  using namespace host;
+  const int pairs = static_cast<int>(pair_tok.size(0));
+  const int rows = static_cast<int>(out.size(0));
+  RuntimeCheck(y.size(0) == pairs && y.size(1) == 5120 && out.size(1) == 5120, "v2w pair_reduce: shapes");
+  if (rows == 0 || pairs == 0) return;
+  LaunchKernel(dim3((5120 / 8 + 127) / 128, pairs < 2048 ? pairs : 2048), dim3(128), out.device())(
+      pair_reduce_kernel,
+      static_cast<const __nv_bfloat16*>(y.data_ptr()),
+      static_cast<const int32_t*>(pair_tok.data_ptr()),
+      static_cast<const int32_t*>(pair_eid.data_ptr()),
+      pairs,
+      rows,
+      static_cast<__nv_bfloat16*>(out.data_ptr()),
+      use_valid_pairs ? static_cast<const int32_t*>(valid_pairs.data_ptr()) : nullptr);
 }
 
 // Load both kernels of this module on the current device now (CUDA loads modules lazily, at a kernel's first
@@ -1913,6 +2127,8 @@ inline void prepare_kernels() {
   g_smem_attr_set = true;
   cudaFuncAttributes attr;
   RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, prep_kernel));
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, row_combine_kernel));
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, pair_reduce_kernel));
 }
 
 }  // namespace dsv4_moe_v2w

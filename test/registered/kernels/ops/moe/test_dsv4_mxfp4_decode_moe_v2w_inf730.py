@@ -167,3 +167,99 @@ def test_v2w_tp8_padded_slice_matches_288_reference():
     x, ids, w = _routing(400, 16, 3, 9)
     err = _rel(V2W.decode_moe(x, ids, w, packed, LIMIT), _reference(x, ids, w, ref_experts))
     assert err < 5e-3, err
+
+
+def _ep_receive(tokens, num_local, top_k, seed, s=1.0, local_share=0.4):
+    """A rank's receive side: token rows (e4m3 + row scale, as the dispatch sends them), their LOCAL top-k ids
+    (-1 = expert of another rank) and weights; some rows have no local expert (pad rows)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x, ids, w = _routing(tokens, num_local, top_k, seed, s)
+    keep = torch.rand(tokens, top_k, device="cuda", generator=g) < local_share
+    ids = torch.where(keep, ids, torch.full_like(ids, -1))
+    return x, ids, w
+
+
+def test_v2w_gather_modes_bit_identical():
+    """Token rows + local top-k (decode_moe_tokens) and token rows + a compact pair list (decode_moe_pairs, also at a
+    fixed capacity with a device-side count): each slot's output equals the pair-row call, each token row equals the
+    fp32 k-ascending sum of its slots; rows without a local slot are not written."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as V2W
+
+    packed = V2W.pack_experts(*_experts(48, 2304))
+    T, K = 700, 6
+    x, ids, w = _ep_receive(T, 48, K, 21)
+    x8 = torch.empty(T, HIDDEN, dtype=torch.uint8, device="cuda")
+    xs = torch.empty(T, dtype=torch.float32, device="cuda")
+    sentinel = torch.full((T, HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
+    out_t = sentinel.clone()
+    V2W.decode_moe_tokens(x8, xs, ids, w, packed, LIMIT, out_t, x=x)  # also quantizes x into x8 / xs
+    t2, k2 = torch.nonzero(ids >= 0, as_tuple=True)
+    pid, pw = ids[t2, k2].unsqueeze(1).contiguous(), w[t2, k2].unsqueeze(1).contiguous()
+    pair_rows = V2W.decode_moe(x[t2].contiguous(), pid, pw, packed, LIMIT, output=torch.empty(t2.numel(), HIDDEN, dtype=torch.bfloat16, device="cuda"))
+    # per pair: bit-identical to the pair-row call
+    _, per_pair = V2W.decode_moe_pairs(x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT)
+    assert torch.equal(per_pair, pair_rows)
+    # per token row: fp32 k-ascending sum of its pairs, one bf16 round
+    Y = torch.zeros(T, K, HIDDEN, device="cuda")
+    Y[t2, k2] = pair_rows.float()
+    ref = torch.zeros(T, HIDDEN, device="cuda")
+    for k in range(K):
+        ref += Y[:, k]
+    has = (ids >= 0).any(1)
+    assert torch.equal(out_t[has], ref.to(torch.bfloat16)[has])
+    assert torch.equal(out_t[~has], sentinel[~has])  # not written
+    out_p = sentinel.clone()
+    V2W.decode_moe_pairs(x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT, out_tokens=out_p)
+    assert torch.equal(out_p, out_t)
+    # fixed capacity (graph shapes): unused entries at the end, device-side count
+    cap = T * K
+    tok_c = torch.full((cap,), T, dtype=torch.int32, device="cuda")
+    eid_c = torch.full((cap,), -1, dtype=torch.int32, device="cuda")
+    w_c = torch.zeros(cap, device="cuda")
+    tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = t2.int(), pid.flatten(), pw.flatten()
+    out_c = sentinel.clone()
+    V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out_c,
+                         num_valid=torch.tensor([t2.numel()], dtype=torch.int32, device="cuda"))
+    assert torch.equal(out_c, out_t)
+
+
+def test_v2w_gather_pairs_cuda_graph():
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as V2W
+
+    packed = V2W.pack_experts(*_experts(48, 2304))
+    V2W.prepare(torch.cuda.current_device(), 2304)
+    T, K = 512, 6
+    cap = T * K
+    x8 = torch.empty(T, HIDDEN, dtype=torch.uint8, device="cuda")
+    xs = torch.empty(T, dtype=torch.float32, device="cuda")
+    tok_c = torch.full((cap,), T, dtype=torch.int32, device="cuda")
+    eid_c = torch.full((cap,), -1, dtype=torch.int32, device="cuda")
+    w_c = torch.zeros(cap, device="cuda")
+    nv = torch.zeros(1, dtype=torch.int32, device="cuda")
+    out = torch.zeros(T, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    def load(seed):
+        x, ids, w = _ep_receive(T, 48, K, seed)
+        V2W.decode_moe_tokens(x8, xs, torch.full_like(ids, -1), w, packed, LIMIT, out, x=x)  # quantize only
+        t2, k2 = torch.nonzero(ids >= 0, as_tuple=True)
+        tok_c.fill_(T), eid_c.fill_(-1), w_c.zero_()
+        tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = t2.int(), ids[t2, k2], w[t2, k2]
+        nv.fill_(t2.numel())
+        ref = torch.zeros_like(out)
+        V2W.decode_moe_tokens(x8, xs, ids, w, packed, LIMIT, ref)
+        return ref, (ids >= 0).any(1)
+
+    load(1)
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv)
+    torch.cuda.current_stream().wait_stream(st)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv)
+    for seed in (2, 3):
+        ref, has = load(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out[has], ref[has])

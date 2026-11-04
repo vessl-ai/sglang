@@ -45,6 +45,9 @@ def _module(inter: int, defines: tuple = ()):
             ("prep", "dsv4_moe_v2w::prep"),
             ("experts", "dsv4_moe_v2w::experts"),
             ("prepare_kernels", "dsv4_moe_v2w::prepare_kernels"),
+            ("prep_gather", "dsv4_moe_v2w::prep_gather"),
+            ("row_combine", "dsv4_moe_v2w::row_combine"),
+            ("pair_reduce", "dsv4_moe_v2w::pair_reduce"),
         ],
         extra_cuda_cflags=[f"-DDSV4_MOE_INTER={inter}"] + [f"-D{d}" for d in defines],
     )
@@ -141,7 +144,129 @@ def decode_moe(
     hs = torch.empty(num_slots, dtype=torch.float32, device=dev)
     y = output if top_k == 1 else hidden_states.new_empty(num_slots, HIDDEN)
     mod.experts(x8, xs, packed.w13, packed.w2, counts, sorted_tokens, sorted_slots, sorted_weights, h, h8, hs, y,
-                work, float(swiglu_limit))
+                work, float(swiglu_limit), y)
     if top_k != 1:
         ws._module().combine(y, ids, output)
     return output
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Gather mode (INF-730): the expert side of an EP dispatch that sends one e4m3 TOKEN row per destination rank.
+
+
+def _scratch(num_experts: int, num_slots: int, inter: int, dev):
+    """Per-call scratch of the experts kernel; sizes depend only on (local experts, slots, width), so they are the
+    same on every rank when the slot count is the fixed receive capacity (CUDA graph capture)."""
+    max_passes = num_experts + num_slots // 32 + 1
+    return dict(
+        counts=torch.empty(num_experts, dtype=torch.int32, device=dev),
+        sorted_slots=torch.empty(num_slots, dtype=torch.int32, device=dev),
+        sorted_tokens=torch.empty(num_slots, dtype=torch.int32, device=dev),
+        sorted_weights=torch.empty(num_slots, dtype=torch.float32, device=dev),
+        work=torch.empty(WORKSPACE_BASE + 5 * max_passes, dtype=torch.int32, device=dev),
+        h=torch.empty(num_slots, inter, dtype=torch.bfloat16, device=dev),
+        h8=torch.empty(num_slots, inter, dtype=torch.uint8, device=dev),
+        hs=torch.empty(num_slots, dtype=torch.float32, device=dev),
+    )
+
+
+def _gather_call(x8, xscale, ids, weights, slot_token, packed, swiglu_limit, y, y_rows, x, defines, valid=None):
+    rows, top_k = ids.shape
+    num_slots = rows * top_k
+    assert num_slots <= PREP_MAX_SLOTS, num_slots
+    dev = ids.device
+    mod = _module(packed.inter, defines)
+    sc = _scratch(packed.w13.shape[0], num_slots, packed.inter, dev)
+    quant_rows = 0
+    if x is not None:  # not yet quantized: the prologue quantizes the token rows (as v2's prep)
+        quant_rows = x.shape[0]
+    else:
+        x = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=dev)
+    use_tok = slot_token is not None
+    if not use_tok:
+        slot_token = sc["counts"]  # unused stand-in
+    direct = y_rows is not None  # a row's only valid slot is written straight to its token row
+    mod.prep_gather(ids, weights, slot_token, int(use_tok), x, quant_rows, int(direct), sc["counts"],
+                    sc["sorted_slots"], sc["sorted_tokens"], sc["sorted_weights"], x8, xscale, sc["work"],
+                    valid if valid is not None else sc["counts"], int(valid is not None))
+    mod.experts(x8, xscale, packed.w13, packed.w2, sc["counts"], sc["sorted_tokens"], sc["sorted_slots"],
+                sc["sorted_weights"], sc["h"], sc["h8"], sc["hs"], y, sc["work"], float(swiglu_limit),
+                y_rows if direct else y)
+    return mod
+
+
+def decode_moe_tokens(
+    x8: torch.Tensor,
+    xscale: torch.Tensor,
+    local_ids: torch.Tensor,
+    weights: torch.Tensor,
+    packed: PackedExperts,
+    swiglu_limit: float,
+    output: torch.Tensor,
+    x: torch.Tensor | None = None,
+    defines: tuple = (),
+) -> torch.Tensor:
+    """Received token rows -> per-token-row partial MoE outputs, reduced on this rank.
+
+    x8 [T, 5120] uint8 (e4m3) and xscale [T] f32: the received rows, quantized with a power-of-2 row scale exactly
+    as v2's prologue does (pass x [T, 5120] bf16 instead to quantize here; x8 / xscale are then outputs).
+    local_ids [T, K] int32: LOCAL expert of each top-k slot, -1 for experts of other ranks and pad rows.
+    weights [T, K] f32. output [T, 5120] bf16: row t = sum over its local slots, k ascending, fp32, one bf16 round;
+    rows with no local slot are not written. Each slot's expert output is bit-identical to the pair-row call
+    (``decode_moe`` with that slot as a top_k 1 row)."""
+    rows, top_k = local_ids.shape
+    if rows == 0:
+        return output
+    ids = local_ids.to(torch.int32).contiguous()
+    w = weights.float().contiguous()
+    if top_k == 1:  # one slot per row: the down epilogue writes the row itself
+        _gather_call(x8, xscale, ids, w, None, packed, swiglu_limit, output, output, x, defines)
+        return output
+    # Every valid slot goes through y; row_combine sums each row's slots (same fp32 k-ascending sum as v2's combine).
+    # (Writing single-slot rows directly costs more in the prologue's per-slot row scan than it saves here.)
+    y = torch.empty(rows * top_k, HIDDEN, dtype=torch.bfloat16, device=ids.device)
+    mod = _gather_call(x8, xscale, ids, w, None, packed, swiglu_limit, y, None, x, defines)
+    mod.row_combine(y, ids, output, 1)
+    return output
+
+
+def decode_moe_pairs(
+    x8: torch.Tensor,
+    xscale: torch.Tensor,
+    pair_tok: torch.Tensor,
+    pair_eid: torch.Tensor,
+    pair_w: torch.Tensor,
+    packed: PackedExperts,
+    swiglu_limit: float,
+    out_tokens: torch.Tensor | None = None,
+    out_pairs: torch.Tensor | None = None,
+    x: torch.Tensor | None = None,
+    defines: tuple = (),
+    num_valid: torch.Tensor | None = None,
+):
+    """Received token rows + a compact list of (token row, local expert, routing weight) pairs.
+
+    pair_tok [P] int32 (row of x8), pair_eid [P] int32 (local expert; -1 = unused capacity), pair_w [P] f32.
+    out_pairs [P, 5120] bf16 (optional): each valid pair's weighted expert output (bit-identical to the pair-row
+    call) when out_tokens is None; scratch otherwise. out_tokens [T, 5120] bf16 (optional): per token row, the sum
+    over its pairs in pair order (fp32, one bf16 round); needs pairs grouped by token row (pair_tok non-decreasing)
+    and unused capacity at the end (pair_eid -1, pair_tok >= T); rows without a pair are not written.
+    num_valid (optional) int32 [1] on the device: only the first num_valid pairs are read (CUDA graphs: the lists have
+    the fixed capacity, the count comes from the dispatch; without it every entry is scanned). Returns
+    (out_tokens, out_pairs)."""
+    num_pairs = pair_tok.shape[0]
+    if out_pairs is None:
+        out_pairs = torch.empty(num_pairs, HIDDEN, dtype=torch.bfloat16, device=pair_tok.device)
+    if num_pairs == 0:
+        return out_tokens, out_pairs
+    tok = pair_tok.to(torch.int32).contiguous()
+    eid = pair_eid.to(torch.int32).contiguous()
+    # With out_tokens, a token row's only pair is written straight to it (out_pairs then holds only the pairs of rows
+    # with several, and is scratch); without, every pair goes to out_pairs.
+    mod = _gather_call(x8, xscale, eid.view(num_pairs, 1), pair_w.float().contiguous().view(num_pairs, 1), tok,
+                       packed, swiglu_limit, out_pairs, out_tokens, x, defines, num_valid)
+    if out_tokens is not None:
+        mod.pair_reduce(out_pairs, tok, eid, out_tokens, num_valid if num_valid is not None else tok,
+                        int(num_valid is not None))
+    return out_tokens, out_pairs
+
