@@ -423,6 +423,7 @@ def _decode_moe_ep_call(
         y,
         routing.work,
         float(swiglu_limit),
+        *((y,) if mod is not v2._module() else ()),  # v2w: its gather mode's token-row output (unused here)
     )
     combine_ep(y, topk_ids, split, output)
     return y if return_y else None
