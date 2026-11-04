@@ -35,7 +35,7 @@ This module is the seam for a dedicated EP kernel: the engine calls only ``suppo
 from __future__ import annotations
 
 import functools
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -132,17 +132,44 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8) -> Tuple[PackedExpe
 
 
 # ---------------------------------------------------------------------------------------------------------
-# Routing: local slots -> virtual slots sorted by virtual expert.
+# Prologue: local slots -> virtual slots sorted by virtual expert, plus the e4m3 row quantization of the tokens.
+# Three launches: one memset (counts + the experts kernel's workspace), count + row quantization, expand.
 
 
-@triton.jit(do_not_specialize=["num_slots"])
-def _ep_count_kernel(ids_ptr, cursor_ptr, rank_ptr, num_slots, BLOCK: tl.constexpr):
-    slots = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    in_range = slots < num_slots
-    ids = tl.load(ids_ptr + slots, mask=in_range, other=-1)
-    valid = in_range & (ids >= 0)
-    rank = tl.atomic_add(cursor_ptr + tl.where(valid, ids, 0), 1, mask=valid)
-    tl.store(rank_ptr + slots, rank, mask=valid)
+@triton.jit(do_not_specialize=["num_slots", "num_slot_blocks"])
+def _ep_count_quant_kernel(
+    ids_ptr,
+    cursor_ptr,
+    rank_ptr,
+    num_slots,
+    num_slot_blocks,
+    x_ptr,
+    x8_ptr,
+    xs_ptr,
+    HID: tl.constexpr,
+    QBLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QUANT: tl.constexpr,
+):
+    """Programs below num_slot_blocks: every local slot takes its rank among its expert's slots (atomic count).
+    The others: one token row each, quantized exactly as mxfp4_w4a8_prefill._row_quant does it (e4m3, one
+    power-of-2 scale per row)."""
+    pid = tl.program_id(0)
+    if pid < num_slot_blocks:
+        slots = pid * BLOCK + tl.arange(0, BLOCK)
+        in_range = slots < num_slots
+        ids = tl.load(ids_ptr + slots, mask=in_range, other=-1)
+        valid = in_range & (ids >= 0)
+        rank = tl.atomic_add(cursor_ptr + tl.where(valid, ids, 0), 1, mask=valid)
+        tl.store(rank_ptr + slots, rank, mask=valid)
+    elif QUANT:
+        r = (pid - num_slot_blocks).to(tl.int64)
+        o = tl.arange(0, QBLOCK)
+        x = tl.load(x_ptr + r * HID + o, mask=o < HID, other=0.0).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(x)), 1e-4)
+        sc = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+        tl.store(x8_ptr + r * HID + o, (x / sc).to(tl.float8e4nv), mask=o < HID)
+        tl.store(xs_ptr + r, sc)
 
 
 @triton.jit(do_not_specialize=["num_slots"])
@@ -151,23 +178,31 @@ def _ep_expand_kernel(
     weights_ptr,
     rank_ptr,
     counts_ptr,
-    offsets_ptr,
+    counts_v_ptr,
     sorted_slots_ptr,
     sorted_tokens_ptr,
     sorted_weights_ptr,
     num_slots,
+    NUM_LOCAL: tl.constexpr,
+    E_BLOCK: tl.constexpr,
     TOP_K: tl.constexpr,
     SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    j = tl.arange(0, E_BLOCK)
+    cnt = tl.load(counts_ptr + j, mask=j < NUM_LOCAL, other=0)
+    first = tl.cumsum(cnt, 0) - cnt  # first sorted position of each local expert's slots
+    if tl.program_id(0) == 0:
+        for s in tl.static_range(SPLIT):
+            tl.store(counts_v_ptr + j * SPLIT + s, cnt, mask=j < NUM_LOCAL)
     slots = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_range = slots < num_slots
     ids = tl.load(ids_ptr + slots, mask=in_range, other=-1)
     valid = in_range & (ids >= 0)
     e = tl.where(valid, ids, 0)
     rank = tl.load(rank_ptr + slots, mask=valid, other=0)
-    count = tl.load(counts_ptr + e, mask=valid, other=0)
-    offset = tl.load(offsets_ptr + e, mask=valid, other=0)
+    count = tl.gather(cnt, e, 0)
+    offset = tl.gather(first, e, 0)
     w = tl.load(weights_ptr + slots, mask=valid, other=0.0)
     token = slots // TOP_K
     for s in tl.static_range(SPLIT):
@@ -177,40 +212,73 @@ def _ep_expand_kernel(
         tl.store(sorted_weights_ptr + pos, w, mask=valid)
 
 
-def route_ep(topk_ids: torch.Tensor, topk_weights: torch.Tensor, num_local: int, split: int):
-    """(counts [E*S], sorted_slots, sorted_tokens, sorted_weights [T*K*S]): the v2 kernel's sorted routing
-    over the virtual experts. Virtual slot (t, k, s) = (t * K + k) * S + s, the row of y it writes. Entries past
-    sum(counts) are left unwritten."""
+class EpRouting(NamedTuple):
+    counts: torch.Tensor  # [E*S] int32 slots of each virtual expert
+    sorted_slots: torch.Tensor  # [T*K*S] int32 virtual slot (t * K + k) * S + s = the row of y it writes
+    sorted_tokens: torch.Tensor  # [T*K*S] int32 token row of x
+    sorted_weights: torch.Tensor  # [T*K*S] fp32 routing weight
+    work: torch.Tensor  # the experts kernel's zeroed workspace
+
+
+def route_ep(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local: int,
+    split: int,
+    hidden_states: Optional[torch.Tensor] = None,
+):
+    """The v2 kernel's sorted routing over the virtual experts (entries past sum(counts) unwritten) and its
+    zeroed workspace; with ``hidden_states`` also its row quantization -> (EpRouting, (x8, xscale) or None)."""
     num_tokens, top_k = topk_ids.shape
     num_slots = num_tokens * top_k
     dev = topk_ids.device
     ids = topk_ids.to(torch.int32).contiguous()
     weights = topk_weights.float().contiguous()
-    cursor = torch.zeros(num_local, dtype=torch.int32, device=dev)
-    rank = torch.empty(num_slots, dtype=torch.int32, device=dev)
-    grid = (triton.cdiv(num_slots, _ROUTE_BLOCK),)
-    _ep_count_kernel[grid](ids, cursor, rank, num_slots, BLOCK=_ROUTE_BLOCK)
-    offsets = torch.cumsum(cursor, 0, dtype=torch.int32) - cursor
+    num_virtual = num_local * split
     vslots = num_slots * split
+    max_passes = num_virtual + vslots // 32 + 1
+    # one memset: the experts kernel's workspace (rounded to 16 bytes, so that the cursors after it keep the
+    # pointer alignment Triton specialized on), then the per-expert cursors
+    work_len = (v2.WORKSPACE_BASE + 2 * max_passes + 3) // 4 * 4
+    zeroed = torch.zeros(work_len + num_local, dtype=torch.int32, device=dev)
+    work, cursor = zeroed[:work_len], zeroed[work_len:]
+    rank = torch.empty(num_slots, dtype=torch.int32, device=dev)
+    slot_blocks = triton.cdiv(num_slots, _ROUTE_BLOCK)
+    quant = None
+    if hidden_states is not None:
+        quant = (
+            torch.empty(num_tokens, HIDDEN, dtype=torch.float8_e4m3fn, device=dev),
+            torch.empty(num_tokens, dtype=torch.float32, device=dev),
+        )
+        x = hidden_states.contiguous()
+    else:  # placeholders of the right types; QUANT=False compiles no access to them
+        x = torch.empty(0, dtype=torch.bfloat16, device=dev)
+        empty = (torch.empty(0, dtype=torch.float8_e4m3fn, device=dev), torch.empty(0, dtype=torch.float32, device=dev))
+    _ep_count_quant_kernel[(slot_blocks + (num_tokens if quant is not None else 0),)](
+        ids,
+        cursor,
+        rank,
+        num_slots,
+        slot_blocks,
+        x,
+        *(quant if quant is not None else empty),
+        HID=HIDDEN,
+        QBLOCK=triton.next_power_of_2(HIDDEN),
+        BLOCK=_ROUTE_BLOCK,
+        QUANT=quant is not None,
+        num_warps=8,
+    )
+    counts = torch.empty(num_virtual, dtype=torch.int32, device=dev)
     sorted_slots = torch.empty(vslots, dtype=torch.int32, device=dev)
     sorted_tokens = torch.empty(vslots, dtype=torch.int32, device=dev)
     sorted_weights = torch.empty(vslots, dtype=torch.float32, device=dev)
-    _ep_expand_kernel[grid](
-        ids,
-        weights,
-        rank,
-        cursor,
-        offsets,
-        sorted_slots,
-        sorted_tokens,
-        sorted_weights,
-        num_slots,
-        TOP_K=top_k,
-        SPLIT=split,
-        BLOCK=_ROUTE_BLOCK,
+    e_block = triton.next_power_of_2(num_local)
+    block = max(64, min(1024, 32768 // e_block))
+    _ep_expand_kernel[(triton.cdiv(num_slots, block),)](
+        ids, weights, rank, cursor, counts, sorted_slots, sorted_tokens, sorted_weights, num_slots,
+        NUM_LOCAL=num_local, E_BLOCK=e_block, TOP_K=top_k, SPLIT=split, BLOCK=block,
     )
-    counts = cursor.view(num_local, 1).expand(num_local, split).reshape(-1)
-    return counts, sorted_slots, sorted_tokens, sorted_weights
+    return EpRouting(counts, sorted_slots, sorted_tokens, sorted_weights, work), quant
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -285,16 +353,15 @@ def _decode_moe_ep_call(
     num_virtual = packed.w13.shape[0]
     assert num_virtual % split == 0, (num_virtual, split)
     dev = output.device
-    counts, sorted_slots, sorted_tokens, sorted_weights = route_ep(
-        topk_ids, topk_weights, num_virtual // split, split
+    routing, quant = route_ep(
+        topk_ids,
+        topk_weights,
+        num_virtual // split,
+        split,
+        hidden_states=hidden_states if row_quant is None else None,
     )
-    if row_quant is None:
-        x8f, xs = _row_quant(hidden_states.contiguous())
-    else:
-        x8f, xs = row_quant
+    x8f, xs = quant if row_quant is None else row_quant
     vslots = num_tokens * top_k * split
-    max_passes = num_virtual + vslots // 32 + 1
-    work = torch.zeros(v2.WORKSPACE_BASE + 2 * max_passes, dtype=torch.int32, device=dev)
     h = torch.empty(vslots, INTER, dtype=torch.bfloat16, device=dev)
     h8 = torch.empty(vslots, INTER, dtype=torch.uint8, device=dev)
     hs = torch.empty(vslots, dtype=torch.float32, device=dev)
@@ -304,15 +371,15 @@ def _decode_moe_ep_call(
         xs,
         packed.w13,
         packed.w2,
-        counts,
-        sorted_tokens,
-        sorted_slots,
-        sorted_weights,
+        routing.counts,
+        routing.sorted_tokens,
+        routing.sorted_slots,
+        routing.sorted_weights,
         h,
         h8,
         hs,
         y,
-        work,
+        routing.work,
         float(swiglu_limit),
     )
     combine_ep(y, topk_ids, split, output)
@@ -393,5 +460,8 @@ def prepare_ep(device_index: int, num_virtual: int, split: int, top_k: int) -> N
         for num_tokens in (2, 16):  # Triton specializes pointers' alignment, not these ints
             x = torch.zeros(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
             ids = torch.full((num_tokens, top_k), -1, dtype=torch.int32, device="cuda")
-            decode_moe_ep(x, ids, torch.ones(ids.shape, device="cuda"), packed, 10.0, split)
+            w = torch.ones(ids.shape, device="cuda")
+            decode_moe_ep(x, ids, w, packed, 10.0, split)
+            # the pre-quantized input path (a dispatch that sends e4m3 rows)
+            decode_moe_ep(None, ids, w, packed, 10.0, split, row_quant=_row_quant(x))
         torch.cuda.synchronize()
