@@ -1540,6 +1540,11 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Reuse the ids of rendered-prompt segments (text between added tokens)
+    # across requests (entrypoints/openai/prompt_segment_cache.py). Budget in
+    # MiB; 0 turns it off. Segments shorter than MIN_CHARS are not stored.
+    SGLANG_OPT_PROMPT_SEGMENT_CACHE_MB = EnvInt(0)
+    SGLANG_OPT_PROMPT_SEGMENT_CACHE_MIN_CHARS = EnvInt(1024)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

@@ -6,6 +6,7 @@ import logging
 import math
 import time
 import uuid
+from array import array
 from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
@@ -49,6 +50,10 @@ from sglang.srt.entrypoints.openai import (
 from sglang.srt.entrypoints.openai import solar_open2_serving as solar
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
+)
+from sglang.srt.entrypoints.openai.prompt_segment_cache import (
+    encode_with_segment_cache,
+    get_prompt_segment_cache,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -497,7 +502,27 @@ class OpenAIServingChat(OpenAIServingBase):
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
+        if isinstance(prompt_ids, array):
+            # From the prompt segment cache; this path is rare, keep a list.
+            prompt_ids = prompt_ids.tolist()
         return prompt_ids + encoded
+
+    def _encode_rendered_prompt(
+        self, real_input: str, request: ChatCompletionRequest
+    ) -> Union[List[int], array]:
+        """Ids of a prompt rendered by a Python chat encoder (dsv4/dsv41/dsv32).
+
+        With SGLANG_OPT_PROMPT_SEGMENT_CACHE_MB > 0, segments that earlier
+        requests already encoded are reused and the ids come back as
+        array('q'). Requests with n > 1 keep the list: parallel sampling
+        expands input_ids as a list of lists.
+        """
+        cache = get_prompt_segment_cache()
+        if cache is not None and (request.n or 1) == 1:
+            return encode_with_segment_cache(
+                self.tokenizer_manager.tokenizer, real_input, cache
+            )
+        return self.tokenizer_manager.tokenizer.encode(real_input)
 
     def _resolve_inline_system_support(self) -> bool:
         if self.chat_encoding_spec is not None:
@@ -1219,8 +1244,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # attached the MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
             self._prompt_text_round_trip_is_lossy
-            and isinstance(processed_messages.prompt_ids, list)
-            and processed_messages.prompt_ids
+            # array: ids from the prompt segment cache.
+            and isinstance(processed_messages.prompt_ids, (list, array))
+            and len(processed_messages.prompt_ids) > 0
             and not (
                 processed_messages.image_data
                 or processed_messages.video_data
@@ -1253,8 +1279,8 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.template_manager.chat_template_name is None
             and not self._prompt_text_round_trip_is_lossy
             and not self._tokenizer_auto_adds_specials
-            and isinstance(processed_messages.prompt_ids, list)
-            and bool(processed_messages.prompt_ids)
+            and isinstance(processed_messages.prompt_ids, (list, array))
+            and len(processed_messages.prompt_ids) > 0
             and not processed_messages.image_data
             and not processed_messages.video_data
             and not processed_messages.audio_data
@@ -1735,7 +1761,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input, request)
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1762,12 +1788,15 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                    # The MM processor expands placeholder ids in a list.
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                else:
+                    prompt_ids = self._encode_rendered_prompt(real_input, request)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input, request)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
