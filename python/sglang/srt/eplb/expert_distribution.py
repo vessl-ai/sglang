@@ -398,6 +398,14 @@ class _SinglePassGatherer(ABC):
         if get_exec().moe.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(expert_location_metadata, rank)
 
+        # INF-730 c-route (rig only): per-row top-k ids with the DP MAX_LEN pad rows
+        # masked, plus the DSpark draft stages, for per-pass EP imbalance analysis.
+        if (
+            get_exec().moe.expert_distribution_recorder_mode == "per_pass"
+            and get_int_env_var("SGLANG_INF730_ROUTE_ROWS", 0) > 0
+        ):
+            return _RouteRowsSinglePassGatherer(expert_location_metadata, rank)
+
         if get_exec().moe.moe_a2a_backend == "mori":
             return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
 
@@ -624,6 +632,134 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
+
+
+class _RouteRowsSinglePassGatherer(_SinglePassGatherer):
+    """INF-730 c-route: record every MoE row's top-k ids of a pass.
+
+    Target layers use their own index; DSpark draft stages use
+    ``num_layers + stage`` (see deepseek_v4_dspark.py). The copy and the DP pad
+    mask are plain kernels, so they are captured into the decode CUDA graphs and
+    replayed with the graph's row count; the row count of every layer call is
+    written into ``_rows_of_layer`` by a captured fill. Only global rank 0 keeps
+    rows: under DP attention + TP MoE every rank routes the same gathered buffer.
+    """
+
+    NUM_DRAFT_LAYERS = 8
+
+    def __init__(self, expert_location_metadata, rank: int):
+        super().__init__(expert_location_metadata, rank)
+        self._num_target_layers = expert_location_metadata.num_layers
+        self.draft_layer_base = self._num_target_layers
+        num_layers = self._num_target_layers + self.NUM_DRAFT_LAYERS
+        max_rows = get_int_env_var("SGLANG_INF730_ROUTE_MAX_ROWS", 4096)
+        self._max_rows = max_rows
+        device = get_device()
+        self._ids = torch.full(
+            (num_layers, max_rows, 8), -1, dtype=torch.int32, device=device
+        )
+        self._rows_of_layer = torch.zeros(num_layers, dtype=torch.int32, device=device)
+        self._top_k_of_layer = torch.zeros(num_layers, dtype=torch.int32, device=device)
+        self._counts = torch.zeros(
+            (num_layers, expert_location_metadata.num_logical_experts),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._keep = torch.distributed.get_rank() == 0
+        self._meta = None
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        gnt = forward_batch.global_num_tokens_cpu
+        self._meta = dict(
+            forward_mode=forward_batch.forward_mode.name,
+            global_forward_mode=(
+                forward_batch.global_forward_mode.name
+                if forward_batch.global_forward_mode is not None
+                else None
+            ),
+            is_extend_in_batch=bool(forward_batch.is_extend_in_batch),
+            batch_size=int(forward_batch.batch_size),
+            global_num_tokens=list(gnt) if gnt is not None else None,
+            dp_padding_mode=(
+                forward_batch.dp_padding_mode.name
+                if forward_batch.dp_padding_mode is not None
+                else None
+            ),
+            time=time.time(),
+        )
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if layer_idx is None or not isinstance(layer_idx, int):
+            return
+        if layer_idx >= self._ids.shape[0]:
+            return
+        rows, top_k = topk_ids.shape
+        # A private copy: the pad mask writes -1 in place, and the real ids must
+        # stay untouched (the dispatcher masks after its own id translation).
+        ids = topk_ids.to(torch.int32).clone()
+        from sglang.srt.layers.dp_attention import (
+            is_dp_max_padding,
+            mask_dp_pad_moe_topk_ids,
+        )
+
+        if is_dp_max_padding():
+            mask_dp_pad_moe_topk_ids(ids)
+        valid = ids >= 0
+        self._counts[layer_idx].scatter_add_(
+            0, ids.masked_fill(~valid, 0).flatten().long(), valid.flatten().int()
+        )
+        if rows > self._max_rows:
+            self._rows_of_layer[layer_idx : layer_idx + 1].fill_(-rows)
+            return
+        self._ids[layer_idx, :rows, :top_k].copy_(ids)
+        self._rows_of_layer[layer_idx : layer_idx + 1].fill_(rows)
+        self._top_k_of_layer[layer_idx : layer_idx + 1].fill_(top_k)
+
+    def reset(self):
+        self._rows_of_layer.zero_()
+        self._counts.zero_()
+        self._meta = None
+
+    def collect(self) -> Dict:
+        meta = self._meta or {}
+        if not self._keep:
+            return dict(meta=meta)
+        from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper
+
+        rows_of_layer = self._rows_of_layer.cpu()
+        top_k_of_layer = self._top_k_of_layer.cpu()
+        used = [i for i in range(len(rows_of_layer)) if int(rows_of_layer[i]) != 0]
+        out = dict(
+            meta=meta,
+            rows_of_layer=rows_of_layer.clone(),
+            counts=self._counts.cpu().clone(),
+            local_dp_buffer_len=int(_DpGatheredBufferWrapper.get_local_dp_buffer_len()),
+            dp_max_padding=bool(_DpGatheredBufferWrapper.is_dp_max_padding()),
+        )
+        if not used:
+            return out
+        target = [i for i in used if i < self._num_target_layers]
+        draft = [i for i in used if i >= self._num_target_layers]
+        for name, layers in (("target", target), ("draft", draft)):
+            if not layers:
+                continue
+            rows = int(rows_of_layer[layers[0]])
+            top_k = int(top_k_of_layer[layers[0]])
+            same = all(
+                int(rows_of_layer[i]) == rows and int(top_k_of_layer[i]) == top_k
+                for i in layers
+            )
+            out[f"{name}_layers"] = layers
+            out[f"{name}_rows_consistent"] = same
+            if rows <= 0 or not same:
+                out[f"{name}_rows_overflow"] = rows
+                continue
+            ids = self._ids[layers, :rows, :top_k]
+            # The pad mask (-1) is the same on every layer; keep only real rows.
+            real = ids[0, :, 0] >= 0
+            out[f"{name}_real_rows_mask"] = real.cpu()
+            out[f"{name}_ids"] = ids[:, real].to(torch.int16).cpu()
+        return out
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
