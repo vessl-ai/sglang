@@ -1582,6 +1582,10 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # INF-730: Linux utilization clamp (0..1024) for scheduler processes, set before their
+    # runtime threads start so they inherit it; negative = off. Under schedutil a host-bound
+    # DP scheduler otherwise settles at a low CPU clock (srt/utils/sched_uclamp.py).
+    SGLANG_OPT_SCHED_UCLAMP_MIN = EnvInt(-1)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
