@@ -263,3 +263,11 @@ def test_v2w_gather_pairs_cuda_graph():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out[has], ref[has])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

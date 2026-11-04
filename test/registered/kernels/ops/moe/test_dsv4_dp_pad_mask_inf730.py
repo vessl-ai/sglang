@@ -149,3 +149,11 @@ def test_v2_real_rows_unchanged_when_pads_masked(switch_on, shape, skew, reqs, b
     assert int((masked[m] != -1).sum()) == 0 and torch.equal(masked[~m], ids[~m])
     out_masked = v2.decode_moe(x, masked, w, packed, SWIGLU_LIMIT)
     assert torch.equal(out_masked[~m], out_routed[~m])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
