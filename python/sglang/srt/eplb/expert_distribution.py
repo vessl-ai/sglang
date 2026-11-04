@@ -686,6 +686,13 @@ class _RouteRowsSinglePassGatherer(_SinglePassGatherer):
                 else None
             ),
             time=time.time(),
+            global_rank=torch.distributed.get_rank(),
+            # request identity (this rank's batch order) to group rows by request across passes
+            req_pool_indices=(
+                forward_batch.req_pool_indices.tolist()
+                if getattr(forward_batch, "req_pool_indices", None) is not None
+                else None
+            ),
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
