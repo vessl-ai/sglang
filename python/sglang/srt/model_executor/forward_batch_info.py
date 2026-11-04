@@ -45,6 +45,9 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    _DpGatheredBufferWrapper,
+    dp_pad_mask_real_counts_enabled,
+    dp_real_num_tokens_buffer,
     dp_slot_in,
     set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
@@ -1748,6 +1751,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_dp_buffer_len = buffer_len
         self.global_num_tokens_padded_cpu = global_num_tokens
         set_dp_buffer_len_from_batch(self)
+        if (
+            dp_padding_mode.is_max_len()
+            and not self.is_extend_in_batch
+            and not model_runner.is_draft_worker
+            and self.global_num_tokens_gpu is not None
+            and dp_pad_mask_real_counts_enabled()
+        ):
+            # INF-730: the real per-rank row counts for the pad mask. global_num_tokens_gpu
+            # still holds them here; the padding below overwrites it with the padded ones.
+            real = dp_real_num_tokens_buffer(
+                sync_group_size, self.global_num_tokens_gpu.device
+            )
+            real.copy_(self.global_num_tokens_gpu)
+            _DpGatheredBufferWrapper.set_dp_real_num_tokens_gpu(real)
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size

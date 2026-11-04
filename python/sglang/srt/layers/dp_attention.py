@@ -255,6 +255,9 @@ class _DpGatheredBufferWrapper:
     _rank_local_allocation: bool = False
     _global_num_tokens: Optional[List[int]] = None
     _global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # INF-730 SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS: each rank's real (unpadded) row
+    # count of the current MAX_LEN forward, or None when it is not known.
+    _real_num_tokens_gpu: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
@@ -272,12 +275,14 @@ class _DpGatheredBufferWrapper:
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
         global_num_tokens_gpu: Optional[torch.Tensor] = None,
+        real_num_tokens_gpu: Optional[torch.Tensor] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
         cls._global_num_tokens_gpu = global_num_tokens_gpu
+        cls._real_num_tokens_gpu = real_num_tokens_gpu
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
@@ -326,6 +331,14 @@ class _DpGatheredBufferWrapper:
         return cls._global_num_tokens_gpu
 
     @classmethod
+    def get_dp_real_num_tokens_gpu(cls) -> Optional[torch.Tensor]:
+        return cls._real_num_tokens_gpu
+
+    @classmethod
+    def set_dp_real_num_tokens_gpu(cls, real_num_tokens_gpu: Optional[torch.Tensor]):
+        cls._real_num_tokens_gpu = real_num_tokens_gpu
+
+    @classmethod
     def get_dp_hidden_size(cls) -> int:
 
         return get_flags().dp.buffer_hidden_size
@@ -351,6 +364,7 @@ def set_dp_buffer_len(
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
     global_num_tokens_gpu: Optional[torch.Tensor] = None,
+    real_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len,
@@ -358,7 +372,31 @@ def set_dp_buffer_len(
         dp_max_padding,
         global_num_tokens,
         global_num_tokens_gpu,
+        real_num_tokens_gpu,
     )
+
+
+# INF-730 SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS: one static int32 [num_dp_ranks] buffer
+# per device. Decode graphs capture the pad mask reading it and every replay refreshes it,
+# so it must never be reallocated.
+_dp_real_num_tokens_bufs: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def dp_pad_mask_real_counts_enabled() -> bool:
+    return (
+        envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
+        and envs.SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS.get()
+    )
+
+
+def dp_real_num_tokens_buffer(num_dp_ranks: int, device) -> torch.Tensor:
+    key = (str(device), num_dp_ranks)
+    buf = _dp_real_num_tokens_bufs.get(key)
+    if buf is None:
+        buf = torch.zeros((num_dp_ranks,), dtype=torch.int32, device=device)
+        _dp_real_num_tokens_bufs[key] = buf
+    return buf
 
 
 def get_global_dp_buffer(group: GroupCoordinator) -> torch.Tensor:
@@ -858,14 +896,25 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
     AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
     the mapping table's last entry).  Capture-safe: per-batch state is read
     only from the replay-updated global_num_tokens_gpu tensor.
+
+    INF-730: under MAX_LEN that tensor holds every rank's padded count when the
+    forward runs, so the mask is a no-op; with
+    SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS the real per-rank counts published
+    for this forward are read instead (None = unknown = mask nothing).
     """
-    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    if dp_pad_mask_real_counts_enabled():
+        counts = _DpGatheredBufferWrapper.get_dp_real_num_tokens_gpu()
+    else:
+        counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
     if counts is None:
         return
     max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
     rows, topk = topk_ids.shape
     if max_len <= 0 or rows != counts.shape[0] * max_len:
         # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
+        return
+    if not topk_ids.is_contiguous():
+        # The kernel indexes [row, k] as row * TOPK + k.
         return
     _mask_dp_pad_topk_ids_kernel[(rows,)](
         topk_ids,
