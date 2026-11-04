@@ -195,6 +195,10 @@ class Mxfp4MarlinMoEMethod:
         )
         # INF-681 k-dmoe2: those experts through the fused v2 kernels (same weights, same output bits).
         self._sm90_decode_w4a8_v2 = envs.SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_V2.get()
+        # INF-730: on expert-parallel layers, v2 over virtual 576-channel experts; the number of virtual
+        # experts per local expert once the weights are packed for it (0: not this path).
+        self._sm90_decode_w4a8_ep = envs.SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP.get()
+        self._ep_split = 0
 
     def create_moe_runner(self, layer, moe_runner_config):
         from sglang.srt.layers.moe.moe_runner import MoeRunner
@@ -313,6 +317,13 @@ class Mxfp4MarlinMoEMethod:
         if self._use_w4a8:
             self._prepare_w4a8_weights(layer)
             return
+        if (
+            self._sm90_decode_w4a8
+            and self._sm90_decode_w4a8_v2
+            and self._sm90_decode_w4a8_ep
+            and self._prepare_sm90_decode_ep_weights(layer)
+        ):
+            return
         if self._sm90_decode_w4a8 and self._prepare_sm90_decode_weights(
             layer, w4a8=True
         ):
@@ -405,6 +416,22 @@ class Mxfp4MarlinMoEMethod:
                     topk_output.topk_weights,
                     add_to=add_to,
                     row_quant=row_quant,
+                )
+            )
+        if self._ep_split:
+            from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep
+
+            # topk_ids are local here: the standard dispatcher mapped the global ids to this rank's experts
+            # (-1 elsewhere, and on dp-attention pad rows with SGLANG_OPT_MASK_DP_PAD_MOE).
+            return StandardCombineInput(
+                hidden_states=decode_moe_ep(
+                    hidden_states,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self._sm90_packed,
+                    self.runner.config.swiglu_limit,
+                    self._ep_split,
+                    output=_moe_output_like(hidden_states),
                 )
             )
         if self._sm90_decode_w4a8:
@@ -588,6 +615,65 @@ class Mxfp4MarlinMoEMethod:
 
                 dsv4_mxfp4_decode_moe_v2.prepare(self._sm90_packed.w13.device.index)
         layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
+        return True
+
+    def _prepare_sm90_decode_ep_weights(self, layer: Module) -> bool:
+        """INF-730 SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: pack an expert-parallel layer's local experts
+        (whole experts, intermediate S x 576) as S virtual 576-channel experts each for the v2 kernel
+        (dsv4_mxfp4_decode_moe_ep). Returns False (weights untouched) on a non-EP layer or a shape the
+        kernel does not cover; the layer then takes the other paths."""
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+        from sglang.srt.runtime_context import get_parallel
+
+        config = self.runner.config
+        num_local, n2, _ = layer.w13_weight.shape
+        hidden = layer.w2_weight.shape[1]
+        inter = n2 // 2
+        if get_parallel().moe_ep_size <= 1:
+            return False
+        scale_max = max(
+            int(layer.w13_weight_scale_inv.data.view(torch.uint8).max()),
+            int(layer.w2_weight_scale_inv.data.view(torch.uint8).max()),
+        )
+        if not (
+            ek.supports_ep(hidden, inter, num_local)
+            and config.activation == "silu"
+            and config.is_gated
+            and config.gemm1_alpha is None
+            and config.swiglu_limit is not None
+            and self.hidden_pad == 0
+            and scale_max <= ek.MAX_E8M0
+        ):
+            log_info_on_rank0(
+                logger,
+                "SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: layer shape not covered "
+                f"(hidden {hidden}, intermediate {inter}, {num_local} local experts); "
+                f"keeping the configured path (layer: {self.prefix})",
+            )
+            return False
+        torch.cuda.empty_cache()
+        self._sm90_packed, split = ek.pack_experts_ep(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+        )
+        del layer.w13_weight, layer.w2_weight
+        del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+        torch.cuda.empty_cache()
+        log_info_on_rank0(
+            logger,
+            "Using the SM90 decode MoE kernel (W4A8 v2) on an expert-parallel layer: "
+            f"{num_local} local experts x {split} virtual 576-channel experts "
+            f"(layer: {self.prefix})",
+        )
+        top_k = getattr(layer, "top_k", None) or 6
+        # Compile and load everything now, not at the first MoE call of graph capture.
+        ek.prepare_ep(
+            self._sm90_packed.w13.device.index, num_local * split, split, int(top_k)
+        )
+        self._ep_split = split
+        layer._dsv4_mxfp4_backend = "sm90_decode_w4a8_ep"
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
