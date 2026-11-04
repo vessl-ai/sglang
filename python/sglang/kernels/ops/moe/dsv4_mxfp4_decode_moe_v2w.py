@@ -1,5 +1,5 @@
 """SM90 W4A8 decode MoE for DeepSeek-V4 MXFP4 experts with a per-rank intermediate width other than TP4's 576
-(INF-730). See ``jit/csrc/moe/dsv4_mxfp4_decode_moe_ep.cuh``: the v2 kernel (#115) with the width a compile-time
+(INF-730). See ``jit/csrc/moe/dsv4_mxfp4_decode_moe_v2w.cuh``: the v2 kernel (#115) with the width a compile-time
 constant, one JIT module per width.
 
 - ``inter=2304``: expert parallel. A rank holds whole experts; pass the rank's (token, local expert) pairs as rows
@@ -37,14 +37,14 @@ class PackedExperts(NamedTuple):
 def _module(inter: int, defines: tuple = ()):
     """defines: extra compile-time switches (ablation builds for measurement only, e.g. "DSV4_ABL_CONSUMER_NOP")."""
     return load_jit(
-        "dsv4_mxfp4_decode_moe_ep",
+        "dsv4_mxfp4_decode_moe_v2w",
         str(inter),
         *(d.replace("=", "_") for d in defines),
-        cuda_files=["moe/dsv4_mxfp4_decode_moe_ep.cuh"],
+        cuda_files=["moe/dsv4_mxfp4_decode_moe_v2w.cuh"],
         cuda_wrappers=[
-            ("prep", "dsv4_moe_ep::prep"),
-            ("experts", "dsv4_moe_ep::experts"),
-            ("prepare_kernels", "dsv4_moe_ep::prepare_kernels"),
+            ("prep", "dsv4_moe_v2w::prep"),
+            ("experts", "dsv4_moe_v2w::experts"),
+            ("prepare_kernels", "dsv4_moe_v2w::prepare_kernels"),
         ],
         extra_cuda_cflags=[f"-DDSV4_MOE_INTER={inter}"] + [f"-D{d}" for d in defines],
     )
@@ -131,7 +131,7 @@ def decode_moe(
     x8 = torch.empty(num_tokens, HIDDEN, dtype=torch.uint8, device=dev)
     xs = torch.empty(num_tokens, dtype=torch.float32, device=dev)
     max_passes = num_experts + num_slots // 32 + 1
-    work = torch.empty(WORKSPACE_BASE + 2 * max_passes, dtype=torch.int32, device=dev)
+    work = torch.empty(WORKSPACE_BASE + 5 * max_passes, dtype=torch.int32, device=dev)
     mod = _module(inter, defines)
     assert num_slots <= PREP_MAX_SLOTS, num_slots
     mod.prep(ids, topk_weights.float().contiguous(), hidden_states.contiguous(), counts, sorted_slots,

@@ -51,7 +51,7 @@
 #include <type_traits>
 
 namespace sglang {
-namespace dsv4_moe_ep {
+namespace dsv4_moe_v2w {
 
 #ifndef DSV4_MOE_INTER
 #define DSV4_MOE_INTER 576
@@ -60,8 +60,8 @@ constexpr int kInter = DSV4_MOE_INTER;
 static_assert(kInter % 64 == 0 && kInter >= 128, "intermediate width: a multiple of 64");
 // Rows per weight pass (DSV4_PASS_ROWS, 32 = v2; 64 = wide passes: an expert's weights are streamed and converted
 // once per 64 rows, wgmma N up to 64; for expert parallel, where an expert gets twice the rows of TP4).
-#ifndef DSV4_PASS_ROWS
-#define DSV4_PASS_ROWS 32
+#ifndef DSV4_PASS_ROWS  // whole experts (EP): 64 (n 128, s 0: 630 -> 575 us, bit-identical); TP slices: 32 (v2)
+#define DSV4_PASS_ROWS (DSV4_MOE_INTER >= 2304 ? 64 : 32)
 #endif
 // Per-warp arrivals (one elected lane after __syncwarp) on the ring's empty barriers and the done FIFO, instead of
 // every consumer thread (128 shared-memory atomics per stage).
@@ -101,8 +101,14 @@ SGL_DEVICE int ready_base(int max_passes) {
   return kDoneBase + max_passes;
 }
 constexpr int kWorkspaceInts(int max_passes) {
-  return kDoneBase + 2 * max_passes;
+  return kDoneBase + 5 * max_passes;  // done, ready, and the global quantization queue (entry, next batch, left)
 }
+// Global quantization queue (DSV4_GLOBAL_QUANT): a pass whose gate/up items are all done is pushed (ws[2] = tail) and
+// its h rows are quantized in kQuantRows-row batches by any helper of the grid, not only by the helper that counted
+// its last item (with whole 2304-wide experts one helper warp quantizing a 32-row pass was a tail of up to ~80 us).
+#ifndef DSV4_GLOBAL_QUANT  // measured (n 128, s 0): 2304 722 -> 630 us (= no quantization at all); 576 857 -> 979 us
+#define DSV4_GLOBAL_QUANT (DSV4_MOE_INTER >= 2304)
+#endif
 
 template <bool kGateUp>
 struct Shape;
@@ -122,7 +128,10 @@ constexpr int kMaxExperts = 512;
 #endif
 constexpr int kRing = DSV4_RING;  // v2: 6
 constexpr int kConsumerWarps = 4;  // per pipeline: one consumer warpgroup
-constexpr int kPipes = 2;
+#ifndef DSV4_PIPES
+#define DSV4_PIPES 2
+#endif
+constexpr int kPipes = DSV4_PIPES;  // v2: 2 (measurement switch)
 constexpr int kThreads = kPipes * 128 + kPipes * 32 + 32;  // + one helper warp
 constexpr int kTilesAll = 2;
 constexpr int kStepW = kConsumerWarps * kTilesAll * 512;    // weight bytes per k64 step
@@ -1324,7 +1333,7 @@ SGL_DEVICE void gate_up_done(const Smem& sm, int pipe, uint32_t& ndone, int e, i
 // It never waits on a flag: the gate/up item that completes an expert may sit in its own done FIFO.
 SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   Meta* m = sm.meta;
-  uint32_t ndone[kPipes] = {0, 0}, nreq[kPipes] = {0, 0};
+  uint32_t ndone[kPipes] = {}, nreq[kPipes] = {};
   int open = kPipes;
   int qhead = 0, qtail = 0, qrow = 0;  // quantization jobs m->qlist[qhead..qtail), next row of the head job
   int32_t* ready = p.ws + ready_base(p.max_passes);
@@ -1332,8 +1341,61 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
   auto pass_index = [&](int e, int pass) { return m->gstart[e] / Shape<true>::kNB + pass; };
   const int total_passes = m->gstart[p.num_experts] / Shape<true>::kNB;
   bool all_ready = false;
+#if DSV4_GLOBAL_QUANT
+  int32_t* gq_entry = p.ws + kDoneBase + 2 * p.max_passes;
+  int32_t* gq_next = gq_entry + p.max_passes;
+  int32_t* gq_left = gq_next + p.max_passes;
+  int scan = 0;  // entries below are exhausted (as seen by this helper)
+  auto rows_of = [&](int ep) { return min(m->cnt[ep & 1023] - kPassRows * (ep >> 10), kPassRows); };
+#endif
   while (open > 0 || qhead != qtail) {
     bool idle = true;
+#if DSV4_GLOBAL_QUANT
+    {
+      int job_e = -1, job_b = 0, job_ep = 0;
+      if (lane == 0) {
+        const int tail = ld_acquire(p.ws + 2);
+        while (scan < tail) {
+          const int code = ld_acquire(gq_entry + scan);
+          if (code == 0) break;  // pushed, not yet published
+          const int ep = code - 1;
+          const int nb = (rows_of(ep) + kQuantRows - 1) / kQuantRows;
+          if (ld_acquire(gq_next + scan) < nb) {
+            const int b = atomicAdd(gq_next + scan, 1);
+            if (b < nb) {
+              job_e = scan;
+              job_b = b;
+              job_ep = ep;
+              break;
+            }
+          }
+          ++scan;
+        }
+      }
+      job_e = __shfl_sync(0xffffffffu, job_e, 0);
+      scan = __shfl_sync(0xffffffffu, scan, 0);
+      if (job_e >= 0) {
+        idle = false;
+        job_b = __shfl_sync(0xffffffffu, job_b, 0);
+        job_ep = __shfl_sync(0xffffffffu, job_ep, 0);
+        const int e = job_ep & 1023, pass = job_ep >> 10;
+        DBG_T0(t_q);
+#ifndef DSV4_ABL_NO_QUANT
+        quant_batch(p, m->off[e] + kPassRows * pass, rows_of(job_ep), job_b * kQuantRows, lane);
+#endif
+        DBG_ADD(lane == 0, 0, 12, t_q);
+        __syncwarp();
+        if (lane == 0) {
+          fence_acq_rel_gpu();  // this batch's h8 / hscale before the count
+          if (atomicSub(gq_left + job_e, 1) == 1) {
+            fence_acq_rel_gpu();  // every batch's writes (released before their counts) before the flag
+            st_release(ready + pass_index(e, pass), 1);
+            atomicAdd(p.ws + 1, 1);
+          }
+        }
+      }
+    }
+#endif
     if (!all_ready && __shfl_sync(0xffffffffu, lane == 0 ? ld_acquire(p.ws + 1) : 0, 0) == total_passes) {  // sticky
       all_ready = true;
       if (lane == 0) st_release_cta(&m->all_ready, 1);
@@ -1378,10 +1440,20 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
           // passes become independent jobs on different helpers, and its down items of a pass wait for that pass
           // only).
           last = atomicAdd(p.ws + kDoneBase + pass_index(ep & 1023, ep >> 10), 1) == Shape<true>::kNB - 1;
+#if DSV4_GLOBAL_QUANT
+          if (last) {
+            fence_acq_rel_gpu();
+            const int idx = atomicAdd(p.ws + 2, 1);
+            gq_left[idx] = (rows_of(ep) + kQuantRows - 1) / kQuantRows;
+            st_release(gq_entry + idx, ep + 1);  // publishes the entry and its count
+          }
+          last = 0;  // nothing queued locally
+#else
           if (last) {
             fence_acq_rel_gpu();
             m->qlist[qtail % kQuantJobs] = ep;
           }
+#endif
           mbar_arrive(smem_u32(&m->done_free[pipe][k]));
         }
         DBG_ADD(lane == 0, 0, 13, t_h);
@@ -1482,9 +1554,10 @@ __global__ void __launch_bounds__(kThreads, 1) moe_v2_kernel(const __grid_consta
   const int warp = uniform(tid / 32);  // warp-uniform role for the compiler (see uniform())
   const int lane = tid % 32;
   // warps 0-3, 4-7: consumer warpgroups; 8, 9: their producers; 10: the helper
-  const bool is_producer = warp == 8 || warp == 9;
-  const bool is_helper = warp == 10;
-  const int pipe = is_producer ? warp - 8 : (is_helper ? 0 : warp / 4);
+  // warps [0, 4 kPipes): consumer warpgroups; then one producer per pipeline; then the helper
+  const bool is_producer = warp >= 4 * kPipes && warp < 5 * kPipes;
+  const bool is_helper = warp == 5 * kPipes;
+  const int pipe = is_producer ? warp - 4 * kPipes : (is_helper ? 0 : warp / 4);
   Smem sm;
   const uint32_t pbase = base + pipe * kPipeStride;
   sm.x_ring = pbase;
@@ -1842,5 +1915,5 @@ inline void prepare_kernels() {
   RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, prep_kernel));
 }
 
-}  // namespace dsv4_moe_ep
+}  // namespace dsv4_moe_v2w
 }  // namespace sglang
