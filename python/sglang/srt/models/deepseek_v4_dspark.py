@@ -947,10 +947,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
         pre = None
-        # Draft MoE layers have no recorder layer index, so keep them out of the stats.
-        with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                x, pre = stage(positions, x, forward_batch, pre)
+        recorder = get_global_expert_distribution_recorder()
+        draft_base = getattr(
+            getattr(recorder, "_single_pass_gatherers", {}).get("primary"),
+            "draft_layer_base",
+            None,
+        )
+        if draft_base is not None:
+            # INF-730 c-route (rig only): record the draft stages after the target layers.
+            for stage_idx, stage in enumerate(self.stages):
+                with recorder.with_current_layer(draft_base + stage_idx):
+                    x, pre = stage(positions, x, forward_batch, pre)
+        else:
+            # Draft MoE layers have no recorder layer index, so keep them out of the stats.
+            with recorder.disable_this_region():
+                for stage in self.stages:
+                    x, pre = stage(positions, x, forward_batch, pre)
         if self.hc_pre_from_prev_sublayer:
             from sglang.kernels.ops.layernorm.mhc import hc_combine
 
