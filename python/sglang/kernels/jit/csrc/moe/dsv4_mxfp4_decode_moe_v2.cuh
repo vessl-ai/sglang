@@ -1333,5 +1333,238 @@ inline void prepare_kernels() {
   RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, prep_kernel));
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// INF-730 SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER: the TP4 decode MoE input all-gathered in FP8.
+//
+// Under DP attention + TP MoE the decoder all-gathers every rank's BF16 rows and this module's prep quantizes all of
+// them. The row quantization is a per-row function, so each rank can quantize its own rows first (the same code
+// path: prep's CTA split, row_scale_of, e4m3x2) and gather the e4m3 rows with their scales and top-k instead:
+// one packed row per token, [x8 5120 B | scale fp32 | K ids int32 | K weights fp32 | pad], kAgRowAlign-aligned,
+// gathered by the same NCCL all-gather (half the bytes), unpacked, then sorted (prep's sort CTAs only) and run by
+// the unchanged experts kernel. Nothing here changes the default path's kernels.
+
+constexpr int kAgRowAlign = 16;
+
+// Row quantization exactly as prep's quantization CTAs (kPrepRows rows per CTA, kPrepWarps / kPrepRows warps per
+// row): x [tokens, 5120] bf16 -> packed rows (e4m3 at +0, fp32 scale at +5120). With gdst, the bf16 row is also
+// copied to gdst (this rank's slot of the gathered buffer, which the router reads).
+__global__ void __launch_bounds__(kPrepThreads) ag_quant_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    int tokens,
+    __nv_bfloat16* __restrict__ gdst,
+    uint8_t* __restrict__ packed,
+    int row_bytes) {
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  constexpr int kPart = 5120 / (kPrepWarps / kPrepRows);
+  constexpr int kVec = kPart / 8 / 32;
+  __shared__ float amax_s[kPrepWarps];
+  const int r = blockIdx.x * kPrepRows + warp / (kPrepWarps / kPrepRows);
+  const int part = warp % (kPrepWarps / kPrepRows);
+  const bool live = r < tokens;
+  uint4 v[kVec];
+  float amax = 0.f;
+  const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<size_t>(live ? r : 0) * 5120 + part * kPart);
+#pragma unroll
+  for (int k = 0; k < kVec; ++k) {
+    v[k] = live ? src[lane + 32 * k] : make_uint4(0, 0, 0, 0);
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&v[k]);
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const float2 f = __bfloat1622float2(b[t]);
+      amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  if (lane == 0) amax_s[warp] = amax;
+  __syncthreads();
+  const int g0 = warp - part;
+#pragma unroll
+  for (int i = 0; i < kPrepWarps / kPrepRows; ++i)
+    amax = fmaxf(amax, amax_s[g0 + i]);
+  if (!live) return;
+  if (gdst != nullptr) {
+    uint4* g = reinterpret_cast<uint4*>(gdst + static_cast<size_t>(r) * 5120 + part * kPart);
+#pragma unroll
+    for (int k = 0; k < kVec; ++k)
+      g[lane + 32 * k] = v[k];
+  }
+  const float sc = row_scale_of(amax);
+  const float inv = __frcp_rn(sc);
+  uint8_t* row = packed + static_cast<size_t>(r) * row_bytes;
+  uint2* dst = reinterpret_cast<uint2*>(row + part * kPart);
+#pragma unroll
+  for (int k = 0; k < kVec; ++k) {
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&v[k]);
+    uint32_t w[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const float2 f0 = __bfloat1622float2(b[2 * t]);
+      const float2 f1 = __bfloat1622float2(b[2 * t + 1]);
+      w[t] = e4m3x2(f0.x, f0.y, inv) | (e4m3x2(f1.x, f1.y, inv) << 16);
+    }
+    dst[lane + 32 * k] = make_uint2(w[0], w[1]);
+  }
+  if (lane == 0 && part == 0) *reinterpret_cast<float*>(row + 5120) = sc;
+}
+
+// top-k ids (int32 or int64) and weights (fp32) of rows [0, tokens) -> packed rows (+5124 ids, +5124 + 4K weights).
+template <typename IdT>
+__global__ void ag_meta_kernel(
+    const IdT* __restrict__ ids, const float* __restrict__ wts, int n, int top_k, uint8_t* __restrict__ packed,
+    int row_bytes) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n * top_k) return;
+  const int r = i / top_k, k = i - r * top_k;
+  uint8_t* row = packed + static_cast<size_t>(r) * row_bytes + 5124;
+  reinterpret_cast<int32_t*>(row)[k] = static_cast<int32_t>(ids[i]);
+  reinterpret_cast<float*>(row + 4 * top_k)[k] = wts[i];
+}
+
+// Gathered packed rows [tokens, row_bytes] -> x8 [tokens, 5120], xscale [tokens], ids [tokens, K], wts [tokens, K].
+// One warp per row.
+constexpr int kUnpackWarps = 8;
+__global__ void __launch_bounds__(kUnpackWarps * 32) ag_unpack_kernel(
+    const uint8_t* __restrict__ packed,
+    int tokens,
+    int top_k,
+    int row_bytes,
+    uint8_t* __restrict__ x8,
+    float* __restrict__ xscale,
+    int32_t* __restrict__ ids,
+    float* __restrict__ wts) {
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int r = blockIdx.x * kUnpackWarps + warp;
+  if (r >= tokens) return;
+  const uint8_t* row = packed + static_cast<size_t>(r) * row_bytes;
+  const uint4* s = reinterpret_cast<const uint4*>(row);
+  uint4* d = reinterpret_cast<uint4*>(x8 + static_cast<size_t>(r) * 5120);
+#pragma unroll
+  for (int k = 0; k < 5120 / 16 / 32; ++k)
+    d[lane + 32 * k] = s[lane + 32 * k];
+  if (lane == 0) xscale[r] = *reinterpret_cast<const float*>(row + 5120);
+  if (lane < top_k) {
+    ids[static_cast<size_t>(r) * top_k + lane] = reinterpret_cast<const int32_t*>(row + 5124)[lane];
+  } else if (lane >= 16 && lane < 16 + top_k) {
+    const int k = lane - 16;
+    wts[static_cast<size_t>(r) * top_k + k] = reinterpret_cast<const float*>(row + 5124 + 4 * top_k)[k];
+  }
+}
+
+inline void ag_quant(tvm::ffi::TensorView x, tvm::ffi::TensorView gdst, tvm::ffi::TensorView packed, int64_t use_gdst) {
+  using namespace host;
+  const int tokens = static_cast<int>(x.size(0));
+  RuntimeCheck(x.size(1) == 5120, "fp8ag quant: x [tokens, 5120] bf16");
+  RuntimeCheck(packed.size(0) >= tokens && packed.size(1) % kAgRowAlign == 0, "fp8ag quant: packed rows");
+  RuntimeCheck(!use_gdst || (gdst.size(0) >= tokens && gdst.size(1) == 5120), "fp8ag quant: gdst [>= tokens, 5120]");
+  if (tokens == 0) return;
+  LaunchKernel(dim3((tokens + kPrepRows - 1) / kPrepRows), dim3(kPrepThreads), x.device())(
+      ag_quant_kernel,
+      static_cast<const __nv_bfloat16*>(x.data_ptr()),
+      tokens,
+      use_gdst ? static_cast<__nv_bfloat16*>(gdst.data_ptr()) : nullptr,
+      static_cast<uint8_t*>(packed.data_ptr()),
+      static_cast<int>(packed.size(1)));
+}
+
+inline void ag_meta(tvm::ffi::TensorView topk_ids, tvm::ffi::TensorView topk_weights, tvm::ffi::TensorView packed) {
+  using namespace host;
+  const int n = static_cast<int>(topk_ids.size(0));
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  RuntimeCheck(packed.size(0) >= n && packed.size(1) >= 5124 + 8 * top_k, "fp8ag meta: packed rows too short");
+  if (n == 0) return;
+  const int threads = 256, blocks = (n * top_k + threads - 1) / threads;
+  if (topk_ids.dtype().bits == 64) {
+    LaunchKernel(dim3(blocks), dim3(threads), topk_ids.device())(
+        ag_meta_kernel<int64_t>,
+        static_cast<const int64_t*>(topk_ids.data_ptr()),
+        static_cast<const float*>(topk_weights.data_ptr()),
+        n,
+        top_k,
+        static_cast<uint8_t*>(packed.data_ptr()),
+        static_cast<int>(packed.size(1)));
+  } else {
+    LaunchKernel(dim3(blocks), dim3(threads), topk_ids.device())(
+        ag_meta_kernel<int32_t>,
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<const float*>(topk_weights.data_ptr()),
+        n,
+        top_k,
+        static_cast<uint8_t*>(packed.data_ptr()),
+        static_cast<int>(packed.size(1)));
+  }
+}
+
+inline void ag_unpack(
+    tvm::ffi::TensorView packed,
+    tvm::ffi::TensorView x8,
+    tvm::ffi::TensorView xscale,
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView topk_weights) {
+  using namespace host;
+  const int tokens = static_cast<int>(x8.size(0));
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  RuntimeCheck(packed.size(0) == tokens && packed.size(1) >= 5124 + 8 * top_k, "fp8ag unpack: packed rows");
+  RuntimeCheck(packed.size(1) % kAgRowAlign == 0 && top_k <= 16, "fp8ag unpack: row alignment / top_k");
+  if (tokens == 0) return;
+  LaunchKernel(dim3((tokens + kUnpackWarps - 1) / kUnpackWarps), dim3(kUnpackWarps * 32), x8.device())(
+      ag_unpack_kernel,
+      static_cast<const uint8_t*>(packed.data_ptr()),
+      tokens,
+      top_k,
+      static_cast<int>(packed.size(1)),
+      static_cast<uint8_t*>(x8.data_ptr()),
+      static_cast<float*>(xscale.data_ptr()),
+      static_cast<int32_t*>(topk_ids.data_ptr()),
+      static_cast<float*>(topk_weights.data_ptr()));
+}
+
+// prep without the row quantization (its sort CTAs only; block 0 still zeroes ws): for rows already quantized.
+inline void prep_sort(
+    tvm::ffi::TensorView topk_ids,
+    tvm::ffi::TensorView topk_weights,
+    tvm::ffi::TensorView counts,
+    tvm::ffi::TensorView sorted_slots,
+    tvm::ffi::TensorView sorted_tokens,
+    tvm::ffi::TensorView sorted_weights,
+    tvm::ffi::TensorView ws) {
+  using namespace host;
+  const int tokens = static_cast<int>(topk_ids.size(0));
+  const int top_k = static_cast<int>(topk_ids.size(1));
+  const int num_experts = static_cast<int>(counts.size(0));
+  RuntimeCheck(tokens * top_k <= kPrepMaxSlots, "v2 prep_sort: at most 16384 routed slots");
+  const int sort_ctas = (num_experts + kSortExperts - 1) / kSortExperts;
+  LaunchKernel(dim3(sort_ctas), dim3(kPrepThreads), topk_ids.device())(
+      prep_kernel,
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<const float*>(topk_weights.data_ptr()),
+      tokens * top_k,
+      top_k,
+      num_experts,
+      sort_ctas,
+      static_cast<int32_t*>(counts.data_ptr()),
+      static_cast<int32_t*>(sorted_slots.data_ptr()),
+      static_cast<int32_t*>(sorted_tokens.data_ptr()),
+      static_cast<float*>(sorted_weights.data_ptr()),
+      static_cast<const __nv_bfloat16*>(nullptr),
+      0,
+      static_cast<uint8_t*>(nullptr),
+      static_cast<float*>(nullptr),
+      static_cast<int32_t*>(ws.data_ptr()),
+      static_cast<int>(ws.size(0)));
+}
+
+// Load the FP8-gather kernels now (as prepare_kernels), so that capture loads nothing.
+inline void prepare_fp8ag_kernels() {
+  using namespace host;
+  cudaFuncAttributes attr;
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, ag_quant_kernel));
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, ag_meta_kernel<int32_t>));
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, ag_meta_kernel<int64_t>));
+  RuntimeDeviceCheck(cudaFuncGetAttributes(&attr, ag_unpack_kernel));
+}
+
 }  // namespace dsv4_moe_v2
 }  // namespace sglang

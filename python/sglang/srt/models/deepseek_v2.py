@@ -1031,18 +1031,41 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
         prerouted=None,
+        routed_rows_hook=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
         the V2/V3 layer-boundary handoff.
 
-        ``prerouted`` (INF-681 k-pfp8): see `forward_prerouted`."""
+        ``prerouted`` (INF-681 k-pfp8): see `forward_prerouted`.
+        ``routed_rows_hook`` (INF-730 SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER, see
+        layers/quantization/dsv4_dp_moe_fp8ag.py): forward_normal hands it the top-k
+        and runs the experts on the (top-k, row quantization) it returns."""
         if prerouted is not None:
             return self.forward_prerouted(
                 hidden_states,
                 prerouted,
                 skip_shared_experts=skip_shared_experts,
                 return_moe_output=return_moe_output,
+            )
+        if routed_rows_hook is not None:
+            # The caller (dsv4_dp_moe_fp8ag.applies) checked that forward_normal is
+            # this MoE's path (no a2a, no mega MoE, shared expert computed by the caller).
+            assert skip_shared_experts and not self._enable_a2a_moe
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if forward_batch is not None
+                    else None
+                ),
+                use_vision_topk=self.gate.e_score_correction_bias_vl is not None,
+                return_moe_output=return_moe_output,
+                routed_rows_hook=routed_rows_hook,
             )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -1342,6 +1365,7 @@ class DeepseekV2MoE(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
+        routed_rows_hook=None,
     ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1417,6 +1441,9 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
+            if routed_rows_hook is not None:
+                # INF-730: top-k and expert input of the gathered rows (FP8 all-gather).
+                topk_output, pre_quant_input = routed_rows_hook(topk_output)
         else:
             pre_quant_input = None
             shared_output = None
