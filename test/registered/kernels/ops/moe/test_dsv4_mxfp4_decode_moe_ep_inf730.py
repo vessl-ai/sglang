@@ -184,7 +184,8 @@ def _packed_ep_and_slices(num_local, seed=0):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
 
-    w13, s13, w2, s2 = (t.cuda() for t in _weights(num_local, seed=seed))
+    # byte views: torch has no cat for e8m0
+    w13, s13, w2, s2 = (t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed))
     packed, split = ek.pack_experts_ep(w13, s13, w2, s2)
     assert split == SPLIT and packed.w13.shape[0] == num_local * SPLIT
     slices = []
