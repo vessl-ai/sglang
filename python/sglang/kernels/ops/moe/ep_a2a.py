@@ -55,7 +55,9 @@ def _align(n: int) -> int:
 
 @dataclasses.dataclass
 class EpRecv:
-    x: torch.Tensor  # [W * max_tokens, x_cols] (input dtype), rows in the receive layout
+    x: (
+        torch.Tensor
+    )  # [W * max_tokens, x_cols] (input dtype), rows in the receive layout
     scale: torch.Tensor  # [W * max_tokens, s_cols] (input dtype)
     topk_ids: torch.Tensor  # [W * max_tokens, K] int32, this rank's local expert ids, -1 = elsewhere / stale row
     topk_weights: torch.Tensor  # [W * max_tokens, K] fp32
@@ -91,8 +93,12 @@ class EpA2A:
         if not 0 < max_tokens <= MAX_TOKENS:
             raise ValueError(f"EpA2A: max_tokens 1..{MAX_TOKENS}, got {max_tokens}")
         if x_bytes % 16 or s_bytes % 4:
-            raise ValueError("EpA2A: x row must be a multiple of 16 bytes, s row of 4 bytes")
-        if not (1 <= dispatch_blocks <= MAX_BLOCKS and 1 <= combine_blocks <= MAX_BLOCKS):
+            raise ValueError(
+                "EpA2A: x row must be a multiple of 16 bytes, s row of 4 bytes"
+            )
+        if not (
+            1 <= dispatch_blocks <= MAX_BLOCKS and 1 <= combine_blocks <= MAX_BLOCKS
+        ):
             raise ValueError(f"EpA2A: 1..{MAX_BLOCKS} blocks")
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.num_experts, self.top_k, self.tmax = num_experts, top_k, max_tokens
@@ -121,17 +127,23 @@ class EpA2A:
         torch.cuda.synchronize(self.device)
         handle = symm_mem.rendezvous(self.buf, group.group_name)
         self.peers = torch.tensor(
-            [int(handle.buffer_ptrs[i]) for i in range(W)], dtype=torch.int64, device=self.device
+            [int(handle.buffer_ptrs[i]) for i in range(W)],
+            dtype=torch.int64,
+            device=self.device,
         )
         per = num_experts // W
         if expert_rank is None:
             if num_experts % W:
-                raise ValueError("EpA2A: give expert_rank/expert_local when experts do not split evenly")
+                raise ValueError(
+                    "EpA2A: give expert_rank/expert_local when experts do not split evenly"
+                )
             e = torch.arange(num_experts, dtype=torch.int32, device=self.device)
             expert_rank, expert_local = e // per, e % per
         self.expert_rank = expert_rank.to(self.device, torch.int32).contiguous()
         self.expert_local = expert_local.to(self.device, torch.int32).contiguous()
-        self.slot_map = torch.full((max_tokens, W), -1, dtype=torch.int32, device=self.device)
+        self.slot_map = torch.full(
+            (max_tokens, W), -1, dtype=torch.int32, device=self.device
+        )
         self.dctr = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=self.device)
         self.cctr = torch.zeros(MAX_BLOCKS, dtype=torch.int32, device=self.device)
         self.recv_counts = torch.zeros(W, dtype=torch.int32, device=self.device)
@@ -147,14 +159,28 @@ class EpA2A:
 
     def _offsets(self):
         L = self.layout
-        return (L["x"], L["s"], L["ids"], L["w"], L["src"], L["cnt"], L["dflag"], L["cflag"], L["y"])
+        return (
+            L["x"],
+            L["s"],
+            L["ids"],
+            L["w"],
+            L["src"],
+            L["cnt"],
+            L["dflag"],
+            L["cflag"],
+            L["y"],
+        )
 
     @property
     def partial_out(self) -> torch.Tensor:
         """[W * S, hidden] BF16 (S = region rows of the last dispatch), in the receive layout: the expert kernel
         writes one row per received row (the weighted sum over this rank's experts of that token)."""
         rows = self.world * self._stride
-        return self._region("y", rows * self.hidden * 2).view(torch.bfloat16).view(rows, self.hidden)
+        return (
+            self._region("y", rows * self.hidden * 2)
+            .view(torch.bfloat16)
+            .view(rows, self.hidden)
+        )
 
     def dispatch(
         self,
@@ -171,9 +197,16 @@ class EpA2A:
         T = x.shape[0]
         stride = self.tmax if region_rows is None else int(region_rows)
         if not T <= stride <= self.tmax:
-            raise ValueError(f"EpA2A.dispatch: need tokens {T} <= region_rows {stride} <= max_tokens {self.tmax}")
-        if x.shape[1] * x.element_size() != self.x_bytes or scale.shape[1] * scale.element_size() != self.s_bytes:
-            raise ValueError("EpA2A.dispatch: x / scale row bytes differ from the constructor's")
+            raise ValueError(
+                f"EpA2A.dispatch: need tokens {T} <= region_rows {stride} <= max_tokens {self.tmax}"
+            )
+        if (
+            x.shape[1] * x.element_size() != self.x_bytes
+            or scale.shape[1] * scale.element_size() != self.s_bytes
+        ):
+            raise ValueError(
+                "EpA2A.dispatch: x / scale row bytes differ from the constructor's"
+            )
         if topk_ids.shape[1] != self.top_k or topk_weights.dtype != torch.float32:
             raise ValueError("EpA2A.dispatch: topk_ids [T, top_k], topk_weights fp32")
         _module().dispatch(
@@ -198,10 +231,16 @@ class EpA2A:
         rows = self.world * stride
         K = self.top_k
         return EpRecv(
-            x=self._region("x", rows * self.x_bytes).view(x.dtype).view(rows, x.shape[1]),
-            scale=self._region("s", rows * self.s_bytes).view(scale.dtype).view(rows, scale.shape[1]),
+            x=self._region("x", rows * self.x_bytes)
+            .view(x.dtype)
+            .view(rows, x.shape[1]),
+            scale=self._region("s", rows * self.s_bytes)
+            .view(scale.dtype)
+            .view(rows, scale.shape[1]),
             topk_ids=self._region("ids", rows * K * 4).view(torch.int32).view(rows, K),
-            topk_weights=self._region("w", rows * K * 4).view(torch.float32).view(rows, K),
+            topk_weights=self._region("w", rows * K * 4)
+            .view(torch.float32)
+            .view(rows, K),
             src_token=self._region("src", rows * 4).view(torch.int32),
             counts=self.recv_counts,
         )
@@ -210,7 +249,11 @@ class EpA2A:
         """Sum, for every token of the last dispatch, the partial_out rows of the ranks it went to (fp32, rank
         order) -> out [T, hidden] BF16. Rows of out past T are not written."""
         T = self._num_tokens
-        if out is not None and (out.shape[0] < T or out.shape[1] != self.hidden or out.dtype != torch.bfloat16):
+        if out is not None and (
+            out.shape[0] < T
+            or out.shape[1] != self.hidden
+            or out.dtype != torch.bfloat16
+        ):
             raise ValueError("EpA2A.combine: out must be bf16 [>= T, hidden]")
         if out is not None and out.shape[0] != T:
             out = out[:T]

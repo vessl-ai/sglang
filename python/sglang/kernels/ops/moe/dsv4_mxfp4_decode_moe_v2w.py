@@ -54,7 +54,11 @@ def _module(inter: int, defines: tuple = ()):
 
 
 def _specs(inter: int):
-    w13 = (inter // 64, 2, lambda j, w, t: t * inter + 64 * j + 16 * w)  # tile 0 gate, tile 1 up
+    w13 = (
+        inter // 64,
+        2,
+        lambda j, w, t: t * inter + 64 * j + 16 * w,
+    )  # tile 0 gate, tile 1 up
     w2 = (40, 2, lambda j, w, t: 128 * j + 64 * t + 16 * w)
     return w13, w2
 
@@ -62,7 +66,11 @@ def _specs(inter: int):
 def pack_w13_w2(w13, s13, w2, s2) -> PackedExperts:
     """[E, 2I, H/2] (gate rows then up rows, low nibble = even k) + e8m0 scales, [E, H, I/2] + scales."""
     inter = w13.shape[1] // 2
-    assert w13.shape[2] * 2 == HIDDEN and w2.shape[1] == HIDDEN and w2.shape[2] * 2 == inter, (w13.shape, w2.shape)
+    assert (
+        w13.shape[2] * 2 == HIDDEN
+        and w2.shape[1] == HIDDEN
+        and w2.shape[2] * 2 == inter
+    ), (w13.shape, w2.shape)
     spec13, spec2 = _specs(inter)
     return PackedExperts(ws._pack(w13, s13, spec13), ws._pack(w2, s2, spec2), inter)
 
@@ -74,7 +82,9 @@ def pack_experts(w1, s1, w3, s3, w2, s2) -> PackedExperts:
     return pack_w13_w2(torch.cat([w1, w3], 1), s13, w2, s2)
 
 
-def pack_tp_slice(w1, s1, w3, s3, w2, s2, rank: int, tp: int, pad_to: int) -> PackedExperts:
+def pack_tp_slice(
+    w1, s1, w3, s3, w2, s2, rank: int, tp: int, pad_to: int
+) -> PackedExperts:
     """TP slice `rank` of `tp` of whole experts, zero-padded from I/tp to `pad_to` channels (zero e2m1 weights)."""
     I = w1.shape[1]
     sl = I // tp
@@ -82,13 +92,19 @@ def pack_tp_slice(w1, s1, w3, s3, w2, s2, rank: int, tp: int, pad_to: int) -> Pa
     E = w1.shape[0]
 
     def pad_rows(t):
-        out = torch.zeros((E, pad_to) + tuple(t.shape[2:]), dtype=t.dtype, device=t.device)
-        out[:, :sl] = t[:, c0:c0 + sl]
+        out = torch.zeros(
+            (E, pad_to) + tuple(t.shape[2:]), dtype=t.dtype, device=t.device
+        )
+        out[:, :sl] = t[:, c0 : c0 + sl]
         return out
 
-    def pad_k(t, per_byte):  # pad the last dim (K) from sl / per_byte to pad_to / per_byte
-        out = torch.zeros(t.shape[:2] + (pad_to // per_byte,), dtype=t.dtype, device=t.device)
-        out[:, :, : sl // per_byte] = t[:, :, c0 // per_byte:(c0 + sl) // per_byte]
+    def pad_k(
+        t, per_byte
+    ):  # pad the last dim (K) from sl / per_byte to pad_to / per_byte
+        out = torch.zeros(
+            t.shape[:2] + (pad_to // per_byte,), dtype=t.dtype, device=t.device
+        )
+        out[:, :, : sl // per_byte] = t[:, :, c0 // per_byte : (c0 + sl) // per_byte]
         return out
 
     u8, e8 = torch.uint8, s1.dtype
@@ -137,14 +153,39 @@ def decode_moe(
     work = torch.empty(WORKSPACE_BASE + 5 * max_passes, dtype=torch.int32, device=dev)
     mod = _module(inter, defines)
     assert num_slots <= PREP_MAX_SLOTS, num_slots
-    mod.prep(ids, topk_weights.float().contiguous(), hidden_states.contiguous(), counts, sorted_slots,
-             sorted_tokens, sorted_weights, x8, xs, work)
+    mod.prep(
+        ids,
+        topk_weights.float().contiguous(),
+        hidden_states.contiguous(),
+        counts,
+        sorted_slots,
+        sorted_tokens,
+        sorted_weights,
+        x8,
+        xs,
+        work,
+    )
     h = hidden_states.new_empty(num_slots, inter)
     h8 = torch.empty(num_slots, inter, dtype=torch.uint8, device=dev)
     hs = torch.empty(num_slots, dtype=torch.float32, device=dev)
     y = output if top_k == 1 else hidden_states.new_empty(num_slots, HIDDEN)
-    mod.experts(x8, xs, packed.w13, packed.w2, counts, sorted_tokens, sorted_slots, sorted_weights, h, h8, hs, y,
-                work, float(swiglu_limit), y)
+    mod.experts(
+        x8,
+        xs,
+        packed.w13,
+        packed.w2,
+        counts,
+        sorted_tokens,
+        sorted_slots,
+        sorted_weights,
+        h,
+        h8,
+        hs,
+        y,
+        work,
+        float(swiglu_limit),
+        y,
+    )
     if top_k != 1:
         ws._module().combine(y, ids, output)
     return output
@@ -163,14 +204,29 @@ def _scratch(num_experts: int, num_slots: int, inter: int, dev):
         sorted_slots=torch.empty(num_slots, dtype=torch.int32, device=dev),
         sorted_tokens=torch.empty(num_slots, dtype=torch.int32, device=dev),
         sorted_weights=torch.empty(num_slots, dtype=torch.float32, device=dev),
-        work=torch.empty(WORKSPACE_BASE + 5 * max_passes, dtype=torch.int32, device=dev),
+        work=torch.empty(
+            WORKSPACE_BASE + 5 * max_passes, dtype=torch.int32, device=dev
+        ),
         h=torch.empty(num_slots, inter, dtype=torch.bfloat16, device=dev),
         h8=torch.empty(num_slots, inter, dtype=torch.uint8, device=dev),
         hs=torch.empty(num_slots, dtype=torch.float32, device=dev),
     )
 
 
-def _gather_call(x8, xscale, ids, weights, slot_token, packed, swiglu_limit, y, y_rows, x, defines, valid=None):
+def _gather_call(
+    x8,
+    xscale,
+    ids,
+    weights,
+    slot_token,
+    packed,
+    swiglu_limit,
+    y,
+    y_rows,
+    x,
+    defines,
+    valid=None,
+):
     rows, top_k = ids.shape
     num_slots = rows * top_k
     assert num_slots <= PREP_MAX_SLOTS, num_slots
@@ -178,20 +234,53 @@ def _gather_call(x8, xscale, ids, weights, slot_token, packed, swiglu_limit, y, 
     mod = _module(packed.inter, defines)
     sc = _scratch(packed.w13.shape[0], num_slots, packed.inter, dev)
     quant_rows = 0
-    if x is not None:  # not yet quantized: the prologue quantizes the token rows (as v2's prep)
+    if (
+        x is not None
+    ):  # not yet quantized: the prologue quantizes the token rows (as v2's prep)
         quant_rows = x.shape[0]
     else:
         x = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=dev)
     use_tok = slot_token is not None
     if not use_tok:
         slot_token = sc["counts"]  # unused stand-in
-    direct = y_rows is not None  # a row's only valid slot is written straight to its token row
-    mod.prep_gather(ids, weights, slot_token, int(use_tok), x, quant_rows, int(direct), sc["counts"],
-                    sc["sorted_slots"], sc["sorted_tokens"], sc["sorted_weights"], x8, xscale, sc["work"],
-                    valid if valid is not None else sc["counts"], int(valid is not None))
-    mod.experts(x8, xscale, packed.w13, packed.w2, sc["counts"], sc["sorted_tokens"], sc["sorted_slots"],
-                sc["sorted_weights"], sc["h"], sc["h8"], sc["hs"], y, sc["work"], float(swiglu_limit),
-                y_rows if direct else y)
+    direct = (
+        y_rows is not None
+    )  # a row's only valid slot is written straight to its token row
+    mod.prep_gather(
+        ids,
+        weights,
+        slot_token,
+        int(use_tok),
+        x,
+        quant_rows,
+        int(direct),
+        sc["counts"],
+        sc["sorted_slots"],
+        sc["sorted_tokens"],
+        sc["sorted_weights"],
+        x8,
+        xscale,
+        sc["work"],
+        valid if valid is not None else sc["counts"],
+        int(valid is not None),
+    )
+    mod.experts(
+        x8,
+        xscale,
+        packed.w13,
+        packed.w2,
+        sc["counts"],
+        sc["sorted_tokens"],
+        sc["sorted_slots"],
+        sc["sorted_weights"],
+        sc["h"],
+        sc["h8"],
+        sc["hs"],
+        y,
+        sc["work"],
+        float(swiglu_limit),
+        y_rows if direct else y,
+    )
     return mod
 
 
@@ -220,12 +309,16 @@ def decode_moe_tokens(
     ids = local_ids.to(torch.int32).contiguous()
     w = weights.float().contiguous()
     if top_k == 1:  # one slot per row: the down epilogue writes the row itself
-        _gather_call(x8, xscale, ids, w, None, packed, swiglu_limit, output, output, x, defines)
+        _gather_call(
+            x8, xscale, ids, w, None, packed, swiglu_limit, output, output, x, defines
+        )
         return output
     # Every valid slot goes through y; row_combine sums each row's slots (same fp32 k-ascending sum as v2's combine).
     # (Writing single-slot rows directly costs more in the prologue's per-slot row scan than it saves here.)
     y = torch.empty(rows * top_k, HIDDEN, dtype=torch.bfloat16, device=ids.device)
-    mod = _gather_call(x8, xscale, ids, w, None, packed, swiglu_limit, y, None, x, defines)
+    mod = _gather_call(
+        x8, xscale, ids, w, None, packed, swiglu_limit, y, None, x, defines
+    )
     mod.row_combine(y, ids, output, 1)
     return output
 
@@ -256,17 +349,36 @@ def decode_moe_pairs(
     (out_tokens, out_pairs)."""
     num_pairs = pair_tok.shape[0]
     if out_pairs is None:
-        out_pairs = torch.empty(num_pairs, HIDDEN, dtype=torch.bfloat16, device=pair_tok.device)
+        out_pairs = torch.empty(
+            num_pairs, HIDDEN, dtype=torch.bfloat16, device=pair_tok.device
+        )
     if num_pairs == 0:
         return out_tokens, out_pairs
     tok = pair_tok.to(torch.int32).contiguous()
     eid = pair_eid.to(torch.int32).contiguous()
     # With out_tokens, a token row's only pair is written straight to it (out_pairs then holds only the pairs of rows
     # with several, and is scratch); without, every pair goes to out_pairs.
-    mod = _gather_call(x8, xscale, eid.view(num_pairs, 1), pair_w.float().contiguous().view(num_pairs, 1), tok,
-                       packed, swiglu_limit, out_pairs, out_tokens, x, defines, num_valid)
+    mod = _gather_call(
+        x8,
+        xscale,
+        eid.view(num_pairs, 1),
+        pair_w.float().contiguous().view(num_pairs, 1),
+        tok,
+        packed,
+        swiglu_limit,
+        out_pairs,
+        out_tokens,
+        x,
+        defines,
+        num_valid,
+    )
     if out_tokens is not None:
-        mod.pair_reduce(out_pairs, tok, eid, out_tokens, num_valid if num_valid is not None else tok,
-                        int(num_valid is not None))
+        mod.pair_reduce(
+            out_pairs,
+            tok,
+            eid,
+            out_tokens,
+            num_valid if num_valid is not None else tok,
+            int(num_valid is not None),
+        )
     return out_tokens, out_pairs
-

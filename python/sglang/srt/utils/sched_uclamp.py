@@ -74,7 +74,9 @@ def get_current_thread_sched_attr() -> SchedAttr:
     """``sched_getattr`` of the calling thread; raises OSError where unsupported."""
     nrs = _syscall_numbers()
     if nrs is None:
-        raise OSError(f"sched_getattr is not available on {sys.platform}/{platform.machine()}")
+        raise OSError(
+            f"sched_getattr is not available on {sys.platform}/{platform.machine()}"
+        )
     attr = SchedAttr()
     ret = _libc().syscall(
         ctypes.c_long(nrs[1]),
@@ -97,7 +99,9 @@ def set_current_thread_uclamp_min(value: int) -> int:
         raise ValueError(f"uclamp min must be in [0, {UCLAMP_MAX_VALUE}], got {value}")
     nrs = _syscall_numbers()
     if nrs is None:
-        raise OSError(f"sched_setattr is not available on {sys.platform}/{platform.machine()}")
+        raise OSError(
+            f"sched_setattr is not available on {sys.platform}/{platform.machine()}"
+        )
     # Start from the current attributes: the kernel compares sched_nice with the
     # thread's nice value even with KEEP_PARAMS, so a zero there would read as a
     # priority raise for a thread with a positive nice value.

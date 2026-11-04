@@ -45,7 +45,9 @@ class EpA2ADecodeComm:
         # torch ProcessGroup.
         self.pg = getattr(group, "device_group", group)
         self.hidden = hidden
-        self.max_rows = int(max_rows or os.environ.get("SGLANG_OPT_DSV4_EP_A2A_MAX_ROWS", "1024"))
+        self.max_rows = int(
+            max_rows or os.environ.get("SGLANG_OPT_DSV4_EP_A2A_MAX_ROWS", "1024")
+        )
         self._a2a: dict = {}
 
     def _get(self, num_local_experts: int, top_k: int) -> EpA2A:
@@ -66,19 +68,30 @@ class EpA2ADecodeComm:
                 x_bytes=self.hidden,
                 s_bytes=4,
                 hidden=self.hidden,
-                dispatch_blocks=int(os.environ.get("SGLANG_OPT_DSV4_EP_A2A_DISPATCH_BLOCKS", "16")),
-                combine_blocks=int(os.environ.get("SGLANG_OPT_DSV4_EP_A2A_COMBINE_BLOCKS", "32")),
+                dispatch_blocks=int(
+                    os.environ.get("SGLANG_OPT_DSV4_EP_A2A_DISPATCH_BLOCKS", "16")
+                ),
+                combine_blocks=int(
+                    os.environ.get("SGLANG_OPT_DSV4_EP_A2A_COMBINE_BLOCKS", "32")
+                ),
             )
             self._a2a[key] = a2a
         return a2a
 
-    def dispatch(self, x8, xscale, topk_ids, topk_weights, *, num_local_experts, ep_rank) -> EpDispatchOutput:
+    def dispatch(
+        self, x8, xscale, topk_ids, topk_weights, *, num_local_experts, ep_rank
+    ) -> EpDispatchOutput:
         a2a = self._get(num_local_experts, topk_ids.shape[1])
         if ep_rank != a2a.rank:
             raise ValueError(f"ep_a2a: ep_rank {ep_rank} != group rank {a2a.rank}")
         n = x8.shape[0]
         recv = a2a.dispatch(
-            x8, xscale.reshape(n, 1), topk_ids, topk_weights, mask_stale=True, region_rows=n
+            x8,
+            xscale.reshape(n, 1),
+            topk_ids,
+            topk_weights,
+            mask_stale=True,
+            region_rows=n,
         )
         return EpDispatchOutput(
             recv.x, recv.scale.reshape(-1), recv.topk_ids, recv.topk_weights, a2a
@@ -90,7 +103,9 @@ class EpA2ADecodeComm:
     def combine(self, partial, dispatched, out) -> torch.Tensor:
         a2a: EpA2A = dispatched.handle
         if partial.data_ptr() != a2a.partial_out.data_ptr():
-            raise ValueError("ep_a2a: the experts must write into combine_buffer() (symmetric memory)")
+            raise ValueError(
+                "ep_a2a: the experts must write into combine_buffer() (symmetric memory)"
+            )
         a2a.combine(out=out)
         return out
 

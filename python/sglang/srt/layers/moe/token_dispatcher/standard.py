@@ -8,10 +8,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    dp_pad_mask_real_counts_enabled,
     get_dp_global_num_tokens,
     get_local_dp_buffer,
     is_allocation_symmetric,
-    dp_pad_mask_real_counts_enabled,
     is_dp_max_padding,
     mask_dp_pad_moe_topk_ids,
 )

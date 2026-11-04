@@ -120,7 +120,10 @@ def virtual_expert_weights(w13, s13, w2, s2):
         raise ValueError(f"intermediate {inter} is not a multiple of {INTER}")
     hidden = w2.shape[1]
     assert w2.shape == (E, hidden, inter // 2), w2.shape
-    assert s13.shape[:2] == (E, n2) and s2.shape[:2] == (E, hidden), (s13.shape, s2.shape)
+    assert s13.shape[:2] == (E, n2) and s2.shape[:2] == (E, hidden), (
+        s13.shape,
+        s2.shape,
+    )
 
     def gate_up(t):  # [E, 2I, X] -> [E*S, 2*576, X]
         x = t.shape[2]
@@ -133,9 +136,7 @@ def virtual_expert_weights(w13, s13, w2, s2):
     def down(t):  # [E, H, I/g] -> [E*S, H, 576/g]
         x = t.shape[2] // split
         return (
-            t.reshape(E, hidden, split, x)
-            .transpose(1, 2)
-            .reshape(E * split, hidden, x)
+            t.reshape(E, hidden, split, x).transpose(1, 2).reshape(E * split, hidden, x)
         )
 
     return gate_up(w13), gate_up(s13), down(w2), down(s2)
@@ -148,7 +149,9 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
     E = w13.shape[0]
     # Byte views: the reorder copies bytes, and e8m0 has few kernels.
     w13, s13, w2, s2 = (t.view(torch.uint8) for t in (w13, s13, w2, s2))
-    out13 = out2 = None  # filled chunk by chunk (no final cat: its copy left ~7 GB of fragments at EP8 v2w)
+    out13 = out2 = (
+        None  # filled chunk by chunk (no final cat: its copy left ~7 GB of fragments at EP8 v2w)
+    )
     for e0 in range(0, E, expert_chunk):
         e1 = min(E, e0 + expert_chunk)
         if mode == "v2w":
@@ -159,13 +162,15 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
             )
             p = ws.pack_experts(v13, vs13, vw2, vs2)
             del v13, vs13, vw2, vs2
-        per = p.w13.shape[0] // (e1 - e0)  # packed experts per local expert (virtual: S, v2w: 1)
+        per = p.w13.shape[0] // (
+            e1 - e0
+        )  # packed experts per local expert (virtual: S, v2w: 1)
         if out13 is None:
             out13 = p.w13.new_empty((E * per,) + tuple(p.w13.shape[1:]))
             out2 = p.w2.new_empty((E * per,) + tuple(p.w2.shape[1:]))
         n, lo = p.w13.shape[0], e0 * per
-        out13[lo:lo + n].copy_(p.w13)
-        out2[lo:lo + n].copy_(p.w2)
+        out13[lo : lo + n].copy_(p.w13)
+        out2[lo : lo + n].copy_(p.w2)
         del p
         torch.cuda.empty_cache()
     if mode == "v2w":
@@ -233,7 +238,9 @@ def _ep_expand_kernel(
 ):
     j = tl.arange(0, E_BLOCK)
     cnt = tl.load(counts_ptr + j, mask=j < NUM_LOCAL, other=0)
-    first = tl.cumsum(cnt, 0) - cnt  # first sorted position of each local expert's slots
+    first = (
+        tl.cumsum(cnt, 0) - cnt
+    )  # first sorted position of each local expert's slots
     if tl.program_id(0) == 0:
         for s in tl.static_range(SPLIT):
             tl.store(counts_v_ptr + j * SPLIT + s, cnt, mask=j < NUM_LOCAL)
@@ -256,7 +263,9 @@ def _ep_expand_kernel(
 
 class EpRouting(NamedTuple):
     counts: torch.Tensor  # [E*S] int32 slots of each virtual expert
-    sorted_slots: torch.Tensor  # [T*K*S] int32 virtual slot (t * K + k) * S + s = the row of y it writes
+    sorted_slots: (
+        torch.Tensor
+    )  # [T*K*S] int32 virtual slot (t * K + k) * S + s = the row of y it writes
     sorted_tokens: torch.Tensor  # [T*K*S] int32 token row of x
     sorted_weights: torch.Tensor  # [T*K*S] fp32 routing weight
     work: torch.Tensor  # the experts kernel's zeroed workspace
@@ -296,7 +305,10 @@ def route_ep(
         x = hidden_states.contiguous()
     else:  # placeholders of the right types; QUANT=False compiles no access to them
         x = torch.empty(0, dtype=torch.bfloat16, device=dev)
-        empty = (torch.empty(0, dtype=torch.float8_e4m3fn, device=dev), torch.empty(0, dtype=torch.float32, device=dev))
+        empty = (
+            torch.empty(0, dtype=torch.float8_e4m3fn, device=dev),
+            torch.empty(0, dtype=torch.float32, device=dev),
+        )
     _ep_count_quant_kernel[(slot_blocks + (num_tokens if quant is not None else 0),)](
         ids,
         cursor,
@@ -318,8 +330,20 @@ def route_ep(
     e_block = triton.next_power_of_2(num_local)
     block = max(64, min(1024, 32768 // e_block))
     _ep_expand_kernel[(triton.cdiv(num_slots, block),)](
-        ids, weights, rank, cursor, counts, sorted_slots, sorted_tokens, sorted_weights, num_slots,
-        NUM_LOCAL=num_local, E_BLOCK=e_block, TOP_K=top_k, SPLIT=split, BLOCK=block,
+        ids,
+        weights,
+        rank,
+        cursor,
+        counts,
+        sorted_slots,
+        sorted_tokens,
+        sorted_weights,
+        num_slots,
+        NUM_LOCAL=num_local,
+        E_BLOCK=e_block,
+        TOP_K=top_k,
+        SPLIT=split,
+        BLOCK=block,
     )
     return EpRouting(counts, sorted_slots, sorted_tokens, sorted_weights, work), quant
 
@@ -353,7 +377,9 @@ def _ep_combine_kernel(
     tl.store(out_ptr + t * HIDDEN_ + cols, acc.to(tl.bfloat16), mask=cmask)
 
 
-def combine_ep(y: torch.Tensor, topk_ids: torch.Tensor, split: int, out: torch.Tensor) -> torch.Tensor:
+def combine_ep(
+    y: torch.Tensor, topk_ids: torch.Tensor, split: int, out: torch.Tensor
+) -> torch.Tensor:
     num_tokens, top_k = topk_ids.shape
     assert y.shape == (num_tokens * top_k * split, HIDDEN), y.shape
     assert out.shape == (num_tokens, HIDDEN) and out.is_contiguous(), out.shape
@@ -429,7 +455,9 @@ def _decode_moe_ep_call(
         y,
         routing.work,
         float(swiglu_limit),
-        *((y,) if mod is not v2._module() else ()),  # v2w: its gather mode's token-row output (unused here)
+        *(
+            (y,) if mod is not v2._module() else ()
+        ),  # v2w: its gather mode's token-row output (unused here)
     )
     combine_ep(y, topk_ids, split, output)
     return y if return_y else None
@@ -496,7 +524,11 @@ def decode_moe_ep(
 
 @functools.cache
 def prepare_ep(
-    device_index: int, num_virtual: int, split: int, top_k: int, inter: Optional[int] = None
+    device_index: int,
+    num_virtual: int,
+    split: int,
+    top_k: int,
+    inter: Optional[int] = None,
 ) -> None:
     """Build and load everything ``decode_moe_ep`` launches for this shape, at weight-processing time (the expert
     kernel's JIT module and kernels, the Triton prologue and combine for this top-k and split), with calls on a
@@ -518,7 +550,10 @@ def prepare_ep(
                 one.expand(num_virtual, 40, inter * 68),
                 inter,
             )
-        for num_tokens in (2, 16):  # Triton specializes pointers' alignment, not these ints
+        for num_tokens in (
+            2,
+            16,
+        ):  # Triton specializes pointers' alignment, not these ints
             x = torch.zeros(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
             ids = torch.full((num_tokens, top_k), -1, dtype=torch.int32, device="cuda")
             w = torch.ones(ids.shape, device="cuda")

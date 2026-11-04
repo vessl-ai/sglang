@@ -30,17 +30,28 @@ E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 def _experts(num_experts, inter, seed=0):
     g = torch.Generator().manual_seed(seed)
     nib = lambda *s: torch.randint(-128, 128, s, generator=g, dtype=torch.int8).cuda()  # noqa: E731
-    sc = lambda *s: torch.randint(119, 123, s, generator=g, dtype=torch.uint8).view(torch.float8_e8m0fnu).cuda()  # noqa: E731
-    return (nib(num_experts, inter, HIDDEN // 2), sc(num_experts, inter, HIDDEN // 32),
-            nib(num_experts, inter, HIDDEN // 2), sc(num_experts, inter, HIDDEN // 32),
-            nib(num_experts, HIDDEN, inter // 2), sc(num_experts, HIDDEN, inter // 32))
+    sc = lambda *s: (
+        torch.randint(119, 123, s, generator=g, dtype=torch.uint8)
+        .view(torch.float8_e8m0fnu)
+        .cuda()
+    )  # noqa: E731
+    return (
+        nib(num_experts, inter, HIDDEN // 2),
+        sc(num_experts, inter, HIDDEN // 32),
+        nib(num_experts, inter, HIDDEN // 2),
+        sc(num_experts, inter, HIDDEN // 32),
+        nib(num_experts, HIDDEN, inter // 2),
+        sc(num_experts, HIDDEN, inter // 32),
+    )
 
 
 def _dequant(weight, scale):
     lut = torch.tensor(E2M1, device="cuda")
     w = weight.view(torch.uint8).long()
     values = torch.stack([lut[w & 0xF], lut[w >> 4]], -1).flatten(-2)
-    return values * torch.exp2(scale.view(torch.uint8).float() - 127.0).repeat_interleave(32, -1)
+    return values * torch.exp2(
+        scale.view(torch.uint8).float() - 127.0
+    ).repeat_interleave(32, -1)
 
 
 def _q_rows(v):
@@ -73,10 +84,16 @@ def _reference(x, ids, wts, experts, width=None):
 
 def _routing(tokens, num_experts, top_k, seed, s=0.0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    pop = (1.0 / torch.arange(1, num_experts + 1, device="cuda", dtype=torch.float64)) ** s
-    ids = torch.multinomial(pop.expand(tokens, num_experts), top_k, replacement=False, generator=g).int()
+    pop = (
+        1.0 / torch.arange(1, num_experts + 1, device="cuda", dtype=torch.float64)
+    ) ** s
+    ids = torch.multinomial(
+        pop.expand(tokens, num_experts), top_k, replacement=False, generator=g
+    ).int()
     x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
-    w = torch.softmax(torch.randn(tokens, top_k, device="cuda", generator=g), -1).float()
+    w = torch.softmax(
+        torch.randn(tokens, top_k, device="cuda", generator=g), -1
+    ).float()
     return x, ids, w
 
 
@@ -91,12 +108,19 @@ def test_v2w_576_bit_identical_to_v2():
 
     w1, s1, w3, s3, w2, s2 = _experts(384, 576)
     u8 = torch.uint8
-    p = WS.pack_experts(torch.cat([w1, w3], 1), torch.cat([s1.view(u8), s3.view(u8)], 1).view(s1.dtype), w2, s2)
+    p = WS.pack_experts(
+        torch.cat([w1, w3], 1),
+        torch.cat([s1.view(u8), s3.view(u8)], 1).view(s1.dtype),
+        w2,
+        s2,
+    )
     pw = V2W.PackedExperts(p.w13, p.w2, 576)
     for tokens, s in ((4, 0.0), (300, 0.0), (1100, 1.2)):
         x, ids, w = _routing(tokens, 384, 6, tokens, s)
         ids[-1] = -1  # a masked (dp pad) row
-        assert torch.equal(V2W.decode_moe(x, ids, w, pw, LIMIT), V2.decode_moe(x, ids, w, p, LIMIT))
+        assert torch.equal(
+            V2W.decode_moe(x, ids, w, pw, LIMIT), V2.decode_moe(x, ids, w, p, LIMIT)
+        )
 
 
 @pytest.mark.parametrize("s", [0.0, 1.2])
@@ -119,8 +143,12 @@ def test_v2w_2304_build_switches_bit_identical():
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as V2W
 
     packed = V2W.pack_experts(*_experts(48, 2304))
-    x, ids, w = _routing(3000, 48, 1, 11, 1.2)  # hot experts: hundreds of rows, several 64-row passes
-    base = V2W.decode_moe(x, ids, w, packed, LIMIT, defines=("DSV4_PASS_ROWS=32", "DSV4_GLOBAL_QUANT=0")).clone()
+    x, ids, w = _routing(
+        3000, 48, 1, 11, 1.2
+    )  # hot experts: hundreds of rows, several 64-row passes
+    base = V2W.decode_moe(
+        x, ids, w, packed, LIMIT, defines=("DSV4_PASS_ROWS=32", "DSV4_GLOBAL_QUANT=0")
+    ).clone()
     for _ in range(3):
         assert torch.equal(V2W.decode_moe(x, ids, w, packed, LIMIT), base)
     o = torch.empty_like(x)
@@ -162,10 +190,18 @@ def test_v2w_tp8_padded_slice_matches_288_reference():
     packed = V2W.pack_tp_slice(*experts, rank=rank, tp=8, pad_to=320)
     sl = slice(288 * rank, 288 * (rank + 1))
     w1, s1, w3, s3, w2, s2 = experts
-    ref_experts = (w1[:, sl], s1[:, sl], w3[:, sl], s3[:, sl], w2[:, :, 144 * rank:144 * (rank + 1)],
-                   s2[:, :, 9 * rank:9 * (rank + 1)])
+    ref_experts = (
+        w1[:, sl],
+        s1[:, sl],
+        w3[:, sl],
+        s3[:, sl],
+        w2[:, :, 144 * rank : 144 * (rank + 1)],
+        s2[:, :, 9 * rank : 9 * (rank + 1)],
+    )
     x, ids, w = _routing(400, 16, 3, 9)
-    err = _rel(V2W.decode_moe(x, ids, w, packed, LIMIT), _reference(x, ids, w, ref_experts))
+    err = _rel(
+        V2W.decode_moe(x, ids, w, packed, LIMIT), _reference(x, ids, w, ref_experts)
+    )
     assert err < 5e-3, err
 
 
@@ -192,12 +228,23 @@ def test_v2w_gather_modes_bit_identical():
     xs = torch.empty(T, dtype=torch.float32, device="cuda")
     sentinel = torch.full((T, HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
     out_t = sentinel.clone()
-    V2W.decode_moe_tokens(x8, xs, ids, w, packed, LIMIT, out_t, x=x)  # also quantizes x into x8 / xs
+    V2W.decode_moe_tokens(
+        x8, xs, ids, w, packed, LIMIT, out_t, x=x
+    )  # also quantizes x into x8 / xs
     t2, k2 = torch.nonzero(ids >= 0, as_tuple=True)
     pid, pw = ids[t2, k2].unsqueeze(1).contiguous(), w[t2, k2].unsqueeze(1).contiguous()
-    pair_rows = V2W.decode_moe(x[t2].contiguous(), pid, pw, packed, LIMIT, output=torch.empty(t2.numel(), HIDDEN, dtype=torch.bfloat16, device="cuda"))
+    pair_rows = V2W.decode_moe(
+        x[t2].contiguous(),
+        pid,
+        pw,
+        packed,
+        LIMIT,
+        output=torch.empty(t2.numel(), HIDDEN, dtype=torch.bfloat16, device="cuda"),
+    )
     # per pair: bit-identical to the pair-row call
-    _, per_pair = V2W.decode_moe_pairs(x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT)
+    _, per_pair = V2W.decode_moe_pairs(
+        x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT
+    )
     assert torch.equal(per_pair, pair_rows)
     # per token row: fp32 k-ascending sum of its pairs, one bf16 round
     Y = torch.zeros(T, K, HIDDEN, device="cuda")
@@ -209,17 +256,32 @@ def test_v2w_gather_modes_bit_identical():
     assert torch.equal(out_t[has], ref.to(torch.bfloat16)[has])
     assert torch.equal(out_t[~has], sentinel[~has])  # not written
     out_p = sentinel.clone()
-    V2W.decode_moe_pairs(x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT, out_tokens=out_p)
+    V2W.decode_moe_pairs(
+        x8, xs, t2.int(), pid.flatten(), pw.flatten(), packed, LIMIT, out_tokens=out_p
+    )
     assert torch.equal(out_p, out_t)
     # fixed capacity (graph shapes): unused entries at the end, device-side count
     cap = T * K
     tok_c = torch.full((cap,), T, dtype=torch.int32, device="cuda")
     eid_c = torch.full((cap,), -1, dtype=torch.int32, device="cuda")
     w_c = torch.zeros(cap, device="cuda")
-    tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = t2.int(), pid.flatten(), pw.flatten()
+    tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = (
+        t2.int(),
+        pid.flatten(),
+        pw.flatten(),
+    )
     out_c = sentinel.clone()
-    V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out_c,
-                         num_valid=torch.tensor([t2.numel()], dtype=torch.int32, device="cuda"))
+    V2W.decode_moe_pairs(
+        x8,
+        xs,
+        tok_c,
+        eid_c,
+        w_c,
+        packed,
+        LIMIT,
+        out_tokens=out_c,
+        num_valid=torch.tensor([t2.numel()], dtype=torch.int32, device="cuda"),
+    )
     assert torch.equal(out_c, out_t)
 
 
@@ -240,10 +302,16 @@ def test_v2w_gather_pairs_cuda_graph():
 
     def load(seed):
         x, ids, w = _ep_receive(T, 48, K, seed)
-        V2W.decode_moe_tokens(x8, xs, torch.full_like(ids, -1), w, packed, LIMIT, out, x=x)  # quantize only
+        V2W.decode_moe_tokens(
+            x8, xs, torch.full_like(ids, -1), w, packed, LIMIT, out, x=x
+        )  # quantize only
         t2, k2 = torch.nonzero(ids >= 0, as_tuple=True)
         tok_c.fill_(T), eid_c.fill_(-1), w_c.zero_()
-        tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = t2.int(), ids[t2, k2], w[t2, k2]
+        tok_c[: t2.numel()], eid_c[: t2.numel()], w_c[: t2.numel()] = (
+            t2.int(),
+            ids[t2, k2],
+            w[t2, k2],
+        )
         nv.fill_(t2.numel())
         ref = torch.zeros_like(out)
         V2W.decode_moe_tokens(x8, xs, ids, w, packed, LIMIT, ref)
@@ -253,11 +321,15 @@ def test_v2w_gather_pairs_cuda_graph():
     st = torch.cuda.Stream()
     st.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(st):
-        V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv)
+        V2W.decode_moe_pairs(
+            x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv
+        )
     torch.cuda.current_stream().wait_stream(st)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        V2W.decode_moe_pairs(x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv)
+        V2W.decode_moe_pairs(
+            x8, xs, tok_c, eid_c, w_c, packed, LIMIT, out_tokens=out, num_valid=nv
+        )
     for seed in (2, 3):
         ref, has = load(seed)
         graph.replay()

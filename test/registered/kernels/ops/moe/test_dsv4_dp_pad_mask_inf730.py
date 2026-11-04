@@ -45,9 +45,9 @@ def _ids(rows, num_experts, top_k, seed, skew=0.0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     pop = torch.zeros(num_experts, device="cuda")
     if skew:
-        pop = (-skew * torch.log(torch.arange(1, num_experts + 1, device="cuda").float()))[
-            torch.randperm(num_experts, device="cuda", generator=g)
-        ]
+        pop = (
+            -skew * torch.log(torch.arange(1, num_experts + 1, device="cuda").float())
+        )[torch.randperm(num_experts, device="cuda", generator=g)]
     logits = pop + torch.randn(rows, num_experts, device="cuda", generator=g)
     w, ids = torch.topk(torch.softmax(logits, -1), top_k, dim=-1)
     return ids.int().contiguous(), (w / w.sum(-1, keepdim=True)).float().contiguous()
@@ -56,7 +56,11 @@ def _ids(rows, num_experts, top_k, seed, skew=0.0):
 def _expected_mask(counts, max_len, top_k):
     pos = torch.arange(W * max_len, device="cuda") % max_len
     rank = torch.arange(W * max_len, device="cuda") // max_len
-    return (pos >= torch.tensor(counts, device="cuda")[rank]).unsqueeze(1).expand(-1, top_k)
+    return (
+        (pos >= torch.tensor(counts, device="cuda")[rank])
+        .unsqueeze(1)
+        .expand(-1, top_k)
+    )
 
 
 @pytest.mark.parametrize("counts", [[16, 16, 16, 16], [13, 16, 9, 0], [1, 2, 3, 4]])
@@ -111,7 +115,9 @@ def _synthetic_packed(num_experts, seed=0):
 
     g = torch.Generator().manual_seed(seed)
     nib = lambda *s: torch.randint(-128, 128, s, generator=g, dtype=torch.int8)  # noqa: E731
-    sc = lambda *s: torch.randint(119, 123, s, generator=g, dtype=torch.uint8).view(torch.float8_e8m0fnu)  # noqa: E731
+    sc = lambda *s: torch.randint(119, 123, s, generator=g, dtype=torch.uint8).view(
+        torch.float8_e8m0fnu
+    )  # noqa: E731
     return ws.pack_experts(
         nib(num_experts, 2 * INTER, HIDDEN // 2).cuda(),
         sc(num_experts, 2 * INTER, HIDDEN // 32).cuda(),
@@ -123,7 +129,8 @@ def _synthetic_packed(num_experts, seed=0):
 @pytest.mark.parametrize("shape", ["target", "draft"])
 @pytest.mark.parametrize("skew", [0.0, 1.0])
 @pytest.mark.parametrize(
-    "reqs,bucket", [((94, 96, 96, 95), 96), ((104, 106, 108, 110), 112), ((8, 1, 0, 5), 8)]
+    "reqs,bucket",
+    [((94, 96, 96, 95), 96), ((104, 106, 108, 110), 112), ((8, 1, 0, 5), 8)],
 )
 def test_v2_real_rows_unchanged_when_pads_masked(switch_on, shape, skew, reqs, bucket):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
@@ -136,14 +143,23 @@ def test_v2_real_rows_unchanged_when_pads_masked(switch_on, shape, skew, reqs, b
         pytest.skip("over the v2 prologue's slot limit")
     packed = _synthetic_packed(num_experts, seed=3)
     g = torch.Generator(device="cuda").manual_seed(4)
-    x = (torch.randn(W * max_len, HIDDEN, device="cuda", generator=g) * 0.7).to(torch.bfloat16)
+    x = (torch.randn(W * max_len, HIDDEN, device="cuda", generator=g) * 0.7).to(
+        torch.bfloat16
+    )
     ids, w = _ids(W * max_len, num_experts, top_k, seed=5, skew=skew)
     m = _expected_mask(counts, max_len, top_k)[:, 0]
-    x[m] = (torch.randn(int(m.sum()), HIDDEN, device="cuda", generator=g) * 1e3).to(torch.bfloat16)  # stale pads
+    x[m] = (torch.randn(int(m.sum()), HIDDEN, device="cuda", generator=g) * 1e3).to(
+        torch.bfloat16
+    )  # stale pads
     out_routed = v2.decode_moe(x, ids.clone(), w, packed, SWIGLU_LIMIT)
     masked = ids.clone()
     dpa.set_dp_buffer_len(
-        W * max_len, max_len, True, [max_len] * W, None, torch.tensor(counts, dtype=torch.int32, device="cuda")
+        W * max_len,
+        max_len,
+        True,
+        [max_len] * W,
+        None,
+        torch.tensor(counts, dtype=torch.int32, device="cuda"),
     )
     dpa.mask_dp_pad_moe_topk_ids(masked)
     assert int((masked[m] != -1).sum()) == 0 and torch.equal(masked[~m], ids[~m])
