@@ -1394,7 +1394,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buf is None:
             return
         counts = forward_batch.global_num_tokens_cpu
-        if counts is None or len(counts) != buf.shape[0]:
+        if (
+            counts is None
+            or len(counts) != buf.shape[0]
+            # Coordinated spec-prefill rounds keep raw request counts (not token units).
+            or getattr(forward_batch, "dp_spec_prefill_coordination_applied", False)
+        ):
             buf.fill_(_DP_PAD_ALL_VALID)
             return
         buf.copy_(
