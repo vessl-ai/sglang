@@ -365,3 +365,11 @@ def test_ep_v2w_cuda_graph_replay():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1)), seed
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
