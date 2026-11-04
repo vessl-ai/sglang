@@ -1235,6 +1235,17 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # INF-730: make SGLANG_OPT_MASK_DP_PAD_MOE mask under MAX_LEN padding, and also for a
+    # TP MoE (ep_size 1). The mask above reads global_num_tokens_gpu, which holds the
+    # PADDED count of every rank by the time a MAX_LEN forward runs (eager:
+    # prepare_mlp_sync_batch overwrites it; decode graphs: never passed at capture, and
+    # the replay buffer is filled with the padded count), so it never masks a row. With
+    # this switch the target model's decode/verify forwards publish each rank's REAL row
+    # count in a separate device buffer (eager: before the padding overwrite; graphs: a
+    # static buffer passed at capture and refreshed by every replay) and the mask reads
+    # that. Pad rows then get top-k -1 and the experts skip them; real rows' outputs do
+    # not change. The draft worker is left as it was.
+    SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
