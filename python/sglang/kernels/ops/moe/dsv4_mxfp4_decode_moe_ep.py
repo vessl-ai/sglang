@@ -148,7 +148,7 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
     E = w13.shape[0]
     # Byte views: the reorder copies bytes, and e8m0 has few kernels.
     w13, s13, w2, s2 = (t.view(torch.uint8) for t in (w13, s13, w2, s2))
-    parts13, parts2 = [], []
+    out13 = out2 = None  # filled chunk by chunk (no final cat: its copy left ~7 GB of fragments at EP8 v2w)
     for e0 in range(0, E, expert_chunk):
         e1 = min(E, e0 + expert_chunk)
         if mode == "v2w":
@@ -159,12 +159,18 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
             )
             p = ws.pack_experts(v13, vs13, vw2, vs2)
             del v13, vs13, vw2, vs2
-        parts13.append(p.w13)
-        parts2.append(p.w2)
+        per = p.w13.shape[0] // (e1 - e0)  # packed experts per local expert (virtual: S, v2w: 1)
+        if out13 is None:
+            out13 = p.w13.new_empty((E * per,) + tuple(p.w13.shape[1:]))
+            out2 = p.w2.new_empty((E * per,) + tuple(p.w2.shape[1:]))
+        n, lo = p.w13.shape[0], e0 * per
+        out13[lo:lo + n].copy_(p.w13)
+        out2[lo:lo + n].copy_(p.w2)
         del p
+        torch.cuda.empty_cache()
     if mode == "v2w":
-        return v2w.PackedExperts(torch.cat(parts13), torch.cat(parts2), w13.shape[1] // 2), 1
-    return PackedExperts(torch.cat(parts13), torch.cat(parts2)), split_of(w13.shape[1] // 2)
+        return v2w.PackedExperts(out13, out2, w13.shape[1] // 2), 1
+    return PackedExperts(out13, out2), split_of(w13.shape[1] // 2)
 
 
 # ---------------------------------------------------------------------------------------------------------
