@@ -3734,7 +3734,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             if ep_decode_comm.applies(
                 self.mlp, forward_batch, shared_local=_do_shared_local
             ):
-                return self._run_ep_decode_moe(hidden_states, input_ids)
+                return self._run_ep_decode_moe(
+                    hidden_states, input_ids, forward_batch.num_token_non_padded
+                )
         # INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL): the replicated shared
         # expert on this rank's own CP shard, before (or beside) the MoE all-gather.
         _cp_shared = None
@@ -3943,7 +3945,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         return hidden_states
 
     def _run_ep_decode_moe(
-        self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """INF-730 SGLANG_OPT_DSV4_EP_MOE_COMM: route, dispatch, run the local experts and combine this rank's
         own rows (srt/layers/moe/ep_decode_comm.py) instead of the all-gather path; the shared expert runs on
@@ -3965,7 +3970,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 shared.record_stream(torch.cuda.current_stream())
             else:
                 shared = _forward_shared_experts_rank_local(self.mlp, hidden_states)
-        out = ep_decode_comm.forward_ep_decode_moe(self.mlp, hidden_states, input_ids)
+        out = ep_decode_comm.forward_ep_decode_moe(
+            self.mlp, hidden_states, input_ids, num_token_non_padded
+        )
         if shared is not None:
             if stream is not None:
                 torch.cuda.current_stream().wait_stream(stream)

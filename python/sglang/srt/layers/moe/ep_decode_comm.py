@@ -187,21 +187,26 @@ def applies(mlp, forward_batch, *, shared_local: bool) -> bool:
     return True
 
 
-def _mask_local_pad_rows(topk_ids: torch.Tensor) -> None:
-    """MAX_LEN padding: rows at or past this rank's token count carry stale values; give them no expert."""
-    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens_gpu
-    from sglang.srt.runtime_context import get_parallel
-
-    counts = get_dp_global_num_tokens_gpu()
-    if counts is None:
+def _mask_local_pad_rows(
+    topk_ids: torch.Tensor, num_token_non_padded: Optional[torch.Tensor]
+) -> None:
+    """MAX_LEN padding: rows at or past this rank's token count carry stale values; give them no expert, so they
+    are neither dispatched nor computed. The count is the forward batch's local ``num_token_non_padded`` (a CUDA
+    graph slot refilled at every replay; the DP buffer's per-rank GPU counts are not usable here: decode graph
+    capture does not pass them, and the replay buffer holds the padded counts)."""
+    if num_token_non_padded is None:
         return
-    real = counts[get_parallel().attn_dp_rank]
     rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
-    topk_ids.masked_fill_((rows >= real).unsqueeze(1), -1)
+    topk_ids.masked_fill_(
+        (rows >= num_token_non_padded.reshape(-1)[:1]).unsqueeze(1), -1
+    )
 
 
 def forward_ep_decode_moe(
-    mlp, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor]
+    mlp,
+    hidden_states: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The routed-expert output of this rank's own rows ([n, 5120] bf16, MAX_LEN-padded local buffer); the
     caller adds the shared expert."""
@@ -216,7 +221,7 @@ def forward_ep_decode_moe(
     num_local = method._sm90_packed.w13.shape[0] // method._ep_split
     topk_output = mlp.route_rows(hidden_states, input_ids)
     topk_ids = topk_output.topk_ids.to(torch.int32).contiguous()
-    _mask_local_pad_rows(topk_ids)
+    _mask_local_pad_rows(topk_ids, num_token_non_padded)
     x8, xs = _row_quant(hidden_states.contiguous())
     dispatched = comm.dispatch(
         x8.view(torch.uint8),
