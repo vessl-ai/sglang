@@ -635,8 +635,9 @@ class Mxfp4MarlinMoEMethod:
             int(layer.w13_weight_scale_inv.data.view(torch.uint8).max()),
             int(layer.w2_weight_scale_inv.data.view(torch.uint8).max()),
         )
+        mode = ek.kernel_mode()
         if not (
-            ek.supports_ep(hidden, inter, num_local)
+            ek.supports_ep(hidden, inter, num_local, mode)
             and config.activation == "silu"
             and config.is_gated
             and config.gemm1_alpha is None
@@ -647,7 +648,7 @@ class Mxfp4MarlinMoEMethod:
             log_info_on_rank0(
                 logger,
                 "SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: layer shape not covered "
-                f"(hidden {hidden}, intermediate {inter}, {num_local} local experts); "
+                f"(hidden {hidden}, intermediate {inter}, {num_local} local experts, kernel {mode}); "
                 f"keeping the configured path (layer: {self.prefix})",
             )
             return False
@@ -657,23 +658,32 @@ class Mxfp4MarlinMoEMethod:
             layer.w13_weight_scale_inv.data,
             layer.w2_weight.data,
             layer.w2_weight_scale_inv.data,
+            mode=mode,
         )
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
         torch.cuda.empty_cache()
         log_info_on_rank0(
             logger,
-            "Using the SM90 decode MoE kernel (W4A8 v2) on an expert-parallel layer: "
-            f"{num_local} local experts x {split} virtual 576-channel experts "
-            f"(layer: {self.prefix})",
+            "Using the SM90 decode MoE kernel on an expert-parallel layer: "
+            + (
+                f"v2w, {num_local} local whole experts (intermediate {inter}) "
+                if mode == "v2w"
+                else f"W4A8 v2, {num_local} local experts x {split} virtual 576-channel experts "
+            )
+            + f"(layer: {self.prefix})",
         )
         top_k = getattr(layer, "top_k", None) or 6
         # Compile and load everything now, not at the first MoE call of graph capture.
         ek.prepare_ep(
-            self._sm90_packed.w13.device.index, num_local * split, split, int(top_k)
+            self._sm90_packed.w13.device.index,
+            num_local * split,
+            split,
+            int(top_k),
+            inter if mode == "v2w" else None,
         )
         self._ep_split = split
-        layer._dsv4_mxfp4_backend = "sm90_decode_w4a8_ep"
+        layer._dsv4_mxfp4_backend = f"sm90_decode_w4a8_ep_{mode}"
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:

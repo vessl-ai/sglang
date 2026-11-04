@@ -119,6 +119,7 @@ def test_split_and_support_rules():
     assert ek.supports_ep(5120, 2304, 48) and ek.supports_ep(5120, 2304, 16)
     assert ek.supports_ep(5120, 2304, 128) and not ek.supports_ep(5120, 2304, 129)
     assert not ek.supports_ep(4096, 2304, 48) and not ek.supports_ep(5120, 288, 48)
+    assert ek.supports_ep(5120, 2304, 48, "v2w") and not ek.supports_ep(5120, 1152, 48, "v2w")
 
 
 # ------------------------------------------------------------------------------------------------- GPU
@@ -297,3 +298,70 @@ def test_ep_token_chunks(monkeypatch):
     ref = ek.decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT)
     monkeypatch.setattr(ek, "max_virtual_slots", lambda: 7 * 6 * SPLIT * 16)  # 112 tokens per call
     assert torch.equal(ek.decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT), ref)
+
+
+# ------------------------------------------------------------------------------------- v2w (whole experts)
+
+
+def _packed_v2w(num_local, seed=0):
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as v2w
+
+    w13, s13, w2, s2 = (t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed))
+    packed, split = ek.pack_experts_ep(w13, s13, w2, s2, mode="v2w")
+    assert split == 1 and packed.inter == FULL and packed.w13.shape[0] == num_local
+    whole = v2w.pack_w13_w2(w13, s13, w2, s2)  # a-moe's own packing of the same experts, in one piece
+    assert torch.equal(packed.w13, whole.w13) and torch.equal(packed.w2, whole.w2)
+    return packed
+
+
+@needs_sm90
+@pytest.mark.parametrize("shape", list(SHAPES))
+def test_ep_v2w_bit_identical_to_v2w_wrapper(shape):
+    """SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL=v2w: this module's prologue + combine around the v2w experts kernel give
+    the bits of a-moe's own wrapper (its prep + the v2 top-k combine), on token rows with local top-k ids."""
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as v2w
+    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep
+
+    num_local, top_k = SHAPES[shape]
+    packed = _packed_v2w(num_local)
+    for tokens, skew in ((1, 0.0), (7, 0.0), (520, 0.0), (520, 1.2), (2048, 1.0), (4096, 0.6)):
+        ids_g, wts = _global_routing(tokens, num_local * EP, top_k, seed=tokens, skew=skew)
+        ids = _local(ids_g, 2, num_local).cuda()
+        if tokens > 8:
+            ids[-3:] = -1
+        wts = wts.cuda()
+        x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        ref = v2w.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
+        for _ in range(3):
+            assert torch.equal(decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1), ref), (shape, tokens, skew)
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
+
+        out = decode_moe_ep(None, ids, wts, packed, SWIGLU_LIMIT, 1, row_quant=ws._row_quant(x))
+        assert torch.equal(out, ref), (shape, tokens, "row_quant")
+
+
+@needs_sm90
+def test_ep_v2w_cuda_graph_replay():
+    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep, prepare_ep
+
+    packed = _packed_v2w(48)
+    prepare_ep(torch.cuda.current_device(), 48, 1, 6, FULL)
+    tokens = 2048
+    x = torch.zeros(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((tokens, 6), -1, dtype=torch.int32, device="cuda")
+    wts = torch.zeros(tokens, 6, device="cuda")
+    out = torch.empty(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1, output=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1, output=out)
+    for seed, skew in ((1, 0.0), (2, 1.2)):
+        ids_g, w = _global_routing(tokens, 384, 6, seed=seed, skew=skew)
+        ids.copy_(_local(ids_g, 6, 48))
+        wts.copy_(w)
+        x.copy_(torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1)), seed

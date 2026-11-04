@@ -28,8 +28,16 @@ Buffers are sized for the worst case (every slot of every token on this rank): `
 in token chunks, which is allowed in eager mode only (prefill); below it ``decode_moe_ep`` is CUDA-graph safe (no
 host sync).
 
-This module is the seam for a dedicated EP kernel: the engine calls only ``supports_ep``, ``pack_experts_ep``,
-``prepare_ep`` and ``decode_moe_ep``.
+Kernels (SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL):
+- ``v2w`` (default): ``dsv4_mxfp4_decode_moe_v2w`` (INF-730 track a-moe), the v2 kernel compiled for whole 2304-wide
+  experts (64-row passes, grid-wide h quantization). S = 1: one slot per (token, k), y = T * K rows. h is quantized
+  once per 2304-wide row (TP4 quantizes each 576 slice), so the numerics differ from TP4 by ~0.4% (a-moe).
+- ``virtual``: the v2 kernel on S = 4 virtual 576-channel experts per local expert (above), bit-identical rows to TP4.
+Both use this module's prologue (routing + row quantization) and combine, so the pre-quantized input of a
+dispatch (``row_quant``) works for both.
+
+This module is the seam for the EP expert kernel: the engine calls only ``kernel_mode``, ``supports_ep``,
+``pack_experts_ep``, ``prepare_ep`` and ``decode_moe_ep``.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
+from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as v2w
 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
 
 HIDDEN = ws.HIDDEN
@@ -54,6 +63,20 @@ _ROUTE_BLOCK = 1024
 _COMBINE_BLOCK = 1024
 
 
+V2W_WIDTHS = (2304,)  # whole-expert widths the v2w kernel is built and tested for
+
+
+def kernel_mode() -> str:
+    from sglang.srt.environ import envs
+
+    mode = envs.SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL.get()
+    if mode not in ("v2w", "virtual"):
+        raise ValueError(
+            f"SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL must be 'v2w' or 'virtual', got {mode!r}"
+        )
+    return mode
+
+
 def split_of(inter_per_rank: int) -> int:
     """Virtual experts per local expert (0 when the intermediate size is not a multiple of 576)."""
     if inter_per_rank <= 0 or inter_per_rank % INTER:
@@ -61,7 +84,15 @@ def split_of(inter_per_rank: int) -> int:
     return inter_per_rank // INTER
 
 
-def supports_ep(hidden: int, inter_per_rank: int, num_local_experts: int) -> bool:
+def supports_ep(
+    hidden: int, inter_per_rank: int, num_local_experts: int, mode: str = "virtual"
+) -> bool:
+    if mode == "v2w":
+        return (
+            hidden == HIDDEN
+            and inter_per_rank in V2W_WIDTHS
+            and 0 < num_local_experts <= MAX_VIRTUAL_EXPERTS
+        )
     split = split_of(inter_per_rank)
     return (
         hidden == HIDDEN
@@ -110,25 +141,30 @@ def virtual_expert_weights(w13, s13, w2, s2):
     return gate_up(w13), gate_up(s13), down(w2), down(s2)
 
 
-def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8) -> Tuple[PackedExperts, int]:
-    """One layer's local whole experts -> (PackedExperts over E * S virtual experts, S). Packs ``expert_chunk``
-    whole experts at a time, so the transient copy is a few experts, not the layer."""
+def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtual"):
+    """One layer's local whole experts -> (packed, S): ``virtual`` = ws.PackedExperts over E * S virtual 576
+    experts; ``v2w`` = v2w.PackedExperts over the E whole experts, S = 1. Packs ``expert_chunk`` experts at a time,
+    so the transient copy is a few experts, not the layer."""
     E = w13.shape[0]
-    split = split_of(w13.shape[1] // 2)
     # Byte views: the reorder copies bytes, and e8m0 has few kernels.
     w13, s13, w2, s2 = (t.view(torch.uint8) for t in (w13, s13, w2, s2))
     parts13, parts2 = [], []
     for e0 in range(0, E, expert_chunk):
         e1 = min(E, e0 + expert_chunk)
-        v13, vs13, v2w, vs2 = virtual_expert_weights(
-            w13[e0:e1], s13[e0:e1], w2[e0:e1], s2[e0:e1]
-        )
-        p = ws.pack_experts(v13, vs13, v2w, vs2)
+        if mode == "v2w":
+            p = v2w.pack_w13_w2(w13[e0:e1], s13[e0:e1], w2[e0:e1], s2[e0:e1])
+        else:
+            v13, vs13, vw2, vs2 = virtual_expert_weights(
+                w13[e0:e1], s13[e0:e1], w2[e0:e1], s2[e0:e1]
+            )
+            p = ws.pack_experts(v13, vs13, vw2, vs2)
+            del v13, vs13, vw2, vs2
         parts13.append(p.w13)
         parts2.append(p.w2)
-        del v13, vs13, v2w, vs2, p
-    packed = PackedExperts(torch.cat(parts13), torch.cat(parts2))
-    return packed, split
+        del p
+    if mode == "v2w":
+        return v2w.PackedExperts(torch.cat(parts13), torch.cat(parts2), w13.shape[1] // 2), 1
+    return PackedExperts(torch.cat(parts13), torch.cat(parts2)), split_of(w13.shape[1] // 2)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -239,7 +275,8 @@ def route_ep(
     max_passes = num_virtual + vslots // 32 + 1
     # one memset: the experts kernel's workspace (rounded to 16 bytes, so that the cursors after it keep the
     # pointer alignment Triton specialized on), then the per-expert cursors
-    work_len = (v2.WORKSPACE_BASE + 2 * max_passes + 3) // 4 * 4
+    # v2 needs 32 + 2 x passes ints, v2w 32 + 5 x passes; one size for both
+    work_len = (v2.WORKSPACE_BASE + 5 * max_passes + 3) // 4 * 4
     zeroed = torch.zeros(work_len + num_local, dtype=torch.int32, device=dev)
     work, cursor = zeroed[:work_len], zeroed[work_len:]
     rank = torch.empty(num_slots, dtype=torch.int32, device=dev)
@@ -362,11 +399,16 @@ def _decode_moe_ep_call(
     )
     x8f, xs = quant if row_quant is None else row_quant
     vslots = num_tokens * top_k * split
-    h = torch.empty(vslots, INTER, dtype=torch.bfloat16, device=dev)
-    h8 = torch.empty(vslots, INTER, dtype=torch.uint8, device=dev)
+    if isinstance(packed, v2w.PackedExperts):
+        assert split == 1, split
+        inter, mod = packed.inter, v2w._module(packed.inter)
+    else:
+        inter, mod = INTER, v2._module()
+    h = torch.empty(vslots, inter, dtype=torch.bfloat16, device=dev)
+    h8 = torch.empty(vslots, inter, dtype=torch.uint8, device=dev)
     hs = torch.empty(vslots, dtype=torch.float32, device=dev)
     y = torch.empty(vslots, HIDDEN, dtype=torch.bfloat16, device=dev)
-    v2._module().experts(
+    mod.experts(
         x8f.view(torch.uint8),
         xs,
         packed.w13,
@@ -446,17 +488,29 @@ def decode_moe_ep(
 
 
 @functools.cache
-def prepare_ep(device_index: int, num_virtual: int, split: int, top_k: int) -> None:
-    """Build and load everything ``decode_moe_ep`` launches for this shape, at weight-processing time (the v2
-    module and its kernels, the Triton routing and combine kernels for this top-k and split), with one call on
-    a routing whose every slot is masked (no expert work, no weight read). The first MoE call of CUDA graph
-    capture then compiles and loads nothing."""
-    v2.prepare(device_index)
+def prepare_ep(
+    device_index: int, num_virtual: int, split: int, top_k: int, inter: Optional[int] = None
+) -> None:
+    """Build and load everything ``decode_moe_ep`` launches for this shape, at weight-processing time (the expert
+    kernel's JIT module and kernels, the Triton prologue and combine for this top-k and split), with calls on a
+    routing whose every slot is masked (no expert work, no weight read). The first MoE call of CUDA graph capture
+    then compiles and loads nothing. ``inter``: the v2w kernel's whole-expert width (None: the virtual v2 path)."""
+    if inter is None:
+        v2.prepare(device_index)
+    else:
+        v2w.prepare(device_index, inter)
     with torch.cuda.device(device_index):
         one = torch.zeros(1, dtype=torch.uint8, device="cuda")
-        packed = PackedExperts(
-            one.expand(num_virtual, 9, 348160), one.expand(num_virtual, 40, 39168)
-        )
+        if inter is None:
+            packed = PackedExperts(
+                one.expand(num_virtual, 9, 348160), one.expand(num_virtual, 40, 39168)
+            )
+        else:
+            packed = v2w.PackedExperts(
+                one.expand(num_virtual, inter // 64, 348160),
+                one.expand(num_virtual, 40, inter * 68),
+                inter,
+            )
         for num_tokens in (2, 16):  # Triton specializes pointers' alignment, not these ints
             x = torch.zeros(num_tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
             ids = torch.full((num_tokens, top_k), -1, dtype=torch.int32, device="cuda")

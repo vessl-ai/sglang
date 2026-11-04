@@ -1837,6 +1837,10 @@ class Envs:
     # INF-730: the largest tokens x top-k x virtual experts one EP decode MoE call handles (its buffers grow
     # with it: 10 KiB of bf16 output per virtual slot); larger calls run in token chunks (eager only).
     SGLANG_OPT_DSV4_EP_DECODE_MOE_MAX_VSLOTS = EnvInt(131072)
+    # INF-730: the expert kernel of SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: "v2w" = whole 2304-wide experts
+    # (dsv4_mxfp4_decode_moe_v2w; h quantized per whole row, ~0.4% from TP4), "virtual" = the v2 kernel on
+    # 576-channel virtual experts (rows bit-identical to TP4's slices).
+    SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL = EnvStr("v2w")
     # INF-730: the expert-parallel decode MoE's communication (srt/layers/moe/ep_decode_comm.py), on decode
     # forwards of the layers SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP covers: "" (default) keeps the BF16
     # all-gather of every DP rank's rows + reduce-scatter; "ag" routes the local rows and all-gathers their
