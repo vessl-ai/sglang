@@ -3694,11 +3694,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
+        # INF-730: also with EP over the whole TP group (should_use_dp_reduce_scatterv), whose
+        # reduce_scatterv over the MAX_LEN-padded (equal) chunks runs as one ncclReduce per rank
+        # (ring LL, ~7x the symmetric reduce-scatter at DP8 decode sizes).
         _use_reduce_scatter = (
             envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
-            and not should_use_dp_reduce_scatterv()
             and forward_batch.dp_padding_mode is not None
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
@@ -3895,7 +3897,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
+            if (
+                should_use_dp_reduce_scatterv() or _use_reduce_scatterv
+            ) and not _use_reduce_scatter:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
