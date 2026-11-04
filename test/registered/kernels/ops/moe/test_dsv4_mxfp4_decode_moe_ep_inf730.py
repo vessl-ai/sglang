@@ -55,7 +55,24 @@ def _weights(num_experts, inter=FULL, seed=0, hidden=HIDDEN):
 
 
 _E2M1 = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
     dtype=torch.float64,
 )
 
@@ -83,7 +100,10 @@ def test_virtual_experts_slice_whole_experts_cpu():
     hidden = 256  # small hidden for a fast float64 reference; the slicing is along the intermediate dim
     w13, s13, w2, s2 = _weights(3, hidden=hidden, seed=1)
     v13, vs13, v2w, vs2 = virtual_expert_weights(
-        w13.view(torch.uint8), s13.view(torch.uint8), w2.view(torch.uint8), s2.view(torch.uint8)
+        w13.view(torch.uint8),
+        s13.view(torch.uint8),
+        w2.view(torch.uint8),
+        s2.view(torch.uint8),
     )
     assert v13.shape == (3 * SPLIT, 2 * INTER, hidden // 2)
     assert v2w.shape == (3 * SPLIT, hidden, INTER // 2)
@@ -105,7 +125,13 @@ def test_virtual_experts_slice_whole_experts_cpu():
     for e in range(3):
         whole = _expert_ref(x, w13[e], s13[e], w2[e], s2[e])
         parts = sum(
-            _expert_ref(x, v13[e * SPLIT + s], vs13[e * SPLIT + s], v2w[e * SPLIT + s], vs2[e * SPLIT + s])
+            _expert_ref(
+                x,
+                v13[e * SPLIT + s],
+                vs13[e * SPLIT + s],
+                v2w[e * SPLIT + s],
+                vs2[e * SPLIT + s],
+            )
             for s in range(SPLIT)
         )
         torch.testing.assert_close(parts, whole, rtol=1e-9, atol=1e-9)
@@ -119,7 +145,9 @@ def test_split_and_support_rules():
     assert ek.supports_ep(5120, 2304, 48) and ek.supports_ep(5120, 2304, 16)
     assert ek.supports_ep(5120, 2304, 128) and not ek.supports_ep(5120, 2304, 129)
     assert not ek.supports_ep(4096, 2304, 48) and not ek.supports_ep(5120, 288, 48)
-    assert ek.supports_ep(5120, 2304, 48, "v2w") and not ek.supports_ep(5120, 1152, 48, "v2w")
+    assert ek.supports_ep(5120, 2304, 48, "v2w") and not ek.supports_ep(
+        5120, 1152, 48, "v2w"
+    )
 
 
 # ------------------------------------------------------------------------------------------------- GPU
@@ -132,9 +160,13 @@ def _global_routing(tokens, num_global, top_k, seed, skew=0.0, rows_per_req=4):
     reqs = (tokens + rows_per_req - 1) // rows_per_req
     pop = torch.zeros(num_global)
     if skew > 0:
-        pop = torch.log((1.0 / torch.arange(1, num_global + 1, dtype=torch.float64)) ** skew).float()
+        pop = torch.log(
+            (1.0 / torch.arange(1, num_global + 1, dtype=torch.float64)) ** skew
+        ).float()
         pop = pop[torch.randperm(num_global, generator=g)]
-    req = torch.randn(reqs, num_global, generator=g).repeat_interleave(rows_per_req, 0)[:tokens]
+    req = torch.randn(reqs, num_global, generator=g).repeat_interleave(rows_per_req, 0)[
+        :tokens
+    ]
     logits = pop + req + 0.5 * torch.randn(tokens, num_global, generator=g)
     w, ids = torch.topk(torch.softmax(logits, -1), top_k, dim=-1)
     return ids.int(), (w / w.sum(-1, keepdim=True)).float()
@@ -143,7 +175,9 @@ def _global_routing(tokens, num_global, top_k, seed, skew=0.0, rows_per_req=4):
 def _local(ids_global, rank, num_local):
     lo = rank * num_local
     local = ids_global - lo
-    return torch.where((ids_global >= lo) & (ids_global < lo + num_local), local, -1).int()
+    return torch.where(
+        (ids_global >= lo) & (ids_global < lo + num_local), local, -1
+    ).int()
 
 
 def _slice_y(x, ids_local, wts, packed_slice):
@@ -153,17 +187,33 @@ def _slice_y(x, ids_local, wts, packed_slice):
 
     T, K = ids_local.shape
     E = packed_slice.w13.shape[0]
-    counts, sorted_slots, sorted_tokens, sorted_weights = ws._sort_slots(ids_local, wts, E)
+    counts, sorted_slots, sorted_tokens, sorted_weights = ws._sort_slots(
+        ids_local, wts, E
+    )
     x8, xs = ws._row_quant(x.contiguous())
     slots = T * K
-    work = torch.zeros(v2.WORKSPACE_BASE + 2 * (E + slots // 32 + 1), dtype=torch.int32, device="cuda")
+    work = torch.zeros(
+        v2.WORKSPACE_BASE + 2 * (E + slots // 32 + 1), dtype=torch.int32, device="cuda"
+    )
     h = x.new_empty(slots, INTER)
     h8 = torch.empty(slots, INTER, dtype=torch.uint8, device="cuda")
     hs = torch.empty(slots, dtype=torch.float32, device="cuda")
     y = torch.zeros(slots, HIDDEN, dtype=torch.bfloat16, device="cuda")
     v2._module().experts(
-        x8.view(torch.uint8), xs, packed_slice.w13, packed_slice.w2, counts, sorted_tokens,
-        sorted_slots, sorted_weights, h, h8, hs, y, work, SWIGLU_LIMIT,
+        x8.view(torch.uint8),
+        xs,
+        packed_slice.w13,
+        packed_slice.w2,
+        counts,
+        sorted_tokens,
+        sorted_slots,
+        sorted_weights,
+        h,
+        h8,
+        hs,
+        y,
+        work,
+        SWIGLU_LIMIT,
     )
     return y
 
@@ -186,7 +236,9 @@ def _packed_ep_and_slices(num_local, seed=0):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
 
     # byte views: torch has no cat for e8m0
-    w13, s13, w2, s2 = (t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed))
+    w13, s13, w2, s2 = (
+        t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed)
+    )
     packed, split = ek.pack_experts_ep(w13, s13, w2, s2)
     assert split == SPLIT and packed.w13.shape[0] == num_local * SPLIT
     slices = []
@@ -217,10 +269,19 @@ def test_ep_bit_identical_to_tp_slices(shape):
     packed, slices = _packed_ep_and_slices(num_local)
     rank = 3
     # 1 token up to DP8 x 64 requests x 4 rows; skewed routing gives hot experts with several passes
-    for tokens, skew in ((1, 0.0), (7, 0.0), (64, 0.0), (520, 0.0), (520, 1.2), (2048, 1.0)):
+    for tokens, skew in (
+        (1, 0.0),
+        (7, 0.0),
+        (64, 0.0),
+        (520, 0.0),
+        (520, 1.2),
+        (2048, 1.0),
+    ):
         ids_g, wts = _global_routing(tokens, num_local * EP, top_k, seed=tokens)
         if skew:
-            ids_g, wts = _global_routing(tokens, num_local * EP, top_k, seed=tokens, skew=skew)
+            ids_g, wts = _global_routing(
+                tokens, num_local * EP, top_k, seed=tokens, skew=skew
+            )
         ids = _local(ids_g, rank, num_local).cuda()
         if tokens > 8:
             ids[-3:] = -1  # dp-attention pad rows (SGLANG_OPT_MASK_DP_PAD_MOE)
@@ -240,7 +301,15 @@ def test_ep_no_local_slot_gives_zero():
     x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
     ids = torch.full((33, 6), -1, dtype=torch.int32, device="cuda")
     out = torch.full((33, HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
-    decode_moe_ep(x, ids, torch.ones(33, 6, device="cuda"), packed, SWIGLU_LIMIT, SPLIT, output=out)
+    decode_moe_ep(
+        x,
+        ids,
+        torch.ones(33, 6, device="cuda"),
+        packed,
+        SWIGLU_LIMIT,
+        SPLIT,
+        output=out,
+    )
     assert torch.count_nonzero(out) == 0
 
 
@@ -262,7 +331,10 @@ def test_ep_row_quant_input_matches():
 
 @needs_sm90
 def test_ep_cuda_graph_replay():
-    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep, prepare_ep
+    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import (
+        decode_moe_ep,
+        prepare_ep,
+    )
 
     packed, _ = _packed_ep_and_slices(48)
     prepare_ep(torch.cuda.current_device(), 48 * SPLIT, SPLIT, 6)
@@ -271,7 +343,9 @@ def test_ep_cuda_graph_replay():
     ids = torch.full((tokens, 6), -1, dtype=torch.int32, device="cuda")
     wts = torch.zeros(tokens, 6, device="cuda")
     out = torch.empty(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT, output=out)  # warm the allocator
+    decode_moe_ep(
+        x, ids, wts, packed, SWIGLU_LIMIT, SPLIT, output=out
+    )  # warm the allocator
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -283,7 +357,9 @@ def test_ep_cuda_graph_replay():
         x.copy_(torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16))
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT)), seed
+        assert torch.equal(
+            out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT)
+        ), seed
 
 
 @needs_sm90
@@ -296,7 +372,9 @@ def test_ep_token_chunks(monkeypatch):
     ids, wts = _local(ids_g, 7, 48).cuda(), wts.cuda()
     x = torch.randn(1000, HIDDEN, device="cuda", dtype=torch.bfloat16)
     ref = ek.decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT)
-    monkeypatch.setattr(ek, "max_virtual_slots", lambda: 7 * 6 * SPLIT * 16)  # 112 tokens per call
+    monkeypatch.setattr(
+        ek, "max_virtual_slots", lambda: 7 * 6 * SPLIT * 16
+    )  # 112 tokens per call
     assert torch.equal(ek.decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, SPLIT), ref)
 
 
@@ -307,10 +385,14 @@ def _packed_v2w(num_local, seed=0):
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
     from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as v2w
 
-    w13, s13, w2, s2 = (t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed))
+    w13, s13, w2, s2 = (
+        t.view(torch.uint8).cuda() for t in _weights(num_local, seed=seed)
+    )
     packed, split = ek.pack_experts_ep(w13, s13, w2, s2, mode="v2w")
     assert split == 1 and packed.inter == FULL and packed.w13.shape[0] == num_local
-    whole = v2w.pack_w13_w2(w13, s13, w2, s2)  # a-moe's own packing of the same experts, in one piece
+    whole = v2w.pack_w13_w2(
+        w13, s13, w2, s2
+    )  # a-moe's own packing of the same experts, in one piece
     assert torch.equal(packed.w13, whole.w13) and torch.equal(packed.w2, whole.w2)
     return packed
 
@@ -325,8 +407,17 @@ def test_ep_v2w_bit_identical_to_v2w_wrapper(shape):
 
     num_local, top_k = SHAPES[shape]
     packed = _packed_v2w(num_local)
-    for tokens, skew in ((1, 0.0), (7, 0.0), (520, 0.0), (520, 1.2), (2048, 1.0), (4096, 0.6)):
-        ids_g, wts = _global_routing(tokens, num_local * EP, top_k, seed=tokens, skew=skew)
+    for tokens, skew in (
+        (1, 0.0),
+        (7, 0.0),
+        (520, 0.0),
+        (520, 1.2),
+        (2048, 1.0),
+        (4096, 0.6),
+    ):
+        ids_g, wts = _global_routing(
+            tokens, num_local * EP, top_k, seed=tokens, skew=skew
+        )
         ids = _local(ids_g, 2, num_local).cuda()
         if tokens > 8:
             ids[-3:] = -1
@@ -334,16 +425,23 @@ def test_ep_v2w_bit_identical_to_v2w_wrapper(shape):
         x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
         ref = v2w.decode_moe(x, ids, wts, packed, SWIGLU_LIMIT)
         for _ in range(3):
-            assert torch.equal(decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1), ref), (shape, tokens, skew)
+            assert torch.equal(
+                decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1), ref
+            ), (shape, tokens, skew)
         from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
 
-        out = decode_moe_ep(None, ids, wts, packed, SWIGLU_LIMIT, 1, row_quant=ws._row_quant(x))
+        out = decode_moe_ep(
+            None, ids, wts, packed, SWIGLU_LIMIT, 1, row_quant=ws._row_quant(x)
+        )
         assert torch.equal(out, ref), (shape, tokens, "row_quant")
 
 
 @needs_sm90
 def test_ep_v2w_cuda_graph_replay():
-    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep, prepare_ep
+    from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import (
+        decode_moe_ep,
+        prepare_ep,
+    )
 
     packed = _packed_v2w(48)
     prepare_ep(torch.cuda.current_device(), 48, 1, 6, FULL)
@@ -364,7 +462,9 @@ def test_ep_v2w_cuda_graph_replay():
         x.copy_(torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16))
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1)), seed
+        assert torch.equal(out, decode_moe_ep(x, ids, wts, packed, SWIGLU_LIMIT, 1)), (
+            seed
+        )
 
 
 if __name__ == "__main__":

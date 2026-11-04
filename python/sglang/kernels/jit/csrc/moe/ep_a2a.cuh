@@ -57,24 +57,24 @@ struct DispatchArgs {
   // tmax: rows per source region in this call (region s = rows [s * tmax, (s + 1) * tmax) of every receive array).
   // It must be the same on every rank and at most the buffer capacity (checked by the Python wrapper).
   int rank, world, tmax, num_tokens, top_k, num_experts, x_bytes, s_bytes, mask_stale;
-  const uint8_t* x;    // [T, x_bytes]
-  const uint8_t* s;    // [T, s_bytes]
-  const void* ids;     // [T, K] int32 or int64, global expert ids, -1 = no expert
-  const float* wts;    // [T, K]
+  const uint8_t* x;             // [T, x_bytes]
+  const uint8_t* s;             // [T, s_bytes]
+  const void* ids;              // [T, K] int32 or int64, global expert ids, -1 = no expert
+  const float* wts;             // [T, K]
   const int32_t* expert_rank;   // [E]
   const int32_t* expert_local;  // [E]
-  int32_t* slot_map;   // [>= T, W] local: slot of token t in destination d's region, -1 if not sent
-  uint32_t* ctr;       // [kMaxBlocks] local epoch per block
-  int32_t* recv_counts;  // [W] local output: rows received from every source this call
+  int32_t* slot_map;            // [>= T, W] local: slot of token t in destination d's region, -1 if not sent
+  uint32_t* ctr;                // [kMaxBlocks] local epoch per block
+  int32_t* recv_counts;         // [W] local output: rows received from every source this call
 };
 
 struct CombineArgs {
   const int64_t* peers;
   Layout lay;
   int rank, world, tmax, num_tokens, hidden;  // tmax: the region stride of the matching dispatch
-  const int32_t* slot_map;  // [>= T, W]
-  uint32_t* ctr;            // [kMaxBlocks]
-  __nv_bfloat16* out;       // [T, hidden]
+  const int32_t* slot_map;                    // [>= T, W]
+  uint32_t* ctr;                              // [kMaxBlocks]
+  __nv_bfloat16* out;                         // [T, hidden]
 };
 
 SGL_DEVICE uint32_t ld_acquire_sys(const uint32_t* p) {
@@ -97,15 +97,12 @@ SGL_DEVICE uint4 ld_relaxed_sys_16B(const void* p) {
 
 SGL_DEVICE uint4 ld_nc_16B(const void* p) {
   uint4 v;
-  asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(p));
+  asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
   return v;
 }
 
 SGL_DEVICE void st_16B(void* p, const uint4& v) {
-  asm volatile("st.global.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "l"(p)
-               : "memory");
+  asm volatile("st.global.v4.b32 [%4], {%0, %1, %2, %3};" ::"r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "l"(p) : "memory");
 }
 
 // Before a block raises its flag: the release store below already orders this block's earlier writes (bar.sync
@@ -162,8 +159,10 @@ __global__ void __launch_bounds__(kThreads, 1) dispatch_kernel(const DispatchArg
     s_mask[t] = static_cast<uint8_t>(m);
     for (int d = 0; d < W; ++d) {
       if (m >> d & 1) {
-        if (d < 4) lo += 1ull << (16 * d);
-        else hi += 1ull << (16 * (d - 4));
+        if (d < 4)
+          lo += 1ull << (16 * d);
+        else
+          hi += 1ull << (16 * (d - 4));
       }
     }
   }
@@ -217,8 +216,10 @@ __global__ void __launch_bounds__(kThreads, 1) dispatch_kernel(const DispatchArg
         const int sh = 16 * (d & 3);
         if (m >> d & 1) {
           s_slot[t * kMaxRanks + d] = static_cast<uint16_t>((base >> sh) & 0xffffull);
-          if (d < 4) blo += 1ull << sh;
-          else bhi += 1ull << sh;
+          if (d < 4)
+            blo += 1ull << sh;
+          else
+            bhi += 1ull << sh;
         } else {
           s_slot[t * kMaxRanks + d] = 0xffff;
         }
@@ -318,7 +319,8 @@ __global__ void __launch_bounds__(kThreads, 1) dispatch_kernel(const DispatchArg
     for (int i = blockIdx.x * kThreads + tid; i < rows; i += gridDim.x * kThreads) {
       const int src = i / a.tmax, sl = i - src * a.tmax;
       if (sl >= s_cnt[src]) {
-        for (int k = 0; k < K; ++k) my_ids[static_cast<int64_t>(i) * K + k] = -1;
+        for (int k = 0; k < K; ++k)
+          my_ids[static_cast<int64_t>(i) * K + k] = -1;
       }
     }
   }
@@ -380,7 +382,8 @@ __global__ void __launch_bounds__(kThreads, 1) combine_kernel(const CombineArgs 
       if (v >= nvec) break;
       float acc[8];
 #pragma unroll
-      for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+      for (int j = 0; j < 8; ++j)
+        acc[j] = 0.f;
 #pragma unroll
       for (int d = 0; d < kMaxRanks; ++d) {
         if (m >> d & 1) {
@@ -396,7 +399,8 @@ __global__ void __launch_bounds__(kThreads, 1) combine_kernel(const CombineArgs 
       uint4 o;
       __nv_bfloat162* oh = reinterpret_cast<__nv_bfloat162*>(&o);
 #pragma unroll
-      for (int j = 0; j < 4; ++j) oh[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
+      for (int j = 0; j < 4; ++j)
+        oh[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);
       st_16B(dst + v * 16, o);
     }
   }
@@ -405,8 +409,15 @@ __global__ void __launch_bounds__(kThreads, 1) combine_kernel(const CombineArgs 
 }
 
 inline Layout make_layout(
-    int64_t off_x, int64_t off_s, int64_t off_ids, int64_t off_w, int64_t off_src, int64_t off_cnt,
-    int64_t off_dflag, int64_t off_cflag, int64_t off_y) {
+    int64_t off_x,
+    int64_t off_s,
+    int64_t off_ids,
+    int64_t off_w,
+    int64_t off_src,
+    int64_t off_cnt,
+    int64_t off_dflag,
+    int64_t off_cflag,
+    int64_t off_y) {
   return Layout{off_x, off_s, off_ids, off_w, off_src, off_cnt, off_dflag, off_cflag, off_y};
 }
 

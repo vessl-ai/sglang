@@ -55,7 +55,7 @@ class PromptSegmentCache:
     def __init__(self, budget_bytes: int, min_chars: int):
         self.budget_bytes = budget_bytes
         self.min_chars = min_chars
-        self._entries: "OrderedDict[str, array]" = OrderedDict()
+        self._entries: OrderedDict[str, array] = OrderedDict()
         self._bytes = 0
         self._lock = threading.Lock()
         self.hits = 0

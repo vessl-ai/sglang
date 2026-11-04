@@ -127,12 +127,12 @@ constexpr int kMaxExperts = 512;
 #ifndef DSV4_RING
 #define DSV4_RING 6
 #endif
-constexpr int kRing = DSV4_RING;  // v2: 6
+constexpr int kRing = DSV4_RING;   // v2: 6
 constexpr int kConsumerWarps = 4;  // per pipeline: one consumer warpgroup
 #ifndef DSV4_PIPES
 #define DSV4_PIPES 2
 #endif
-constexpr int kPipes = DSV4_PIPES;  // v2: 2 (measurement switch)
+constexpr int kPipes = DSV4_PIPES;                         // v2: 2 (measurement switch)
 constexpr int kThreads = kPipes * 128 + kPipes * 32 + 32;  // + one helper warp
 constexpr int kTilesAll = 2;
 constexpr int kStepW = kConsumerWarps * kTilesAll * 512;    // weight bytes per k64 step
@@ -146,7 +146,8 @@ template <bool kGateUp>
 constexpr size_t item_bytes() {
   return static_cast<size_t>(Shape<kGateUp>::kStages - 1) * kFullStage + last_stage_bytes<kGateUp>();
 }
-static_assert(item_bytes<true>() == 348160 && item_bytes<false>() == static_cast<size_t>(kInter) * 68, "packed item sizes");
+static_assert(
+    item_bytes<true>() == 348160 && item_bytes<false>() == static_cast<size_t>(kInter) * 68, "packed item sizes");
 constexpr int kXSlot = kPassRows * 128;  // pass rows x one 128-byte swizzle atom
 constexpr size_t kXRing = static_cast<size_t>(kRing) * kXSlot;
 constexpr size_t kWRing = static_cast<size_t>(kRing) * kFullStage;
@@ -665,10 +666,22 @@ SGL_DEVICE void wgmma_e4m3_acc<16>(float (&d)[8], const uint32_t (&a)[4], uint64
 }
 template <>
 SGL_DEVICE void wgmma_e4m3_acc<24>(float (&d)[12], const uint32_t (&a)[4], uint64_t desc, int acc) {
-  asm volatile(DSV4_ACC_HEAD(24, "%17") "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, %16, p, 1, 1;\n}\n"
-               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-                 "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"(acc));
+  asm volatile(
+      DSV4_ACC_HEAD(
+          24, "%17") "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11}, {%12, %13, %14, %15}, %16, p, 1, 1;\n}\n"
+      : "+f"(d[0]),
+        "+f"(d[1]),
+        "+f"(d[2]),
+        "+f"(d[3]),
+        "+f"(d[4]),
+        "+f"(d[5]),
+        "+f"(d[6]),
+        "+f"(d[7]),
+        "+f"(d[8]),
+        "+f"(d[9]),
+        "+f"(d[10]),
+        "+f"(d[11])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc), "r"(acc));
 }
 template <>
 SGL_DEVICE void wgmma_e4m3_acc<32>(float (&d)[16], const uint32_t (&a)[4], uint64_t desc, int acc) {
@@ -719,7 +732,8 @@ struct FoldState {
       for (int i = 0; i < 4; ++i) {
         uint32_t v = a[kB][t][i];
 #pragma unroll
-        for (int o = 0; o < DSV4_FOLD_EXTRA_OPS; ++o) v = (o & 1) ? (v ^ (d8 << o)) : (v + (d8 & (0x08080808u >> o)));
+        for (int o = 0; o < DSV4_FOLD_EXTRA_OPS; ++o)
+          v = (o & 1) ? (v ^ (d8 << o)) : (v + (d8 & (0x08080808u >> o)));
         a[kB][t][i] = v;
       }
     }
@@ -872,7 +886,7 @@ SGL_DEVICE void consumer_pass(const Params& p, const Smem& sm, uint32_t& g, cons
     DBG_ADD(cw == 0 && lane == 0, it.pipe, 6, t_f);
     DBG_T0(t_m);
 #ifndef DSV4_ABL_NO_PROXY_FENCE  // ablation
-    fence_proxy_async();  // cp.async (generic proxy) writes of the X atom -> wgmma (async proxy) reads
+    fence_proxy_async();         // cp.async (generic proxy) writes of the X atom -> wgmma (async proxy) reads
 #endif
     const bool last_stage = st == S::kStages - 1;
     const int nsteps = last_stage ? S::kLastSteps : 2;
@@ -934,7 +948,7 @@ SGL_DEVICE void consumer_pass(const Params& p, const Smem& sm, uint32_t& g, cons
       fence_operands(ps.acc[0]);
     } else
 #endif
-    if constexpr (kBatch == 4) {
+        if constexpr (kBatch == 4) {
       if (nsteps == 2) {
         ps.template convert<0>(wt[0], swt[0]);
         ps.template convert<1>(wt[0], swt[0]);
@@ -1049,52 +1063,52 @@ SGL_DEVICE void consumer_pass(const Params& p, const Smem& sm, uint32_t& g, cons
 #ifdef DSV4_ABL_NO_EPILOGUE  // ablation: no h / y stores
   if (it.nrows < 0)
 #endif
-  // Epilogue: acc[t][4jj + 2i + e2] = D[row 16q + grp + 8i of tile t][activation row 8jj + 2c + e2].
-  if constexpr (kGateUp) {
+    // Epilogue: acc[t][4jj + 2i + e2] = D[row 16q + grp + 8i of tile t][activation row 8jj + 2c + e2].
+    if constexpr (kGateUp) {
 #pragma unroll
-    for (int jj = 0; jj < kNch; ++jj)
+      for (int jj = 0; jj < kNch; ++jj)
 #pragma unroll
-      for (int e2 = 0; e2 < 2; ++e2) {
-        const int r = 8 * jj + 2 * c + e2;
-        if (r < nrows) {
-          const float2 rm = rowmeta[r];
-          const float rs = rm.x;
-          __nv_bfloat16* hrow = p.h + static_cast<size_t>(__float_as_int(rm.y)) * S::kOutLd;
-#pragma unroll
-          for (int ih = 0; ih < 2; ++ih) {
-            const int idx = 4 * jj + 2 * ih + e2;
-            float gate = bf16_round(acc[0][idx] * rs);
-            float up = bf16_round(acc[1][idx] * rs);
-            const float lim = p.limit;
-            gate = gate > lim ? lim : gate;
-            up = up > lim ? lim : (up < -lim ? -lim : up);
-            const float act = bf16_round(gate / (1.0f + expf(-gate)));
-            hrow[64 * j + 16 * q + grp + 8 * ih] = __float2bfloat16_rn(act * up);
-          }
-        }
-      }
-  } else {
-#pragma unroll
-    for (int jj = 0; jj < kNch; ++jj)
-#pragma unroll
-      for (int e2 = 0; e2 < 2; ++e2) {
-        const int r = 8 * jj + 2 * c + e2;
-        if (r < nrows) {
-          const float2 rm = rowmeta[r];
-          const float sc = rm.x;
-          const int dst = __float_as_int(rm.y);
-          __nv_bfloat16* orow = dst >= 0 ? p.y + static_cast<size_t>(dst) * S::kOutLd
-                                         : p.y_rows + static_cast<size_t>(~dst) * S::kOutLd;
-#pragma unroll
-          for (int t = 0; t < kT; ++t)
+        for (int e2 = 0; e2 < 2; ++e2) {
+          const int r = 8 * jj + 2 * c + e2;
+          if (r < nrows) {
+            const float2 rm = rowmeta[r];
+            const float rs = rm.x;
+            __nv_bfloat16* hrow = p.h + static_cast<size_t>(__float_as_int(rm.y)) * S::kOutLd;
 #pragma unroll
             for (int ih = 0; ih < 2; ++ih) {
-              const int chan = 128 * j + 64 * t + 16 * q + grp + 8 * ih;
-              orow[chan] = __float2bfloat16_rn(acc[t][4 * jj + 2 * ih + e2] * sc);
+              const int idx = 4 * jj + 2 * ih + e2;
+              float gate = bf16_round(acc[0][idx] * rs);
+              float up = bf16_round(acc[1][idx] * rs);
+              const float lim = p.limit;
+              gate = gate > lim ? lim : gate;
+              up = up > lim ? lim : (up < -lim ? -lim : up);
+              const float act = bf16_round(gate / (1.0f + expf(-gate)));
+              hrow[64 * j + 16 * q + grp + 8 * ih] = __float2bfloat16_rn(act * up);
             }
+          }
         }
-      }
-  }
+    } else {
+#pragma unroll
+      for (int jj = 0; jj < kNch; ++jj)
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2) {
+          const int r = 8 * jj + 2 * c + e2;
+          if (r < nrows) {
+            const float2 rm = rowmeta[r];
+            const float sc = rm.x;
+            const int dst = __float_as_int(rm.y);
+            __nv_bfloat16* orow = dst >= 0 ? p.y + static_cast<size_t>(dst) * S::kOutLd
+                                           : p.y_rows + static_cast<size_t>(~dst) * S::kOutLd;
+#pragma unroll
+            for (int t = 0; t < kT; ++t)
+#pragma unroll
+              for (int ih = 0; ih < 2; ++ih) {
+                const int chan = 128 * j + 64 * t + 16 * q + grp + 8 * ih;
+                orow[chan] = __float2bfloat16_rn(acc[t][4 * jj + 2 * ih + e2] * sc);
+              }
+          }
+        }
+    }
   DBG_ADD(cw == 0 && lane == 0, it.pipe, 7, t_ep);
 }
 
@@ -1408,7 +1422,8 @@ SGL_DEVICE void helper(const Params& p, const Smem& sm, int lane) {
       if (mbar_test(smem_u32(&m->req_full[pipe]), nreq[pipe] & 1) &&
           __shfl_sync(
               0xffffffffu,
-              lane == 0 ? ld_acquire(ready + pass_index(m->req[pipe].x, (m->req[pipe].z - m->off[m->req[pipe].x]) / kPassRows))
+              lane == 0 ? ld_acquire(
+                              ready + pass_index(m->req[pipe].x, (m->req[pipe].z - m->off[m->req[pipe].x]) / kPassRows))
                         : 0,
               0) != 0) {
         idle = false;
@@ -1617,7 +1632,7 @@ __global__ void __launch_bounds__(kThreads, 1) moe_v2_kernel(const __grid_consta
     for (int k = 0; k < kPipes; ++k) {
       const uint32_t fb = base + k * kPipeStride + kXRing + kWRing;
       for (int i = 0; i < kRing; ++i) {
-        mbar_init(fb + i * 8, 33);                             // expect_tx + 32 cp.async arrivals
+        mbar_init(fb + i * 8, 33);                           // expect_tx + 32 cp.async arrivals
         mbar_init(fb + (kRing + i) * 8, kConsumerArrivals);  // every consumer thread (or warp) arrives
       }
       for (int i = 0; i < kDoneSlots; ++i) {
@@ -1711,8 +1726,8 @@ constexpr int kPrepWarps = kPrepThreads / 32;
 #define DSV4_SORT_EXPERTS (DSV4_MOE_INTER >= 2304 ? 1 : 4)
 #endif
 constexpr int kSortExperts = DSV4_SORT_EXPERTS;  // experts per sort CTA (v2: 4)
-constexpr int kPrepMaxSlots = 32768;  // v2: 16384
-constexpr int kPrepRows = 4;  // token rows per quantization CTA
+constexpr int kPrepMaxSlots = 32768;             // v2: 16384
+constexpr int kPrepRows = 4;                     // token rows per quantization CTA
 
 SGL_DEVICE int block_excl_scan(int v, int* tmp, int& total) {  // exclusive scan over the CTA's warps, warp-wise
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -2030,9 +2045,10 @@ inline void row_combine(tvm::ffi::TensorView y, tvm::ffi::TensorView ids, tvm::f
   using namespace host;
   const int rows = static_cast<int>(ids.size(0));
   const int top_k = static_cast<int>(ids.size(1));
-  RuntimeCheck(top_k <= kRowCombineMaxK && y.size(1) == 5120 && out.size(1) == 5120 && out.size(0) >= rows &&
-                   y.size(0) == static_cast<int64_t>(rows) * top_k,
-               "v2w row_combine: shapes");
+  RuntimeCheck(
+      top_k <= kRowCombineMaxK && y.size(1) == 5120 && out.size(1) == 5120 && out.size(0) >= rows &&
+          y.size(0) == static_cast<int64_t>(rows) * top_k,
+      "v2w row_combine: shapes");
   if (rows == 0) return;
   LaunchKernel(dim3((5120 / 8 + 127) / 128, rows), dim3(128), ids.device())(
       row_combine_kernel,
@@ -2089,8 +2105,13 @@ __global__ void pair_reduce_kernel(
     reinterpret_cast<uint4*>(out + static_cast<size_t>(t) * 5120)[v] = o;
   }
 }
-inline void pair_reduce(tvm::ffi::TensorView y, tvm::ffi::TensorView pair_tok, tvm::ffi::TensorView pair_eid,
-                        tvm::ffi::TensorView out, tvm::ffi::TensorView valid_pairs, int64_t use_valid_pairs) {
+inline void pair_reduce(
+    tvm::ffi::TensorView y,
+    tvm::ffi::TensorView pair_tok,
+    tvm::ffi::TensorView pair_eid,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView valid_pairs,
+    int64_t use_valid_pairs) {
   using namespace host;
   const int pairs = static_cast<int>(pair_tok.size(0));
   const int rows = static_cast<int>(out.size(0));
