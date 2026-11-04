@@ -2874,6 +2874,16 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+# INF-730 (layers/quantization/dsv4_dp_moe_fp8ag.py), imported only when used.
+_DP_MOE_FP8AG = envs.SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER.get()
+
+
+def _dp_moe_fp8ag():
+    from sglang.srt.layers.quantization import dsv4_dp_moe_fp8ag
+
+    return dsv4_dp_moe_fp8ag
+
+
 # INF-681 k-pfp8 (layers/quantization/dsv4_cp_moe_fp8ag.py), imported only when used.
 _CP_MOE_FP8AG_ANY = (
     envs.SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER.get()
@@ -3730,6 +3740,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         _cp_shared_input = None
         # INF-681 k-pfp8: the shard's top-k (and FP8 rows) gathered instead of BF16 rows.
         _cp_prerouted = None
+        # INF-730: the DP decode MoE input gathered as e4m3 rows (and the local rows, for VERIFY).
+        _fp8ag_hook = None
+        _fp8ag_local = None
         _cp_local_rows = None
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
@@ -3808,9 +3821,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             # memory (bf16-max scale) that overflows the MoE and the combine.
             if _is_hip:
                 _mask_dp_pad_rows(local_hidden_states, forward_batch)
-            # self_attn has already reduced across attention TP, so these hidden
-            # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            # INF-730 SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER: gather e4m3 rows + top-k instead
+            # (the MoE's routed_rows_hook does the all-gather after top-k).
+            if _DP_MOE_FP8AG:
+                _fp8ag_hook = _dp_moe_fp8ag().maybe_begin(
+                    self.mlp,
+                    hidden_states,
+                    local_hidden_states,
+                    forward_batch,
+                    shared_local=_do_shared_local,
+                )
+                if _fp8ag_hook is not None and _dp_moe_fp8ag().verify_enabled():
+                    _fp8ag_local = local_hidden_states
+            if _fp8ag_hook is None:
+                # self_attn has already reduced across attention TP, so these hidden
+                # states are replicated and must not be summed by a partial gather.
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -3841,6 +3867,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 and not _use_tp_attn_a2a_scatter
             )
             moe_kwargs = {} if _cp_prerouted is None else {"prerouted": _cp_prerouted}
+            _fp8ag_ref = None
+            if _fp8ag_hook is not None:
+                moe_kwargs["routed_rows_hook"] = _fp8ag_hook
+                if _fp8ag_local is not None:
+                    # VERIFY: the BF16 all-gather path on its own buffer, for comparison.
+                    _ref_rows = get_global_dp_buffer(get_parallel().tp_group)
+                    dp_gather_replicate(_ref_rows, _fp8ag_local, forward_batch)
+                    _fp8ag_ref = self.mlp(
+                        _ref_rows,
+                        forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        skip_shared_experts=True,
+                        return_moe_output=False,
+                    ).clone()
+                    del _ref_rows
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -3850,6 +3892,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 return_moe_output=return_moe_output,
                 **moe_kwargs,
             )
+            if _fp8ag_ref is not None:
+                _dp_moe_fp8ag().verify_compare(
+                    getattr(self, "layer_id", "?"), hidden_states, _fp8ag_ref
+                )
+                _fp8ag_ref = _fp8ag_local = None
             if _cp_prerouted is not None:
                 if envs.SGLANG_OPT_DSV4_CP_MOE_FP8AG_VERIFY.get():
                     _cp_moe_fp8ag().verify(

@@ -1767,6 +1767,17 @@ class Envs:
     #   4 ranks, 1.97 MB per rank on H200: all-gather 42.7 -> 28.5 us (recv symmetric),
     #   reduce-scatter 38.5 -> 30.0 us (send symmetric).
     SGLANG_OPT_DSV4_DP_SYMM_MOE_OUTPUT = EnvBool(False)
+    # INF-730 DP_FP8_MOE_GATHER (layers/quantization/dsv4_dp_moe_fp8ag.py): under attention
+    # DP + TP MoE + MAX_LEN padding with the SM90 W4A8 v2 decode experts, every rank
+    # quantizes its own rows the way the v2 prologue does and all-gathers e4m3 rows with
+    # their scale and top-k (5,184 B per row at top 6) instead of BF16 rows (10,240 B).
+    # The router still runs on the gathered buffer's shape (this rank's slot holds its
+    # rows), so top-k, expert input and MoE output are the BF16 path's bit for bit.
+    # Needs SGLANG_DP_SHARED_EXPERT_LOCAL (no BF16 copy of the other ranks' rows exists).
+    # _VERIFY (debug, eager forwards only): also run the BF16 path and log layers whose
+    # MoE output differs.
+    SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER = EnvBool(False)
+    SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER_VERIFY = EnvBool(False)
     # INF-681 k-dnm iteration 3: with SGLANG_OPT_DSV4_DENSE_GEMM_GRAN128, run the listed
     # 128x128-requantized linears (wo_b, the TP1 shared expert gate_up) through cuBLASLt's
     # blockwise FP8 kernel instead of DeepGEMM when the call has more than this many rows

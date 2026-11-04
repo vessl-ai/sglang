@@ -391,7 +391,10 @@ class Mxfp4MarlinMoEMethod:
 
             if not isinstance(row_quant, W4A8RowQuant):
                 row_quant = None
-            elif not self._use_w4a8:
+            elif not (
+                self._use_w4a8
+                or (self._sm90_decode_w4a8 and self._sm90_decode_w4a8_v2)
+            ):
                 raise RuntimeError(
                     f"{self.prefix}: a W4A8 row-quantized MoE input reached a "
                     "non-W4A8 path"
@@ -408,6 +411,25 @@ class Mxfp4MarlinMoEMethod:
                 )
             )
         if self._sm90_decode_w4a8:
+            if row_quant is not None:
+                # INF-730 SGLANG_OPT_DSV4_DP_FP8_MOE_GATHER: the rows arrive quantized
+                # the way the v2 prologue quantizes them (dsv4_dp_moe_fp8ag.py);
+                # hidden_states only carry the shape.
+                from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_v2 import (
+                    decode_moe_prequant,
+                )
+
+                return StandardCombineInput(
+                    hidden_states=decode_moe_prequant(
+                        row_quant.q,
+                        row_quant.s,
+                        topk_output.topk_ids,
+                        topk_output.topk_weights,
+                        self._sm90_packed,
+                        self.runner.config.swiglu_limit,
+                        output=_moe_output_like(hidden_states),
+                    )
+                )
             if self._sm90_decode_w4a8_v2:
                 from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_v2 import (
                     decode_moe as decode_moe_w4a8,
