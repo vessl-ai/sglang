@@ -187,4 +187,11 @@ def _finish_vision_topk(
     ):
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
+    if not use_mega_moe:
+        # INF-730 c-route: the non-MegaMoE branch never reached the recorder, so the
+        # expert distribution of DSV4.1's VL-gated routing was silently empty.
+        n_shared = config.num_fused_shared_experts or 0
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=indices[:, : indices.shape[1] - n_shared] if n_shared else indices
+        )
     return weights, indices
