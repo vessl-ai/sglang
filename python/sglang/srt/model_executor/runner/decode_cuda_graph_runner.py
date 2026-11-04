@@ -55,6 +55,8 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_pad_mask_real_counts_enabled,
+    dp_real_num_tokens_buffer,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -127,6 +129,9 @@ except ImportError:
     KTRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# INF-730: a per-rank count no row position reaches (the pad mask then keeps every row).
+_DP_PAD_ALL_VALID = 1 << 30
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1286,6 +1291,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
                     forward_batch.global_num_tokens_cpu,
+                    # INF-730: the graph's pad mask reads the static real-count
+                    # buffer that every replay refreshes (None = no mask captured).
+                    real_num_tokens_gpu=self._dp_pad_real_counts_buffer(),
                 )
                 set_is_extend_in_batch(False)
 
@@ -1329,6 +1337,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
+            _real_counts = self._dp_pad_real_counts_buffer()
+            if _real_counts is not None:
+                # Warmup runs mask nothing; the captured mask reads replay values.
+                _real_counts.fill_(_DP_PAD_ALL_VALID)
             canary_ctx = (
                 c.with_active_single_forward_manager(0)
                 if (c := self.model_runner.canary_manager) is not None
@@ -1360,6 +1372,35 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+
+    def _dp_pad_real_counts_buffer(self) -> Optional[torch.Tensor]:
+        """INF-730 SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS: the static per-rank real
+        row-count buffer the target model's decode graphs mask DP pad rows by, or None
+        (switch off, no MLP-TP gather, draft worker, ragged verify)."""
+        if (
+            not dp_pad_mask_real_counts_enabled()
+            or not self.require_mlp_tp_gather
+            or self.model_runner.is_draft_worker
+            or self.ragged_verify_mode
+        ):
+            return None
+        return dp_real_num_tokens_buffer(self.num_dp_ranks, self.device)
+
+    def _publish_dp_real_counts(self, forward_batch: ForwardBatch) -> None:
+        """Write this replay's real per-rank row counts (the unpadded, spec-scaled
+        global_num_tokens; the graph path skips prepare_mlp_sync_batch, so they are
+        still real here) into the buffer the captured pad mask reads."""
+        buf = self._dp_pad_real_counts_buffer()
+        if buf is None:
+            return
+        counts = forward_batch.global_num_tokens_cpu
+        if counts is None or len(counts) != buf.shape[0]:
+            buf.fill_(_DP_PAD_ALL_VALID)
+            return
+        buf.copy_(
+            torch.tensor(counts, dtype=torch.int32, pin_memory=True),
+            non_blocking=True,
+        )
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
@@ -1422,6 +1463,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
+            self._publish_dp_real_counts(forward_batch)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1514,6 +1556,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
         self._set_dp_real_num_tokens(raw_num_token)
+        self._publish_dp_real_counts(forward_batch)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
