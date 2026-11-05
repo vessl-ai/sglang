@@ -542,6 +542,20 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if not hip and "tilelang" in chosen:
+        import torch
+
+        # Explicit capability, not is_sm80_family(): that one is cached, and these checks
+        # must follow torch.cuda.get_device_capability (the unit tests patch it).
+        if torch.cuda.is_available() and (
+            8,
+            0,
+        ) <= torch.cuda.get_device_capability() < (8, 9):
+            # SM8x: fail at boot on a malformed sparse MLA setting, not at first use.
+            from sglang.kernels.ops.attention.dsa.sm80 import validate_sm80_settings
+
+            validate_sm80_settings()
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
@@ -555,8 +569,14 @@ def _check_dsa_backend_constraints(
     import torch
 
     major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (8, 0):
+        raise ValueError("CUDA TileLang FP8 KV requires SM80 or newer.")
     if (major, minor) < (8, 9):
-        raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
+        # SM80 family: the KV pool stays fp8 and the TileLang kernels convert it to
+        # bf16 in-kernel. Validate the tile settings at boot instead of at first use.
+        from sglang.kernels.ops.attention.dsa.sm80 import validate_sm80_fp8kv
+
+        validate_sm80_fp8kv()
 
 
 def _check_tilelang_dsa_fp8_kv(

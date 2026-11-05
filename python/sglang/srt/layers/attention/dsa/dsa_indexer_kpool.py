@@ -31,7 +31,14 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    get_device_core_count,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 if is_cuda():
     try:
@@ -45,6 +52,7 @@ if is_npu():
     except ImportError:
         pass
 
+from sglang.kernels.ops.attention.dsa.sm80 import is_sm80_family
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -64,6 +72,9 @@ from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
+
+# kpool_indexer_sm80 is imported lazily where it is used: it needs
+# triton.language.extra.cuda, which does not exist on non-CUDA builds.
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -193,7 +204,10 @@ class IndexerKPool(MultiPlatformOp):
             self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
-            self.sm_count = deep_gemm.get_num_sms()
+            if is_sm80_family():  # no DeepGEMM on SM80
+                self.sm_count = get_device_core_count(torch.cuda.current_device())
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
         self.wq_b = ReplicatedLinear(
@@ -940,6 +954,14 @@ class IndexerKPool(MultiPlatformOp):
                 )
             return logits
 
+        if is_sm80_family():
+            from sglang.kernels.ops.attention.dsa.kpool_indexer_sm80 import (
+                fp8_mqa_logits_sm80,
+            )
+
+            return fp8_mqa_logits_sm80(
+                q_fp8, k_fp8, k_scale, weights, starts, ends, clean_logits=clean_logits
+            )
         return deep_gemm.fp8_mqa_logits(
             q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
         )
@@ -1002,6 +1024,7 @@ class IndexerKPool(MultiPlatformOp):
             not use_aiter_paged_mqa
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
+        use_sm80_paged_mqa = not use_aiter_paged_mqa and is_sm80_family()
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -1010,7 +1033,7 @@ class IndexerKPool(MultiPlatformOp):
                 seqlens_32,
                 blocksize,
                 build_schedule_metadata=not (
-                    use_aiter_paged_mqa or use_tilelang_paged_mqa
+                    use_aiter_paged_mqa or use_tilelang_paged_mqa or use_sm80_paged_mqa
                 ),
             )
         )
@@ -1050,6 +1073,19 @@ class IndexerKPool(MultiPlatformOp):
                 pool_schedule_metadata,
                 pool_max_seq_len,
                 clean_logits=False,
+            )
+        elif use_sm80_paged_mqa:
+            from sglang.kernels.ops.attention.dsa.kpool_indexer_sm80 import (
+                fp8_paged_mqa_logits_sm80,
+            )
+
+            logits = fp8_paged_mqa_logits_sm80(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8,
+                weights,
+                pool_context_lens,
+                pool_block_tables,
+                pool_max_seq_len,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -1415,8 +1451,10 @@ class IndexerKPool(MultiPlatformOp):
                             token_page_table, kpool
                         )[:pool_pages].contiguous()
                     seq_len_t = torch.tensor(
-                        [pool_seq_len], dtype=torch.int32, device=q_fp8.device
-                    )
+                        [pool_seq_len],
+                        dtype=torch.int32,
+                        pin_memory=True,  # pinned, avoids a stream sync; eager only
+                    ).to(q_fp8.device, non_blocking=True)
                     k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                         layer_id,
                         seq_len_t,
@@ -1685,6 +1723,11 @@ class IndexerKPool(MultiPlatformOp):
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
         elif not is_npu():
             from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+
+            if is_sm80_family():  # the Triton fp8 store needs SM89+
+                from sglang.kernels.ops.attention.dsa.kpool_indexer_sm80 import (
+                    act_quant_sm80 as act_quant,
+                )
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

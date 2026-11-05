@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa.sm80 import is_sm80_family
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
@@ -340,6 +341,10 @@ def _set_k_and_s_triton(
     else:
         buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
+    if is_sm80_family(
+        buf.device.index
+    ):  # no fp8e4nv in Triton below SM89: copy the bytes
+        buf_fp8, index_k = buf, index_k.view(torch.uint8)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
         buf_fp8,

@@ -22,6 +22,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
     with_phase,
 )
+from sglang.srt.runtime_context import cp_min_extend_tokens
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -164,12 +165,14 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
             lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
         ),
-        # CP all_gather replay size mismatch under BCG.
+        # CP all_gather replay size mismatch under BCG. A CP token threshold keeps CP
+        # batches out of the graph (the captured buckets are below it).
         (
             "context parallel (attn_cp_size > 1)",
             lambda: (
                 resolved_view(server_args).attn_cp_size > 1
                 and not supports_prefill_cp_bcg(server_args)
+                and cp_min_extend_tokens() <= 0
             ),
         ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.

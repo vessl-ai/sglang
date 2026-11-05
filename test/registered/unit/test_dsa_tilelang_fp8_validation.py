@@ -23,10 +23,15 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
     def test_cuda_fp8_tilelang_allowed(self, _capability):
         _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=False)
 
-    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
-    def test_cuda_fp8_requires_fp8_tensor_cores(self, _capability):
-        with self.assertRaisesRegex(ValueError, "SM89"):
+    @patch("torch.cuda.get_device_capability", return_value=(7, 5))
+    def test_cuda_fp8_requires_sm80(self, _capability):
+        with self.assertRaisesRegex(ValueError, "SM80"):
             _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=False)
+
+    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
+    def test_cuda_fp8_sm80_family_allowed(self, _capability):
+        # SM8x decodes the fp8 KV to bf16 in-kernel instead of needing fp8 tensor cores
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=False)
 
     def test_cuda_fp8_tilelang_dcp_rejected(self):
         with self.assertRaisesRegex(ValueError, "dcp-size"):

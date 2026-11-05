@@ -55,6 +55,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.bcg import (
     PrefillCPBCGInput,
 )
@@ -130,6 +131,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
+    cp_min_extend_tokens,
     get_exec,
     get_flags,
     get_memory,
@@ -352,6 +354,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        if cp_min_extend_tokens() > 0 and get_cp_strategy() is not None:
+            # Extends of at least that many tokens run with CP, eagerly; capture only
+            # the buckets of the smaller ones.
+            min_cp_tokens = cp_min_extend_tokens()
+            kept = [t for t in self.capture_num_tokens if t < min_cp_tokens]
+            if not kept:
+                raise ValueError(
+                    "no prefill graph bucket is below SGLANG_CP_MIN_EXTEND_TOKENS="
+                    f"{min_cp_tokens}; lower it or add smaller --cuda-graph-bs-prefill "
+                    "buckets"
+                )
+            logger.info(
+                "Prefill CUDA graph buckets limited to < %d tokens by "
+                "SGLANG_CP_MIN_EXTEND_TOKENS: %s",
+                min_cp_tokens,
+                kept,
+            )
+            self.capture_num_tokens = kept
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)

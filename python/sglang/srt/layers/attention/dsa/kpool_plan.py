@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.sm80 import is_sm80_family
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
@@ -561,6 +562,8 @@ def _compute_pool_schedule_metadata(
     index_page_size: int,
 ) -> Optional[torch.Tensor]:
     if not is_cuda():
+        return None
+    if is_sm80_family():  # the SM80 paged-MQA kernel takes no schedule
         return None
     deep_gemm = _get_deep_gemm()
     if deep_gemm is None:
