@@ -20,7 +20,9 @@ Expected behavior: Both tools should be parsed correctly.
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.solar_open2_detector import TOOL_CALL_END
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
@@ -133,6 +135,61 @@ class TestParallelToolCalls(unittest.TestCase):
         self.assertEqual(
             params2["filename"], "doc2", "Second tool filename should be doc2"
         )
+
+
+class TestSolarOpen2ParallelToolCallsFalse(unittest.TestCase):
+    """required/named tool_choice use the JSON-schema array constraint, whose
+    ``maxItems=1`` caps the call count for ``parallel_tool_calls=False``. For
+    ``auto`` (no grammar) OpenAIServingChat enforces it instead: it injects
+    ``<|tool_call:end|>`` as a stop string (solar_open2_serving rule 3) and
+    glues it back onto the trimmed text before handing it to the detector
+    (rule 4).
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                ),
+            ),
+        ]
+        self.parser = FunctionCallParser(self.tools, "solar_open2")
+
+    def test_json_schema_caps_parallel_tool_calls_false(self):
+        result = self.parser.get_structure_constraint(
+            "required", parallel_tool_calls=False
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "json_schema")
+        self.assertEqual(result[1]["minItems"], 1)
+        self.assertEqual(result[1]["maxItems"], 1)
+
+    def test_stop_trimmed_call_glued_back_yields_one_call_non_stream(self):
+        trimmed = '<|tool_call:start|>get_weather\n{"location": "Seoul"}'
+        text = trimmed + TOOL_CALL_END
+        normal_text, calls = self.parser.parse_non_stream(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "get_weather")
+        self.assertEqual(json.loads(calls[0].parameters), {"location": "Seoul"})
+
+    def test_stop_trimmed_call_glued_back_yields_one_call_stream(self):
+        trimmed = '<|tool_call:start|>get_weather\n{"location": "Seoul"}'
+        text = trimmed + TOOL_CALL_END
+        collected = []
+        for chunk in (text[: len(text) // 2], text[len(text) // 2 :]):
+            _, calls = self.parser.parse_stream_chunk(chunk)
+            collected.extend(calls)
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0].name, "get_weather")
+        self.assertEqual(json.loads(collected[0].parameters), {"location": "Seoul"})
 
 
 if __name__ == "__main__":

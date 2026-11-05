@@ -345,6 +345,34 @@ def _migrate_deprecated_dp_rank(values: dict) -> dict:
     return values
 
 
+class RepetitionDetectionParams(BaseModel):
+    """N-gram loop detector, vLLM-parity (``SamplingParams.repetition_detection``).
+
+    The request is finished early once a contiguous block of the tail of the
+    generated tokens, with length in ``[min_pattern_size, max_pattern_size]``,
+    repeats back-to-back at least ``min_count`` times. ``max_pattern_size == 0``
+    (the default) disables the feature.
+    """
+
+    max_pattern_size: int = 0
+    min_pattern_size: int = 0
+    min_count: int = 0
+
+    @model_validator(mode="after")
+    def validate_repetition_detection(self) -> RepetitionDetectionParams:
+        if self.max_pattern_size < 0:
+            raise ValueError("max_pattern_size must be >= 0")
+        if self.min_pattern_size < 0:
+            raise ValueError("min_pattern_size must be >= 0")
+        if self.min_pattern_size > self.max_pattern_size:
+            raise ValueError("min_pattern_size must be <= max_pattern_size")
+        if self.max_pattern_size > 0 and self.min_count < 2:
+            raise ValueError(
+                "min_count must be >= 2 when max_pattern_size is set (> 0)"
+            )
+        return self
+
+
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -507,7 +535,9 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "content_filter", "abort", "repetition"]
+    ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     token_ids: Optional[List[int]] = None
@@ -547,7 +577,9 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
+    finish_reason: Optional[
+        Literal["stop", "length", "content_filter", "abort", "repetition"]
+    ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     token_ids: Optional[List[int]] = None
@@ -1006,6 +1038,7 @@ class ChatCompletionRequest(PDRoutingFields):
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
+    repetition_detection: Optional[RepetitionDetectionParams] = None
     stop_token_ids: Optional[List[int]] = None
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
@@ -1222,6 +1255,11 @@ class ChatCompletionRequest(PDRoutingFields):
             "presence_penalty": self.presence_penalty,
             "frequency_penalty": self.frequency_penalty,
             "repetition_penalty": get_param("repetition_penalty"),
+            "repetition_detection": (
+                self.repetition_detection.model_dump()
+                if self.repetition_detection is not None
+                else None
+            ),
             "regex": self.regex,
             "ebnf": self.ebnf,
             "n": self.n,
@@ -1310,7 +1348,13 @@ class ChatCompletionResponseChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "repetition",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1372,7 +1416,13 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "repetition",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1994,6 +2044,7 @@ class ResponsesRequest(PDRoutingFields):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
+    repetition_detection: Optional[RepetitionDetectionParams] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -2184,6 +2235,8 @@ class ResponsesRequest(PDRoutingFields):
             params["min_p"] = self.min_p
         if self.repetition_penalty is not None:
             params["repetition_penalty"] = self.repetition_penalty
+        if self.repetition_detection is not None:
+            params["repetition_detection"] = self.repetition_detection.model_dump()
 
         # Apply any additional default parameters
         for key, value in default_params.items():

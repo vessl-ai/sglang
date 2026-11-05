@@ -171,6 +171,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
 
+    /// Mark the worker as removed from the registry. After this,
+    /// `set_healthy` still tracks the health state but no longer writes the
+    /// worker's health gauge, so a health check racing with the removal
+    /// cannot resurrect a tombstoned series.
+    fn mark_removed(&self);
+
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
 
@@ -653,6 +659,9 @@ pub struct BasicWorker {
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
+    /// Set once when the registry removes the worker; gates the health gauge
+    /// so late health checks cannot write it back after the tombstone.
+    pub removed: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
@@ -727,7 +736,23 @@ impl Worker for BasicWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Release);
+        if self.removed.load(Ordering::SeqCst) {
+            // The registry has removed this worker and tombstoned its gauges.
+            // A health check that raced with the removal must not resurrect
+            // them: it would leave a permanent stale series, since nothing
+            // updates a removed worker's gauges again.
+            return;
+        }
         Metrics::set_worker_health(self.url(), healthy);
+        if self.removed.load(Ordering::SeqCst) {
+            // Removal ran between the check above and the gauge write:
+            // restore the tombstone the write just clobbered.
+            Metrics::remove_worker_metrics(self.url());
+        }
+    }
+
+    fn mark_removed(&self) {
+        self.removed.store(true, Ordering::SeqCst);
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1045,6 +1070,10 @@ impl Worker for DPAwareWorker {
 
     fn set_healthy(&self, healthy: bool) {
         self.base_worker.set_healthy(healthy);
+    }
+
+    fn mark_removed(&self) {
+        self.base_worker.mark_removed();
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -1631,6 +1660,23 @@ mod tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+
+    #[test]
+    fn test_set_healthy_still_tracks_state_after_removal() {
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        worker.mark_removed();
+
+        // A health check that raced with the removal still records its
+        // outcome in the worker's state; only the gauge write is gated.
+        worker.set_healthy(true);
+        assert!(worker.is_healthy());
+        worker.set_healthy(false);
+        assert!(!worker.is_healthy());
     }
 
     #[test]
