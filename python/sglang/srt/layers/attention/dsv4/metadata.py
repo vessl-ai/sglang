@@ -7,6 +7,7 @@ from typing import Any, Iterator, List, Optional
 
 import torch
 
+from sglang.srt.layers.attention.dsv4.sm80_compat import is_sm80_dsv4
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
@@ -26,7 +27,7 @@ from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
 
-_IS_SM120 = is_sm120_supported()
+_IS_SM120 = is_sm120_supported() or is_sm80_dsv4()
 
 """
 Some comments on the common terms used in DeepSeekV4Backend:

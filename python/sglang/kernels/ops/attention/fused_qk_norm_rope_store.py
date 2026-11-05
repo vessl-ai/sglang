@@ -15,6 +15,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.ops.quantization.fp8_e4m3_sw import SW_FP8, f32_to_e4m3fn
 
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
@@ -284,6 +285,8 @@ def _fused_qk_norm_rope_store_kernel(
             # fnuz bias 8), so the fnuz read decodes every element 2x too small.
             if IS_FNUZ:
                 x_fp8_cast = x_fp8.to(tl.float8e4b8)
+            elif SW_FP8:
+                x_fp8_cast = f32_to_e4m3fn(x_fp8.to(tl.float32))
             else:
                 x_fp8_cast = x_fp8.to(tl.float8e4nv)
             x_fp8_bytes = x_fp8_cast.to(tl.uint8, bitcast=True)
