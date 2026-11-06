@@ -1235,6 +1235,17 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # INF-730: make SGLANG_OPT_MASK_DP_PAD_MOE mask under MAX_LEN padding, and also for a
+    # TP MoE (ep_size 1). The mask above reads global_num_tokens_gpu, which holds the
+    # PADDED count of every rank by the time a MAX_LEN forward runs (eager:
+    # prepare_mlp_sync_batch overwrites it; decode graphs: never passed at capture, and
+    # the replay buffer is filled with the padded count), so it never masks a row. With
+    # this switch the target model's decode/verify forwards publish each rank's REAL row
+    # count in a separate device buffer (eager: before the padding overwrite; graphs: a
+    # static buffer passed at capture and refreshed by every replay) and the mask reads
+    # that. Pad rows then get top-k -1 and the experts skip them; real rows' outputs do
+    # not change. The draft worker is left as it was.
+    SGLANG_OPT_DSV4_DP_PAD_MASK_REAL_COUNTS = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
@@ -1571,6 +1582,10 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # INF-730: Linux utilization clamp (0..1024) for scheduler processes, set before their
+    # runtime threads start so they inherit it; negative = off. Under schedutil a host-bound
+    # DP scheduler otherwise settles at a low CPU clock (srt/utils/sched_uclamp.py).
+    SGLANG_OPT_SCHED_UCLAMP_MIN = EnvInt(-1)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
@@ -1829,6 +1844,23 @@ class Envs:
     # and down with dynamically handed-out work, plus one prologue launch (expert sort, token row quant).
     # Same packed weights; output bit-identical to the W4A8 kernels. CUDA-graph safe.
     SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_V2 = EnvBool(False)
+    # INF-730, sub-switch of SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8 + _V2 (no effect without both): on
+    # expert-parallel MoE layers (--ep-size > 1), whose ranks hold whole experts (intermediate S x 576), run
+    # the v2 kernel on S virtual 576-channel experts per local expert (dsv4_mxfp4_decode_moe_ep). Each virtual
+    # slot computes what TP-S rank s computes; only the order of the final sums changes. CUDA-graph safe.
+    SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP = EnvBool(False)
+    # INF-730: the largest tokens x top-k x virtual experts one EP decode MoE call handles (its buffers grow
+    # with it: 10 KiB of bf16 output per virtual slot); larger calls run in token chunks (eager only).
+    SGLANG_OPT_DSV4_EP_DECODE_MOE_MAX_VSLOTS = EnvInt(131072)
+    # INF-730: the expert kernel of SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: "v2w" = whole 2304-wide experts
+    # (dsv4_mxfp4_decode_moe_v2w; h quantized per whole row, ~0.4% from TP4), "virtual" = the v2 kernel on
+    # 576-channel virtual experts (rows bit-identical to TP4's slices).
+    SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL = EnvStr("v2w")
+    # INF-730: the expert-parallel decode MoE's communication (srt/layers/moe/ep_decode_comm.py), on decode
+    # forwards of the layers SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP covers: "" (default) keeps the BF16
+    # all-gather of every DP rank's rows + reduce-scatter; "ag" routes the local rows and all-gathers their
+    # e4m3 rows, scales and top-k instead; "<module>:<factory>" plugs in a dispatch/combine implementation.
+    SGLANG_OPT_DSV4_EP_MOE_COMM = EnvStr("")
     # Prefill only, SM90: run those MXFP4 experts as FP8 x FP8 triton_kernels GEMMs
     # (just-in-time FP8 weights, FP8 activations with a power-of-2 row scale).
     # Takes precedence over SGLANG_OPT_DSV4_TRITON_KERNELS_MOE(_DECODE). No CUDA graphs:

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
@@ -136,6 +137,7 @@ def _finish_vision_topk(
 ):
     config = moe.topk.topk_config
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
+    remapped = False  # INF-730: ids mapped to physical below (non-MegaMoE)
     if use_mega_moe:
         # Use the same EPLB mapping, recording and home-rank shared slots as
         # ordinary top-k before handing physical expert IDs to MegaMoE.
@@ -160,6 +162,17 @@ def _finish_vision_topk(
                 topk_ids=recorder_ids
             )
     else:
+        if expert_location_dispatch_info is not None:
+            # INF-730: EPLB or a static placement without MegaMoE: the dispatcher
+            # takes physical expert ids. A masked (-1) pad row aliases the map's
+            # last entry here, so the pad rows are masked again below.
+            assert not config.num_fused_shared_experts, (
+                "VL routing with an expert placement and fused shared experts"
+            )
+            indices = topk_ids_logical_to_physical(
+                indices, expert_location_dispatch_info
+            )
+            remapped = True
         weights = _scale_fused_shared_weights(
             weights,
             config.num_fused_shared_experts,
@@ -168,8 +181,17 @@ def _finish_vision_topk(
     # Shared-slot remapping can overwrite padded weights; mask last so idle
     # and partially padded DP ranks never dispatch a phantom shared expert.
     if num_token_non_padded is not None and (
-        not padded_rows_masked or (use_mega_moe and config.num_fused_shared_experts)
+        not padded_rows_masked
+        or (use_mega_moe and config.num_fused_shared_experts)
+        or (not use_mega_moe and remapped)
     ):
         _mask_topk_ids_padded_region(indices, num_token_non_padded)
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
+    if not use_mega_moe:
+        # INF-730 c-route: the non-MegaMoE branch never reached the recorder, so the
+        # expert distribution of DSV4.1's VL-gated routing was silently empty.
+        n_shared = config.num_fused_shared_experts or 0
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=indices[:, : indices.shape[1] - n_shared] if n_shared else indices
+        )
     return weights, indices

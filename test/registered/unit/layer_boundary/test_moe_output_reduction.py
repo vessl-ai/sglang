@@ -207,6 +207,7 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         )
                     ),
                     _SHARED_EXPERT_LOCAL=False,
+                    _EP_MOE_COMM_ON=False,
                     _is_hip=False,
                     nullcontext=contextlib.nullcontext,
                     get_global_dp_buffer=lambda g: torch.empty(4, 3),

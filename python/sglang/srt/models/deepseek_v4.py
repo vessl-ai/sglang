@@ -2879,6 +2879,9 @@ _CP_MOE_FP8AG_ANY = (
     envs.SGLANG_OPT_DSV4_CP_MOE_LOCAL_ROUTER.get()
     or envs.SGLANG_OPT_DSV4_CP_MOE_FP8_ALLGATHER.get()
 )
+# INF-730 (srt/layers/moe/ep_decode_comm.py): the EP decode MoE's dispatch/combine instead of the
+# BF16 all-gather + reduce-scatter.
+_EP_MOE_COMM_ON = bool(envs.SGLANG_OPT_DSV4_EP_MOE_COMM.get())
 
 
 def _cp_moe_fp8ag():
@@ -3691,11 +3694,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
+        # INF-730: also with EP over the whole TP group (should_use_dp_reduce_scatterv), whose
+        # reduce_scatterv over the MAX_LEN-padded (equal) chunks runs as one ncclReduce per rank
+        # (ring LL, ~7x the symmetric reduce-scatter at DP8 decode sizes).
         _use_reduce_scatter = (
             envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
-            and not should_use_dp_reduce_scatterv()
             and forward_batch.dp_padding_mode is not None
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
@@ -3723,6 +3728,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        if _use_tp_moe_gather and _EP_MOE_COMM_ON:
+            from sglang.srt.layers.moe import ep_decode_comm
+
+            if ep_decode_comm.applies(
+                self.mlp, forward_batch, shared_local=_do_shared_local
+            ):
+                return self._run_ep_decode_moe(
+                    hidden_states, input_ids, forward_batch.num_token_non_padded
+                )
         # INF-681 k-pcomm (SGLANG_OPT_DSV4_CP_SHARED_EXPERT_LOCAL): the replicated shared
         # expert on this rank's own CP shard, before (or beside) the MoE all-gather.
         _cp_shared = None
@@ -3885,7 +3899,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 get_local_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
+            if (
+                should_use_dp_reduce_scatterv() or _use_reduce_scatterv
+            ) and not _use_reduce_scatter:
                 # SUM the TP-sharded per-rank partial expert outputs AND scatter
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
@@ -3927,6 +3943,41 @@ class DeepseekV4DecoderLayer(nn.Module):
                 attn_tp_all_gather(gathered, hidden_states.contiguous())
                 hidden_states = torch.cat(gathered)
         return hidden_states
+
+    def _run_ep_decode_moe(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        num_token_non_padded: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """INF-730 SGLANG_OPT_DSV4_EP_MOE_COMM: route, dispatch, run the local experts and combine this rank's
+        own rows (srt/layers/moe/ep_decode_comm.py) instead of the all-gather path; the shared expert runs on
+        the same local rows (beside it on the shared-expert stream when that is on) and is added after."""
+        from sglang.srt.layers.moe import ep_decode_comm
+
+        shared = None
+        stream = None
+        if (
+            hidden_states.shape[0] > 0
+            and getattr(self.mlp, "shared_experts", None) is not None
+        ):
+            stream = _dp_shared_expert_stream()
+            if stream is not None:
+                stream.wait_stream(torch.cuda.current_stream())
+                hidden_states.record_stream(stream)
+                with torch.cuda.stream(stream), _dp_shared_expert_sm_cap():
+                    shared = _forward_shared_experts_rank_local(self.mlp, hidden_states)
+                shared.record_stream(torch.cuda.current_stream())
+            else:
+                shared = _forward_shared_experts_rank_local(self.mlp, hidden_states)
+        out = ep_decode_comm.forward_ep_decode_moe(
+            self.mlp, hidden_states, input_ids, num_token_non_padded
+        )
+        if shared is not None:
+            if stream is not None:
+                torch.cuda.current_stream().wait_stream(stream)
+            out = out + shared[: out.shape[0]]
+        return out
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)

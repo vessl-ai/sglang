@@ -8,6 +8,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    dp_pad_mask_real_counts_enabled,
     get_dp_global_num_tokens,
     get_local_dp_buffer,
     is_allocation_symmetric,
@@ -237,6 +238,16 @@ class StandardDispatcher(BaseDispatcher):
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
                 elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                     raise NotImplementedError()
+        elif (
+            _MASK_DP_PAD_MOE
+            and self.moe_ep_size == 1
+            and dp_pad_mask_real_counts_enabled()
+            and TopKOutputChecker.format_is_standard(topk_output)
+            and is_dp_max_padding()
+        ):
+            # INF-730: a TP MoE under attention DP gathers every rank's MAX_LEN chunk
+            # too, pad rows included; drop them the same way (global ids, no mapping).
+            mask_dp_pad_moe_topk_ids(topk_output.topk_ids)
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

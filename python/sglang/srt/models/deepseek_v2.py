@@ -118,7 +118,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     adds_replicated_output_to_partial,
@@ -962,6 +967,44 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
+    def _expert_location_dispatch_info(self) -> Optional[ExpertLocationDispatchInfo]:
+        """The logical -> physical expert map for this layer's top-k, or None. Also under a static
+        placement (INF-730: --init-expert-location without --enable-eplb, which sets
+        --ep-dispatch-algorithm): the ranks then hold experts by physical id, so the top-k must be
+        mapped as with EPLB."""
+        moe = get_exec().moe
+        if self.is_nextn or not (
+            moe.enable_eplb or moe.ep_dispatch_algorithm is not None
+        ):
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+
+    def route_rows(
+        self, hidden_states: torch.Tensor, input_ids: Optional[torch.Tensor]
+    ) -> TopKOutput:
+        """INF-730 (srt/layers/moe/ep_decode_comm.py): the top-k of these rows exactly as forward_normal
+        computes it (router GEMM, then the hash, vision or plain top-k; physical ids under an expert
+        placement), for a caller that routes a rank's own rows before dispatching them. ``input_ids``: the
+        token ids of these rows (hash and vision routing), or None. Pad rows are the caller's to mask."""
+        dispatch_info = self._expert_location_dispatch_info()
+        router_logits = self.gate(hidden_states, None)
+        if self.gate.e_score_correction_bias_vl is not None:
+            return vision_topk(
+                self,
+                router_logits,
+                input_ids,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        topk_kwargs = (
+            {"input_ids": input_ids} if getattr(self, "is_hash", False) else {}
+        )
+        return self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=dispatch_info,
+            **topk_kwargs,
+        )
+
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
             _enable_pcg_dsv2_dual_stream
@@ -1098,11 +1141,7 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._expert_location_dispatch_info()
 
         # router_logits: (num_tokens, n_experts)
         if _is_hip:
@@ -1135,6 +1174,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
                 )
             else:
                 topk_output = self.topk(
@@ -1307,11 +1347,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if get_exec().moe.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._expert_location_dispatch_info()
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1371,6 +1407,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
                 )
             else:
                 topk_output = self.topk(
