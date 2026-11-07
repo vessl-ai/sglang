@@ -367,7 +367,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
-from sglang.srt.utils.foundry_adapter import activate_foundry
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.sched_uclamp import maybe_set_scheduler_uclamp_min
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -6154,6 +6154,7 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        get_foundry_adapter().log_init_summary()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
