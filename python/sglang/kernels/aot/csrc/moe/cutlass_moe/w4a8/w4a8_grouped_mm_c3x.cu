@@ -144,29 +144,6 @@ bool try_dispatch_w4a8_moe_mm_h200(
     } else {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     }
-  } else if (n == 1024 && k == 4096) {
-    // GLM-5.3 group gemm 1 at TP-4. Every tile here is K=128, so the scales must be
-    // packed 1-way: keep in step with cutlass_w4a8_scale_alignment in cutlass_moe.py.
-    if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 16, 128, 1, 1, 1>));
-    } else if (m <= 768) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 32, 128, 1, 1, 1>));
-    } else if (m <= 2048) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 64, 128, 1, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 128, 128, 1, 1, 1>));
-    }
-  } else if (n == 4096 && k == 512) {
-    // GLM-5.3 group gemm 2 at TP-4. K=128 tiles, 1-way scales as above.
-    if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 16, 128, 1, 1, 1>));
-    } else if (m <= 768) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 2, 1, 1>));
-    } else if (m <= 2048) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 64, 128, 1, 1, 1>));
-    } else {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 128, 128, 1, 1, 1>));
-    }
   } else {
     return false;
   }

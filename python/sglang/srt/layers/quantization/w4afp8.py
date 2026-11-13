@@ -125,13 +125,14 @@ class W4AFp8Config(QuantizationConfig):
 
 
 def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
-    """Interleave [E, N, K // 128] scales into the layout `cutlass_w4a8_moe_mm` reads."""
-    from sgl_kernel import cutlass_w4a8_scale_alignment
+    """Interleave [E, N, K // 128] scales into the layout the w4a8 grouped GEMM reads."""
+    from sglang.kernels.ops.moe.w4a8_h200_k128 import uses_k128_tiles
 
     s_shape = scales.shape
-    alignment = cutlass_w4a8_scale_alignment(
-        n=s_shape[1], k=s_shape[2] * 128, device=scales.device
-    )
+    if uses_k128_tiles(n=s_shape[1], k=s_shape[2] * 128, device=scales.device):
+        alignment = 1
+    else:
+        alignment = 4 if s_shape[2] % 4 == 0 else 1
     scales_interleaved = scales.reshape(
         s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
     )

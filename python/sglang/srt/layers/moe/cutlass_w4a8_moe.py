@@ -11,10 +11,9 @@ _is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
-    from sgl_kernel import (
-        cutlass_w4a8_moe_mm,
-        get_cutlass_w4a8_moe_mm_data,
-    )
+    from sgl_kernel import get_cutlass_w4a8_moe_mm_data
+
+    from sglang.kernels.ops.moe.w4a8_h200_k128 import cutlass_w4a8_moe_mm
 
 if _is_cuda:
     from sglang.kernels.ops.activation.activation import silu_and_mul

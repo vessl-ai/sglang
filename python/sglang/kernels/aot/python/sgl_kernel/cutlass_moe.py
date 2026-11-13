@@ -1,18 +1,4 @@
-import re
-
 import torch
-
-# Must match the H200 table in w4a8_grouped_mm_c3x.cu: these (N, K) shapes run K=128 tiles there.
-_H200_K128_SHAPES = {(1024, 4096), (4096, 512)}
-
-
-def cutlass_w4a8_scale_alignment(n: int, k: int, device: torch.device) -> int:
-    """Scale groups interleaved per entry of `b_scales` that `cutlass_w4a8_moe_mm`
-    expects for an [E, N, K] weight; a tile of K columns reads K // 128 of them."""
-    name = torch.cuda.get_device_name(device)
-    if (n, k) in _H200_K128_SHAPES and re.search(r"(?:^| )H200(?: |$)", name):
-        return 1
-    return 4 if k % 512 == 0 else 1
 
 
 def get_cutlass_w4a8_moe_mm_data(
