@@ -12,6 +12,7 @@ import torch
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
+from .scoring import log_score_tile_budget
 from .types import (
     CandidateMetadata,
     CapturedPrefillInputs,
@@ -67,10 +68,14 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
+    use_deep_gemm_prefill = _use_deep_gemm_prefill()
+    if use_deep_gemm_prefill:
+        # Only the DeepGEMM prefill indexer scores in tiles.
+        log_score_tile_budget()
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
-        use_deep_gemm_prefill=_use_deep_gemm_prefill(),
+        use_deep_gemm_prefill=use_deep_gemm_prefill,
         use_deep_gemm_decode=is_sm100_or_newer(),
     )
 

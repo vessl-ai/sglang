@@ -5,6 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
+import logging
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Tuple
 
@@ -33,9 +34,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+logger = logging.getLogger(__name__)
+
 # TODO: use a per-forward mqa_logits_budget_bytes() budget that also
 # leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Prefill indexer calls SGLANG_DSV41_INDEXER_SCORE_BUDGET_SELFCHECK has compared.
+_score_self_checks = 0
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -269,7 +274,34 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
     )
 
 
-def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+def score_tile_budget_mb() -> Optional[int]:
+    """SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB; None when unset."""
+    from sglang.srt.environ import envs
+
+    budget_mb = envs.SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB.get()
+    if budget_mb is not None and budget_mb <= 0:
+        raise ValueError(
+            f"SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB must be positive, got {budget_mb}"
+        )
+    return budget_mb
+
+
+def log_score_tile_budget() -> None:
+    """One line at engine start when SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB is set."""
+    budget_mb = score_tile_budget_mb()
+    if budget_mb is not None:
+        logger.info(
+            "DSV4.1 prefill indexer: logits tile budget %d MB "
+            "(SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB)",
+            budget_mb,
+        )
+
+
+def _score_tiles(
+    data: DeepGEMMPrefillData,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    budget_bytes: int,
+):
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -277,7 +309,77 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=budget_bytes,
+    )
+
+
+def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
+    budget_mb = score_tile_budget_mb()
+    if budget_mb is None:
+        yield from _score_tiles(data, kv, _DEEP_GEMM_SCORE_BUDGET_BYTES)
+        return
+    tiles = _score_tiles(data, kv, budget_mb << 20)
+    if _score_self_check_due(data):
+        tiles = _self_checked_tiles(
+            tiles,
+            _score_tiles(data, kv, _DEEP_GEMM_SCORE_BUDGET_BYTES),
+            data.compress_lens,
+        )
+    yield from tiles
+
+
+def _score_self_check_due(data: DeepGEMMPrefillData) -> bool:
+    global _score_self_checks
+    from sglang.srt.environ import envs
+
+    if _score_self_checks >= envs.SGLANG_DSV41_INDEXER_SCORE_BUDGET_SELFCHECK.get():
+        return False
+    # The comparison reads its result back, which a graph capture cannot do.
+    if data.q_fp4.is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    _score_self_checks += 1
+    return True
+
+
+def _self_checked_tiles(
+    tiles: Iterator[tuple[slice, torch.Tensor]],
+    reference: Iterator[tuple[slice, torch.Tensor]],
+    lengths: torch.Tensor,
+) -> Iterator[tuple[slice, torch.Tensor]]:
+    """``tiles`` unchanged. Each row's logits below its length are compared bitwise
+    with the same row's in ``reference``, the same rows tiled under the built-in
+    budget, and the result is logged once ``tiles`` is exhausted."""
+    ref_rows, ref = slice(0, 0), None
+    num_tiles = differing = 0
+    for rows, logits in tiles:
+        num_tiles += 1
+        row = rows.start
+        while row < rows.stop:
+            if row >= ref_rows.stop:
+                # Free the previous reference tile before the next one is scored.
+                ref = None
+                ref_rows, ref = next(reference)
+            stop = min(rows.stop, ref_rows.stop)
+            mine = logits[row - rows.start : stop - rows.start]
+            theirs = ref[row - ref_rows.start : stop - ref_rows.start]
+            valid = (
+                torch.arange(mine.shape[1], device=mine.device)[None, :]
+                < lengths[row:stop, None]
+            )
+            differing += int(((mine != theirs) & valid).any(dim=1).sum())
+            del mine, theirs, valid
+            row = stop
+        yield rows, logits
+        # Free this tile's logits before the generator scores the next one.
+        del logits
+    log = logger.warning if differing else logger.info
+    log(
+        "DSV4.1 prefill indexer: tile budget self-check %d: %d of %d rows in %d "
+        "tiles differ from the built-in budget's logits",
+        _score_self_checks,
+        differing,
+        lengths.shape[0],
+        num_tiles,
     )
 
 

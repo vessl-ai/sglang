@@ -1854,6 +1854,13 @@ class Envs:
     # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
     # and head-sum ops.
     SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # Budget in MB of one logits tile of the DeepSeek-V4.1 DeepGEMM prefill indexer,
+    # in place of the built-in budget. Unset: the built-in budget.
+    SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB = EnvInt(None)
+    # With SGLANG_DSV41_INDEXER_SCORE_BUDGET_MB set: on this many first prefill
+    # indexer calls, also score under the built-in budget and log whether the logits
+    # are the same. Each checked call allocates the built-in budget's tiles as well.
+    SGLANG_DSV41_INDEXER_SCORE_BUDGET_SELFCHECK = EnvInt(0)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
