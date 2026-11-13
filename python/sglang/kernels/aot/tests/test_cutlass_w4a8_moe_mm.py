@@ -2,7 +2,7 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import cutlass_w4a8_moe_mm
+from sgl_kernel import cutlass_w4a8_moe_mm, cutlass_w4a8_scale_alignment
 from utils import is_hopper
 
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
@@ -33,7 +33,7 @@ def pack_interleave(num_experts, ref_weight, ref_scale):
     w_q = weight.view((num_experts, n, k // 2)).view(torch.int8)
     w_q = w_q.contiguous()
 
-    alignment = 4 if k % 512 == 0 else 1
+    alignment = cutlass_w4a8_scale_alignment(n=n, k=k, device=ref_scale.device)
     scale_interleaved = ref_scale.reshape(
         ref_scale.shape[0],
         ref_scale.shape[1],

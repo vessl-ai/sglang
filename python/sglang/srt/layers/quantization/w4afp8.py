@@ -125,10 +125,13 @@ class W4AFp8Config(QuantizationConfig):
 
 
 def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
-    """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+    """Interleave [E, N, K // 128] scales into the layout `cutlass_w4a8_moe_mm` reads."""
+    from sgl_kernel import cutlass_w4a8_scale_alignment
+
     s_shape = scales.shape
-    # Reshape to separate groups of 4
-    alignment = 4 if s_shape[2] % 4 == 0 else 1
+    alignment = cutlass_w4a8_scale_alignment(
+        n=s_shape[1], k=s_shape[2] * 128, device=scales.device
+    )
     scales_interleaved = scales.reshape(
         s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
     )
