@@ -24,17 +24,71 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+# INF-834 SGLANG_OPT_INF834_NUMA_PRECOMPUTE: gpu_id -> (numa_node, numactl args
+# before the probe, (probed args, probe stderr)), filled concurrently for every
+# GPU before the scheduler spawn loop. Each lookup does an NVML init/shutdown and
+# one or more `numactl ... true` probes; serially that is paid once per GPU on
+# the spawn path. The cached values are exactly what the inline path computes.
+_inf834_binding_cache: dict = {}
+
+
+def _inf834_resolve_binding(server_args: ServerArgs, gpu_id: int):
+    numa_node = get_numa_node_if_available(server_args, gpu_id)
+    if numa_node is None:
+        return None, None, None
+    numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+    if numactl_args is None:
+        return numa_node, None, None
+    return numa_node, numactl_args, _probe_numactl_args(numactl_args)
+
+
+def precompute_subprocess_bindings(server_args: ServerArgs, gpu_ids) -> None:
+    """Resolve the NUMA binding of every GPU in parallel (no-op unless
+    SGLANG_OPT_INF834_NUMA_PRECOMPUTE=1 and SGLANG_NUMA_BIND_V2). A GPU whose
+    lookup raised is left out, so configure_subprocess redoes it inline and
+    raises or warns exactly as it would without the switch."""
+    if not (
+        envs.SGLANG_OPT_INF834_NUMA_PRECOMPUTE.get() and envs.SGLANG_NUMA_BIND_V2.get()
+    ):
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    gpu_ids = sorted(set(gpu_ids))
+    tic = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=max(1, len(gpu_ids))) as pool:
+        futures = {
+            g: pool.submit(_inf834_resolve_binding, server_args, g) for g in gpu_ids
+        }
+        for g, fut in futures.items():
+            try:
+                _inf834_binding_cache[g] = fut.result()
+            except Exception as e:
+                logger.info(f"INF834 numa precompute: GPU {g} left inline ({e!r})")
+    logger.info(
+        f"INF834 numa precompute: {len(_inf834_binding_cache)}/{len(gpu_ids)} GPUs "
+        f"resolved in {time.perf_counter() - tic:.2f} s"
+    )
+
+
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
-        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        cached = _inf834_binding_cache.pop(gpu_id, None)
+        if cached is not None:
+            numa_node, numactl_args, probed = cached
+        else:
+            numa_node = get_numa_node_if_available(server_args, gpu_id)
+            numactl_args = probed = None
         if numa_node is not None:
             # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
-            numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if cached is None:
+                numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
             if numactl_args is not None:
                 # Verify numactl can actually apply the binding before we exec it
                 # in front of the interpreter; relax the memory policy if not.
-                numactl_args, probe_err = _probe_numactl_args(numactl_args)
+                if probed is None:
+                    probed = _probe_numactl_args(numactl_args)
+                numactl_args, probe_err = probed
                 if numactl_args is None:
                     # numactl could not apply even a CPU-only binding (e.g.
                     # set_mempolicy(2)/sched_setaffinity(2) blocked by seccomp,

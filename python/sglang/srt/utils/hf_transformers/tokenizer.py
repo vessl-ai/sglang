@@ -467,6 +467,13 @@ def _ensure_fastokens_patched():
     logger.info("fastokens backend enabled - transformers patched successfully")
 
 
+# INF-834 SGLANG_OPT_INF834_TOKENIZER_MEMO: one tokenizer object per process and
+# per identical call. A scheduler process loads the same tokenizer twice (the
+# Scheduler before the model load, the target TpModelWorker after it, about 2 s
+# each for DeepSeek-V4.1); both only read it.
+_inf834_tokenizer_memo: dict = {}
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -477,6 +484,57 @@ def get_tokenizer(
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_INF834_TOKENIZER_MEMO.get():
+        return _get_tokenizer_uncached(
+            tokenizer_name,
+            *args,
+            tokenizer_mode=tokenizer_mode,
+            trust_remote_code=trust_remote_code,
+            tokenizer_revision=tokenizer_revision,
+            tokenizer_backend=tokenizer_backend,
+            **kwargs,
+        )
+    try:
+        key = (
+            tokenizer_name,
+            args,
+            tokenizer_mode,
+            trust_remote_code,
+            tokenizer_revision,
+            tokenizer_backend,
+            tuple(sorted(kwargs.items())),
+        )
+        hash(key)
+    except TypeError:
+        key = None
+    if key is not None and key in _inf834_tokenizer_memo:
+        logger.info(f"INF834 tokenizer memo: reused the tokenizer of {tokenizer_name}")
+        return _inf834_tokenizer_memo[key]
+    tokenizer = _get_tokenizer_uncached(
+        tokenizer_name,
+        *args,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        tokenizer_revision=tokenizer_revision,
+        tokenizer_backend=tokenizer_backend,
+        **kwargs,
+    )
+    if key is not None:
+        _inf834_tokenizer_memo[key] = tokenizer
+    return tokenizer
+
+
+def _get_tokenizer_uncached(
+    tokenizer_name: str,
+    *args,
+    tokenizer_mode: str = "auto",
+    trust_remote_code: bool = False,
+    tokenizer_revision: Optional[str] = None,
+    tokenizer_backend: str = "huggingface",
+    **kwargs,
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     # Tiktoken format has its own backend — no fastokens patching needed.
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer

@@ -3,6 +3,18 @@
 import platform as _platform
 import sys as _sys
 
+import os as _os
+
+if _os.environ.get("SGLANG_OPT_INF834_EARLY_CUINIT", "").lower() in ("1", "true"):
+    # INF-834: start the CUDA driver init (cuInit, seconds on an 8-GPU node) on a
+    # thread now, so it overlaps this process's Python imports instead of
+    # running inside the first torch.cuda.is_available() call (a module-level
+    # is_cuda() reached during the imports). cuInit is process-wide and
+    # idempotent; it creates no context and allocates no device memory.
+    from sglang._inf834_early_cuinit import start as _inf834_start_cuinit
+
+    _inf834_start_cuinit()
+
 # sglang.srt.environ must run before the rest of this file's imports
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is

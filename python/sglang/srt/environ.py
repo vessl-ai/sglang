@@ -2352,6 +2352,22 @@ class Envs:
     # Server warmup thread: poll /model_info every 50 ms from the start instead
     # of sleeping 1 s before the first attempt.
     SGLANG_OPT_INF834_FAST_WARMUP_POLL = EnvBool(False)
+    # Start cuInit on a thread at the top of `import sglang` (every process:
+    # main, schedulers, DP controller, HTTP workers) so it overlaps the Python
+    # imports. Read from os.environ directly in sglang/__init__.py (before
+    # this module is imported); registered here for the switch list.
+    SGLANG_OPT_INF834_EARLY_CUINIT = EnvBool(False)
+    # Resolve the NUMA binding (NVML lookup + numactl probe) of every GPU in
+    # parallel before the scheduler spawn loop instead of once per GPU inside it.
+    SGLANG_OPT_INF834_NUMA_PRECOMPUTE = EnvBool(False)
+    # MoE expert repack at load (W6): skip the per-layer and per-chunk
+    # torch.cuda.empty_cache() calls; "Load weight end" empties the cache once.
+    SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE = EnvBool(False)
+    # Diagnostic (not a lever): per-layer synchronized timing of the repack steps.
+    SGLANG_OPT_INF834_W6_PROFILE = EnvBool(False)
+    # One tokenizer object per process for identical get_tokenizer() calls (the
+    # scheduler and its target TpModelWorker load the same tokenizer).
+    SGLANG_OPT_INF834_TOKENIZER_MEMO = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

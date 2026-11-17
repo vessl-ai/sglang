@@ -928,6 +928,20 @@ class Engine(EngineScoreMixin, EngineBase):
                 _calculate_rank_ranges(get_parallel().node_rank)
             )
 
+            if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
+                # INF-834 (SGLANG_OPT_INF834_NUMA_PRECOMPUTE): resolve every GPU's
+                # NUMA binding in parallel; no-op when the switch is off.
+                numa_utils.precompute_subprocess_bindings(
+                    server_args,
+                    [
+                        get_device().base_gpu_id
+                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                        for pp_rank in pp_rank_range
+                        for tp_rank in tp_rank_range
+                    ],
+                )
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)

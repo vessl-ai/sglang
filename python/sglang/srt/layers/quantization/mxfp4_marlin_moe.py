@@ -595,7 +595,9 @@ class Mxfp4MarlinMoEMethod:
             f"Using the SM90 decode MoE kernel ({'W4A8 warp-specialized wgmma' if w4a8 else 'W4A16'}) "
             f"for MXFP4 experts (layer: {self.prefix})",
         )
-        torch.cuda.empty_cache()
+        from sglang.srt.layers.quantization.inf834_w6 import repack_empty_cache
+
+        repack_empty_cache()
         self._sm90_packed = dk.pack_experts(
             layer.w13_weight.data,
             layer.w13_weight_scale_inv.data,
@@ -604,7 +606,7 @@ class Mxfp4MarlinMoEMethod:
         )
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        torch.cuda.empty_cache()
+        repack_empty_cache()
         if w4a8:
             # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
             dk.prepare(self._sm90_packed.w13.device.index)
@@ -623,8 +625,13 @@ class Mxfp4MarlinMoEMethod:
         (dsv4_mxfp4_decode_moe_ep). Returns False (weights untouched) on a non-EP layer or a shape the
         kernel does not cover; the layer then takes the other paths."""
         from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+        from sglang.srt.layers.quantization.inf834_w6 import (
+            StepTimer,
+            repack_empty_cache,
+        )
         from sglang.srt.runtime_context import get_parallel
 
+        timer = StepTimer()
         config = self.runner.config
         num_local, n2, _ = layer.w13_weight.shape
         hidden = layer.w2_weight.shape[1]
@@ -636,6 +643,7 @@ class Mxfp4MarlinMoEMethod:
             int(layer.w2_weight_scale_inv.data.view(torch.uint8).max()),
         )
         mode = ek.kernel_mode()
+        timer.mark("scale_max")
         if not (
             ek.supports_ep(hidden, inter, num_local, mode)
             and config.activation == "silu"
@@ -652,7 +660,8 @@ class Mxfp4MarlinMoEMethod:
                 f"keeping the configured path (layer: {self.prefix})",
             )
             return False
-        torch.cuda.empty_cache()
+        repack_empty_cache()
+        timer.mark("empty_cache_pre")
         self._sm90_packed, split = ek.pack_experts_ep(
             layer.w13_weight.data,
             layer.w13_weight_scale_inv.data,
@@ -660,9 +669,11 @@ class Mxfp4MarlinMoEMethod:
             layer.w2_weight_scale_inv.data,
             mode=mode,
         )
+        timer.mark("pack")
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        torch.cuda.empty_cache()
+        repack_empty_cache()
+        timer.mark("del_empty_cache_post")
         log_info_on_rank0(
             logger,
             "Using the SM90 decode MoE kernel on an expert-parallel layer: "
@@ -684,6 +695,11 @@ class Mxfp4MarlinMoEMethod:
         )
         self._ep_split = split
         layer._dsv4_mxfp4_backend = f"sm90_decode_w4a8_ep_{mode}"
+        timer.mark("prepare_ep")
+        if timer.on:
+            log_info_on_rank0(
+                logger, f"INF834 W6 profile {self.prefix}: {timer.summary()}"
+            )
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:
