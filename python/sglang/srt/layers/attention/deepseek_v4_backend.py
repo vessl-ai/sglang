@@ -415,8 +415,6 @@ def _copy_or_replace(dst, src):
     return src
 
 
-@dataclass
-
 def _set_in_graph(obj, name: str, value: torch.Tensor) -> None:
     """Refresh a metadata tensor from inside the captured forward (INF-834).
 
@@ -439,6 +437,8 @@ def _set_in_graph(obj, name: str, value: torch.Tensor) -> None:
     else:
         setattr(obj, name, value)
 
+
+@dataclass
 class DSV4AttnMetadata:
     page_size: int
     page_table: torch.Tensor
