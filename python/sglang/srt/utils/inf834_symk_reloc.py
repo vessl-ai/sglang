@@ -64,6 +64,9 @@ _SECTION_ARG_BUFFER_DATA = 5
 _NODE_ENTRY_SIZE = 168
 _NODE_KERNEL = 0
 
+# Kernels that take ncclSymkDevComm by value.
+_SYMK = "ncclSymk"
+
 _shadow_dirs: list[str] = []
 
 
@@ -288,15 +291,25 @@ def moved_words(
     candidates: dict[int, set[int]] = {}
     positional_candidates: dict[tuple[int, int], set[int]] = {}
     problems: list[str] = []
+    # The shared part is that of the symmetric kernels (they all start with the
+    # same ncclSymkDevComm); other NCCL kernels in the probe have no such part.
     shared: dict[str, int] = {}
-    for group in sorted(
-        {label.split("/")[0] for label in set(save_probe) & set(load_probe)}
-    ):
-        labels = [l for l in save_probe if l.split("/")[0] == group and l in load_probe]
-        shared[group] = min(
-            _common_prefix_len([bytes.fromhex(save_probe[l]["args"]) for l in labels]),
-            _common_prefix_len([bytes.fromhex(load_probe[l]["args"]) for l in labels]),
-        )
+    common = set(save_probe) & set(load_probe)
+    for group in sorted({label.split("/")[0] for label in common}):
+        labels = [
+            label
+            for label in sorted(common)
+            if label.split("/")[0] == group and _SYMK in save_probe[label]["kernel"]
+        ]
+        if labels:
+            shared[group] = min(
+                _common_prefix_len(
+                    [bytes.fromhex(save_probe[x]["args"]) for x in labels]
+                ),
+                _common_prefix_len(
+                    [bytes.fromhex(load_probe[x]["args"]) for x in labels]
+                ),
+            )
     for label in sorted(set(save_probe) | set(load_probe)):
         a, b = save_probe.get(label), load_probe.get(label)
         if a is None or b is None:
@@ -313,7 +326,7 @@ def moved_words(
                 f"{label}: argument size {len(ab)} on SAVE, {len(bb)} on LOAD"
             )
             continue
-        prefix = shared.get(label.split("/")[0], 0)
+        prefix = shared.get(label.split("/")[0], 0) if _SYMK in a["kernel"] else 0
         usable = len(ab) // 8 * 8
         for off in range(0, usable, 8):
             (wa,) = struct.unpack_from("<Q", ab, off)
@@ -390,6 +403,7 @@ def relocate_cugraph(
         name = data[str_off + fn_off : str_off + fn_off + fn_len]
         if kernel_filter.encode() not in name:
             continue
+        is_symk = _SYMK.encode() in name
         touched = False
         start = arg_off + a_off
         for off in range(start, start + a_size // 8 * 8, 8):
@@ -397,7 +411,7 @@ def relocate_cugraph(
                 continue
             (w,) = struct.unpack_from("<Q", data, off)
             new = moved.get(w)
-            if new is None:
+            if new is None and is_symk:
                 new = positional.get((off - start, w))
             if new is None:
                 continue
@@ -605,7 +619,9 @@ def probe_and_relocate(*, device: str, forward_stream: torch.cuda.Stream) -> Non
         _write_audit(mode, rank, cfg, probe, extra)
         return
     t1 = time.perf_counter()
-    kernel_filter = os.environ.get("SGLANG_OPT_INF834_SYMK_RELOC_KERNELS", "ncclSymk")
+    # Address words are rewritten in every NCCL kernel's argument buffer; state
+    # words (by position) only in the symmetric kernels'.
+    kernel_filter = os.environ.get("SGLANG_OPT_INF834_SYMK_RELOC_KERNELS", "nccl")
     shadow, stats = build_shadow_workspace(
         workspace_dir, moved, kernel_filter, positional
     )
