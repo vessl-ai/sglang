@@ -1486,6 +1486,8 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Pass the DP-wide token count to the Mega MoE tile heuristic (upstream #46093).
+    SGLANG_HQ_MEGA_MOE_GLOBAL_TOKENS_HINT = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1847,6 +1849,13 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Round the DeepSeek-V4.1 DeepGEMM prefill indexer's logits tiles, past one SM
+    # wave of row blocks, down to whole waves (upstream sgl-project/sglang#47684).
+    SGLANG_DSV41_INDEXER_WAVE_TILES = EnvBool(False)
+    # With SGLANG_DSV41_INDEXER_WAVE_TILES on: on this many first prefill indexer
+    # calls, also score with the unrounded tiles and log whether the logits are the
+    # same. Each checked call allocates the unrounded tiles as well.
+    SGLANG_DSV41_INDEXER_WAVE_TILES_SELFCHECK = EnvInt(0)
     # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
     # TP ranks instead of scoring every row on every rank.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
@@ -1854,6 +1863,12 @@ class Envs:
     # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
     # and head-sum ops.
     SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # hq INF-845: on SM100, index-Q RoPE + fp4 pack calls of >= 8192 (token, head)
+    # rows run one thread per fp4 block (upstream #48733) instead of one warp per row.
+    SGLANG_HQ_INDEX_Q_BLOCK_KERNEL = EnvBool(False)
+    # With the block kernel on, compare this many of its first calls (>= 8192 rows,
+    # outside graph capture) byte for byte with the warp kernel and log the result.
+    SGLANG_HQ_INDEX_Q_BLOCK_KERNEL_CHECK = EnvInt(0)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)

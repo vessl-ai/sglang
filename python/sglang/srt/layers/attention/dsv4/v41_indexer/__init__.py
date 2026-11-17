@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.index_logits import log_wave_tiles
 from sglang.srt.utils import is_cuda
 
 from .full_topk import FullTopKIndexer
@@ -67,10 +68,14 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
+    use_deep_gemm_prefill = _use_deep_gemm_prefill()
+    if use_deep_gemm_prefill:
+        # Only the DeepGEMM prefill indexer scores in tiles.
+        log_wave_tiles()
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
-        use_deep_gemm_prefill=_use_deep_gemm_prefill(),
+        use_deep_gemm_prefill=use_deep_gemm_prefill,
         use_deep_gemm_decode=is_sm100_or_newer(),
     )
 

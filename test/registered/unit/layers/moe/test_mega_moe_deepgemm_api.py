@@ -904,5 +904,86 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             )
 
 
+class TestMegaMoeGlobalTokensHint(CustomTestCase):
+    def _run(self, hint_on: bool, dp_counts):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        deep_gemm.get_block_m_for_mega_moe = MagicMock(return_value=64)
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+            shared_l1_acts_sf=object(),
+            group=SimpleNamespace(size=lambda: 4),
+            num_experts=8,
+            num_max_tokens_per_rank=16,
+            num_topk=2,
+            mma_type="fp8xfp4",
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            _mega_moe_weights_built=True,
+            _mega_moe_nvfp4=False,
+        )
+        with (
+            envs.SGLANG_HQ_MEGA_MOE_GLOBAL_TOKENS_HINT.override(hint_on),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="fp8xfp4"),
+            patch.object(mega_moe, "mega_moe_pre_dispatch"),
+            patch.object(mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer),
+            patch.object(
+                mega_moe,
+                "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                mega_moe, "get_dp_global_num_tokens", return_value=dp_counts
+            ),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(mega_moe, "is_dsa_enable_prefill_cp", return_value=False),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
+            ),
+        ):
+            mega_moe.run_mega_routed_experts(
+                experts,
+                torch.zeros((3, 4), dtype=torch.bfloat16),
+                torch.zeros((3, 2), dtype=torch.int64),
+                torch.full((3, 2), 0.5, dtype=torch.bfloat16),
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=3,
+                num_shared_experts=1,
+                shared_l1_weights=object(),
+                shared_l2_weights=object(),
+            )
+        return (
+            deep_gemm.fp8_fp4_mega_moe.call_args.kwargs,
+            deep_gemm.get_block_m_for_mega_moe.call_args.kwargs,
+        )
+
+    def test_switch_on_passes_dp_wide_count_to_kernel_and_block_m(self):
+        kernel, block_m = self._run(True, [3, 10, 0, 7])
+        self.assertEqual(kernel["global_num_tokens"], 20)
+        self.assertEqual(block_m["global_num_tokens"], 20)
+
+    def test_switch_on_caps_count_at_buffer_capacity(self):
+        kernel, block_m = self._run(True, [3, 16, 16, 40])
+        self.assertEqual(kernel["global_num_tokens"], 4 * 16)
+        self.assertEqual(block_m["global_num_tokens"], 4 * 16)
+
+    def test_switch_off_keeps_per_rank_heuristic(self):
+        kernel, block_m = self._run(False, [3, 10, 0, 7])
+        self.assertNotIn("global_num_tokens", kernel)
+        self.assertIsNone(block_m["global_num_tokens"])
+
+
 if __name__ == "__main__":
     unittest.main()
