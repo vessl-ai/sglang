@@ -1854,6 +1854,12 @@ class Envs:
     # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
     # and head-sum ops.
     SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # hq INF-845: on SM100, index-Q RoPE + fp4 pack calls of >= 8192 (token, head)
+    # rows run one thread per fp4 block (upstream #48733) instead of one warp per row.
+    SGLANG_HQ_INDEX_Q_BLOCK_KERNEL = EnvBool(False)
+    # With the block kernel on, compare this many of its first calls (>= 8192 rows,
+    # outside graph capture) byte for byte with the warp kernel and log the result.
+    SGLANG_HQ_INDEX_Q_BLOCK_KERNEL_CHECK = EnvInt(0)
     # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
     # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
     SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
