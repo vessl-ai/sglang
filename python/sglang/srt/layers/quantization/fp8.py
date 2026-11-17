@@ -78,6 +78,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     unshuffle_aiter_fp8_weight,
     use_aiter_bpreshuffle_gemm,
 )
+from sglang.srt.layers.quantization.halops_block_fp8 import (
+    halops_linear,
+    halops_weight_scale,
+)
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
@@ -505,6 +509,9 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
+    # Set by __init__; the default keeps instances built without it off HALOps.
+    halops_block_fp8 = False
+
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
@@ -560,6 +567,17 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_block_fp8_mxfp8_linear(
                 self.mxfp8_dense_backend
             )
+        # Bf16-input MXFP8 calls of a FlashInfer layer go to HALOps instead.
+        self.halops_block_fp8 = bool(
+            self.block_fp8_as_mxfp8
+            and envs.SGLANG_HQ_HALOPS_BLOCK_FP8.get()
+            and _is_cuda
+            and get_platform().is_sm100
+            and (
+                self.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or self.mxfp8_dense_backend.is_flashinfer_cutedsl()
+            )
+        )
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -990,6 +1008,14 @@ class Fp8LinearMethod(LinearMethodBase):
         # weight_scale_inv stays in place for the Triton fallback and raw readers;
         # the swizzled copy is stored separately.
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
+        if self.halops_block_fp8:
+            halops_scale = halops_weight_scale(
+                layer.weight, scale_u8, layer.weight_scale_inv_swizzled
+            )
+            if halops_scale is None:
+                layer.weight_scale_inv_halops = None
+            else:
+                copy_or_rebind_param(layer, "weight_scale_inv_halops", halops_scale)
         layer.block_fp8_mxfp8_ready = True
 
     def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
@@ -1378,6 +1404,25 @@ class Fp8LinearMethod(LinearMethodBase):
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv
+            if (
+                self.halops_block_fp8
+                and not isinstance(x, tuple)
+                and getattr(layer, "weight_scale_inv_halops", None) is not None
+            ):
+                return halops_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv_halops,
+                    bias=bias,
+                    fallback=lambda: self.w8a8_mxfp8_linear(
+                        input=x,
+                        weight=layer.weight,
+                        weight_scale=weight_scale,
+                        input_scale=None,
+                        bias=bias,
+                        **extra_kwargs,
+                    ),
+                )
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
                     input=x[0],

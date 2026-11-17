@@ -658,6 +658,26 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
+# HALOps (https://github.com/PaddlePaddle/HALOps): the MXFP8 dense GEMM that
+# SGLANG_HQ_HALOPS_BLOCK_FP8=1 serves block-FP8 linears with. Only prebuilt
+# wheels are published, at the index upstream's Dockerfile reads
+# (https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/). Installed in
+# this stage so a build on an earlier framework base still gets it; a wheel
+# whose digest differs fails the build.
+ARG HALOPS_WHEEL_URL_PREFIX=https://paddle-whl.cdn.bcebos.com/stable/cu132/halops/halops-0.1.0-cp312-cp312-linux_
+RUN --mount=type=cache,target=/root/.cache/uv \
+    arch="$(uname -m)" \
+    && case "$arch" in \
+         x86_64) sha=15d8fabbf1ac467b861c6264c58c1da7764e8f00f3a3968396920b7295e93596 ;; \
+         aarch64) sha=50a59879867cbef944146c664c5ea161165e159d54676bb518b68dc38fcb4348 ;; \
+         *) echo "no halops wheel for $arch" && exit 1 ;; \
+       esac \
+    && whl="/tmp/halops-0.1.0-cp312-cp312-linux_${arch}.whl" \
+    && curl -fsSL --retry 3 -o "$whl" "${HALOPS_WHEEL_URL_PREFIX}${arch}.whl" \
+    && echo "$sha  $whl" | sha256sum -c - \
+    && uv pip install --no-deps "$whl" \
+    && rm -f "$whl"
+
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
