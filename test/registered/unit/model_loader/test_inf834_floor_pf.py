@@ -592,7 +592,7 @@ def write_safetensors(path, tensors):
             f.write(b)
 
 
-def file_views(tmp, named, shards=2, direct=True):
+def file_views(tmp, named, shards=2, direct=True, w2=True, rows=None):
     """The checkpoint as SELECTIVE_READ hands it out: views over file mappings."""
     from sglang.srt.model_loader import inf834_selective_read as sr
 
@@ -606,9 +606,12 @@ def file_views(tmp, named, shards=2, direct=True):
     env = {
         "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
         "SGLANG_OPT_INF834_DIRECT_READ": "1" if direct else "0",
+        "SGLANG_OPT_INF834_DIRECT_READ_W2": "1" if w2 else "0",
     }
     stats = sr.new_stats()
-    flt = sr.Inf834ReadFilter(label="test", keep=lambda n: True)
+    flt = sr.Inf834ReadFilter(
+        label="test", keep=lambda n: True, rows=rows or (lambda name, shape: None)
+    )
     with mock.patch.dict(os.environ, env):
         out = {}
         for path in paths:
@@ -629,13 +632,14 @@ class TestDirectRead(CustomTestCase):
                 )
         return named
 
-    def _load(self, views, named, num_experts, tp_size, tp_rank, block, direct):
+    def _load(self, views, named, num_experts, tp_size, tp_rank, block, direct, w2=True):
         experts = make_experts(num_experts, tp_size, tp_rank)
         pending = []
         env = {
             "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
             "SGLANG_OPT_INF834_EXPERT_BULK_BLOCK": str(block),
             "SGLANG_OPT_INF834_DIRECT_READ": "1" if direct else "0",
+            "SGLANG_OPT_INF834_DIRECT_READ_W2": "1" if w2 else "0",
         }
         with mock.patch.dict(os.environ, env):
             loader = Inf834ExpertBulkLoader(
@@ -685,6 +689,40 @@ class TestDirectRead(CustomTestCase):
                             state(want).items(), state(got).values()
                         ):
                             self.assertTrue(torch.equal(a, b), k)
+
+    def test_hybrid_preads_contiguous_pieces_only(self):
+        """DIRECT_READ_W2=0: w1/w3 rows (and scales) of this rank are pread and not
+        populated; w2 (a column slice, strided) stays populated and is gathered."""
+        import re
+
+        n, tp_size, tp_rank = 11, 4, 3
+        named = self._ckpt(n)
+
+        def rows(name, shape):  # what DeepseekV4's read filter gives a TP rank
+            if re.search(r"\.experts\.\d+\.(w1|w3)\.", name):
+                k = shape[0] // tp_size
+                return tp_rank * k, k
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            views, stats = file_views(
+                tmp, {k: t for k, t in named.values()}, w2=False, rows=rows
+            )
+            self.assertGreater(stats.bytes_direct, 0)  # w1/w3 left to pread
+            self.assertGreater(stats.bytes_prefetched, 0)  # w2 still populated
+            for tps, tpr in ((tp_size, tp_rank), (2, 0), (1, 0)):
+                with self.subTest(tp_size=tps, tp_rank=tpr):
+                    want = self._reference(named, n, tps, tpr)
+                    got, loader = self._load(
+                        views, named, n, tps, tpr, 4, direct=True, w2=False
+                    )
+                    self.assertEqual(loader.tensors_fallback, 0)
+                    if tps > 1:  # w13 + w13 scale blocks direct, w2 ones gathered
+                        self.assertEqual(loader.blocks_direct * 2, loader.blocks_done)
+                    else:  # TP1: every piece is contiguous
+                        self.assertEqual(loader.blocks_direct, loader.blocks_done)
+                    for (k, a), b in zip(state(want).items(), state(got).values()):
+                        self.assertTrue(torch.equal(a, b), k)
 
     def test_untagged_tensors_take_the_mapping_path(self):
         n = 5
@@ -740,13 +778,28 @@ class TestDirectRead(CustomTestCase):
                     "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
                     "SGLANG_OPT_INF834_EXPERT_BULK_BLOCK": "4",
                     "SGLANG_OPT_INF834_DIRECT_READ": "1",
+                    "SGLANG_OPT_INF834_DIRECT_READ_W2": "1",
+                }
+            )
+            hybrid, text_h = run(
+                {
+                    "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
+                    "SGLANG_OPT_INF834_EXPERT_BULK_BLOCK": "4",
+                    "SGLANG_OPT_INF834_DIRECT_READ": "1",
                 }
             )
         for k in want:
             self.assertTrue(
                 torch.equal(want[k].view(torch.uint8), got[k].view(torch.uint8)), k
             )
+            self.assertTrue(
+                torch.equal(want[k].view(torch.uint8), hybrid[k].view(torch.uint8)), k
+            )
         import re
+
+        m = re.search(r"INF834 direct read \[target\]: (\d+) of (\d+) blocks", text_h)
+        self.assertIsNotNone(m, text_h)
+        self.assertEqual(int(m.group(1)) * 2, int(m.group(2)))  # w13 blocks only
 
         m = re.search(r"INF834 direct read \[target\]: (\d+) of (\d+) blocks", text)
         self.assertIsNotNone(m, text)

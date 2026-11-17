@@ -2393,6 +2393,11 @@ class Envs:
     # mapping. Only for layers the blockwise loader handles (TP experts); with
     # expert placement (EP) the per-tensor loader would fault the pages in.
     SGLANG_OPT_INF834_DIRECT_READ = EnvBool(False)
+    # DIRECT_READ for w2 too: the w2 column slice of a TP rank is strided in the file,
+    # so pread reads the whole tensor (tp_size times the bytes). Off (the default):
+    # only pieces contiguous in the file (w1/w3 rows of this rank, their scales) are
+    # pread; w2 stays populated and is gathered from the mapping.
+    SGLANG_OPT_INF834_DIRECT_READ_W2 = EnvBool(False)
     # HiCache host pools from the mooncake allocator: allocate (populate) the
     # segments of the sizes recorded by the previous boot in a background thread
     # while the weights load; an allocation of a recorded size then takes the
