@@ -2312,6 +2312,14 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # ===================================================================
+    # INF-834 boot-time levers (all off by default; off = upstream behaviour)
+    # ===================================================================
+    # Keep the symm-mem NCCL allocator .so in a persistent cache directory
+    # (TORCH_EXTENSIONS_DIR, else SGLANG_CACHE_DIR) instead of rebuilding it
+    # under tempfile.gettempdir() in every new container.
+    SGLANG_OPT_INF834_SYMM_ALLOC_CACHE = EnvBool(False)
+
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 
