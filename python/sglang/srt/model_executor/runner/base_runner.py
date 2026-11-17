@@ -42,6 +42,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.capture_state import (
+    prepare_capture_state,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -256,6 +259,7 @@ class BaseRunner(ABC):
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
         self._pre_initialize_pcie_ipc_workspace()
+        self._prepare_capture_state()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -351,6 +355,18 @@ class BaseRunner(ABC):
         pcie_ipc_comm.prepare(
             hidden=mr.model_config.hidden_size,
             max_rows=self._widest_decode_rows(),
+        )
+
+    def _prepare_capture_state(self):
+        """Build the comm state the first forward creates lazily, before CG capture."""
+        mr = self.model_runner
+        prepare_capture_state(
+            model=mr.model,
+            dtype=mr.dtype,
+            is_draft_worker=mr.is_draft_worker,
+            is_ep_scale_joiner=get_exec().moe.is_ep_scale_joiner,
+            device=mr.device,
+            forward_stream=mr.forward_stream,
         )
 
     def _widest_decode_rows(self) -> Optional[int]:

@@ -521,5 +521,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "cuda_graph_persistence",
+    "cuda_graph_persistence_config",
 )
 # fmt: on

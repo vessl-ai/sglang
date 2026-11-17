@@ -145,6 +145,7 @@ from sglang.srt.utils import (
     set_ulimit,
     start_follower_grpc_server,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -918,6 +919,9 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         prelaunched_schedulers = {}
 
+        # Foundry (--cuda-graph-persistence): activated here at the latest; it
+        # wraps every spawn below with its hook preload and environment pins.
+        foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -933,6 +937,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 _inf834_standby._count() > 0
                 and not get_exec().features.enable_memory_saver
                 and not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get()
+                # foundry's hook preload is set at spawn; a standby child started
+                # before it cannot carry it.
+                and not foundry_adapter.enabled
             )
             if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
                 # INF-834 (SGLANG_OPT_INF834_NUMA_PRECOMPUTE): resolve every GPU's
@@ -987,6 +994,7 @@ class Engine(EngineScoreMixin, EngineBase):
                             proc = mp.Process(target=target, args=args)
                             with (
                                 memory_saver_adapter.configure_subprocess(),
+                                foundry_adapter.configure_subprocess(server_args),
                                 numa_utils.configure_subprocess(server_args, gpu_id),
                             ):
                                 proc.start()
@@ -1011,7 +1019,7 @@ class Engine(EngineScoreMixin, EngineBase):
             )
             try:
                 proc = None
-                if _inf834_standby._count() > 0:
+                if _inf834_standby._count() > 0 and not foundry_adapter.enabled:
                     proc = _inf834_standby.take(
                         "dp_controller",
                         None,
@@ -1024,7 +1032,9 @@ class Engine(EngineScoreMixin, EngineBase):
                     proc = mp.Process(
                         target=run_data_parallel_controller_process, kwargs=dp_kwargs
                     )
-                    proc.start()
+                    # The controller passes the hook preload on to its schedulers.
+                    with foundry_adapter.configure_subprocess(server_args):
+                        proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
