@@ -1,4 +1,6 @@
 import fcntl
+import hashlib
+import json
 import logging
 import math
 import os
@@ -146,6 +148,104 @@ def _local_rank_compile_lock(
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+def _inf834_sweep_identity(
+    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int, m_list: List[int]
+) -> dict:
+    """What a finished pre-compile sweep depends on: the group, the M list and the
+    libraries and device that pick and build the kernels."""
+    try:
+        from importlib.metadata import version
+
+        dg_version = version("sgl-deep-gemm")
+    except Exception:
+        dg_version = getattr(deep_gemm, "__version__", "unknown")
+    try:
+        num_sms = int(deep_gemm.get_num_sms())
+    except Exception:
+        num_sms = -1
+    m_digest = hashlib.sha1(",".join(map(str, m_list)).encode()).hexdigest()[:16]
+    return {
+        "kernel_type": kernel_type.name,
+        "n": n,
+        "k": k,
+        "num_groups": num_groups,
+        "m_count": len(m_list),
+        "m_digest": m_digest,
+        "deep_gemm": dg_version,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "device": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "capability": list(torch.cuda.get_device_capability()),
+        "num_sms": num_sms,
+        "nvrtc": os.environ.get("DG_JIT_USE_NVRTC", ""),
+    }
+
+
+def _inf834_kernel_entries(cache_dir: str) -> int:
+    """Number of compiled kernels in the DeepGEMM JIT cache (one directory each)."""
+    for sub in ("cache", ""):
+        path = os.path.join(cache_dir, sub)
+        if os.path.isdir(path):
+            try:
+                with os.scandir(path) as it:
+                    n = sum(1 for e in it if e.name.startswith("kernel."))
+            except OSError:
+                n = 0
+            if n or not sub:
+                return n
+    return 0
+
+
+def _inf834_sweep_stamp_path(identity: dict) -> str:
+    key = hashlib.sha1(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+    name = (
+        f"{identity['kernel_type']}_n{identity['n']}_k{identity['k']}"
+        f"_g{identity['num_groups']}_{key}.json"
+    )
+    return os.path.join(os.environ["DG_JIT_CACHE_DIR"], "inf834_sweeps", name)
+
+
+def _inf834_sweep_stamp_valid(identity: dict) -> bool:
+    """A stamp written by a finished sweep with the same identity, with at least as
+    many compiled kernels on disk now as when it was written."""
+    path = _inf834_sweep_stamp_path(identity)
+    try:
+        with open(path) as f:
+            stamp = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if stamp.get("identity") != identity:
+        return False
+    have = _inf834_kernel_entries(os.environ["DG_JIT_CACHE_DIR"])
+    if have < int(stamp.get("kernel_entries", 0)):
+        logger.warning(
+            "INF834 deepgemm sweep: stamp %s expects %s compiled kernels but the "
+            "cache holds %d; running the sweep",
+            path,
+            stamp.get("kernel_entries"),
+            have,
+        )
+        return False
+    return True
+
+
+def _inf834_write_sweep_stamp(identity: dict, secs: float) -> None:
+    path = _inf834_sweep_stamp_path(identity)
+    stamp = {
+        "identity": identity,
+        "kernel_entries": _inf834_kernel_entries(os.environ["DG_JIT_CACHE_DIR"]),
+        "sweep_seconds": round(secs, 3),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(stamp, f, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("INF834 deepgemm sweep: cannot write stamp %s: %s", path, e)
+
+
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -183,12 +283,52 @@ def _maybe_compile_deep_gemm_one_type_all(
         )
 
         with _local_rank_compile_lock(kernel_type, n, k, num_groups):
-            _compile_deep_gemm_one_type_all(
+            if not envs.SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP.get():
+                _compile_deep_gemm_one_type_all(
+                    kernel_type=kernel_type,
+                    n=n,
+                    k=k,
+                    num_groups=num_groups,
+                    m_list=_BUILTIN_M_LIST,
+                )
+                return
+            identity = _inf834_sweep_identity(
+                kernel_type, n, k, num_groups, _BUILTIN_M_LIST
+            )
+            if _inf834_sweep_stamp_valid(identity):
+                # The kernels this sweep would load are on disk; each is loaded
+                # at its first use, as on the ranks that never sweep.
+                logger.info(
+                    "INF834 deepgemm sweep: skipped <%s> N=%d, K=%d, num_groups=%d "
+                    "(%d Ms; stamp %s)",
+                    kernel_type.name,
+                    n,
+                    k,
+                    num_groups,
+                    len(_BUILTIN_M_LIST),
+                    os.path.basename(_inf834_sweep_stamp_path(identity)),
+                )
+                return
+            tic = time.perf_counter()
+            swept_all = _compile_deep_gemm_one_type_all(
                 kernel_type=kernel_type,
                 n=n,
                 k=k,
                 num_groups=num_groups,
                 m_list=_BUILTIN_M_LIST,
+            )
+            secs = time.perf_counter() - tic
+            if swept_all:
+                _inf834_write_sweep_stamp(identity, secs)
+            logger.info(
+                "INF834 deepgemm sweep: ran <%s> N=%d, K=%d, num_groups=%d in %.2fs; "
+                "stamp %s",
+                kernel_type.name,
+                n,
+                k,
+                num_groups,
+                secs,
+                "written" if swept_all else "not written (M list was cut for memory)",
             )
 
 
@@ -199,7 +339,9 @@ def _compile_deep_gemm_one_type_all(
     k: int,
     num_groups: int,
     m_list: List[int],
-) -> None:
+) -> bool:
+    """Returns False when the M list was cut to fit the memory budget."""
+    swept_all = True
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
@@ -238,6 +380,7 @@ def _compile_deep_gemm_one_type_all(
                 f"Available memory {memory_budget}GB is less than required memory {required_memory}GB for warmup, reducing max_m to {max_m} to avoid out of memory"
             )
             m_list = [m for m in m_list if m <= max_m]
+            swept_all = False
 
         # Need some methods to estimate needed memory for warmup
         executor = _BaseWarmupExecutor.create(
@@ -264,6 +407,7 @@ def _compile_deep_gemm_one_type_all(
     finally:
         # Restore symmetric memory context
         restore_symmetric_memory_context(saved_context)
+    return swept_all
 
 
 class _BaseWarmupExecutor:

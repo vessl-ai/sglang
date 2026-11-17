@@ -14,6 +14,7 @@ import logging
 import mmap
 import os
 import re
+import threading
 import time
 from typing import Optional
 
@@ -895,6 +896,54 @@ class _HostTable:
             logger.info(msg)
 
 
+_inf834_copy_pool = None
+_inf834_copy_pool_lock = threading.Lock()
+
+
+def inf834_copy_rows_parallel(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY: dst.copy_(src) for two host tensors
+    of the same shape, as contiguous row ranges copied by
+    SGLANG_OPT_INF834_ENGRAM_COPY_THREADS threads (Tensor.copy_ releases the GIL).
+    The ranges are disjoint, so the result is the bytes of one copy_."""
+    global _inf834_copy_pool
+    if dst.shape != src.shape or dst.dim() == 0:
+        dst.copy_(src)
+        return
+    threads = max(1, envs.SGLANG_OPT_INF834_ENGRAM_COPY_THREADS.get())
+    rows = dst.shape[0]
+    nbytes = dst.numel() * dst.element_size()
+    # Below 64 MiB per thread the split costs more than it saves.
+    threads = min(threads, rows, max(1, nbytes // (64 << 20)))
+    if threads <= 1:
+        dst.copy_(src)
+        return
+    with _inf834_copy_pool_lock:
+        if _inf834_copy_pool is None:
+            import concurrent.futures
+
+            _inf834_copy_pool = concurrent.futures.ThreadPoolExecutor(
+                max(1, envs.SGLANG_OPT_INF834_ENGRAM_COPY_THREADS.get()),
+                thread_name_prefix="inf834-engram-copy",
+            )
+        pool = _inf834_copy_pool
+    tic = time.perf_counter()
+    bounds = [rows * i // threads for i in range(threads + 1)]
+    futures = [
+        pool.submit(dst[a:b].copy_, src[a:b])
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if b > a
+    ]
+    for future in futures:
+        future.result()
+    logger.info(
+        "INF834 engram parallel copy: %.1f GiB (%d rows) on %d threads in %.1fs",
+        nbytes / 2**30,
+        rows,
+        len(futures),
+        time.perf_counter() - tic,
+    )
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -961,6 +1010,11 @@ class EngramEmbedding(nn.Module):
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
+        elif (
+            envs.SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY.get()
+            and param.data.device.type == "cpu"
+        ):
+            inf834_copy_rows_parallel(param.data, loaded_weight[rows])
         else:
             param.data.copy_(loaded_weight[rows])
         if self.host_table is not None:

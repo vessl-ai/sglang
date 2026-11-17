@@ -5722,9 +5722,43 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+        inf834_profile = None
+        if envs.SGLANG_OPT_INF834_LOAD_PROFILE.get():
+            from sglang.srt.model_loader.inf834_load_profile import Inf834LoadProfile
+
+            inf834_profile = Inf834LoadProfile("draft" if is_nextn else "target")
+            weights = inf834_profile.wrap_iterator(weights)
+        inf834_bulk = None
+        inf834_expert_route = None
+        if envs.SGLANG_OPT_INF834_EXPERT_BULK_LOAD.get() and not _is_npu:
+            from sglang.srt.model_loader.inf834_expert_bulk import (
+                Inf834ExpertBulkLoader,
+                make_expert_route,
+            )
+
+            inf834_expert_route = make_expert_route(expert_params_mapping)
+        if not is_nextn and envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+            from sglang.srt.mem_cache.inf834_host_prealloc import (
+                maybe_start_host_pool_prealloc,
+            )
+
+            maybe_start_host_pool_prealloc()
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
+            if inf834_expert_route is not None:
+
+                def inf834_submit(func, *args):
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=True,
+                        func=func,
+                        func_args=args,
+                    )
+
+                inf834_bulk = Inf834ExpertBulkLoader(inf834_submit)
             for name, loaded_weight in weights:
                 if (
                     self.wo_a_fp8
@@ -5844,7 +5878,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         break
                     else:
                         skip_unmaterialized_expert_param = False
-                        for mapping in expert_params_mapping:
+                        for mapping in (
+                            expert_params_mapping
+                            if inf834_expert_route is None
+                            else inf834_expert_route(name)
+                        ):
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
@@ -5856,6 +5894,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             param = params_dict[resolved_name]
                             weight_loader = param.weight_loader
+                            if (
+                                inf834_bulk is not None
+                                and use_async_loading
+                                and inf834_bulk.offer(
+                                    param,
+                                    loaded_weight,
+                                    resolved_name,
+                                    shard_id,
+                                    expert_id,
+                                )
+                            ):
+                                loaded_params.add(resolved_name)
+                                break
                             maybe_executor_submit(
                                 executor=executor,
                                 futures=futures,
@@ -6004,8 +6055,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
+            if inf834_bulk is not None:
+                inf834_bulk.finish()
+            if inf834_profile is not None:
+                inf834_profile.mark("stream")
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+            if inf834_bulk is not None:
+                inf834_bulk.close("draft" if is_nextn else "target")
+            if inf834_profile is not None:
+                inf834_profile.mark("async tail")
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
@@ -6043,12 +6102,20 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if inf834_profile is not None:
+            inf834_profile.mark("post_load_weights")
 
         if not is_nextn:
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            if inf834_profile is not None:
+                inf834_profile.mark("engram finish")
             self._prewarm_mhc_kernels()
+            if inf834_profile is not None:
+                inf834_profile.mark("mhc prewarm")
+        if inf834_profile is not None:
+            inf834_profile.log(len(weight_names))
 
     def inf834_checkpoint_read_filter(self):
         """SGLANG_OPT_INF834_SELECTIVE_READ: the checkpoint tensors load_weights

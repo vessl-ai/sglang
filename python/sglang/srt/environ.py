@@ -2343,6 +2343,32 @@ class Envs:
     # Diagnostic for the A/B proof (not a lever): when set to a directory, write
     # a per-rank digest of every loaded tensor after load_model.
     SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
+    # DeepGEMM pre-compile session: after a full sweep over the M list for one
+    # (kernel type, N, K, groups) finishes, leave a stamp next to the compiled
+    # kernels (DG_JIT_CACHE_DIR/inf834_sweeps). A later boot that finds a
+    # matching stamp skips the sweep, which otherwise executes every GEMM of the
+    # M list on the first rank only to load kernels that are already on disk.
+    SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP = EnvBool(False)
+    # Engram per-rank host table: copy this rank's rows from the checkpoint
+    # mapping with ENGRAM_COPY_THREADS threads instead of one memcpy.
+    SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY = EnvBool(False)
+    SGLANG_OPT_INF834_ENGRAM_COPY_THREADS = EnvInt(8)
+    # Routed MoE experts loaded through the plain FusedMoE.weight_loader: gather
+    # EXPERT_BULK_BLOCK experts' TP slices into one host staging buffer (pinned
+    # unless EXPERT_BULK_PIN=0) and copy each block to the device once, instead
+    # of one pageable host-to-device copy per checkpoint tensor; route expert
+    # names with one regex instead of a scan over every (expert, projection).
+    SGLANG_OPT_INF834_EXPERT_BULK_LOAD = EnvBool(False)
+    SGLANG_OPT_INF834_EXPERT_BULK_BLOCK = EnvInt(64)
+    SGLANG_OPT_INF834_EXPERT_BULK_PIN = EnvBool(True)
+    # HiCache host pools from the mooncake allocator: allocate (populate) the
+    # segments of the sizes recorded by the previous boot in a background thread
+    # while the weights load; an allocation of a recorded size then takes the
+    # ready segment. Sizes are recorded under SGLANG_CACHE_DIR/inf834_host_pools.
+    SGLANG_OPT_INF834_HOST_POOL_PREALLOC = EnvBool(False)
+    # Diagnostic (not a lever): log where DeepseekV4 load_weights spends its wall
+    # time (name routing, loader wait, async tail, post-load steps).
+    SGLANG_OPT_INF834_LOAD_PROFILE = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
