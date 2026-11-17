@@ -2336,6 +2336,10 @@ class Envs:
     # DSpark draft weight load: the same selective path with "mtp.*" as the
     # filter, so the draft opens the 3 shards holding its tensors, not all 48.
     SGLANG_OPT_INF834_DRAFT_SHARDS = EnvBool(False)
+    # Pre-fault host pools (HiCache mmap allocator) and the Engram per-rank
+    # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
+    SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
+    SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

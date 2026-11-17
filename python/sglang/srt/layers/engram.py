@@ -788,7 +788,14 @@ class _HostTable:
                 # Cached checkpoint pages, left by a previous server or by the loader,
                 # make the 512 MiB huge-page faults fall back, so empty them first.
                 _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+                from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                    inf834_populate_write_parallel,
+                )
+
+                inf834_populate_write_parallel(self.mm, nbytes)
+            else:
+                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
             if keep_cache:
                 mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
                 logger.info(
