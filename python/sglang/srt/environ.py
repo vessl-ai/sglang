@@ -1847,6 +1847,13 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Round the DeepSeek-V4.1 DeepGEMM prefill indexer's logits tiles, past one SM
+    # wave of row blocks, down to whole waves (upstream sgl-project/sglang#47684).
+    SGLANG_DSV41_INDEXER_WAVE_TILES = EnvBool(False)
+    # With SGLANG_DSV41_INDEXER_WAVE_TILES on: on this many first prefill indexer
+    # calls, also score with the unrounded tiles and log whether the logits are the
+    # same. Each checked call allocates the unrounded tiles as well.
+    SGLANG_DSV41_INDEXER_WAVE_TILES_SELFCHECK = EnvInt(0)
     # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
     # TP ranks instead of scoring every row on every rank.
     SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
