@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang import _inf834_standby
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -928,6 +929,11 @@ class Engine(EngineScoreMixin, EngineBase):
                 _calculate_rank_ranges(get_parallel().node_rank)
             )
 
+            inf834_standby_ok = (
+                _inf834_standby._count() > 0
+                and not get_exec().features.enable_memory_saver
+                and not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get()
+            )
             if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
                 # INF-834 (SGLANG_OPT_INF834_NUMA_PRECOMPUTE): resolve every GPU's
                 # NUMA binding in parallel; no-op when the switch is off.
@@ -966,12 +972,24 @@ class Engine(EngineScoreMixin, EngineBase):
                                 None,
                                 writer,
                             )
-                        proc = mp.Process(target=target, args=args)
-                        with (
-                            memory_saver_adapter.configure_subprocess(),
-                            numa_utils.configure_subprocess(server_args, gpu_id),
-                        ):
-                            proc.start()
+                        proc = None
+                        if inf834_standby_ok:
+                            # INF-834 (SGLANG_OPT_INF834_STANDBY_CHILDREN): a child
+                            # that imported while this process did; None = spawn.
+                            proc = _inf834_standby.take(
+                                "scheduler",
+                                gpu_id,
+                                numa_utils.resolve_numactl_args(server_args, gpu_id),
+                                target,
+                                args,
+                            )
+                        if proc is None:
+                            proc = mp.Process(target=target, args=args)
+                            with (
+                                memory_saver_adapter.configure_subprocess(),
+                                numa_utils.configure_subprocess(server_args, gpu_id),
+                            ):
+                                proc.start()
 
                     scheduler_procs.append(proc)
                     if prelaunch_dp_schedulers:
@@ -984,23 +1002,35 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
-            proc = mp.Process(
-                target=run_data_parallel_controller_process,
-                kwargs=dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    pipe_writer=writer,
-                    run_scheduler_process_func=run_scheduler_process_func,
-                    prelaunched_schedulers=prelaunched_schedulers or None,
-                ),
+            dp_kwargs = dict(
+                server_args=server_args,
+                port_args=port_args,
+                pipe_writer=writer,
+                run_scheduler_process_func=run_scheduler_process_func,
+                prelaunched_schedulers=prelaunched_schedulers or None,
             )
             try:
-                proc.start()
+                proc = None
+                if _inf834_standby._count() > 0:
+                    proc = _inf834_standby.take(
+                        "dp_controller",
+                        None,
+                        None,
+                        run_data_parallel_controller_process,
+                        (),
+                        dp_kwargs,
+                    )
+                if proc is None:
+                    proc = mp.Process(
+                        target=run_data_parallel_controller_process, kwargs=dp_kwargs
+                    )
+                    proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
             scheduler_procs.insert(0, proc)
 
+        _inf834_standby.release_unused()
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 

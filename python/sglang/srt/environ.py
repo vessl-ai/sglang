@@ -2394,6 +2394,14 @@ class Envs:
     # Diagnostic (not a lever): log where DeepseekV4 load_weights spends its wall
     # time (name routing, loader wait, async tail, post-load steps).
     SGLANG_OPT_INF834_LOAD_PROFILE = EnvBool(False)
+    # With TOKENIZER_MEMO: the scheduler process starts its tokenizer load on a
+    # thread before the distributed init, instead of after it.
+    SGLANG_OPT_INF834_TOKENIZER_PREFETCH = EnvBool(False)
+    # Number of standby scheduler children (GPUs 0..n-1) plus one standby DP
+    # controller, started by `import sglang` in the main process of
+    # `python -m sglang.launch_server` so their imports overlap the main
+    # process's. 0 = off. Read from os.environ in sglang/_inf834_standby.py.
+    SGLANG_OPT_INF834_STANDBY_CHILDREN = EnvInt(0)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

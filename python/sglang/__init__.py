@@ -15,6 +15,13 @@ if _os.environ.get("SGLANG_OPT_INF834_EARLY_CUINIT", "").lower() in ("1", "true"
 
     _inf834_start_cuinit()
 
+if _os.environ.get("SGLANG_OPT_INF834_STANDBY_CHILDREN", "0") not in ("", "0"):
+    # INF-834: standby scheduler / DP controller children that import while this
+    # (main) process imports; see sglang/_inf834_standby.py.
+    from sglang._inf834_standby import maybe_start as _inf834_standby_start
+
+    _inf834_standby_start()
+
 # sglang.srt.environ must run before the rest of this file's imports
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
