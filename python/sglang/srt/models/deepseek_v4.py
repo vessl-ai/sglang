@@ -6050,6 +6050,96 @@ class DeepseekV4ForCausalLM(nn.Module):
                     layer.engram.embed.finish_load(label=f"layer {i}")
             self._prewarm_mhc_kernels()
 
+    def inf834_checkpoint_read_filter(self):
+        """SGLANG_OPT_INF834_SELECTIVE_READ: the checkpoint tensors load_weights
+        consumes on this rank (see model_loader/inf834_selective_read.py). Skips
+        only what load_weights would drop anyway: routed experts with no local
+        slot (decided like FusedMoE.weight_loader), mtp.* (the draft's), and
+        vision tensors when vision is off. Row ranges steer the prefetch only."""
+        if (
+            not envs.SGLANG_OPT_INF834_SELECTIVE_READ.get()
+            or type(self) is not DeepseekV4ForCausalLM
+        ):
+            return None
+        import re
+
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+        )
+        from sglang.srt.model_loader.inf834_selective_read import (
+            Inf834ReadFilter,
+            expert_consumed,
+            fused_moe_skips_nonlocal,
+        )
+
+        layers = self.model.layers
+        n_routed = self.config.n_routed_experts
+        consumed: dict[int, set[int]] = {}  # layer -> logical experts loaded here
+        experts_by_layer = {}
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            experts = getattr(getattr(layers[layer_id], "mlp", None), "experts", None)
+            if experts is None:
+                continue
+            experts_by_layer[layer_id] = experts
+            if not fused_moe_skips_nonlocal(experts):
+                continue
+            meta = (
+                get_global_expert_location_metadata()
+                if experts.uses_expert_location
+                else None
+            )
+            consumed[layer_id] = {
+                e for e in range(n_routed) if expert_consumed(experts, meta, e)
+            }
+        skip_vision = (
+            getattr(self.config, "model_type", None) == "deepseek_v41"
+            and self.vision is None
+        )
+        expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.")
+        engram_re = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+        def keep(name: str) -> bool:
+            if name.startswith("mtp."):
+                return False
+            if skip_vision and (
+                name.startswith(("vision.", "aligner.", "image_"))
+                or name.endswith(".ffn.gate.bias_vl")
+            ):
+                return False
+            m = expert_re.match(name)
+            if m is not None:
+                local = consumed.get(int(m.group(1)))
+                return local is None or int(m.group(2)) in local
+            return True
+
+        def rows(name: str, shape):
+            m = engram_re.match(name)
+            if m is not None:
+                engram = getattr(layers[int(m.group(1))], "engram", None)
+                if engram is None:
+                    return None
+                return engram.embed.row_start, engram.embed.rows
+            m = expert_re.match(name)
+            if m is not None and m.group(3) in ("w1", "w3"):
+                experts = experts_by_layer.get(int(m.group(1)))
+                tp_size = getattr(experts, "moe_tp_size", 1)
+                if tp_size > 1 and not getattr(experts, "use_triton_kernels", True):
+                    n = shape[0] // tp_size
+                    return experts.moe_tp_rank * n, n
+            return None
+
+        n_local = [len(v) for v in consumed.values()]
+        logger.info(
+            "INF834 selective read [target]: %d MoE layers filtered, logical experts "
+            "loaded per layer min %s max %s of %d; vision skipped=%s",
+            len(consumed),
+            min(n_local) if n_local else "-",
+            max(n_local) if n_local else "-",
+            n_routed,
+            skip_vision,
+        )
+        return Inf834ReadFilter(label="target", keep=keep, rows=rows)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 

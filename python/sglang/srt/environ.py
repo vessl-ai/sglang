@@ -2328,6 +2328,11 @@ class Envs:
     # hash of the tokenizer files, the map builder's source and library versions;
     # a hit skips loading the HF tokenizer and the per-token normalization loop.
     SGLANG_OPT_INF834_TOKEN_MAP_CACHE = EnvBool(False)
+    # Target model weight load: open only shards holding tensors this rank
+    # consumes, route only those tensors, and pre-populate their byte ranges
+    # (Engram: own rows) with MADV_POPULATE_READ on PREFETCH_THREADS threads.
+    SGLANG_OPT_INF834_SELECTIVE_READ = EnvBool(False)
+    SGLANG_OPT_INF834_PREFETCH_THREADS = EnvInt(8)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
