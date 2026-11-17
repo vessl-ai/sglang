@@ -181,6 +181,10 @@ class SchedulerInitResult:
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
+    # INF-834 (SGLANG_OPT_INF834_EARLY_HTTP_WORKERS): when set, the launch did
+    # not wait for the schedulers; calling it does the wait and the steps that
+    # follow it, and returns the SubprocessWatchdog.
+    finish_startup: Optional[Callable[[], Any]] = None
 
     def stop_grpc_server(self) -> None:
         if self.grpc_server is not None:
@@ -1126,6 +1130,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
         placement_group=None,
+        allow_deferred_scheduler_ready: bool = False,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1332,32 +1337,52 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
-        startup_complete = False
-        try:
-            # Wait for the model to finish loading
-            scheduler_init_result.wait_for_ready()
+        def finish_startup() -> SubprocessWatchdog:
+            startup_complete = False
+            try:
+                # Wait for the model to finish loading
+                scheduler_init_result.wait_for_ready()
 
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+                cls._set_startup_time(
+                    tokenizer_manager, scheduler_init_result, startup_tic
+                )
 
-            # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+                # Get back some info from scheduler to tokenizer_manager
+                tokenizer_manager.max_req_input_len = (
+                    scheduler_init_result.scheduler_infos[0]["max_req_input_len"]
+                )
 
-            # Set up subprocess liveness watchdog to detect crashes
-            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            processes.extend(detoken_procs)
-            names.extend(detoken_names)
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
-            startup_complete = True
-        finally:
-            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
-                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+                # Set up subprocess liveness watchdog to detect crashes
+                # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+                processes = list(scheduler_procs or [])
+                names = [f"scheduler_{i}" for i in range(len(processes))]
+                processes.extend(detoken_procs)
+                names.extend(detoken_names)
+                subprocess_watchdog = SubprocessWatchdog(
+                    processes=processes, process_names=names
+                )
+                subprocess_watchdog.start()
+                startup_complete = True
+                return subprocess_watchdog
+            finally:
+                if not startup_complete and isinstance(
+                    tokenizer_manager, TokenizerManager
+                ):
+                    tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+
+        if (
+            allow_deferred_scheduler_ready
+            and envs.SGLANG_OPT_INF834_EARLY_HTTP_WORKERS.get()
+            and isinstance(tokenizer_manager, MultiTokenizerRouter)
+            # Only the uvicorn worker path waits for the late scheduler info.
+            and not get_serving().enable_http2
+        ):
+            # The caller starts the HTTP workers now and runs finish_startup()
+            # on a thread, so the workers' startup overlaps the model load.
+            scheduler_init_result.finish_startup = finish_startup
+            subprocess_watchdog = None
+        else:
+            subprocess_watchdog = finish_startup()
 
         return (
             tokenizer_manager,

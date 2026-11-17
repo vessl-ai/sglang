@@ -37,6 +37,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
@@ -165,6 +166,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
+    write_to_shared_memory,
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
@@ -269,6 +271,12 @@ async def init_multi_tokenizer() -> ServerArgs:
         completion_template=get_serving().completion_template,
     )
 
+    if scheduler_info is None:
+        # INF-834 early HTTP workers: this worker was started before the
+        # schedulers were ready. Everything above needed no scheduler; the
+        # scheduler info arrives in a second segment once the model is loaded.
+        scheduler_info = await _inf834_wait_for_scheduler_info(main_pid)
+
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
@@ -281,6 +289,85 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     return server_args
+
+
+def _inf834_scheduler_info_shm_names(main_pid: int) -> Tuple[str, str]:
+    """(data segment, marker segment). The marker is created after the data is
+    fully written, so a reader that sees the marker never reads a partial pickle."""
+    return (
+        f"multi_tokenizer_sched_info_{main_pid}",
+        f"multi_tokenizer_sched_info_ready_{main_pid}",
+    )
+
+
+async def _inf834_wait_for_scheduler_info(main_pid: int) -> Dict:
+    data_name, marker_name = _inf834_scheduler_info_shm_names(main_pid)
+    tic = time.perf_counter()
+    while True:
+        try:
+            read_from_shared_memory(marker_name)
+            break
+        except FileNotFoundError:
+            pass
+        if os.getppid() != main_pid:
+            raise RuntimeError(
+                "INF834 early HTTP workers: the main process exited before the "
+                "schedulers were ready"
+            )
+        await asyncio.sleep(0.05)
+    scheduler_info = read_from_shared_memory(data_name)
+    logger.info(
+        f"INF834 early HTTP workers: worker {os.getpid()} was ready "
+        f"{time.perf_counter() - tic:.1f} s before the scheduler info arrived"
+    )
+    return scheduler_info
+
+
+def _inf834_publish_scheduler_info(scheduler_info: Dict) -> List:
+    """Main process: publish the scheduler info for workers that were started early."""
+    data_name, marker_name = _inf834_scheduler_info_shm_names(os.getpid())
+    data_shm = write_to_shared_memory(scheduler_info, data_name)
+    data_shm.close()
+    marker_shm = write_to_shared_memory(True, marker_name)
+    marker_shm.close()
+    return [data_shm, marker_shm]
+
+
+def _inf834_finish_deferred_startup(
+    deferred_startup: Callable,
+    tokenizer_manager,
+    scheduler_infos: List[Dict],
+    shm_handles: List,
+    workers_started_at: float,
+):
+    """Thread in the main process (early HTTP workers): wait for the schedulers,
+    then hand the scheduler info to the HTTP workers that are already running.
+    A launch failure ends the whole process tree, as it does without the switch
+    (there the exception leaves launch_server)."""
+    try:
+        subprocess_watchdog = deferred_startup()
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+        if _global_state is not None:
+            _global_state.scheduler_info = scheduler_infos[0]
+        shm_handles.extend(
+            _inf834_publish_scheduler_info(
+                {
+                    **scheduler_infos[0],
+                    "startup_time": tokenizer_manager.startup_time,
+                }
+            )
+        )
+        logger.info(
+            "INF834 early HTTP workers: scheduler info published "
+            f"{time.perf_counter() - workers_started_at:.1f} s after the HTTP "
+            "workers were started"
+        )
+    except BaseException:
+        logger.error(
+            "INF834 early HTTP workers: engine startup failed: "
+            f"{get_exception_traceback()}"
+        )
+        kill_process_tree(os.getpid())
 
 
 @asynccontextmanager
@@ -2310,8 +2397,17 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Wait until the server is launched
     success = False
-    for _ in range(120):
-        time.sleep(1)
+    fast_poll = envs.SGLANG_OPT_INF834_FAST_WARMUP_POLL.get()
+    if fast_poll:
+        logger.info("INF834 fast warmup poll: /model_info every 50 ms")
+    poll_deadline = time.perf_counter() + 120
+    for attempt in range(120 if not fast_poll else 10**9):
+        if not fast_poll:
+            time.sleep(1)
+        elif attempt > 0:
+            if time.perf_counter() > poll_deadline:
+                break
+            time.sleep(0.05)
         try:
             res = requests.get(
                 url + "/model_info", timeout=5, headers=headers, verify=ssl_verify
@@ -2646,17 +2742,21 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    deferred_startup: Optional[Callable[[], Any]] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
     Called by launch_server after subprocesses have been launched.
+    ``deferred_startup`` (INF-834 early HTTP workers) is set when the schedulers
+    are still initializing: ``scheduler_infos`` is then filled, and the info
+    published to the workers, by a thread that runs ``deferred_startup``.
     """
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
-            scheduler_info=scheduler_infos[0],
+            scheduler_info=scheduler_infos[0] if deferred_startup is None else {},
         )
     )
 
@@ -2702,14 +2802,39 @@ def _setup_and_run_http_server(
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
         app.is_single_tokenizer_mode = False
-        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
-            port_args,
-            server_args,
-            {
-                **scheduler_infos[0],
-                "startup_time": tokenizer_manager.startup_time,
-            },
-        )
+        inf834_extra_shm: List = []
+        if deferred_startup is None:
+            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+                port_args,
+                server_args,
+                {
+                    **scheduler_infos[0],
+                    "startup_time": tokenizer_manager.startup_time,
+                },
+            )
+        else:
+            # The workers start now with no scheduler info; the thread below
+            # publishes it as soon as the schedulers are ready.
+            multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, None
+            )
+            logger.info(
+                "INF834 early HTTP workers: starting "
+                f"{get_serving().tokenizer_worker_num} HTTP workers before the "
+                "schedulers are ready"
+            )
+            threading.Thread(
+                target=_inf834_finish_deferred_startup,
+                name="inf834-deferred-startup",
+                args=(
+                    deferred_startup,
+                    tokenizer_manager,
+                    scheduler_infos,
+                    inf834_extra_shm,
+                    time.perf_counter(),
+                ),
+                daemon=True,
+            ).start()
 
     try:
         # Update logging configs
@@ -2871,6 +2996,8 @@ def _setup_and_run_http_server(
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
                 multi_tokenizer_args_shm.unlink()
+            for shm in inf834_extra_shm:
+                shm.unlink()
             if _global_state is not None:
                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
 
@@ -2950,6 +3077,7 @@ def launch_server(
         init_tokenizer_manager_func=init_tokenizer_manager_func,
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
+        allow_deferred_scheduler_ready=True,
     )
 
     if get_parallel().node_rank >= 1:
@@ -2974,4 +3102,5 @@ def launch_server(
             subprocess_watchdog,
             execute_warmup_func=execute_warmup_func,
             launch_callback=launch_callback,
+            deferred_startup=scheduler_init_result.finish_startup,
         )

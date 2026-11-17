@@ -2343,6 +2343,15 @@ class Envs:
     # Diagnostic for the A/B proof (not a lever): when set to a directory, write
     # a per-rank digest of every loaded tensor after load_model.
     SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
+    # Multi-tokenizer mode (--tokenizer-worker-num > 1, uvicorn workers): start
+    # the HTTP worker processes right after the schedulers are launched instead
+    # of after they are ready, so their import and tokenizer load overlap the
+    # weight load. Each worker finishes everything that needs no scheduler info,
+    # then waits for it; /health stays unanswered until then.
+    SGLANG_OPT_INF834_EARLY_HTTP_WORKERS = EnvBool(False)
+    # Server warmup thread: poll /model_info every 50 ms from the start instead
+    # of sleeping 1 s before the first attempt.
+    SGLANG_OPT_INF834_FAST_WARMUP_POLL = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
