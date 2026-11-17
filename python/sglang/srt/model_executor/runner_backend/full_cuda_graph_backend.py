@@ -111,6 +111,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        # Foundry LOAD: the dummy-batch tensors a restored graph reads (a native
+        # capture keeps them reachable through the graph's own capture).
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -253,5 +256,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None
