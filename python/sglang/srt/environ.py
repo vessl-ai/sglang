@@ -2328,6 +2328,11 @@ class Envs:
     # hash of the tokenizer files, the map builder's source and library versions;
     # a hit skips loading the HF tokenizer and the per-token normalization loop.
     SGLANG_OPT_INF834_TOKEN_MAP_CACHE = EnvBool(False)
+    # DSpark committed-SWA translation: pass the element count and the KV pool size
+    # as runtime values instead of constexprs, so one Triton kernel serves every
+    # batch size (otherwise each new batch x width compiles a kernel on the first
+    # request that has it, and every kernel is keyed on the boot-time pool size).
+    SGLANG_OPT_INF834_COMMIT_SWA_RUNTIME_N = EnvBool(False)
     # Target model weight load: open only shards holding tensors this rank
     # consumes, route only those tensors, and pre-populate their byte ranges
     # (Engram: own rows) with MADV_POPULATE_READ on PREFETCH_THREADS threads.
