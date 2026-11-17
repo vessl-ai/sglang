@@ -235,9 +235,15 @@ def load_file_filtered(
             if direct_read:
                 # Where the bytes are in the file (SGLANG_OPT_INF834_DIRECT_READ).
                 t._inf834_file_src = (st_file, data_start + begin)
-                if _DIRECT_READ_NAME.search(name):
+                if _DIRECT_READ_NAME.search(name) and (
+                    envs.SGLANG_OPT_INF834_DIRECT_READ_W2.get()
+                    or (t.dim() > 0 and read_filter.rows(name, tuple(info["shape"])))
+                ):
+                    # This rank's bytes of the tensor are one contiguous file range
+                    # (rows() gives them), or w2 is pread as well: the blockwise
+                    # loader preads them, so no populate here.
                     stats.add(bytes_direct=nbytes)
-                    continue  # the blockwise loader preads them; no populate
+                    continue
             addr = base + data_start + begin
             rows = read_filter.rows(name, tuple(info["shape"])) if t.dim() > 0 else None
             if rows is not None and t.shape[0] > 0:

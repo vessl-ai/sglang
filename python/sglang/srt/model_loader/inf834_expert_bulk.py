@@ -26,6 +26,9 @@ buffer instead of torch.cat from the mapping: a piece that is contiguous in the
 file (w1/w3 rows of this rank) is read straight to its place; a strided piece (the
 w2 column slice) is read as the covering byte range into a per-thread scratch
 buffer and its columns copied out. Same bytes; the page tables are never filled.
+That last case reads tp_size times the w2 bytes, which lost on a warm page cache, so
+by default (SGLANG_OPT_INF834_DIRECT_READ_W2=0) only file-contiguous pieces are pread
+and w2 blocks gather from the mapping, which the selective reader still populates.
 """
 
 from __future__ import annotations
@@ -109,6 +112,9 @@ class Inf834ExpertBulkLoader:
         from sglang.srt.model_loader.inf834_selective_read import direct_read_enabled
 
         self._direct = direct_read_enabled()
+        # Strided pieces (the w2 column slice) are pread only with DIRECT_READ_W2;
+        # otherwise their block gathers from the (populated) mapping as before.
+        self._direct_w2 = envs.SGLANG_OPT_INF834_DIRECT_READ_W2.get()
         self._fds: Dict[str, int] = {}
         self._tls = threading.local()
         self.blocks_direct = 0
@@ -279,7 +285,7 @@ class Inf834ExpertBulkLoader:
             self._abandon(block)
             return False
         block.slots[slot] = src
-        if self._direct:
+        if self._direct and (src.is_contiguous() or self._direct_w2):
             tag = getattr(loaded_weight, "_inf834_file_src", None)
             if tag is not None:
                 delta = src.data_ptr() - loaded_weight.data_ptr()
