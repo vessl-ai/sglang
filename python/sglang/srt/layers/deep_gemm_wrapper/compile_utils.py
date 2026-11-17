@@ -181,19 +181,19 @@ def _inf834_sweep_identity(
     }
 
 
-def _inf834_kernel_entries(cache_dir: str) -> int:
-    """Number of compiled kernels in the DeepGEMM JIT cache (one directory each)."""
+def _inf834_kernel_dirs(cache_dir: str) -> List[str]:
+    """Names of the compiled kernels in the DeepGEMM JIT cache (one directory each)."""
     for sub in ("cache", ""):
         path = os.path.join(cache_dir, sub)
         if os.path.isdir(path):
             try:
                 with os.scandir(path) as it:
-                    n = sum(1 for e in it if e.name.startswith("kernel."))
+                    names = sorted(e.name for e in it if e.name.startswith("kernel."))
             except OSError:
-                n = 0
-            if n or not sub:
-                return n
-    return 0
+                names = []
+            if names or not sub:
+                return names
+    return []
 
 
 def _inf834_sweep_stamp_path(identity: dict) -> str:
@@ -206,8 +206,14 @@ def _inf834_sweep_stamp_path(identity: dict) -> str:
 
 
 def _inf834_sweep_stamp_valid(identity: dict) -> bool:
-    """A stamp written by a finished sweep with the same identity, with at least as
-    many compiled kernels on disk now as when it was written."""
+    """A stamp written by a finished sweep with the same identity, whose recorded
+    kernel directories are all in the cache now.
+
+    The stamp records every kernel directory present when the sweep finished, a
+    superset of the kernels that sweep loaded or compiled (DeepGEMM does not say
+    which ones it used). Requiring all of them is therefore sufficient: a skipped
+    sweep never misses a kernel it would have produced. It is conservative: a
+    kernel of another group missing from the cache also makes this group sweep."""
     path = _inf834_sweep_stamp_path(identity)
     try:
         with open(path) as f:
@@ -216,14 +222,19 @@ def _inf834_sweep_stamp_valid(identity: dict) -> bool:
         return False
     if stamp.get("identity") != identity:
         return False
-    have = _inf834_kernel_entries(os.environ["DG_JIT_CACHE_DIR"])
-    if have < int(stamp.get("kernel_entries", 0)):
+    recorded = stamp.get("kernel_dirs")
+    if not isinstance(recorded, list) or not recorded:
+        # A stamp without the directory list (older format): sweep and rewrite it.
+        return False
+    have = set(_inf834_kernel_dirs(os.environ["DG_JIT_CACHE_DIR"]))
+    missing = [d for d in recorded if d not in have]
+    if missing:
         logger.warning(
-            "INF834 deepgemm sweep: stamp %s expects %s compiled kernels but the "
-            "cache holds %d; running the sweep",
-            path,
-            stamp.get("kernel_entries"),
-            have,
+            "INF834 deepgemm sweep: stamp %s lists %d kernel directories missing from "
+            "the cache (first: %s); running the sweep",
+            os.path.basename(path),
+            len(missing),
+            missing[0],
         )
         return False
     return True
@@ -233,7 +244,7 @@ def _inf834_write_sweep_stamp(identity: dict, secs: float) -> None:
     path = _inf834_sweep_stamp_path(identity)
     stamp = {
         "identity": identity,
-        "kernel_entries": _inf834_kernel_entries(os.environ["DG_JIT_CACHE_DIR"]),
+        "kernel_dirs": _inf834_kernel_dirs(os.environ["DG_JIT_CACHE_DIR"]),
         "sweep_seconds": round(secs, 3),
     }
     try:

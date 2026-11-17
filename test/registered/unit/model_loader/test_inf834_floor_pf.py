@@ -548,6 +548,41 @@ class TestDeepGemmSweepStamp(CustomTestCase):
             self._call()
             self.assertEqual(len(self.sweeps), 3)
 
+    def test_same_count_other_kernels_sweeps(self):
+        """A tier where another role's kernels replace this group's (same count):
+        the stamp names the directories, so the swap is seen and the sweep runs."""
+        with mock.patch.dict(
+            os.environ, {"SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP": "1"}
+        ):
+            self._call()
+            os.rmdir(os.path.join(self.tmp.name, "cache", "kernel.b.2"))
+            os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.c.3"))
+            with self.assertLogs("sglang", level="WARNING") as logs:
+                self._call()
+            self.assertEqual(len(self.sweeps), 2)
+            self.assertIn("kernel.b.2", "\n".join(logs.output))
+            # More kernels than recorded (a union tier) is fine.
+            os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.d.4"))
+            self._call()
+            self.assertEqual(len(self.sweeps), 2)
+
+    def test_count_only_stamp_is_not_trusted(self):
+        import json
+
+        with mock.patch.dict(
+            os.environ, {"SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP": "1"}
+        ):
+            self._call()
+            d = os.path.join(self.tmp.name, "inf834_sweeps")
+            path = os.path.join(d, os.listdir(d)[0])
+            stamp = json.load(open(path))
+            stamp.pop("kernel_dirs")
+            stamp["kernel_entries"] = 2
+            json.dump(stamp, open(path, "w"))
+            self._call()
+            self.assertEqual(len(self.sweeps), 2)
+            self.assertIn("kernel_dirs", json.load(open(path)))
+
     def test_cut_sweep_leaves_no_stamp(self):
         self.swept_all = False
         with mock.patch.dict(
