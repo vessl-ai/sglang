@@ -18,11 +18,20 @@ FusedMoE._load_w13 / _load_w2 use; a tensor or parameter outside the cases
 listed in _plan_for / offer is left to the per-tensor loader, and so is every
 piece of a block that never completes. The bytes that end up in the parameters
 are the same; no device memory is allocated (copy_ into existing parameters).
+
+SGLANG_OPT_INF834_DIRECT_READ (with SELECTIVE_READ): the selective reader leaves the
+routed-expert tensors unpopulated and tags each with its file and offset. A block
+whose pieces all carry that tag is filled by pread from the file into the staging
+buffer instead of torch.cat from the mapping: a piece that is contiguous in the
+file (w1/w3 rows of this rank) is read straight to its place; a strided piece (the
+w2 column slice) is read as the covering byte range into a per-thread scratch
+buffer and its columns copied out. Same bytes; the page tables are never filled.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -56,13 +65,15 @@ class _Plan:
 
 
 class _Block:
-    __slots__ = ("plan", "first", "count", "slots", "filled", "calls", "closed")
+    __slots__ = ("plan", "first", "count", "slots", "srcs", "filled", "calls", "closed")
 
     def __init__(self, plan: _Plan, first: int, count: int):
         self.plan = plan
         self.first = first
         self.count = count
         self.slots: List[Optional[torch.Tensor]] = [None] * (count * plan.pieces)
+        # DIRECT_READ: (path, file offset of the piece's first byte) per slot, or None.
+        self.srcs: List[Optional[Tuple[str, int]]] = [None] * (count * plan.pieces)
         self.filled = 0
         # The original weight_loader arguments, in arrival order, for the fallback.
         self.calls: List[tuple] = []
@@ -91,6 +102,13 @@ class Inf834ExpertBulkLoader:
         self.bytes_bulk = 0
         self.gather_secs = 0.0
         self.copy_secs = 0.0
+        from sglang.srt.model_loader.inf834_selective_read import direct_read_enabled
+
+        self._direct = direct_read_enabled()
+        self._fds: Dict[str, int] = {}
+        self._tls = threading.local()
+        self.blocks_direct = 0
+        self.bytes_direct_read = 0
 
     # ------------------------------------------------------------------ plan
     @staticmethod
@@ -236,6 +254,11 @@ class Inf834ExpertBulkLoader:
             self._abandon(block)
             return False
         block.slots[slot] = src
+        if self._direct:
+            tag = getattr(loaded_weight, "_inf834_file_src", None)
+            if tag is not None:
+                delta = src.data_ptr() - loaded_weight.data_ptr()
+                block.srcs[slot] = (tag[0], tag[1] + delta)
         block.calls.append((param, loaded_weight, weight_name, shard_id, expert_id))
         block.filled += 1
         if block.filled == len(block.slots):
@@ -277,7 +300,10 @@ class Inf834ExpertBulkLoader:
         staging = self._staging(nbytes, pin)
         tic = time.perf_counter()
         pieces = block.slots
-        if dst.element_size() == 1:
+        if self._direct and all(s is not None for s in block.srcs):
+            self._read_block(block, staging)
+            typed = staging.view(dst.dtype).view(dst.shape)
+        elif dst.element_size() == 1:
             # Byte views: torch.cat does not cover every one-byte dtype (float8_*).
             pieces = [p.view(torch.uint8) for p in pieces]
             out = staging.view(-1, *pieces[0].shape[1:])
@@ -291,14 +317,66 @@ class Inf834ExpertBulkLoader:
         dst.copy_(typed)
         end = time.perf_counter()
         n = len(block.slots)
-        block.slots, block.calls = [], []
+        direct = self._direct and all(s is not None for s in block.srcs)
+        block.slots, block.calls, block.srcs = [], [], []
         with self._lock:
+            if direct:
+                self.blocks_direct += 1
+                self.bytes_direct_read += nbytes
             self._free.setdefault((nbytes, pin), []).append(staging)
             self.tensors_bulk += n
             self.blocks_done += 1
             self.bytes_bulk += nbytes
             self.gather_secs += mid - tic
             self.copy_secs += end - mid
+
+    # ----------------------------------------------------------- direct read
+    def _fd(self, path: str) -> int:
+        with self._lock:
+            fd = self._fds.get(path)
+            if fd is None:
+                fd = self._fds[path] = os.open(path, os.O_RDONLY)
+            return fd
+
+    def _scratch(self, nbytes: int) -> torch.Tensor:
+        buf = getattr(self._tls, "buf", None)
+        if buf is None or buf.numel() < nbytes:
+            buf = self._tls.buf = torch.empty(nbytes, dtype=torch.uint8)
+        return buf[:nbytes]
+
+    @staticmethod
+    def _pread(fd: int, dst: torch.Tensor, offset: int) -> None:
+        """Fill the contiguous uint8 host tensor dst from the file at offset."""
+        view = memoryview(dst.numpy())
+        done, total = 0, dst.numel()
+        while done < total:
+            got = os.preadv(fd, [view[done:]], offset + done)
+            if got <= 0:
+                raise OSError(f"INF834 direct read: short read at {offset + done}")
+            done += got
+
+    def _read_block(self, block: _Block, staging: torch.Tensor) -> None:
+        """staging (uint8) <- the pieces' bytes read from their files, in slot order:
+        the layout torch.cat(block.slots) produces."""
+        pos = 0
+        for piece, (path, offset) in zip(block.slots, block.srcs):
+            es = piece.element_size()
+            nbytes = piece.numel() * es
+            out = staging[pos : pos + nbytes]
+            fd = self._fd(path)
+            if piece.is_contiguous():
+                self._pread(fd, out, offset)
+            elif piece.dim() == 2 and piece.stride(1) == 1:
+                rows, row_bytes = piece.shape[0], piece.shape[1] * es
+                pitch = piece.stride(0) * es
+                cover = self._scratch((rows - 1) * pitch + row_bytes)
+                self._pread(fd, cover, offset)
+                out.view(rows, row_bytes).copy_(
+                    cover.as_strided((rows, row_bytes), (pitch, 1))
+                )
+            else:  # not a layout offer() produces; read it from the mapping
+                out.copy_(piece.contiguous().view(-1).view(torch.uint8))
+            pos += nbytes
 
     # ---------------------------------------------------------------- finish
     def finish(self) -> None:
@@ -313,6 +391,9 @@ class Inf834ExpertBulkLoader:
         the pinned host cache they came from) and log what was done."""
         with self._lock:
             self._free.clear()
+            fds, self._fds = list(self._fds.values()), {}
+        for fd in fds:
+            os.close(fd)
         if self._pinned_used:
             empty = getattr(torch._C, "_host_emptyCache", None)
             if empty is not None:
@@ -332,6 +413,15 @@ class Inf834ExpertBulkLoader:
             self.gather_secs,
             self.copy_secs,
         )
+        if self._direct:
+            logger.info(
+                "INF834 direct read [%s]: %d of %d blocks (%.2f GB) read from the "
+                "checkpoint files into staging with pread",
+                label,
+                self.blocks_direct,
+                self.blocks_done,
+                self.bytes_direct_read / 1e9,
+            )
 
 
 def make_expert_route(expert_params_mapping) -> Optional[Callable[[str], tuple]]:

@@ -2386,6 +2386,13 @@ class Envs:
     SGLANG_OPT_INF834_EXPERT_BULK_LOAD = EnvBool(False)
     SGLANG_OPT_INF834_EXPERT_BULK_BLOCK = EnvInt(64)
     SGLANG_OPT_INF834_EXPERT_BULK_PIN = EnvBool(True)
+    # With EXPERT_BULK_LOAD and SELECTIVE_READ: read the routed-expert tensors that
+    # the blockwise loader places with pread straight into its host staging
+    # buffer (rank rows only for w1/w3; whole tensor then the column slice for
+    # w2) instead of mapping them with MADV_POPULATE_READ and gathering from the
+    # mapping. Only for layers the blockwise loader handles (TP experts); with
+    # expert placement (EP) the per-tensor loader would fault the pages in.
+    SGLANG_OPT_INF834_DIRECT_READ = EnvBool(False)
     # HiCache host pools from the mooncake allocator: allocate (populate) the
     # segments of the sizes recorded by the previous boot in a background thread
     # while the weights load; an allocation of a recorded size then takes the

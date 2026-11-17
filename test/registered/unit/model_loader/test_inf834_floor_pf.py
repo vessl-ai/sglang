@@ -557,5 +557,201 @@ class TestDeepGemmSweepStamp(CustomTestCase):
         self.assertEqual(len(self.sweeps), 2)
 
 
+
+# ------------------------------------------------------------------ direct read
+_ST_DTYPE = {
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.float32: "F32",
+    E8M0: "F8_E8M0",
+}
+
+
+def write_safetensors(path, tensors):
+    """A safetensors file written by hand (no dependency on the writer's dtype list)."""
+    import json
+    import struct
+
+    header, blobs, pos = {}, [], 0
+    for name, t in tensors.items():
+        raw = t.contiguous().view(torch.uint8).reshape(-1).numpy().tobytes()
+        header[name] = {
+            "dtype": _ST_DTYPE[t.dtype],
+            "shape": list(t.shape),
+            "data_offsets": [pos, pos + len(raw)],
+        }
+        blobs.append(raw)
+        pos += len(raw)
+    text = json.dumps(header).encode()
+    text += b" " * (-len(text) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(text)))
+        f.write(text)
+        for b in blobs:
+            f.write(b)
+
+
+def file_views(tmp, named, shards=2, direct=True):
+    """The checkpoint as SELECTIVE_READ hands it out: views over file mappings."""
+    from sglang.srt.model_loader import inf834_selective_read as sr
+
+    names = sorted(named)
+    paths = []
+    for i in range(shards):
+        part = {n: named[n] for n in names[i::shards]}
+        path = os.path.join(tmp, f"model-{i:05d}.safetensors")
+        write_safetensors(path, part)
+        paths.append(path)
+    env = {
+        "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
+        "SGLANG_OPT_INF834_DIRECT_READ": "1" if direct else "0",
+    }
+    stats = sr.new_stats()
+    flt = sr.Inf834ReadFilter(label="test", keep=lambda n: True)
+    with mock.patch.dict(os.environ, env):
+        out = {}
+        for path in paths:
+            out.update(sr.load_file_filtered(path, flt, stats))
+    return out, stats
+
+
+class TestDirectRead(CustomTestCase):
+    def _ckpt(self, num_experts, seed=4321):
+        gen = torch.Generator().manual_seed(seed)
+        named = {}
+        for e in range(num_experts):
+            for (shard_id, is_scale), t in checkpoint_expert(gen).items():
+                leaf = "scale" if is_scale else "weight"
+                named[(e, shard_id, is_scale)] = (
+                    f"layers.0.ffn.experts.{e}.{shard_id}.{leaf}",
+                    t,
+                )
+        return named
+
+    def _load(self, views, named, num_experts, tp_size, tp_rank, block, direct):
+        experts = make_experts(num_experts, tp_size, tp_rank)
+        pending = []
+        env = {
+            "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
+            "SGLANG_OPT_INF834_EXPERT_BULK_BLOCK": str(block),
+            "SGLANG_OPT_INF834_DIRECT_READ": "1" if direct else "0",
+        }
+        with mock.patch.dict(os.environ, env):
+            loader = Inf834ExpertBulkLoader(
+                lambda func, *args: pending.append((func, args))
+            )
+            for e in lexicographic(num_experts):
+                for (ee, shard_id, is_scale), (name, _) in named.items():
+                    if ee != e:
+                        continue
+                    param, pname = param_for(experts, shard_id, is_scale)
+                    t = views[name]
+                    if not loader.offer(param, t, pname, shard_id, e):
+                        experts.weight_loader(param, t, pname, shard_id, e)
+            loader.finish()
+            for func, args in pending:
+                func(*args)
+            loader.close("test")
+        return experts, loader
+
+    def _reference(self, named, num_experts, tp_size, tp_rank):
+        experts = make_experts(num_experts, tp_size, tp_rank)
+        for e in lexicographic(num_experts):
+            for (ee, shard_id, is_scale), (_, t) in named.items():
+                if ee == e:
+                    param, pname = param_for(experts, shard_id, is_scale)
+                    experts.weight_loader(param, t, pname, shard_id, e)
+        return experts
+
+    def test_same_bytes_as_weight_loader(self):
+        n = 11
+        named = self._ckpt(n)
+        with tempfile.TemporaryDirectory() as tmp:
+            views, stats = file_views(tmp, {k: t for k, t in named.values()})
+            self.assertGreater(stats.bytes_direct, 0)
+            self.assertEqual(stats.bytes_prefetched, 0)  # experts are all it holds
+            for tp_size, tp_rank in ((1, 0), (2, 1), (4, 0), (4, 3)):
+                for block in (1, 4, 64):
+                    with self.subTest(tp_size=tp_size, tp_rank=tp_rank, block=block):
+                        want = self._reference(named, n, tp_size, tp_rank)
+                        got, loader = self._load(
+                            views, named, n, tp_size, tp_rank, block, direct=True
+                        )
+                        self.assertEqual(loader.tensors_fallback, 0)
+                        self.assertEqual(loader.blocks_direct, loader.blocks_done)
+                        self.assertGreater(loader.bytes_direct_read, 0)
+                        for (k, a), b in zip(
+                            state(want).items(), state(got).values()
+                        ):
+                            self.assertTrue(torch.equal(a, b), k)
+
+    def test_untagged_tensors_take_the_mapping_path(self):
+        n = 5
+        named = self._ckpt(n)
+        with tempfile.TemporaryDirectory() as tmp:
+            views, stats = file_views(
+                tmp, {k: t for k, t in named.values()}, direct=False
+            )
+            self.assertEqual(stats.bytes_direct, 0)
+            self.assertGreater(stats.bytes_prefetched, 0)
+            self.assertFalse(
+                any(hasattr(v, "_inf834_file_src") for v in views.values())
+            )
+            want = self._reference(named, n, 4, 2)
+            got, loader = self._load(views, named, n, 4, 2, 4, direct=True)
+            self.assertEqual(loader.blocks_direct, 0)
+            self.assertGreater(loader.blocks_done, 0)
+            for (k, a), b in zip(state(want).items(), state(got).values()):
+                self.assertTrue(torch.equal(a, b), k)
+
+    def test_switch_needs_bulk_load(self):
+        from sglang.srt.model_loader import inf834_selective_read as sr
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_OPT_INF834_DIRECT_READ": "1",
+                "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "0",
+            },
+        ):
+            self.assertFalse(sr.direct_read_enabled())
+
+    def test_load_weights_from_files(self):
+        """DeepseekV4ForCausalLM.load_weights over file-backed views: switch on and
+        off leave the same parameters, and every expert block is read directly."""
+        case = TestLoadWeightsIntegration()
+        stream = case._stream()
+        with tempfile.TemporaryDirectory() as tmp:
+            views, _ = file_views(tmp, dict(stream))
+            ordered = [(k, views[k]) for k, _ in stream]
+
+            def run(env):
+                model = case._model(4, 1)
+                with mock.patch.dict(os.environ, env):
+                    with self.assertLogs("sglang", level="INFO") as logs:
+                        model.load_weights(iter(ordered))
+                params = {k: v.data.clone() for k, v in model.named_parameters()}
+                return params, "\n".join(logs.output)
+
+            want, _ = run({"SGLANG_OPT_INF834_LOAD_PROFILE": "1"})
+            got, text = run(
+                {
+                    "SGLANG_OPT_INF834_EXPERT_BULK_LOAD": "1",
+                    "SGLANG_OPT_INF834_EXPERT_BULK_BLOCK": "4",
+                    "SGLANG_OPT_INF834_DIRECT_READ": "1",
+                }
+            )
+        for k in want:
+            self.assertTrue(
+                torch.equal(want[k].view(torch.uint8), got[k].view(torch.uint8)), k
+            )
+        import re
+
+        m = re.search(r"INF834 direct read \[target\]: (\d+) of (\d+) blocks", text)
+        self.assertIsNotNone(m, text)
+        self.assertGreater(int(m.group(2)), 0)
+        self.assertEqual(m.group(1), m.group(2))
+
+
 if __name__ == "__main__":
     unittest.main()
