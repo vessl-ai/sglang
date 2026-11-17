@@ -2370,6 +2370,13 @@ class Envs:
     SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE = EnvBool(False)
     # Diagnostic (not a lever): per-layer synchronized timing of the repack steps.
     SGLANG_OPT_INF834_W6_PROFILE = EnvBool(False)
+    # W6, narrower than DEFER_EMPTY_CACHE (which shrank the KV pool and is not to be
+    # shipped): skip only the empty_cache after each 8-expert chunk of the EP repack;
+    # the per-layer calls before and after the repack stay.
+    SGLANG_OPT_INF834_MOE_PACK_SKIP_CHUNK_EMPTY_CACHE = EnvBool(False)
+    # Standby children: read each GPU's NUMA node from sysfs (PCI bus-id order) instead of
+    # NVML, whose init waits behind the concurrent cuInit (2.7 s on the main thread).
+    SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA = EnvBool(False)
     # One tokenizer object per process for identical get_tokenizer() calls (the
     # scheduler and its target TpModelWorker load the same tokenizer).
     SGLANG_OPT_INF834_TOKENIZER_MEMO = EnvBool(False)

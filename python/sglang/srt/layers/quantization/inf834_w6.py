@@ -1,10 +1,14 @@
 """INF-834 helpers for the MoE expert repack at load (decoder segment W6).
 
-SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE (lever): skip the torch.cuda.empty_cache() calls inside the
+SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE (REJECTED on 2026-11-17, do not ship: on the EP8 decoder it
+shrank "avail mem" at load end from 84.10 to 74.55 GB and max_total_num_tokens by 15.5%; freeing per layer
+matters for fragmentation): skip the torch.cuda.empty_cache() calls inside the
 per-layer expert repack (two per layer plus one per 8-expert chunk). The freed raw-weight blocks stay in the
 caching allocator and are reused by the next layer's packed tensors; get_available_gpu_memory() at
 "Load weight end" calls empty_cache() itself, so the memory reported there and the KV pool sizing still see
-every fully free segment returned. Gate: max_total_num_tokens and "avail mem" at load end unchanged.
+every fully free segment returned, but not the segments that reuse left partly occupied.
+SGLANG_OPT_INF834_MOE_PACK_SKIP_CHUNK_EMPTY_CACHE: the narrower variant, see dsv4_mxfp4_decode_moe_ep.pack_experts_ep.
+Gate for both: max_total_num_tokens and "avail mem" at load end equal to native.
 
 SGLANG_OPT_INF834_W6_PROFILE (diagnostic, not a lever): per-layer timing of the repack steps with a device
 synchronize around each, logged on rank 0.

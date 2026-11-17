@@ -34,6 +34,8 @@ PRELOAD = (
     "sglang.srt.managers.data_parallel_controller",
 )
 
+_PROC_NVIDIA_GPUS = "/proc/driver/nvidia/gpus"  # module globals so a test can point them elsewhere
+_SYS_PCI_DEVICES = "/sys/bus/pci/devices"
 _lock = threading.Lock()
 _pool = {}  # key -> (process, parent connection, numactl args or None)
 _ready = threading.Event()
@@ -157,23 +159,17 @@ def _numactl_args_for(gpu_ids):
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
         return out  # logical -> NVML index mapping left to the engine
     try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
+        nodes, how = _gpu_nodes(gpu_ids)
+    except Exception as e:
+        _log(f"numa lookup failed ({e!r}); standby children start without a binding")
         return out
+    _stats["numa_source"] = how
     try:
-        n_nodes = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
-        bits = 64
-        size = max(1, math.ceil(n_nodes / bits))
         allowed = os.sched_getaffinity(0)
         for g in gpu_ids:
-            h = pynvml.nvmlDeviceGetHandleByIndex(g)
-            mask = pynvml.nvmlDeviceGetMemoryAffinity(h, size, pynvml.NVML_AFFINITY_SCOPE_NODE)
-            nodes = [i for i in range(n_nodes) if mask[i // bits] & (1 << (i % bits))]
-            if not nodes:
+            node = nodes.get(g)
+            if node is None:
                 continue
-            node = nodes[0]
             node_cpus = _node_cpus(node)
             if not node_cpus:
                 args = f"--cpunodebind={node} --membind={node}"
@@ -187,14 +183,62 @@ def _numactl_args_for(gpu_ids):
                     args = f"--physcpubind={','.join(str(c) for c in sorted(target))} --membind={node}"
             out[g] = _probed(args)
     except Exception as e:
-        _log(f"numa lookup failed ({e!r}); standby children start without a binding")
+        _log(f"numa binding failed ({e!r}); standby children start without a binding")
         out = {g: None for g in gpu_ids}
+    return out
+
+
+def _gpu_nodes_sysfs(gpu_ids):
+    """SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA: the NUMA node of each GPU from sysfs, without the
+    NVIDIA driver. NVML numbers GPUs in PCI bus-id order, so GPU i is the i-th entry of
+    /proc/driver/nvidia/gpus sorted by bus id; its node is /sys/bus/pci/devices/<bus id>/numa_node.
+    nvmlInit runs behind the CUDA driver initialization (cuInit) in this process, which the
+    early-cuInit thread has just started, so the NVML path costs seconds here. Returns None when
+    sysfs does not give one node per GPU; the engine's NVML result is compared at the handoff."""
+    root = _PROC_NVIDIA_GPUS
+    if not os.path.isdir(root):
+        return None
+    bus_ids = sorted(os.listdir(root), key=lambda b: b.lower())
+    if not bus_ids or max(gpu_ids) >= len(bus_ids):
+        return None
+    nodes = {}
+    for g in gpu_ids:
+        try:
+            node = int(open(f"{_SYS_PCI_DEVICES}/{bus_ids[g].lower()}/numa_node").read().strip())
+        except (OSError, ValueError):
+            return None
+        nodes[g] = node if node >= 0 else None
+    return nodes
+
+
+def _gpu_nodes(gpu_ids):
+    """({gpu_id: NUMA node or None}, source)."""
+    if os.environ.get("SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA", "").lower() in ("1", "true"):
+        nodes = _gpu_nodes_sysfs(gpu_ids)
+        if nodes is not None:
+            return nodes, "sysfs"
+    import glob
+    import math
+
+    import pynvml
+
+    pynvml.nvmlInit()
+    try:
+        n_nodes = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
+        bits = 64
+        size = max(1, math.ceil(n_nodes / bits))
+        nodes = {}
+        for g in gpu_ids:
+            h = pynvml.nvmlDeviceGetHandleByIndex(g)
+            mask = pynvml.nvmlDeviceGetMemoryAffinity(h, size, pynvml.NVML_AFFINITY_SCOPE_NODE)
+            found = [i for i in range(n_nodes) if mask[i // bits] & (1 << (i % bits))]
+            nodes[g] = found[0] if found else None
+        return nodes, "nvml"
     finally:
         try:
             pynvml.nvmlShutdown()
         except Exception:
             pass
-    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -240,7 +284,7 @@ def _launcher(n: int) -> None:
             _stats["started"] = len(_pool)
         _log(
             f"started {len(_pool)} standby children in {time.perf_counter() - _t0:.2f} s "
-            f"(NUMA lookup {t_bind:.2f} s; bindings: {bindings})"
+            f"(NUMA lookup {t_bind:.2f} s via {_stats.get('numa_source', '-')}; bindings: {bindings})"
         )
     except Exception as e:
         _log(f"could not start standby children ({e!r})")
