@@ -5744,6 +5744,28 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             maybe_start_host_pool_prealloc()
 
+        inf834_direct = None
+        if not is_nextn and getattr(self, "_inf834_ep_direct_sources", None):
+            from sglang.srt.model_loader.inf834_ep_direct import (
+                Inf834EpDirectExperts,
+                make_resolver,
+            )
+
+            inf834_direct_resolve = make_resolver(
+                lambda ckpt_name: self.remap_weight_name_to_dpsk_hf_format(
+                    ckpt_name,
+                    is_nextn=False,
+                    num_hidden_layers=self.config.num_hidden_layers,
+                ),
+                expert_params_mapping,
+                params_dict,
+            )
+            inf834_direct = Inf834EpDirectExperts(
+                self._inf834_ep_direct_sources, inf834_direct_resolve
+            )
+            self._inf834_ep_direct_sources = None
+            inf834_direct.launch()
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
@@ -6059,6 +6081,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 inf834_bulk.finish()
             if inf834_profile is not None:
                 inf834_profile.mark("stream")
+            if inf834_direct is not None:
+                inf834_direct.join("target")
+                loaded_params.update(inf834_direct.loaded_names)
+                weight_names.extend(inf834_direct.weight_names)
+                if inf834_profile is not None:
+                    inf834_profile.mark("ep direct wait")
             for future in concurrent.futures.as_completed(futures):
                 future.result()
             if inf834_bulk is not None:
@@ -6165,6 +6193,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.")
         engram_re = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
 
+        # INF-834 SGLANG_OPT_INF834_EP_DIRECT_EXPERTS: the filtered layers' routed experts
+        # are read by model_loader/inf834_ep_direct.py beside the stream, not streamed.
+        direct_layers: set[int] = set()
+        self._inf834_ep_direct_sources = None
+        from sglang.srt.model_loader import inf834_ep_direct
+
+        if inf834_ep_direct.enabled() and consumed:
+            from sglang.srt.runtime_context import get_model
+
+            try:
+                self._inf834_ep_direct_sources = inf834_ep_direct.list_sources(
+                    get_model().model_path, consumed
+                )
+                direct_layers = set(consumed)
+            except (OSError, ValueError, KeyError) as e:
+                logger.warning(
+                    "INF834 ep direct experts: off, cannot list the checkpoint (%r)", e
+                )
+
         def keep(name: str) -> bool:
             if name.startswith("mtp."):
                 return False
@@ -6175,6 +6222,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 return False
             m = expert_re.match(name)
             if m is not None:
+                if int(m.group(1)) in direct_layers:
+                    return False
                 local = consumed.get(int(m.group(1)))
                 return local is None or int(m.group(2)) in local
             return True

@@ -2377,6 +2377,12 @@ class Envs:
     # Standby children: read each GPU's NUMA node from sysfs (PCI bus-id order) instead of
     # NVML, whose init waits behind the concurrent cuInit (2.7 s on the main thread).
     SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA = EnvBool(False)
+    # Decoder W2: with SELECTIVE_READ, the filtered MoE layers' routed experts are read by
+    # pread into pinned staging (EP_DIRECT_THREADS worker threads, EP_DIRECT_BLOCK local
+    # slots per host-to-device copy) beside the weight stream instead of being streamed.
+    SGLANG_OPT_INF834_EP_DIRECT_EXPERTS = EnvBool(False)
+    SGLANG_OPT_INF834_EP_DIRECT_THREADS = EnvInt(8)
+    SGLANG_OPT_INF834_EP_DIRECT_BLOCK = EnvInt(16)
     # One tokenizer object per process for identical get_tokenizer() calls (the
     # scheduler and its target TpModelWorker load the same tokenizer).
     SGLANG_OPT_INF834_TOKENIZER_MEMO = EnvBool(False)
