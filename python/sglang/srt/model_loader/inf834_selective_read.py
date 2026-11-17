@@ -334,3 +334,79 @@ def log_stats(read_filter: Inf834ReadFilter, stats: _Stats, wall_secs: float) ->
         stats.prefetch_secs,
         wall_secs,
     )
+
+
+def _tensor_digest(t: torch.Tensor) -> str:
+    """Order-sensitive digest of a tensor's bytes: a position-weighted byte sum,
+    computed in 16 MiB chunks on the GPU when there is one (host tensors are
+    copied chunk by chunk), else on the CPU."""
+    if t.numel() == 0:
+        return "empty"
+    flat = t.detach().reshape(-1)
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+    raw = flat.view(torch.uint8)
+    device = (
+        raw.device
+        if raw.device.type != "cpu"
+        else torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else raw.device
+    )
+    total, step = 0, 1 << 24
+    for start in range(0, raw.numel(), step):
+        chunk = raw[start : start + step].to(device).to(torch.int64)
+        weight = torch.arange(start, start + chunk.numel(), device=device) % 65521 + 1
+        total += int((chunk * weight).sum())
+        del chunk, weight
+    return f"w{total:x}"
+
+
+def write_digest(model: torch.nn.Module, out_dir: str) -> None:
+    """SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR (diagnostic for the A/B proof): one JSON
+    per rank and model class with a digest of every parameter, buffer and other
+    tensor attribute after load and post-processing. Allocates temporary device
+    memory (then empties the cache): never combine with a foundry SAVE/LOAD run."""
+    import hashlib
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    tic = time.perf_counter()
+    seen, digests = set(), {}
+    for kind, items in (
+        ("param", model.named_parameters(remove_duplicate=False)),
+        ("buffer", model.named_buffers(remove_duplicate=False)),
+    ):
+        for name, t in items:
+            key = (t.data_ptr(), t.dtype, tuple(t.shape))
+            seen.add(key)
+            digests[f"{kind}:{name}"] = f"{t.dtype}|{tuple(t.shape)}|{t.device.type}|{_tensor_digest(t)}"
+    for mod_name, mod in model.named_modules():
+        for attr, value in vars(mod).items():
+            if not isinstance(value, torch.Tensor) or attr.startswith("_"):
+                continue
+            key = (value.data_ptr(), value.dtype, tuple(value.shape))
+            if key in seen:
+                continue
+            seen.add(key)
+            digests[f"attr:{mod_name}.{attr}"] = (
+                f"{value.dtype}|{tuple(value.shape)}|{value.device.type}|{_tensor_digest(value)}"
+            )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    whole = hashlib.blake2b(
+        "\n".join(f"{k}={v}" for k, v in sorted(digests.items()) if not k.startswith("attr:")).encode(),
+        digest_size=12,
+    ).hexdigest()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{type(model).__name__}-rank{rank}.json")
+    with open(path, "w") as f:
+        json.dump(digests, f, indent=0, sort_keys=True)
+    logger.info(
+        "INF834 weight digest %s rank=%d: %d tensors, params+buffers %s, %.1fs -> %s",
+        type(model).__name__,
+        rank,
+        len(digests),
+        whole,
+        time.perf_counter() - tic,
+        path,
+    )

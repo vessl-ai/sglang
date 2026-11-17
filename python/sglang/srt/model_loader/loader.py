@@ -1049,6 +1049,10 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+        if envs.SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR.get():
+            from sglang.srt.model_loader.inf834_selective_read import write_digest
+
+            write_digest(model, envs.SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR.get())
         return model.eval()
 
     @staticmethod

@@ -2340,6 +2340,9 @@ class Envs:
     # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
     SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
     SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
+    # Diagnostic for the A/B proof (not a lever): when set to a directory, write
+    # a per-rank digest of every loaded tensor after load_model.
+    SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
