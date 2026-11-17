@@ -17,6 +17,8 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -95,6 +97,26 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
             return None
         return tuple(shared) if isinstance(output, tuple) else shared
     return None
+
+
+logger = logging.getLogger(__name__)
+
+_inf834_warmups: Optional[int] = None
+
+
+def _inf834_capture_warmups() -> int:
+    """Eager warmup forwards per captured shape after a backend's first shape
+    (SGLANG_OPT_INF834_CAPTURE_WARMUPS, default 2). Read once and logged once."""
+    global _inf834_warmups
+    if _inf834_warmups is None:
+        raw = os.environ.get("SGLANG_OPT_INF834_CAPTURE_WARMUPS", "")
+        _inf834_warmups = max(1, int(raw)) if raw.strip() else 2
+        if _inf834_warmups != 2:
+            logger.info(
+                f"INF834 capture warmups: {_inf834_warmups} eager forward(s) per shape "
+                "after each runner's first shape (default 2)"
+            )
+    return _inf834_warmups
 
 
 class FullCudaGraphBackend(BaseCudaGraphBackend):
@@ -190,13 +212,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+        # INF-834: SGLANG_OPT_INF834_CAPTURE_WARMUPS=<n> (default 2, minimum 1) sets the
+        # warmups of every shape after this backend's first; the first shape keeps two,
+        # because it pays the process-wide one-time setup (kernel loads, DeepGEMM session).
+        num_warmups = 2 if not self._graphs else _inf834_capture_warmups()
         warmup_output = None
-        for warmup_step in range(2):
+        for warmup_step in range(num_warmups):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
                 output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
+            if self._reuse_output_buffer and warmup_step == num_warmups - 1:
                 warmup_output = output
             del output
             if profiler is not None:
