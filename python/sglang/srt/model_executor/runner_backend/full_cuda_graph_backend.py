@@ -148,15 +148,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         foundry = get_foundry_adapter()
         trace = getattr(self, "_foundry_alloc_trace", None)
         if trace is not None:
-            # INF-834 debug: dump the allocator history once, before the first shape.
-            self._foundry_alloc_trace = None
+            # INF-834 debug: dump the allocator history before every shape of the
+            # scope (the history accumulates from the scope start), so a LOAD that
+            # aborts in a later shape still leaves the state it reached.
             import os
             import pickle
 
             os.makedirs(trace[0], exist_ok=True)
-            with open(os.path.join(trace[0], f"{trace[1]}.pickle"), "wb") as f:
+            n = getattr(self, "_foundry_alloc_trace_n", 0)
+            self._foundry_alloc_trace_n = n + 1
+            with open(os.path.join(trace[0], f"{trace[1]}_{n:02d}.pickle"), "wb") as f:
                 pickle.dump(torch.cuda.memory._snapshot(), f)
-            torch.cuda.memory._record_memory_history(enabled=None)
         if foundry.enabled:
             # CUDA graph persistence: SAVE captures and archives this shape;
             # LOAD restores it. None: Foundry fell back, capture natively.
