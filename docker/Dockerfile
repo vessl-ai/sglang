@@ -606,7 +606,7 @@ WORKDIR /sgl-workspace
 
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-        cp -r /tmp/local_src /sgl-workspace/sglang; \
+        rm -rf /sgl-workspace/sglang && cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     elif [ -z "$SGL_VERSION" ]; then \
@@ -690,7 +690,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     elif ! printf '%s\n' 12.9 "${CUDA_VERSION}" | sort -V -C; then \
         echo "[sgl-nvidia-mega] skip (CUDA_VERSION=${CUDA_VERSION} < 12.9)"; \
     else \
-        git clone "${SGL_NVIDIA_MEGA_REPO}" /sgl-workspace/sgl-nvidia-mega \
+        rm -rf /sgl-workspace/sgl-nvidia-mega \
+        && git clone "${SGL_NVIDIA_MEGA_REPO}" /sgl-workspace/sgl-nvidia-mega \
         && cd /sgl-workspace/sgl-nvidia-mega \
         && git checkout -f "${SGL_NVIDIA_MEGA_COMMIT}" \
         && uv pip install --no-deps -e . \
