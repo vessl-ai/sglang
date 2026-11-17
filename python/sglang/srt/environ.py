@@ -1486,6 +1486,8 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Pass the DP-wide token count to the Mega MoE tile heuristic (upstream #46093).
+    SGLANG_HQ_MEGA_MOE_GLOBAL_TOKENS_HINT = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
