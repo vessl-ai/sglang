@@ -2333,6 +2333,9 @@ class Envs:
     # (Engram: own rows) with MADV_POPULATE_READ on PREFETCH_THREADS threads.
     SGLANG_OPT_INF834_SELECTIVE_READ = EnvBool(False)
     SGLANG_OPT_INF834_PREFETCH_THREADS = EnvInt(8)
+    # DSpark draft weight load: the same selective path with "mtp.*" as the
+    # filter, so the draft opens the 3 shards holding its tensors, not all 48.
+    SGLANG_OPT_INF834_DRAFT_SHARDS = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
