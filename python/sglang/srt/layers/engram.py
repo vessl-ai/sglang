@@ -667,10 +667,25 @@ class _HostTable:
         self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
-            # Cached checkpoint pages, left by a previous server or by the loader,
-            # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
+            keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
+            if keep_cache:
+                tic = time.perf_counter()
+            else:
+                # Cached checkpoint pages, left by a previous server or by the loader,
+                # make the 512 MiB huge-page faults fall back, so empty them first.
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
             np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            if keep_cache:
+                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+                logger.info(
+                    "INF834 engram host table %s: kept the checkpoint page cache; "
+                    "pre-fault %.1fs, %.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+                    name,
+                    time.perf_counter() - tic,
+                    mapped_kb / 2**10,
+                    huge_kb / 2**10,
+                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+                )
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
@@ -727,9 +742,17 @@ class _HostTable:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
-            # The loader's own reads refilled the page cache; empty it again so the
-            # collapse can find contiguous memory.
-            drop_checkpoint_page_cache()
+            if envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get():
+                logger.info(
+                    "INF834 engram host table %s: %.1f%% in huge pages before "
+                    "MADV_COLLAPSE; page cache kept",
+                    label,
+                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+                )
+            else:
+                # The loader's own reads refilled the page cache; empty it again so the
+                # collapse can find contiguous memory.
+                drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0

@@ -2319,6 +2319,11 @@ class Envs:
     # (TORCH_EXTENSIONS_DIR, else SGLANG_CACHE_DIR) instead of rebuilding it
     # under tempfile.gettempdir() in every new container.
     SGLANG_OPT_INF834_SYMM_ALLOC_CACHE = EnvBool(False)
+    # Skip the Engram per-rank host table's POSIX_FADV_DONTNEED of the whole
+    # checkpoint (before the pre-fault and again in finish_load), so a warm page
+    # cache survives into the weight load. The huge page share of the table is
+    # logged right after the pre-fault and in finish_load; MADV_COLLAPSE still runs.
+    SGLANG_OPT_INF834_KEEP_PAGE_CACHE = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
