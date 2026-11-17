@@ -32,6 +32,7 @@ import json
 import logging
 import mmap
 import os
+import re
 import struct
 import threading
 import time
@@ -72,6 +73,7 @@ class _Stats:
         self.bytes_kept = 0
         self.bytes_prefetched = 0
         self.prefetch_secs = 0.0
+        self.bytes_direct = 0
 
     def add(self, **kw):
         with self.lock:
@@ -180,6 +182,19 @@ def _read_header(st_file: str) -> Tuple[int, Dict[str, dict]]:
     return 8 + n, header
 
 
+# Routed-expert checkpoint tensors (DeepSeek "layers.N.ffn.experts.E.w1.weight" and
+# HF "model.layers.N.mlp.experts.E.gate_proj.weight" forms): with DIRECT_READ the
+# blockwise expert loader reads these itself, so they are not populated here.
+_DIRECT_READ_NAME = re.compile(r"(^|\.)experts\.\d+\.")
+
+
+def direct_read_enabled() -> bool:
+    return (
+        envs.SGLANG_OPT_INF834_DIRECT_READ.get()
+        and envs.SGLANG_OPT_INF834_EXPERT_BULK_LOAD.get()
+    )
+
+
 def load_file_filtered(
     st_file: str, read_filter: Inf834ReadFilter, stats: _Stats
 ) -> Dict[str, torch.Tensor]:
@@ -194,6 +209,7 @@ def load_file_filtered(
     populate_ranges (kept bytes, row ranges where given) and in the consumer."""
     data_start, header = _read_header(st_file)
     kept = [k for k in header if read_filter.keep(k)]
+    direct_read = direct_read_enabled()
     result: Dict[str, torch.Tensor] = {}
     ranges, kept_bytes = [], 0
     if kept:
@@ -216,6 +232,12 @@ def load_file_filtered(
             result[name] = t
             nbytes = end - begin
             kept_bytes += nbytes
+            if direct_read:
+                # Where the bytes are in the file (SGLANG_OPT_INF834_DIRECT_READ).
+                t._inf834_file_src = (st_file, data_start + begin)
+                if _DIRECT_READ_NAME.search(name):
+                    stats.add(bytes_direct=nbytes)
+                    continue  # the blockwise loader preads them; no populate
             addr = base + data_start + begin
             rows = read_filter.rows(name, tuple(info["shape"])) if t.dim() > 0 else None
             if rows is not None and t.shape[0] > 0:
@@ -334,6 +356,13 @@ def log_stats(read_filter: Inf834ReadFilter, stats: _Stats, wall_secs: float) ->
         stats.prefetch_secs,
         wall_secs,
     )
+    if stats.bytes_direct:
+        logger.info(
+            "INF834 direct read [%s]: %.2f GB of routed-expert tensors left unpopulated "
+            "for the blockwise loader to pread",
+            read_filter.label,
+            stats.bytes_direct / 1e9,
+        )
 
 
 def _tensor_digest(t: torch.Tensor) -> str:
