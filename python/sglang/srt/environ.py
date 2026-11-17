@@ -1488,6 +1488,16 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
 
     # ===================================================================
+    # HALOps for block-FP8 dense linears (hypothesis INF-852)
+    # ===================================================================
+    # Serve the bf16-input block-FP8 dense linears that run on FlashInfer
+    # CUTLASS / CuTe-DSL through HALOps' MXFP8 dense_gemm (SM100 only).
+    SGLANG_HQ_HALOPS_BLOCK_FP8 = EnvBool(False)
+    # Recompute the first N non-captured HALOps calls on FlashInfer and log
+    # the difference.
+    SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK = EnvInt(0)
+
+    # ===================================================================
     # Top-k kernels
     # ===================================================================
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
