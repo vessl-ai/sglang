@@ -416,6 +416,29 @@ def _copy_or_replace(dst, src):
 
 
 @dataclass
+
+def _set_in_graph(obj, name: str, value: torch.Tensor) -> None:
+    """Refresh a metadata tensor from inside the captured forward (INF-834).
+
+    Copy into the tensor the object already holds instead of rebinding the
+    attribute: the metadata object outlives the capture (it is the one replay
+    reuses), and a rebinding done by the captured forward exists only in a
+    process that ran that forward. A graph restored by CUDA graph persistence
+    (Foundry LOAD) never runs it, so its metadata would keep the pre-capture
+    tensors, and the caching allocator would hold memory the capturing process
+    released. Rebinds when there is no matching tensor to copy into."""
+    current = getattr(obj, name, None)
+    if (
+        isinstance(current, torch.Tensor)
+        and current.shape == value.shape
+        and current.dtype == value.dtype
+        and current.device == value.device
+    ):
+        if current.data_ptr() != value.data_ptr():
+            current.copy_(value)
+    else:
+        setattr(obj, name, value)
+
 class DSV4AttnMetadata:
     page_size: int
     page_table: torch.Tensor
@@ -2448,10 +2471,12 @@ class DeepseekV4AttnBackend(
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
             if self.token_to_kv_pool.request_window is None:
-                metadata.core_attn_metadata.swa_out_cache_loc = (
+                _set_in_graph(
+                    metadata.core_attn_metadata,
+                    "swa_out_cache_loc",
                     self.token_to_kv_pool.translate_loc_from_full_to_swa(
                         out_cache_loc
-                    ).to(torch.int32)
+                    ).to(torch.int32),
                 )
 
             # Refresh low-ratio source metadata from the live decode inputs.
@@ -2459,8 +2484,14 @@ class DeepseekV4AttnBackend(
                 metadata.core_metadata.low_ratios
                 and forward_batch.forward_mode.is_decode()
             ):
-                metadata.low_ratio_req_indices = token_req_indices(forward_batch)
-                metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
+                _set_in_graph(
+                    metadata, "low_ratio_req_indices", token_req_indices(forward_batch)
+                )
+                _set_in_graph(
+                    metadata,
+                    "low_ratio_pos_i64",
+                    forward_batch.positions.to(torch.int64),
+                )
 
             if (
                 self.is_dspark_draft
@@ -2483,8 +2514,12 @@ class DeepseekV4AttnBackend(
                     out_loc=out_cache_loc,
                     block_size=block_size,
                 )
-                metadata.core_attn_metadata.swa_page_indices = swa_page_indices
-                metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
+                _set_in_graph(
+                    metadata.core_attn_metadata, "swa_page_indices", swa_page_indices
+                )
+                _set_in_graph(
+                    metadata.core_attn_metadata, "swa_topk_lengths", swa_topk_lengths
+                )
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
 
