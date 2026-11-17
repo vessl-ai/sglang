@@ -2324,6 +2324,10 @@ class Envs:
     # cache survives into the weight load. The huge page share of the table is
     # logged right after the pre-fault and in finish_load; MADV_COLLAPSE still runs.
     SGLANG_OPT_INF834_KEEP_PAGE_CACHE = EnvBool(False)
+    # Cache the Engram compressed token map under SGLANG_CACHE_DIR, keyed by a
+    # hash of the tokenizer files, the map builder's source and library versions;
+    # a hit skips loading the HF tokenizer and the per-token normalization loop.
+    SGLANG_OPT_INF834_TOKEN_MAP_CACHE = EnvBool(False)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
