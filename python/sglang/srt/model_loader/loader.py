@@ -605,6 +605,7 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_source: Optional[ResolvedSource] = None,
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
+        inf834_read_filter=None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -694,6 +695,14 @@ class DefaultModelLoader(BaseModelLoader):
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             elif use_multithread:
+                inf834_stats = None
+                if inf834_read_filter is not None and not weight_loader_disable_mmap:
+                    from sglang.srt.model_loader import inf834_selective_read
+
+                    inf834_stats = inf834_selective_read.new_stats()
+                    hf_weights_files = inf834_selective_read.files_with_kept_tensors(
+                        hf_weights_files, hf_folder, inf834_read_filter, inf834_stats
+                    )
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -703,6 +712,10 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    inf834_read_filter=(
+                        inf834_read_filter if inf834_stats is not None else None
+                    ),
+                    inf834_stats=inf834_stats,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -761,7 +774,23 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        inf834_filter_fn = getattr(model, "inf834_checkpoint_read_filter", None)
+        inf834_read_filter = inf834_filter_fn() if inf834_filter_fn else None
+        if inf834_read_filter is not None and (
+            self.load_config.load_format
+            in (LoadFormat.NPCACHE, LoadFormat.INSTANTTENSOR, LoadFormat.FASTSAFETENSORS)
+            or not self.load_config.model_loader_extra_config.get(
+                "enable_multithread_load", True
+            )
+        ):
+            logger.warning(
+                "INF834 selective read [%s] needs the default multi-thread "
+                "safetensors loader; ignored for this load",
+                inf834_read_filter.label,
+            )
+        yield from self._get_weights_iterator(
+            primary_weights, inf834_read_filter=inf834_read_filter
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
@@ -1020,6 +1049,10 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+        if envs.SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR.get():
+            from sglang.srt.model_loader.inf834_selective_read import write_digest
+
+            write_digest(model, envs.SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR.get())
         return model.eval()
 
     @staticmethod

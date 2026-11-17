@@ -180,6 +180,44 @@ def restore_symmetric_memory_context(saved_context):
         saved_context.__enter__()
 
 
+def _inf834_cached_allocator_so() -> str:
+    """Persistent path of the built allocator, keyed by everything the build
+    depends on, so a node whose cache directory was prepared never rebuilds it."""
+    import hashlib
+    import sys
+
+    key = hashlib.sha256(
+        "\n".join(
+            [
+                nccl_allocator_source,
+                torch.__version__,
+                str(torch.version.cuda),
+                sys.version,
+                "-lnccl",
+            ]
+        ).encode()
+    ).hexdigest()[:16]
+    base = os.environ.get("TORCH_EXTENSIONS_DIR") or os.path.join(
+        os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), "torch_extensions"
+    )
+    return os.path.join(base, f"symm_allocator-{key}", "nccl_allocator.so")
+
+
+def _inf834_publish_allocator_so(built_so: str, cached_so: str) -> None:
+    """Copy the freshly built .so into the cache; atomic, so concurrent ranks or
+    pods publishing the same bytes never expose a partial file."""
+    import shutil
+
+    try:
+        os.makedirs(os.path.dirname(cached_so), exist_ok=True)
+        tmp = f"{cached_so}.tmp.{os.getpid()}"
+        shutil.copyfile(built_so, tmp)
+        os.replace(tmp, cached_so)
+        logger.info("INF834 symm-mem allocator: published %s", cached_so)
+    except OSError as e:
+        logger.warning("INF834 symm-mem allocator: could not cache %s: %s", cached_so, e)
+
+
 def get_nccl_mem_pool() -> torch.cuda.MemPool:
     """
     Get the shared MemPool for all groups.
@@ -196,30 +234,45 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     if _allocator is None:
         import torch.utils.cpp_extension
 
-        out_dir = os.path.join(tempfile.gettempdir(), "symm_allocator")
-        os.makedirs(out_dir, exist_ok=True)
-        # Make sure to clean up leftover pytorch lock files
-        # from previous runs and synchronize across processes
-        # right after
-        try:
-            os.remove(os.path.join(out_dir, "lock"))
-        except FileNotFoundError:
-            pass
-        torch.distributed.barrier()
-
         nccl_allocator_libname = "nccl_allocator"
-        lib_path = torch.utils.cpp_extension.load_inline(
-            name=nccl_allocator_libname,
-            cpp_sources=nccl_allocator_source,
-            with_cuda=True,
-            extra_ldflags=["-lnccl"],
-            verbose=True,
-            is_python_module=False,
-            build_directory=out_dir,
+        cached_so = (
+            _inf834_cached_allocator_so()
+            if envs.SGLANG_OPT_INF834_SYMM_ALLOC_CACHE.get()
+            else None
         )
+        if cached_so is not None and os.path.isfile(cached_so):
+            # Every rank joins the barrier on both paths, so ranks that disagree
+            # on whether the file exists cannot hang each other.
+            torch.distributed.barrier()
+            lib_path = alloc_so = cached_so
+            logger.info("INF834 symm-mem allocator: loaded cached %s", cached_so)
+        else:
+            out_dir = os.path.join(tempfile.gettempdir(), "symm_allocator")
+            os.makedirs(out_dir, exist_ok=True)
+            # Make sure to clean up leftover pytorch lock files
+            # from previous runs and synchronize across processes
+            # right after
+            try:
+                os.remove(os.path.join(out_dir, "lock"))
+            except FileNotFoundError:
+                pass
+            torch.distributed.barrier()
+
+            lib_path = torch.utils.cpp_extension.load_inline(
+                name=nccl_allocator_libname,
+                cpp_sources=nccl_allocator_source,
+                with_cuda=True,
+                extra_ldflags=["-lnccl"],
+                verbose=True,
+                is_python_module=False,
+                build_directory=out_dir,
+            )
+            alloc_so = f"{out_dir}/{nccl_allocator_libname}.so"
+            if cached_so is not None:
+                _inf834_publish_allocator_so(alloc_so, cached_so)
         nccl_allocator_lib = ctypes.CDLL(lib_path)
         _allocator = CUDAPluggableAllocator(
-            f"{out_dir}/{nccl_allocator_libname}.so",
+            alloc_so,
             "nccl_alloc_plug",
             "nccl_free_plug",
         ).allocator()

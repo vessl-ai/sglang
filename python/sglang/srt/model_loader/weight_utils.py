@@ -1330,13 +1330,29 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    inf834_read_filter=None,
+    inf834_stats=None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+
+    inf834_read_filter (INF-834, mmap path only): load only the tensors the
+    model keeps and pre-populate their bytes; see inf834_selective_read.
     """
+    if inf834_read_filter is not None and not disable_mmap:
+        from sglang.srt.model_loader import inf834_selective_read
+
+        yield from inf834_selective_read.iterate(
+            hf_weights_files,
+            max_workers,
+            inf834_read_filter,
+            inf834_stats,
+            _drop_file_cache_after_load if drop_cache_after_load else None,
+        )
+        return
     prefetch_handle = None
     if prefetch and not disable_mmap:
         prefetch_handle = _prefetch_all_checkpoints(

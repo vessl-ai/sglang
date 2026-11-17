@@ -143,6 +143,71 @@ def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
     return lookup, len(key_to_new)
 
 
+_INF834_SKIP_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".index.json")
+
+
+def inf834_token_map_cache_path(
+    tokenizer_path: str, tokenizer_mode: str, revision: Optional[str]
+) -> Optional[str]:
+    """Cache file for build_compressed_token_map's result, or None when the
+    tokenizer is not a local directory. The key covers every small non-weight
+    file in that directory, the builder's source and the library versions, so
+    anything that could change the map changes the key."""
+    import hashlib
+    import inspect
+
+    import tokenizers
+    import transformers
+
+    if not os.path.isdir(tokenizer_path):
+        return None
+    h = hashlib.sha256()
+    for part in (
+        inspect.getsource(build_compressed_token_map),
+        tokenizers.__version__,
+        transformers.__version__,
+        f"{tokenizer_mode}|{revision}",
+    ):
+        h.update(part.encode())
+        h.update(b"\0")
+    for fn in sorted(os.listdir(tokenizer_path)):
+        path = os.path.join(tokenizer_path, fn)
+        if not os.path.isfile(path) or fn.endswith(_INF834_SKIP_SUFFIXES):
+            continue
+        if os.path.getsize(path) > 64 << 20:
+            continue
+        h.update(fn.encode())
+        h.update(b"\0")
+        with open(path, "rb") as f:
+            h.update(f.read())
+    return os.path.join(
+        os.path.expanduser(envs.SGLANG_CACHE_DIR.get()),
+        "engram_token_map",
+        h.hexdigest()[:32] + ".npy",
+    )
+
+
+def inf834_load_token_map(path: str) -> Optional[tuple[list[int], int]]:
+    try:
+        arr = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    return arr[1:].tolist(), int(arr[0])
+
+
+def inf834_save_token_map(path: str, lookup: list[int], size: int) -> None:
+    """Element 0 is the compressed vocab size, the rest the lookup; written to a
+    temp file and renamed, so concurrent ranks never read a partial file."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            np.save(f, np.array([size, *lookup], dtype=np.int64))
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("INF834 engram token map: could not cache %s: %s", path, e)
+
+
 def compute_hash_multipliers(
     layer_ids: tuple[int, ...], max_ngram_size: int, vocab_size: int
 ) -> torch.Tensor:
@@ -230,10 +295,15 @@ class EngramHasher(nn.Module):
         tokenizer,
         pad_id: int,
         compressed_vocab_size: int,
+        *,
+        prebuilt_token_map: Optional[tuple[list[int], int]] = None,
     ):
         super().__init__()
         self.max_ngram_size = layout.max_ngram_size
-        token_map, vocab_size = build_compressed_token_map(tokenizer)
+        if prebuilt_token_map is not None:
+            token_map, vocab_size = prebuilt_token_map
+        else:
+            token_map, vocab_size = build_compressed_token_map(tokenizer)
         assert vocab_size == compressed_vocab_size, (
             f"the tokenizer normalizes to {vocab_size} distinct tokens but the config "
             f"expects {compressed_vocab_size}; every hash multiplier depends on it"
@@ -273,6 +343,10 @@ class EngramHasher(nn.Module):
     def from_config(
         cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
     ) -> EngramHasher:
+        if envs.SGLANG_OPT_INF834_TOKEN_MAP_CACHE.get():
+            return cls._inf834_from_config_cached(
+                config, layout, image_token_id=image_token_id
+            )
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -289,6 +363,46 @@ class EngramHasher(nn.Module):
             config.engram_compressed_vocab_size,
         )
         result.image_token_id = image_token_id
+        return result
+
+    @classmethod
+    def _inf834_from_config_cached(
+        cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
+    ) -> EngramHasher:
+        tic = time.perf_counter()
+        serving = get_serving()
+        path = inf834_token_map_cache_path(
+            serving.tokenizer_path, serving.tokenizer_mode, get_model().revision
+        )
+        prebuilt = inf834_load_token_map(path) if path is not None else None
+        hit = prebuilt is not None
+        if not hit:
+            tokenizer = get_tokenizer(
+                serving.tokenizer_path,
+                tokenizer_mode=serving.tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend="huggingface",
+            )
+            prebuilt = build_compressed_token_map(tokenizer)
+            if path is not None:
+                inf834_save_token_map(path, *prebuilt)
+        result = cls(
+            layout,
+            None,
+            config.engram_pad_token_id,
+            config.engram_compressed_vocab_size,
+            prebuilt_token_map=prebuilt,
+        )
+        result.image_token_id = image_token_id
+        logger.info(
+            "INF834 engram token map: cache %s (%s), %d tokens -> %d, %.1fs",
+            "hit" if hit else "miss",
+            path,
+            len(prebuilt[0]),
+            prebuilt[1],
+            time.perf_counter() - tic,
+        )
         return result
 
     def forward(
@@ -743,10 +857,32 @@ class _HostTable:
             self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
-            # Cached checkpoint pages, left by a previous server or by the loader,
-            # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
+            if keep_cache:
+                tic = time.perf_counter()
+            else:
+                # Cached checkpoint pages, left by a previous server or by the loader,
+                # make the 512 MiB huge-page faults fall back, so empty them first.
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
+            if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+                from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                    inf834_populate_write_parallel,
+                )
+
+                inf834_populate_write_parallel(self.mm, nbytes)
+            else:
+                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            if keep_cache:
+                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+                logger.info(
+                    "INF834 engram host table %s: kept the checkpoint page cache; "
+                    "pre-fault %.1fs, %.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+                    name,
+                    time.perf_counter() - tic,
+                    mapped_kb / 2**10,
+                    huge_kb / 2**10,
+                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+                )
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
@@ -803,9 +939,17 @@ class _HostTable:
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
-            # The loader's own reads refilled the page cache; empty it again so the
-            # collapse can find contiguous memory.
-            drop_checkpoint_page_cache()
+            if envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get():
+                logger.info(
+                    "INF834 engram host table %s: %.1f%% in huge pages before "
+                    "MADV_COLLAPSE; page cache kept",
+                    label,
+                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+                )
+            else:
+                # The loader's own reads refilled the page cache; empty it again so the
+                # collapse can find contiguous memory.
+                drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0

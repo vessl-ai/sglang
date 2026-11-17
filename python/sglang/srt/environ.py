@@ -2312,6 +2312,38 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # ===================================================================
+    # INF-834 boot-time levers (all off by default; off = upstream behaviour)
+    # ===================================================================
+    # Keep the symm-mem NCCL allocator .so in a persistent cache directory
+    # (TORCH_EXTENSIONS_DIR, else SGLANG_CACHE_DIR) instead of rebuilding it
+    # under tempfile.gettempdir() in every new container.
+    SGLANG_OPT_INF834_SYMM_ALLOC_CACHE = EnvBool(False)
+    # Skip the Engram per-rank host table's POSIX_FADV_DONTNEED of the whole
+    # checkpoint (before the pre-fault and again in finish_load), so a warm page
+    # cache survives into the weight load. The huge page share of the table is
+    # logged right after the pre-fault and in finish_load; MADV_COLLAPSE still runs.
+    SGLANG_OPT_INF834_KEEP_PAGE_CACHE = EnvBool(False)
+    # Cache the Engram compressed token map under SGLANG_CACHE_DIR, keyed by a
+    # hash of the tokenizer files, the map builder's source and library versions;
+    # a hit skips loading the HF tokenizer and the per-token normalization loop.
+    SGLANG_OPT_INF834_TOKEN_MAP_CACHE = EnvBool(False)
+    # Target model weight load: open only shards holding tensors this rank
+    # consumes, route only those tensors, and pre-populate their byte ranges
+    # (Engram: own rows) with MADV_POPULATE_READ on PREFETCH_THREADS threads.
+    SGLANG_OPT_INF834_SELECTIVE_READ = EnvBool(False)
+    SGLANG_OPT_INF834_PREFETCH_THREADS = EnvInt(8)
+    # DSpark draft weight load: the same selective path with "mtp.*" as the
+    # filter, so the draft opens the 3 shards holding its tensors, not all 48.
+    SGLANG_OPT_INF834_DRAFT_SHARDS = EnvBool(False)
+    # Pre-fault host pools (HiCache mmap allocator) and the Engram per-rank
+    # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
+    SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
+    SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
+    # Diagnostic for the A/B proof (not a lever): when set to a directory, write
+    # a per-rank digest of every loaded tensor after load_model.
+    SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
+
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 

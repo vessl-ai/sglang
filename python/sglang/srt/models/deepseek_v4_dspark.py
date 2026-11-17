@@ -1116,6 +1116,19 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 f"or disable the confidence head (enable_confidence_head=False)."
             )
 
+    def inf834_checkpoint_read_filter(self):
+        """SGLANG_OPT_INF834_DRAFT_SHARDS: the draft consumes only mtp.* tensors
+        (_remap_dspark_weight_name returns None for every other name), so the
+        loader opens only the shards holding them and prefetches their bytes
+        (model_loader/inf834_selective_read.py)."""
+        if not envs.SGLANG_OPT_INF834_DRAFT_SHARDS.get() or _is_npu:
+            return None
+        from sglang.srt.model_loader.inf834_selective_read import Inf834ReadFilter
+
+        return Inf834ReadFilter(
+            label="dspark-draft", keep=lambda name: name.startswith("mtp.")
+        )
+
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
         if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
             return None
