@@ -2377,6 +2377,10 @@ class Envs:
     # Standby children: read each GPU's NUMA node from sysfs (PCI bus-id order) instead of
     # NVML, whose init waits behind the concurrent cuInit (2.7 s on the main thread).
     SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA = EnvBool(False)
+    # Standby children: "K=V;K=V" set when each is exec'd, for variables a library reads at
+    # load time. With foundry: the LD_PRELOAD and FOUNDRY_MODE its spawn context sets (the
+    # handoff refuses when they differ from the engine's spawn). Read in sglang/_inf834_standby.py.
+    SGLANG_OPT_INF834_STANDBY_EXEC_ENV = EnvStr("")
     # Decoder W2: with SELECTIVE_READ, the filtered MoE layers' routed experts are read by
     # pread into pinned staging (EP_DIRECT_THREADS worker threads, EP_DIRECT_BLOCK local
     # slots per host-to-device copy) beside the weight stream instead of being streamed.

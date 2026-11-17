@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import time
+from typing import Dict
 
 _ENV_COUNT = "SGLANG_OPT_INF834_STANDBY_CHILDREN"
 _ENV_FORCE = "SGLANG_OPT_INF834_STANDBY_FORCE_MAIN"  # tests: treat any main script as the server
@@ -245,12 +246,59 @@ def _gpu_nodes(gpu_ids):
 # Main process side
 
 
+# SGLANG_OPT_INF834_STANDBY_EXEC_ENV="K=V;K=V": variables a scheduler / DP-controller child must
+# have when it is exec'd, because a library reads them at load time (not Python). With foundry
+# (--cuda-graph-persistence) the engine wraps each such spawn in foundry_adapter.configure_subprocess,
+# which sets LD_PRELOAD (foundry's CUDA hook) and FOUNDRY_MODE for that one spawn; a standby child
+# started at `import sglang` gets them only from this variable. The handoff compares them with the
+# values the engine's own spawn would set and refuses on any difference (see EXEC_TIME_KEYS).
+_ENV_EXEC = "SGLANG_OPT_INF834_STANDBY_EXEC_ENV"
+
+
+def exec_env() -> Dict[str, str]:
+    out = {}
+    for item in os.environ.get(_ENV_EXEC, "").split(";"):
+        if "=" in item:
+            k, v = item.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _exec_time_key(k: str) -> bool:
+    """Variables that take effect when a process is exec'd (dynamic loader, foundry's hook):
+    a standby child cannot take a new value at the handoff. FOUNDRY_SPAWN_T0_NS is only the spawn
+    timestamp foundry's timing log starts from."""
+    return k == "LD_PRELOAD" or (k.startswith("FOUNDRY_") and k != "FOUNDRY_SPAWN_T0_NS")
+
+
 def _spawn(ctx, key, numactl_args):
     import multiprocessing.spawn as mspawn
     import random
 
     parent_conn, child_conn = ctx.Pipe(duplex=True)
     proc = ctx.Process(target=_standby_main, args=(key, child_conn), name=f"inf834-standby-{key[0]}-{key[1]}")
+    extra = exec_env()
+    if extra:
+        # As foundry does: start multiprocessing's resource tracker before the window, or the
+        # first start() launches it with the preload too.
+        from multiprocessing import resource_tracker
+
+        resource_tracker.ensure_running()
+    saved = {k: os.environ.get(k) for k in extra}
+    os.environ.update(extra)
+    try:
+        _start(proc, numactl_args, mspawn, random)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    child_conn.close()
+    return proc, parent_conn
+
+
+def _start(proc, numactl_args, mspawn, random) -> None:
     if numactl_args:
         old = os.fsdecode(mspawn.get_executable())
         path = f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
@@ -264,8 +312,6 @@ def _spawn(ctx, key, numactl_args):
             mspawn.set_executable(old)
     else:
         proc.start()
-    child_conn.close()
-    return proc, parent_conn
 
 
 def _launcher(n: int) -> None:
@@ -284,7 +330,8 @@ def _launcher(n: int) -> None:
             _stats["started"] = len(_pool)
         _log(
             f"started {len(_pool)} standby children in {time.perf_counter() - _t0:.2f} s "
-            f"(NUMA lookup {t_bind:.2f} s via {_stats.get('numa_source', '-')}; bindings: {bindings})"
+            f"(NUMA lookup {t_bind:.2f} s via {_stats.get('numa_source', '-')}; exec env "
+            f"{sorted(exec_env()) or '-'}; bindings: {bindings})"
         )
     except Exception as e:
         _log(f"could not start standby children ({e!r})")
@@ -399,6 +446,18 @@ def _standby_main(key, conn) -> None:
     # some variables itself (cache dirs, library paths) exactly as it did in the main process.
     mine = dict(os.environ)
     changed = {k for k in set(env) | set(mine) if env.get(k) != mine.get(k)}
+    exec_keys = sorted(k for k in changed if _exec_time_key(k))
+    if exec_keys:
+        conn.send(
+            (
+                "refuse",
+                "exec-time env differs from the engine's spawn: "
+                + ", ".join(f"{k}: standby {mine.get(k)!r} engine {env.get(k)!r}" for k in exec_keys)
+                + f" (set {_ENV_EXEC} to the engine's values)",
+            )
+        )
+        conn.close()
+        return
     blocked = sorted(k for k in changed if k in read_keys or k.startswith("CUDA_"))
     if blocked:
         conn.send(("refuse", f"env changed after the standby import and read by it: {blocked}"))

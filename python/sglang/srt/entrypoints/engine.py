@@ -937,9 +937,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 _inf834_standby._count() > 0
                 and not get_exec().features.enable_memory_saver
                 and not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get()
-                # foundry's hook preload is set at spawn; a standby child started
-                # before it cannot carry it.
-                and not foundry_adapter.enabled
             )
             if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
                 # INF-834 (SGLANG_OPT_INF834_NUMA_PRECOMPUTE): resolve every GPU's
@@ -983,13 +980,17 @@ class Engine(EngineScoreMixin, EngineBase):
                         if inf834_standby_ok:
                             # INF-834 (SGLANG_OPT_INF834_STANDBY_CHILDREN): a child
                             # that imported while this process did; None = spawn.
-                            proc = _inf834_standby.take(
-                                "scheduler",
-                                gpu_id,
-                                numa_utils.resolve_numactl_args(server_args, gpu_id),
-                                target,
-                                args,
-                            )
+                            # Inside foundry's spawn context, so the environment the
+                            # handoff compares is the one a spawned child would get
+                            # (foundry's LD_PRELOAD and FOUNDRY_MODE included).
+                            with foundry_adapter.configure_subprocess(server_args):
+                                proc = _inf834_standby.take(
+                                    "scheduler",
+                                    gpu_id,
+                                    numa_utils.resolve_numactl_args(server_args, gpu_id),
+                                    target,
+                                    args,
+                                )
                         if proc is None:
                             proc = mp.Process(target=target, args=args)
                             with (
@@ -1019,15 +1020,16 @@ class Engine(EngineScoreMixin, EngineBase):
             )
             try:
                 proc = None
-                if _inf834_standby._count() > 0 and not foundry_adapter.enabled:
-                    proc = _inf834_standby.take(
-                        "dp_controller",
-                        None,
-                        None,
-                        run_data_parallel_controller_process,
-                        (),
-                        dp_kwargs,
-                    )
+                if _inf834_standby._count() > 0:
+                    with foundry_adapter.configure_subprocess(server_args):
+                        proc = _inf834_standby.take(
+                            "dp_controller",
+                            None,
+                            None,
+                            run_data_parallel_controller_process,
+                            (),
+                            dp_kwargs,
+                        )
                 if proc is None:
                     proc = mp.Process(
                         target=run_data_parallel_controller_process, kwargs=dp_kwargs
