@@ -50,6 +50,12 @@ def prepare_capture_state(
         num_symm_groups = prebuild_symmetric_memory_windows(
             device=device, forward_stream=forward_stream
         )
+        # INF-834: NCCL symmetric kernels take the communicator's device state by
+        # value; record it (SAVE) / move the archive's copies to this process's
+        # addresses (LOAD). Default off (SGLANG_OPT_INF834_SYMK_RELOC=1).
+        from sglang.srt.utils.inf834_symk_reloc import probe_and_relocate
+
+        probe_and_relocate(device=device, forward_stream=forward_stream)
     num_ep_comm = prebuild_ep_decode_comm(model)
     _probe_flashinfer_norm_cluster_size()
     if num_dispatchers or num_gatherers or num_symm_groups or num_ep_comm:
