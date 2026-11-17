@@ -182,18 +182,22 @@ def _inf834_sweep_identity(
 
 
 def _inf834_kernel_dirs(cache_dir: str) -> List[str]:
-    """Names of the compiled kernels in the DeepGEMM JIT cache (one directory each)."""
-    for sub in ("cache", ""):
-        path = os.path.join(cache_dir, sub)
-        if os.path.isdir(path):
-            try:
-                with os.scandir(path) as it:
-                    names = sorted(e.name for e in it if e.name.startswith("kernel."))
-            except OSError:
-                names = []
-            if names or not sub:
-                return names
-    return []
+    """Names of the finished kernels in the DeepGEMM JIT cache.
+
+    sgl-deep-gemm 0.2.2 (its _C.so) builds each kernel in its own directory
+    <DG_JIT_CACHE_DIR>/cache/<kernel name>.<md5>/ (kernel.cu, kernel.cubin,
+    meta.json) and marks it finished with an empty ".committed" file; a directory
+    without the marker is a build in progress or an aborted one."""
+    path = os.path.join(cache_dir, "cache")
+    try:
+        with os.scandir(path) as it:
+            return sorted(
+                e.name
+                for e in it
+                if e.is_dir() and os.path.exists(os.path.join(e.path, ".committed"))
+            )
+    except OSError:
+        return []
 
 
 def _inf834_sweep_stamp_path(identity: dict) -> str:
@@ -240,11 +244,23 @@ def _inf834_sweep_stamp_valid(identity: dict) -> bool:
     return True
 
 
-def _inf834_write_sweep_stamp(identity: dict, secs: float) -> None:
+def _inf834_write_sweep_stamp(identity: dict, secs: float) -> bool:
     path = _inf834_sweep_stamp_path(identity)
+    kernel_dirs = _inf834_kernel_dirs(os.environ["DG_JIT_CACHE_DIR"])
+    if not kernel_dirs:
+        # A finished sweep leaves at least the kernels it loaded or compiled; finding
+        # none means the cache layout is not the one _inf834_kernel_dirs reads. A
+        # stamp with an empty list would never be valid (the sweep would run on
+        # every boot), so write none and say why.
+        logger.warning(
+            "INF834 deepgemm sweep: no finished kernel directories under %s/cache "
+            "after a sweep; stamp not written (unknown DeepGEMM cache layout)",
+            os.environ["DG_JIT_CACHE_DIR"],
+        )
+        return False
     stamp = {
         "identity": identity,
-        "kernel_dirs": _inf834_kernel_dirs(os.environ["DG_JIT_CACHE_DIR"]),
+        "kernel_dirs": kernel_dirs,
         "sweep_seconds": round(secs, 3),
     }
     try:
@@ -255,6 +271,8 @@ def _inf834_write_sweep_stamp(identity: dict, secs: float) -> None:
         os.replace(tmp, path)
     except OSError as e:
         logger.warning("INF834 deepgemm sweep: cannot write stamp %s: %s", path, e)
+        return False
+    return True
 
 
 # TODO improve code
@@ -329,8 +347,7 @@ def _maybe_compile_deep_gemm_one_type_all(
                 m_list=_BUILTIN_M_LIST,
             )
             secs = time.perf_counter() - tic
-            if swept_all:
-                _inf834_write_sweep_stamp(identity, secs)
+            written = swept_all and _inf834_write_sweep_stamp(identity, secs)
             logger.info(
                 "INF834 deepgemm sweep: ran <%s> N=%d, K=%d, num_groups=%d in %.2fs; "
                 "stamp %s",
@@ -339,7 +356,13 @@ def _maybe_compile_deep_gemm_one_type_all(
                 k,
                 num_groups,
                 secs,
-                "written" if swept_all else "not written (M list was cut for memory)",
+                "written"
+                if written
+                else (
+                    "not written (see the warning above)"
+                    if swept_all
+                    else "not written (M list was cut for memory)"
+                ),
             )
 
 
