@@ -78,6 +78,14 @@ class EpA2ADecodeComm:
             self._a2a[key] = a2a
         return a2a
 
+    def prebuild(self, *, num_local_experts: int, top_k: int) -> bool:
+        """Build the (local experts, top-k) shape's buffer now, outside graph capture (see
+        ``ep_decode_comm.prebuild_ep_decode_comm``). Returns whether it was built here."""
+        if (num_local_experts, top_k) in self._a2a:
+            return False
+        self._get(num_local_experts, top_k)
+        return True
+
     def dispatch(
         self, x8, xscale, topk_ids, topk_weights, *, num_local_experts, ep_rank
     ) -> EpDispatchOutput:

@@ -630,6 +630,72 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+# INF-834: under CUDA graph persistence (--cuda-graph-persistence, Foundry) the
+# table's registered host address is a kernel argument baked into the captured
+# decode graphs (engram_gather takes the raw pointers), so LOAD must map every
+# table at the address SAVE used. The tables are then placed one after another,
+# 1 GiB aligned, from this base (well below Foundry's default device region at
+# 0x600000000000), instead of where the kernel's mmap would put them.
+_FIXED_ADDR_BASE = 0x500000000000
+_FIXED_ADDR_ALIGN = 1 << 30
+_fixed_addr_cursor = _FIXED_ADDR_BASE
+
+
+def _graphs_persisted() -> bool:
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    return get_foundry_adapter().enabled
+
+
+def _mmap_at_fixed_address(nbytes: int, fd: Optional[int]):
+    """mmap ``nbytes`` at the next fixed address (MAP_FIXED_NOREPLACE: fails
+    instead of replacing a mapping); returns a writable ctypes byte array."""
+    global _fixed_addr_cursor
+    MAP_FIXED_NOREPLACE = 0x100000
+    addr = _fixed_addr_cursor
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    )
+    if fd is None:
+        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
+    else:
+        flags = mmap.MAP_SHARED | MAP_FIXED_NOREPLACE
+    got = libc.mmap(
+        ctypes.c_void_p(addr),
+        ctypes.c_size_t(nbytes),
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        flags,
+        -1 if fd is None else fd,
+        0,
+    )
+    if got != addr:
+        err = ctypes.get_errno()
+        raise RuntimeError(
+            f"engram host table: mmap of {nbytes} bytes at the fixed address "
+            f"{addr:#x} failed (got {got}, errno {err}); CUDA graph persistence "
+            "needs the same host address in every process"
+        )
+    _fixed_addr_cursor = addr + -(-nbytes // _FIXED_ADDR_ALIGN) * _FIXED_ADDR_ALIGN
+    return (ctypes.c_uint8 * nbytes).from_address(addr)
+
+
+def _madvise_hugepage(buf) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    libc.madvise(
+        ctypes.c_void_p(ctypes.addressof(buf)),
+        ctypes.c_size_t(ctypes.sizeof(buf)),
+        mmap.MADV_HUGEPAGE,
+    )
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -647,24 +713,34 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
-            self.fd = self._open_shared_fd(nbytes, name)
-            self.mm = mmap.mmap(
-                self.fd,
+        self.fd = self._open_shared_fd(nbytes, name) if layout == "shared" else None
+        if _graphs_persisted():
+            self.mm = _mmap_at_fixed_address(nbytes, self.fd)
+            # Advisory before the first touch: pages are allocated huge at fault time.
+            _madvise_hugepage(self.mm)
+            logger.info(
+                "engram host table %s: %d bytes at fixed address %#x (CUDA graph persistence)",
+                name,
                 nbytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                ctypes.addressof(self.mm),
             )
         else:
-            self.fd = None
-            self.mm = mmap.mmap(
-                -1,
-                nbytes,
-                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+            if layout == "shared":
+                self.mm = mmap.mmap(
+                    self.fd,
+                    nbytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            else:
+                self.mm = mmap.mmap(
+                    -1,
+                    nbytes,
+                    flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            # Advisory before the first touch: pages are allocated huge at fault time.
+            self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,

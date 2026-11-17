@@ -365,6 +365,8 @@ class BaseRunner(ABC):
             dtype=mr.dtype,
             is_draft_worker=mr.is_draft_worker,
             is_ep_scale_joiner=get_exec().moe.is_ep_scale_joiner,
+            device=mr.device,
+            forward_stream=mr.forward_stream,
         )
 
     def _widest_decode_rows(self) -> Optional[int]:
