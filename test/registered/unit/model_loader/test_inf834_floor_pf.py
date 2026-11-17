@@ -202,9 +202,10 @@ class TestExpertBulkLoader(CustomTestCase):
         self.assertFalse(
             offered(make_experts(4, 4, 0), tensor=tensors[("w1", False)].float())
         )
+        # A logical expert with several physical copies is left to weight_loader.
         with mock.patch(
             "sglang.srt.eplb.expert_location.get_global_expert_location_metadata",
-            return_value=object(),
+            return_value=_Meta(4, {0: [0, 1]}),
         ):
             self.assertFalse(offered(make_experts(4, 4, 0)))
 
@@ -751,6 +752,54 @@ class TestDirectRead(CustomTestCase):
         self.assertIsNotNone(m, text)
         self.assertGreater(int(m.group(2)), 0)
         self.assertEqual(m.group(1), m.group(2))
+
+
+
+class _Meta:
+    """Expert-location metadata stand-in: identity, with overrides per logical id."""
+
+    def __init__(self, num_logical, extra=None):
+        self.num_logical_experts = num_logical
+        self.extra = extra or {}
+
+    def logical_to_all_physical(self, layer_id, logical_id, require_global=False):
+        return list(self.extra.get(logical_id, [logical_id]))
+
+
+class TestBulkWithExpertLocationMetadata(CustomTestCase):
+    """Every target model has expert-location metadata (also without EPLB);
+    weight_loader then routes through _weight_loader_physical."""
+
+    def _both(self, meta, tp_size=4, tp_rank=1, block=4, n=11):
+        targets = (
+            "sglang.srt.layers.moe.fused_moe_triton.layer.get_global_expert_location_metadata",
+            "sglang.srt.eplb.expert_location.get_global_expert_location_metadata",
+        )
+        with mock.patch(targets[0], lambda: meta), mock.patch(targets[1], lambda: meta):
+            case = TestExpertBulkLoader()
+            want, _ = case._load(n, tp_size, tp_rank, block, bulk=False)
+            got, loader = case._load(n, tp_size, tp_rank, block)
+        for (k, a), b in zip(state(want).items(), state(got).values()):
+            self.assertTrue(torch.equal(a, b), k)
+        return loader
+
+    def test_identity_metadata_goes_blockwise(self):
+        loader = self._both(_Meta(11))
+        self.assertEqual(loader.tensors_bulk, 11 * 6)
+        self.assertEqual(loader.tensors_fallback, 0)
+        self.assertEqual(loader.params_unplanned, [])
+
+    def test_expert_with_two_copies_falls_back(self):
+        loader = self._both(_Meta(11, {3: [3, 3]}))
+        self.assertGreater(loader.tensors_fallback, 0)
+        self.assertGreater(loader.tensors_bulk, 0)
+
+    def test_copy_without_local_slot_is_dropped(self):
+        loader = self._both(_Meta(11, {5: [500]}))
+        # weight_loader leaves slot 5 untouched too; its block never completes, so the
+        # other three experts of that block take the per-tensor loader.
+        self.assertEqual(loader.tensors_noop, 6)
+        self.assertEqual(loader.tensors_fallback, 3 * 6)
 
 
 if __name__ == "__main__":

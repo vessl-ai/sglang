@@ -52,7 +52,9 @@ class _Plan:
     """One eligible destination parameter: w13 (two row halves per expert, sharded
     on rows) or w2 (one piece per expert, sharded on columns)."""
 
-    __slots__ = ("param", "layer", "kind", "pieces", "num_local", "tp_size", "tp_rank")
+    __slots__ = (
+        "param", "layer", "kind", "pieces", "num_local", "tp_size", "tp_rank", "meta"
+    )
 
     def __init__(self, param, layer, kind):
         self.param = param
@@ -62,6 +64,8 @@ class _Plan:
         self.num_local = param.shape[0]
         self.tp_size = layer.moe_tp_size
         self.tp_rank = layer.moe_tp_rank
+        # Expert-location metadata weight_loader routes through (None: plain mapping).
+        self.meta = None
 
 
 class _Block:
@@ -108,6 +112,7 @@ class Inf834ExpertBulkLoader:
         self._fds: Dict[str, int] = {}
         self._tls = threading.local()
         self.blocks_direct = 0
+        self.params_unplanned: List[str] = []
         self.bytes_direct_read = 0
 
     # ------------------------------------------------------------------ plan
@@ -128,12 +133,14 @@ class Inf834ExpertBulkLoader:
             or getattr(loader, "__func__", None) is not FusedMoE.weight_loader
         ):
             return None
-        # weight_loader: only its branch without expert-location metadata.
-        if (
-            layer.uses_expert_location
-            and get_global_expert_location_metadata() is not None
-        ):
-            return None
+        # weight_loader with expert-location metadata (set for every target model,
+        # also without EPLB) goes through _weight_loader_physical per physical copy;
+        # offer() follows it when the logical expert has exactly one copy.
+        meta = (
+            get_global_expert_location_metadata()
+            if layer.uses_expert_location
+            else None
+        )
         if getattr(param, "_sglang_require_global_experts", False):
             return None
         # _weight_loader_impl: nothing may touch the tensor before _load_w13/_load_w2.
@@ -189,7 +196,9 @@ class Inf834ExpertBulkLoader:
             return None
         if kind == "w13" and param.shape[1] % 2:
             return None
-        return _Plan(param, layer, kind)
+        plan = _Plan(param, layer, kind)
+        plan.meta = meta
+        return plan
 
     # ----------------------------------------------------------------- offer
     def offer(
@@ -209,16 +218,32 @@ class Inf834ExpertBulkLoader:
         key = id(param)
         if key not in self._plans:
             self._plans[key] = self._plan_for(param, weight_name)
+            if self._plans[key] is None:
+                self.params_unplanned.append(weight_name)
         plan = self._plans[key]
         if plan is None:
             return False
-        local_id = plan.layer._map_global_expert_id_to_local_expert_id(expert_id)
-        if local_id == -1:
-            # weight_loader returns here too: the expert has no slot on this rank.
-            self.tensors_noop += 1
-            return True
-        if not 0 <= local_id < plan.num_local:
-            return False
+        layer = plan.layer
+        if plan.meta is None:
+            local_id = layer._map_global_expert_id_to_local_expert_id(expert_id)
+            if local_id == -1:
+                # weight_loader returns here too: the expert has no slot on this rank.
+                self.tensors_noop += 1
+                return True
+            if not 0 <= local_id < plan.num_local:
+                return False
+        else:
+            # weight_loader's metadata branch (no fused shared experts here, see
+            # _plan_for): one _weight_loader_physical call per physical copy.
+            physical = plan.meta.logical_to_all_physical(layer.layer_id, expert_id, False)
+            if len(physical) != 1:
+                return False  # several copies: the per-tensor loader places each
+            local_id = layer._map_global_expert_id_to_local_expert_id(physical[0])
+            if local_id < 0 or local_id >= layer.num_local_experts:
+                self.tensors_noop += 1  # _weight_loader_physical returns here
+                return True
+            if local_id >= plan.num_local:
+                return False
         data = param.data
         if loaded_weight.dtype != data.dtype or loaded_weight.dim() != 2:
             return False
@@ -413,6 +438,14 @@ class Inf834ExpertBulkLoader:
             self.gather_secs,
             self.copy_secs,
         )
+        if self.params_unplanned:
+            logger.info(
+                "INF834 expert bulk load [%s]: %d expert parameters not on the blockwise "
+                "path (first: %s)",
+                label,
+                len(self.params_unplanned),
+                ", ".join(self.params_unplanned[:3]),
+            )
         if self._direct:
             logger.info(
                 "INF834 direct read [%s]: %d of %d blocks (%.2f GB) read from the "
