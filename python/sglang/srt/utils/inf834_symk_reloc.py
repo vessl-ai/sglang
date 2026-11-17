@@ -199,10 +199,32 @@ def _symmetric_groups() -> list:
     return groups
 
 
+def _probe_collectives(
+    comm, full: torch.Tensor, part: torch.Tensor, stream, prefix: str, probe: dict
+) -> None:
+    """Capture one all-gather, reduce-scatter and all-reduce of ``comm`` on the
+    given symmetric buffers and record their kernels' argument buffers."""
+    ops = (
+        ("all_gather", lambda: comm.all_gather(full, part)),
+        ("reduce_scatter", lambda: comm.reduce_scatter(part, full)),
+        ("all_reduce", lambda: comm.all_reduce(full)),
+    )
+    with comm.change_state(enable=True):
+        for op_label, launch in ops:
+            for index, (kernel, blob) in enumerate(
+                _capture_kernel_args(stream, launch)
+            ):
+                probe[f"{prefix}/{op_label}/{index}"] = {
+                    "kernel": kernel,
+                    "args": blob.hex(),
+                }
+
+
 def run_probe(*, device: str, forward_stream: torch.cuda.Stream) -> dict:
-    """{label: {"kernel": name, "args": hex}} for one all-gather, reduce-scatter
-    and all-reduce on symmetric buffers of every pynccl group, small and large.
-    Collective: every rank calls it at the same point."""
+    """{"<group>/<size>/<op>/<i>": {"kernel": name, "args": hex}} for one
+    all-gather, reduce-scatter and all-reduce on symmetric buffers of every
+    pynccl group, small and large. Collective: every rank calls it at the same
+    point. Nothing is executed (the captured graphs are destroyed)."""
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
     )
@@ -212,7 +234,6 @@ def run_probe(*, device: str, forward_stream: torch.cuda.Stream) -> dict:
     with torch.get_device_module(device).stream(forward_stream):
         for name, group in _symmetric_groups():
             world = group.world_size
-            comm = group.pynccl_comm
             for size_label, per_rank in (("small", small), ("large", large)):
                 with use_symmetric_memory(group):
                     full = torch.zeros(
@@ -220,18 +241,14 @@ def run_probe(*, device: str, forward_stream: torch.cuda.Stream) -> dict:
                     )
                     part = torch.zeros(per_rank, dtype=torch.bfloat16, device=device)
                 forward_stream.synchronize()
-                ops = (
-                    ("all_gather", lambda: comm.all_gather(full, part)),
-                    ("reduce_scatter", lambda: comm.reduce_scatter(part, full)),
-                    ("all_reduce", lambda: comm.all_reduce(full)),
+                _probe_collectives(
+                    group.pynccl_comm,
+                    full,
+                    part,
+                    forward_stream,
+                    f"{name}/{size_label}",
+                    probe,
                 )
-                with comm.change_state(enable=True):
-                    for op_label, launch in ops:
-                        captured = _capture_kernel_args(forward_stream, launch)
-                        for index, (kernel, blob) in enumerate(captured):
-                            label = f"{name}/{op_label}/{size_label}/{index}"
-                            probe[label] = {"kernel": kernel, "args": blob.hex()}
-                del full, part
         forward_stream.synchronize()
     return probe
 
