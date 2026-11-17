@@ -146,6 +146,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
         foundry = get_foundry_adapter()
+        trace = getattr(self, "_foundry_alloc_trace", None)
+        if trace is not None:
+            # INF-834 debug: dump the allocator history once, before the first shape.
+            self._foundry_alloc_trace = None
+            import os
+            import pickle
+
+            os.makedirs(trace[0], exist_ok=True)
+            with open(os.path.join(trace[0], f"{trace[1]}.pickle"), "wb") as f:
+                pickle.dump(torch.cuda.memory._snapshot(), f)
+            torch.cuda.memory._record_memory_history(enabled=None)
         if foundry.enabled:
             # CUDA graph persistence: SAVE captures and archives this shape;
             # LOAD restores it. None: Foundry fell back, capture natively.

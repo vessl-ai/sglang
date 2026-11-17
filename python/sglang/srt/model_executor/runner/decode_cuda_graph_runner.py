@@ -1124,6 +1124,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        # INF-834 debug (SGLANG_FOUNDRY_ALLOC_TRACE=<dir>): record the caching
+        # allocator's history from here to this runner's first capture_one, where
+        # FullCudaGraphBackend dumps it, to compare SAVE's and LOAD's allocations.
+        trace_dir = os.environ.get("SGLANG_FOUNDRY_ALLOC_TRACE")
+        if trace_dir and get_foundry_adapter().enabled:
+            torch.cuda.memory._record_memory_history(max_entries=200000)
+            self.backend._foundry_alloc_trace = (
+                trace_dir,
+                f"{self._foundry_graph_kind()}_rank{torch.cuda.current_device()}",
+            )
         # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
         with get_foundry_adapter().capture_scope(
             phase="decode",
