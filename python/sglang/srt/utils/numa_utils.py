@@ -70,6 +70,24 @@ def precompute_subprocess_bindings(server_args: ServerArgs, gpu_ids) -> None:
     )
 
 
+def resolve_numactl_args(server_args: ServerArgs, gpu_id: int):
+    """INF-834 standby children: the numactl args configure_subprocess would exec for this GPU
+    in its success path, or None when it would exec none. Returns "<inline>" (matches nothing)
+    when configure_subprocess would take a failure path, so the caller spawns normally and that
+    path runs with its warnings. Reads the precompute cache without consuming it."""
+    if not envs.SGLANG_NUMA_BIND_V2.get():
+        return None
+    cached = _inf834_binding_cache.get(gpu_id)
+    if cached is None:
+        cached = _inf834_resolve_binding(server_args, gpu_id)
+        _inf834_binding_cache[gpu_id] = cached
+    numa_node, numactl_args, probed = cached
+    if numa_node is None or numactl_args is None:
+        return None if numa_node is None else "<inline>"
+    probed_args, _ = probed
+    return probed_args if probed_args is not None else "<inline>"
+
+
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():

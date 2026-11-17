@@ -15,6 +15,8 @@
 
 import json
 import logging
+import threading
+import time
 import warnings
 from pathlib import Path
 from typing import Optional, Union
@@ -510,8 +512,18 @@ def get_tokenizer(
     except TypeError:
         key = None
     if key is not None and key in _inf834_tokenizer_memo:
-        logger.info(f"INF834 tokenizer memo: reused the tokenizer of {tokenizer_name}")
-        return _inf834_tokenizer_memo[key]
+        hit = _inf834_tokenizer_memo[key]
+        if hasattr(hit, "result"):  # a prefetch (SGLANG_OPT_INF834_TOKENIZER_PREFETCH) still running
+            tic = time.perf_counter()
+            hit = hit.result()
+            _inf834_tokenizer_memo[key] = hit
+            logger.info(
+                f"INF834 tokenizer prefetch: used the prefetched tokenizer of "
+                f"{tokenizer_name} (waited {time.perf_counter() - tic:.2f} s)"
+            )
+        else:
+            logger.info(f"INF834 tokenizer memo: reused the tokenizer of {tokenizer_name}")
+        return hit
     tokenizer = _get_tokenizer_uncached(
         tokenizer_name,
         *args,
@@ -524,6 +536,52 @@ def get_tokenizer(
     if key is not None:
         _inf834_tokenizer_memo[key] = tokenizer
     return tokenizer
+
+
+def prefetch_tokenizer(tokenizer_name: str, **kwargs) -> None:
+    """INF-834 SGLANG_OPT_INF834_TOKENIZER_PREFETCH (needs TOKENIZER_MEMO): start loading the
+    tokenizer on a thread now; the first get_tokenizer() call with the same arguments waits for it.
+    A failed prefetch re-raises in that call, as a direct load would."""
+    from concurrent.futures import Future
+
+    from sglang.srt.environ import envs
+
+    if not (
+        envs.SGLANG_OPT_INF834_TOKENIZER_MEMO.get()
+        and envs.SGLANG_OPT_INF834_TOKENIZER_PREFETCH.get()
+    ):
+        return
+    key = (
+        tokenizer_name,
+        (),
+        kwargs.pop("tokenizer_mode", "auto"),
+        kwargs.pop("trust_remote_code", False),
+        kwargs.pop("tokenizer_revision", None),
+        kwargs.pop("tokenizer_backend", "huggingface"),
+        tuple(sorted(kwargs.items())),
+    )
+    if key in _inf834_tokenizer_memo:
+        return
+    fut = Future()
+    _inf834_tokenizer_memo[key] = fut
+
+    def run():
+        try:
+            fut.set_result(
+                _get_tokenizer_uncached(
+                    tokenizer_name,
+                    tokenizer_mode=key[2],
+                    trust_remote_code=key[3],
+                    tokenizer_revision=key[4],
+                    tokenizer_backend=key[5],
+                    **dict(key[6]),
+                )
+            )
+        except BaseException as e:
+            fut.set_exception(e)
+
+    threading.Thread(target=run, name="inf834-tokenizer-prefetch", daemon=True).start()
+    logger.info(f"INF834 tokenizer prefetch: started for {tokenizer_name}")
 
 
 def _get_tokenizer_uncached(

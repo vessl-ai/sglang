@@ -6133,6 +6133,19 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    if not get_serving().skip_tokenizer_init:
+        # INF-834 (SGLANG_OPT_INF834_TOKENIZER_PREFETCH): overlap the tokenizer load
+        # (Scheduler.init_tokenizer, same arguments) with the distributed init.
+        from sglang.srt.utils.hf_transformers.tokenizer import prefetch_tokenizer
+
+        prefetch_tokenizer(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+        )
+
     # Set up tracing
     if get_observability().enable_trace:
         process_tracing_init(
