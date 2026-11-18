@@ -436,6 +436,10 @@ class TestRepacked(Base):
         self.assertFalse(s.begin())
         s.end()
         self.assertFalse(os.path.exists(s.commit))  # waits for the repack
+        # post_load_weights registers aliases (DeepseekV4: layers[i]._next_layer): named_modules() then names
+        # layer 1 "model.layers.0._next_layer"; the save must still find it
+        m.model.layers[0]._next_layer = m.model.layers[1]
+        self.assertIn("model.layers.0._next_layer.mlp.experts", dict(m.named_modules()))
         _repack_all(m)
         ws.finish_model(m)
         return m, s
@@ -461,6 +465,7 @@ class TestRepacked(Base):
         with mock.patch.object(ek, "pack_experts_ep", side_effect=AssertionError("pack must not run")):
             self.assertTrue(d.begin())
             self.assertEqual(d.staged, ["model.layers.0.mlp.experts", "model.layers.1.mlp.experts"])
+            dst.model.layers[0]._next_layer = dst.model.layers[1]  # as post_load_weights does
             _repack_all(dst)
         ws.finish_model(dst)
         got = _packed_bytes(dst)

@@ -681,6 +681,7 @@ class _SaveJob:
         self.sums: List[Optional[str]] = [None] * k
         self.records: Dict[str, Dict[str, object]] = {}
         self.pending: Dict[str, List[int]] = {}
+        self.by_module: Dict[int, str] = {}
         self.secs = 0.0
         self.tmp_dir = os.path.join(snap.dir, ".tmp")
         os.makedirs(self.tmp_dir, exist_ok=True)
@@ -1007,8 +1008,11 @@ class WeightSnapshot:
                     skip.update(idxs)
             job.write_entries([i for i in range(len(ents)) if i not in skip])
             if job.pending:
+                # By module identity: post steps can register aliases (DeepseekV4 post_load_weights sets
+                # layers[i]._next_layer), after which named_modules() names a layer by another path.
                 for prefix, mod in _repack_candidates(self.model).items():
                     mod._inf834_snapshot_save = self
+                    job.by_module[id(mod)] = prefix
                 self._job, self._lock = job, lock
                 lock = None  # held until finish()
                 logger.info("INF834 weight snapshot [%s rank %d]: stream-end part written (%.2f s); waiting for the "
@@ -1031,7 +1035,7 @@ class WeightSnapshot:
         job = self._job
         if job is None:
             return
-        prefix = next((n for n, m in self.model.named_modules() if m is layer), None)
+        prefix = job.by_module.get(id(layer))
         try:
             if prefix not in job.pending:
                 raise RuntimeError(f"repack of an unexpected layer {prefix}")
