@@ -695,7 +695,10 @@ def _huge_pages_in_range(start: int, end: int) -> tuple[int, int]:
     return mapped, huge
 
 
-_ENGRAM_FAULT_CHUNK = 1 << 30
+# 256 MiB: on a node whose free memory has no 2 MiB block, a huge-page fault spent ~0.15 s in
+# failed compaction per 2 MiB per thread (INF-834 e2e s1-aw-1), so the first, over-cap chunk
+# costs ~2.4 s with 8 threads; a normal chunk takes ~0.03 s.
+_ENGRAM_FAULT_CHUNK = 256 << 20
 # Fixed prefix of the one WARNING per table, so boot logs can be grepped for it.
 ENGRAM_FAULT_FALLBACK = "INF834 engram huge-page fallback"
 
@@ -971,12 +974,13 @@ class _HostTable:
             ] = 0
 
     def _prefault_capped(self, cap: float) -> None:
-        """INF-834 SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S: pre-fault chunk by chunk; after
+        """INF-834 SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S: pre-fault in 256 MiB chunks; after
         the first chunk slower than `cap` seconds, fault the rest on 4 KiB pages.
 
         With THP defrag=madvise, a MADV_HUGEPAGE fault that finds no free 2 MiB block
         compacts memory in the faulting thread. A rank whose NUMA node is short of
-        2 MiB blocks then spent up to 55 s here (INF-834 e2e s1-a-1). A 4 KiB fault
+        2 MiB blocks then spent up to 55 s here (INF-834 e2e s1-a-1), and 222 s on a node
+        full of page cache (s1-aw-1). A 4 KiB fault
         never compacts, so the boot path pays at most one slow chunk."""
         tic = time.perf_counter()
         base = self.bytes.data_ptr()
@@ -994,10 +998,11 @@ class _HostTable:
                 self._populate(start, rest)
                 self.small_page_range = (start, rest)
                 logger.warning(
-                    "%s: table %s, a 1 GiB chunk took %.2fs (cap %.2fs) at %.1f GiB; "
+                    "%s: table %s, a %d MiB chunk took %.2fs (cap %.2fs) at %.1f GiB; "
                     "the remaining %.1f GiB is on 4 KiB pages, faulted in %.1fs",
                     ENGRAM_FAULT_FALLBACK,
                     self.name,
+                    length >> 20,
                     slow,
                     cap,
                     (start - length) / 2**30,

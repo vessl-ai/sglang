@@ -2345,7 +2345,7 @@ class Envs:
     # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
     SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
     SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
-    # Engram per-rank host table: pre-fault in 1 GiB chunks, and when one chunk takes
+    # Engram per-rank host table: pre-fault in 256 MiB chunks, and when one chunk takes
     # longer than this many seconds (the node is short of free 2 MiB blocks, so the
     # huge-page faults compact), put the rest of the table on 4 KiB pages
     # (MADV_NOHUGEPAGE) instead of compacting on the boot path. 0 = off.
