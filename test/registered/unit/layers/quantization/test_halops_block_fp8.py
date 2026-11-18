@@ -92,19 +92,36 @@ class TestHalopsWeightScale(CustomTestCase):
         self.assertIsNone(halops_weight_scale(weight, scale, flashinfer_scale))
 
 
+def _fake_sfa(m: int, k: int) -> torch.Tensor:
+    """An input scale shaped as HALOps' ``[ceil(M / 128) * 128, K // 32]``: row
+    r holds a code that differs between 128-row atoms, padding rows hold 0."""
+    sfa = torch.zeros(-(-m // 128) * 128, k // 32, dtype=torch.uint8)
+    r = torch.arange(m)
+    sfa[:m] = (124 + r // 128 + r % 3).to(torch.uint8).unsqueeze(1)
+    return sfa
+
+
+def _fake_scaled_matmul(a, weight, sfa) -> torch.Tensor:
+    """Row r of ``a @ weight^T`` times 2 ** (sfa[r] - 127)."""
+    factor = torch.exp2(sfa[:, 0].float() - 127)
+    return (a.float() @ weight.float().T) * factor[:, None]
+
+
 class _FakeHalops:
-    def __init__(self, value: float = 1.0):
-        self.value = value
+    def __init__(self):
         self.quant_calls = []
         self.gemm_calls = []
 
     def group_wise_quant(self, x, mode, use_swizzle):
         self.quant_calls.append((x, mode, use_swizzle))
-        return x.to(torch.float8_e4m3fn), torch.zeros(1, dtype=torch.uint8)
+        return x.to(torch.float8_e4m3fn), _fake_sfa(*x.shape)
 
     def dense_gemm(self, **kwargs):
         self.gemm_calls.append(kwargs)
-        kwargs["output"].fill_(self.value)
+        a = kwargs["input"]
+        kwargs["output"].copy_(
+            _fake_scaled_matmul(a, kwargs["weight"], kwargs["sfa"][: a.shape[0]])
+        )
 
     def patch(self):
         return mock.patch.object(
@@ -115,8 +132,9 @@ class _FakeHalops:
 
 
 class TestHalopsLinear(_ResetModuleState):
-    def _run(self, fake, x, n=256, bias=None, fallback=None):
-        weight = torch.zeros(n, x.shape[-1], dtype=torch.float8_e4m3fn)
+    def _run(self, fake, x, n=256, bias=None, fallback=None, weight=None):
+        if weight is None:
+            weight = torch.zeros(n, x.shape[-1], dtype=torch.float8_e4m3fn)
         sfb = torch.zeros(1, dtype=torch.uint8)
         fallback = fallback or mock.Mock(side_effect=AssertionError("fallback"))
         with fake.patch():
@@ -127,24 +145,45 @@ class TestHalopsLinear(_ResetModuleState):
 
     def test_forwards_operands_to_dense_gemm(self):
         fake = _FakeHalops()
-        x = torch.ones(2, 3, 128, dtype=torch.float16)
+        x = torch.ones(2, 128, 128, dtype=torch.float16)
         bias = torch.zeros(256, dtype=torch.float16)
-        fake.value = 2.0
-        with mock.patch.object(halops_block_fp8, "HALOPS_BIAS_M_ALIGN", 6):
-            out, weight, sfb = self._run(fake, x, bias=bias)
-        self.assertEqual(out.shape, (2, 3, 256))
+        out, weight, sfb = self._run(fake, x, bias=bias)
+        self.assertEqual(out.shape, (2, 128, 256))
         self.assertEqual(out.dtype, torch.float16)
-        self.assertTrue(torch.all(out == 2.0))
         (q_in, mode, use_swizzle) = fake.quant_calls[0]
-        self.assertEqual(q_in.shape, (6, 128))
+        self.assertEqual(q_in.shape, (256, 128))
         self.assertEqual((mode, use_swizzle), (HALOPS_MODE, True))
         call = fake.gemm_calls[0]
         self.assertIs(call["weight"], weight)
         self.assertIs(call["sfb"], sfb)
-        self.assertEqual(call["output"].shape, (6, 256))
+        self.assertEqual(call["output"].shape, (256, 256))
         self.assertEqual(call["output"].dtype, torch.bfloat16)
         self.assertEqual(call["bias"].dtype, torch.bfloat16)
         self.assertEqual(call["mode"], HALOPS_MODE)
+
+    def test_dense_gemm_gets_whole_row_atoms(self):
+        """HALOps 0.1.0's dense_gemm writes output rows up to the next multiple
+        of 128 when M is not one, past the end of an M-row output. Every call
+        gets a whole number of 128-row atoms, each with its own scale rows, and
+        the M result rows are those of one computation over all M rows."""
+        gen = torch.Generator().manual_seed(0)
+        weight = torch.randint(-1, 2, (256, 128), generator=gen).to(
+            torch.float8_e4m3fn
+        )
+        for m in (4, 256, 300):
+            with self.subTest(m=m):
+                fake = _FakeHalops()
+                x = torch.randint(-1, 2, (m, 128), generator=gen).to(torch.bfloat16)
+                out, _, _ = self._run(fake, x, weight=weight)
+                for call in fake.gemm_calls:
+                    rows = call["input"].shape[0]
+                    self.assertEqual(rows % 128, 0)
+                    self.assertEqual(call["sfa"].shape[0], rows)
+                    self.assertEqual(call["output"].shape[0], rows)
+                expected = _fake_scaled_matmul(
+                    x.to(torch.float8_e4m3fn), weight, _fake_sfa(m, 128)[:m]
+                ).to(torch.bfloat16)
+                self.assertTrue(torch.equal(out, expected))
 
     def test_shapes_no_tile_takes_run_the_original_kernel(self):
         cases = {
@@ -177,10 +216,13 @@ class TestHalopsLinear(_ResetModuleState):
         self.assertIn("N=256 K=128 first M=4", lines[0])
 
     def test_self_check_compares_the_first_nonzero_calls(self):
-        fake = _FakeHalops(value=1.0)
-        x = torch.ones(4, 128, dtype=torch.bfloat16)
+        """The budget is per kind, M a multiple of 128 and not, so calls of one
+        kind cannot spend the checks of the other."""
+        fake = _FakeHalops()
         zeros = mock.Mock(return_value=torch.zeros(4, 256))
-        ref = mock.Mock(return_value=torch.full((4, 256), 0.5))
+        refs = {
+            m: mock.Mock(return_value=torch.full((m, 256), 0.5)) for m in (4, 128)
+        }
         with (
             mock.patch.object(
                 halops_block_fp8.envs.SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK,
@@ -189,13 +231,17 @@ class TestHalopsLinear(_ResetModuleState):
             ),
             self.assertLogs(halops_block_fp8.logger, logging.INFO) as logs,
         ):
-            self._run(fake, x, fallback=zeros)
-            for _ in range(3):
-                self._run(fake, x, fallback=ref)
+            self._run(fake, torch.ones(4, 128, dtype=torch.bfloat16), fallback=zeros)
+            for m, ref in refs.items():
+                x = torch.ones(m, 128, dtype=torch.bfloat16)
+                for _ in range(3):
+                    self._run(fake, x, fallback=ref)
         self.assertEqual(zeros.call_count, 1)
-        self.assertEqual(ref.call_count, 2)
         checks = [r for r in logs.output if "self-check" in r]
-        self.assertEqual(len(checks), 2)
+        for m, ref in refs.items():
+            with self.subTest(m=m):
+                self.assertEqual(ref.call_count, 2)
+                self.assertEqual(sum(f"M={m} " in r for r in checks), 2)
         self.assertIn("max_abs_diff=0.5", checks[0])
 
     def test_self_check_is_off_by_default(self):

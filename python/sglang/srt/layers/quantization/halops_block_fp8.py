@@ -32,7 +32,9 @@ HALOPS_MODE = "w8a8-mxfp8"
 # HALOps w8a8 needs K % 128 == 0.
 HALOPS_K_ALIGN = 128
 
-# Row alignment of the CUTLASS SfAtom 128x4 scale layout.
+# Row alignment of the CUTLASS SfAtom 128x4 scale layout. halops 0.1.0's
+# dense_gemm writes output rows up to the next multiple of 128 when M is not
+# one, so halops_linear gives every call whole 128-row atoms.
 HALOPS_SFATOM_ROW_ALIGN = 128
 
 # The bias epilogue has no per-row store predicate: M must be a multiple of 256.
@@ -41,7 +43,7 @@ HALOPS_BIAS_M_ALIGN = 256
 LOG_PREFIX = "HQ HALOps block-FP8"
 
 _used_shapes = set()
-_selfcheck_left: Optional[int] = None
+_selfcheck_left: Optional[dict[bool, int]] = None
 
 
 def enabled() -> bool:
@@ -123,11 +125,14 @@ def _selfcheck(
 ) -> None:
     """Recompute this call on the original kernel and log the difference, for
     the first SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK calls with a nonzero
-    reference outside CUDA graph capture."""
+    reference outside CUDA graph capture, counted separately for M a multiple
+    of HALOPS_SFATOM_ROW_ALIGN and M not one."""
     global _selfcheck_left
     if _selfcheck_left is None:
-        _selfcheck_left = envs.SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK.get()
-    if _selfcheck_left <= 0 or _capturing(out.device):
+        count = envs.SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK.get()
+        _selfcheck_left = {True: count, False: count}
+    aligned = m % HALOPS_SFATOM_ROW_ALIGN == 0
+    if _selfcheck_left[aligned] <= 0 or _capturing(out.device):
         return
     ref = fallback().float()
     ref_absmax = ref.abs().max().item()
@@ -136,7 +141,7 @@ def _selfcheck(
     diff = out.float() - ref
     max_abs = diff.abs().max().item()
     rel_l2 = (diff.norm() / ref.norm()).item()
-    _selfcheck_left -= 1
+    _selfcheck_left[aligned] -= 1
     logger.info(
         "%s self-check: M=%d N=%d K=%d max_abs_diff=%.6g ref_absmax=%.6g rel_l2=%.6g",
         LOG_PREFIX,
@@ -181,17 +186,32 @@ def halops_linear(
         # dense_gemm types the bias as its (always bf16) output element type.
         bias = bias.to(torch.bfloat16)
     output = torch.empty((m, n), dtype=torch.bfloat16, device=input_2d.device)
-    dense_gemm(
-        input=q_input,
-        weight=weight,
-        sfa=sfa,
-        sfb=weight_scale,
-        output=output,
-        bias=bias,
-        alpha=None,
-        sm_count=-1,
-        mode=HALOPS_MODE,
-    )
+
+    def gemm(a: torch.Tensor, sfa_rows: torch.Tensor, out: torch.Tensor) -> None:
+        dense_gemm(
+            input=a,
+            weight=weight,
+            sfa=sfa_rows,
+            sfb=weight_scale,
+            output=out,
+            bias=bias,
+            alpha=None,
+            sm_count=-1,
+            mode=HALOPS_MODE,
+        )
+
+    body = m // HALOPS_SFATOM_ROW_ALIGN * HALOPS_SFATOM_ROW_ALIGN
+    rest = m - body
+    if body > 0:
+        gemm(q_input[:body], sfa[:body], output[:body])
+    if rest > 0:
+        tail_input = q_input.new_zeros((HALOPS_SFATOM_ROW_ALIGN, k))
+        tail_input[:rest].copy_(q_input[body:])
+        tail_output = torch.empty(
+            (HALOPS_SFATOM_ROW_ALIGN, n), dtype=torch.bfloat16, device=output.device
+        )
+        gemm(tail_input, sfa[body:], tail_output)
+        output[body:].copy_(tail_output[:rest])
     output = output.to(input.dtype).reshape(*input.shape[:-1], n)
 
     if (n, k) not in _used_shapes:

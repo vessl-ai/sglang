@@ -1493,8 +1493,8 @@ class Envs:
     # Serve the bf16-input block-FP8 dense linears that run on FlashInfer
     # CUTLASS / CuTe-DSL through HALOps' MXFP8 dense_gemm (SM100 only).
     SGLANG_HQ_HALOPS_BLOCK_FP8 = EnvBool(False)
-    # Recompute the first N non-captured HALOps calls on FlashInfer and log
-    # the difference.
+    # Recompute the first N non-captured HALOps calls of each kind (M a
+    # multiple of 128, and not) on FlashInfer and log the difference.
     SGLANG_HQ_HALOPS_BLOCK_FP8_SELFCHECK = EnvInt(0)
 
     # ===================================================================
