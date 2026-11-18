@@ -18,6 +18,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import os
@@ -2387,6 +2388,105 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
+async def _send_all_dp_warmup_requests(
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    timeout: int,
+    num_dp_ranks: int,
+    use_input_ids: bool,
+) -> List[int]:
+    """INF-834 (SGLANG_OPT_INF834_WARMUP_ALL_DP): one short /generate pinned to
+    each DP rank, all in parallel; returns the HTTP status per rank."""
+    ssl_context = (
+        ssl_verify
+        if isinstance(ssl_verify, bool)
+        else ssl.create_default_context(cafile=ssl_verify)
+    )
+
+    async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
+        json_data = {
+            "sampling_params": {"temperature": 0.0, "max_new_tokens": 8},
+            "routed_dp_rank": dp_rank,
+        }
+        if use_input_ids:
+            json_data["input_ids"] = [10, 11, 12]
+        else:
+            json_data["text"] = "The capital city of France is"
+        async with session.post(
+            url + "/generate", json=json_data, ssl=ssl_context
+        ) as response:
+            await response.read()
+            return response.status
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout),
+        headers=headers,
+    ) as session:
+        return await asyncio.gather(
+            *(send_request(session, dp_rank) for dp_rank in range(num_dp_ranks))
+        )
+
+
+def _start_all_dp_warmup(
+    url: str,
+    headers: Dict[str, str],
+    ssl_verify: Union[bool, str],
+    timeout: int,
+    model_info: dict,
+) -> Optional[concurrent.futures.Future]:
+    """Start the per-DP-rank warmup on its own thread when the switch applies;
+    the caller waits on the returned future. None when it does not apply."""
+    if not envs.SGLANG_OPT_INF834_WARMUP_ALL_DP.get():
+        return None
+    num_dp_ranks = get_parallel().num_dp_ranks
+    if (
+        num_dp_ranks <= 1
+        or not model_info["is_generation"]
+        or get_observability().debug_tensor_dump_input_file
+    ):
+        logger.info(
+            "INF834 warmup all DP: not applied (num_dp_ranks=%s, is_generation=%s)",
+            num_dp_ranks,
+            model_info["is_generation"],
+        )
+        return None
+    logger.info(
+        "INF834 warmup all DP: one request pinned to each of %s DP ranks",
+        num_dp_ranks,
+    )
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="warmup-all-dp"
+    )
+    future = executor.submit(
+        asyncio.run,
+        _send_all_dp_warmup_requests(
+            url=url,
+            headers=headers,
+            ssl_verify=ssl_verify,
+            timeout=timeout,
+            num_dp_ranks=num_dp_ranks,
+            use_input_ids=bool(get_serving().skip_tokenizer_init),
+        ),
+    )
+    # Do not wait here: a failure of the usual warmup request must not wait
+    # for this thread before the process is killed.
+    executor.shutdown(wait=False)
+    return future
+
+
+def _wait_all_dp_warmup(future: concurrent.futures.Future, start: float) -> None:
+    """Raise (like a failed warmup request) unless every DP rank returned 200."""
+    status_codes = future.result()
+    failed = {dp_rank: code for dp_rank, code in enumerate(status_codes) if code != 200}
+    assert not failed, f"INF834 warmup all DP: failed DP ranks {failed}"
+    logger.info(
+        "INF834 warmup all DP: %s DP ranks returned 200 in %.2f s",
+        len(status_codes),
+        time.perf_counter() - start,
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -2525,6 +2625,14 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if get_disagg().disaggregation_mode == "null":
+            all_dp_start = time.perf_counter()
+            all_dp_future = _start_all_dp_warmup(
+                url=url,
+                headers=headers,
+                ssl_verify=ssl_verify,
+                timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                model_info=model_info,
+            )
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -2533,6 +2641,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if all_dp_future is not None:
+                _wait_all_dp_warmup(all_dp_future, all_dp_start)
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:

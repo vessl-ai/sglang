@@ -2357,6 +2357,13 @@ class Envs:
     # Server warmup thread: poll /model_info every 50 ms from the start instead
     # of sleeping 1 s before the first attempt.
     SGLANG_OPT_INF834_FAST_WARMUP_POLL = EnvBool(False)
+    # Server warmup without disaggregation, more than one DP rank: alongside
+    # the usual warmup request, send one short /generate pinned to each DP rank
+    # (routed_dp_rank) in parallel, and report ready only after all of them
+    # return 200. A rank that never served a request otherwise pays its first
+    # eager forward on the first real request. Any failure is the usual warmup
+    # failure. PD modes already warm every DP rank, so this changes nothing there.
+    SGLANG_OPT_INF834_WARMUP_ALL_DP = EnvBool(False)
     # Start cuInit on a thread at the top of `import sglang` (every process:
     # main, schedulers, DP controller, HTTP workers) so it overlaps the Python
     # imports. Read from os.environ directly in sglang/__init__.py (before
