@@ -470,6 +470,28 @@ class TestHostPoolPrealloc(CustomTestCase):
 
 
 class TestDeepGemmSweepStamp(CustomTestCase):
+    # Directory names as sgl-deep-gemm 0.2.2 writes them under DG_JIT_CACHE_DIR/cache
+    # (taken from the prefill rig's cache on w-c354).
+    KERNELS = (
+        "sm90_fp8_gemm_1d2d.012fc992965e24f116644fadc9b7a842",
+        "sm90_tf32_hc_prenorm_gemm.01ddd3d696814b918b816c12749309e8",
+        "transpose_fp32.028f4d68e525751a880269223839d033",
+        "sm90_fp8_mqa_logits.03bb523fc5cebe2b8d9e8826204ee3d5",
+    )
+
+    def _kernel(self, name, committed=True):
+        d = os.path.join(self.tmp.name, "cache", name)
+        os.makedirs(d)
+        for f in ("kernel.cu", "kernel.cubin", "meta.json"):
+            open(os.path.join(d, f), "w").close()
+        if committed:
+            open(os.path.join(d, ".committed"), "w").close()
+
+    def _rm_kernel(self, name):
+        import shutil
+
+        shutil.rmtree(os.path.join(self.tmp.name, "cache", name))
+
     def setUp(self):
         try:
             from sglang.srt.layers.deep_gemm_wrapper import compile_utils as cu
@@ -477,8 +499,8 @@ class TestDeepGemmSweepStamp(CustomTestCase):
             self.skipTest(f"deep_gemm wrapper unavailable: {e}")
         self.cu = cu
         self.tmp = tempfile.TemporaryDirectory()
-        os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.a.1"))
-        os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.b.2"))
+        for name in self.KERNELS[:2]:
+            self._kernel(name)
         self.identity = {
             "kernel_type": "GEMM_NT_F8F8BF16",
             "n": 8,
@@ -544,7 +566,7 @@ class TestDeepGemmSweepStamp(CustomTestCase):
             self.assertEqual(len(self.sweeps), 2)
             # Kernels gone from the cache: the stamp no longer vouches for it.
             self.identity["n"] = 8
-            os.rmdir(os.path.join(self.tmp.name, "cache", "kernel.b.2"))
+            self._rm_kernel(self.KERNELS[1])
             self._call()
             self.assertEqual(len(self.sweeps), 3)
 
@@ -555,16 +577,42 @@ class TestDeepGemmSweepStamp(CustomTestCase):
             os.environ, {"SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP": "1"}
         ):
             self._call()
-            os.rmdir(os.path.join(self.tmp.name, "cache", "kernel.b.2"))
-            os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.c.3"))
+            self._rm_kernel(self.KERNELS[1])
+            self._kernel(self.KERNELS[2])
             with self.assertLogs("sglang", level="WARNING") as logs:
                 self._call()
             self.assertEqual(len(self.sweeps), 2)
-            self.assertIn("kernel.b.2", "\n".join(logs.output))
+            self.assertIn(self.KERNELS[1], "\n".join(logs.output))
             # More kernels than recorded (a union tier) is fine.
-            os.makedirs(os.path.join(self.tmp.name, "cache", "kernel.d.4"))
+            self._kernel(self.KERNELS[3])
             self._call()
             self.assertEqual(len(self.sweeps), 2)
+
+    def test_stamp_lists_the_real_kernel_directories(self):
+        """After a sweep the stamp must name the cache's finished kernel directories;
+        an empty list here is the bug of 347cde1e69 (it matched kernel.* names)."""
+        import json
+
+        self._kernel("sm90_fp8_gemm_1d2d.ffffffffffffffffffffffffffffffff", committed=False)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP": "1"}
+        ):
+            self._call()
+        d = os.path.join(self.tmp.name, "inf834_sweeps")
+        stamp = json.load(open(os.path.join(d, os.listdir(d)[0])))
+        self.assertEqual(stamp["kernel_dirs"], sorted(self.KERNELS[:2]))  # unfinished excluded
+
+    def test_no_finished_kernels_writes_no_stamp(self):
+        for name in self.KERNELS[:2]:
+            self._rm_kernel(name)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP": "1"}
+        ):
+            with self.assertLogs("sglang", level="WARNING") as logs:
+                self._call()
+        self.assertIn("stamp not written", "\n".join(logs.output))
+        self.assertFalse(os.listdir(os.path.join(self.tmp.name, "inf834_sweeps"))
+                         if os.path.isdir(os.path.join(self.tmp.name, "inf834_sweeps")) else [])
 
     def test_count_only_stamp_is_not_trusted(self):
         import json
