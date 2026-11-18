@@ -708,35 +708,6 @@ def _madvise(addr: int, length: int, advice: int) -> None:
         raise OSError(err, os.strerror(err))
 
 
-_MADV_COLLAPSE = 25  # Linux >= 6.1; not in Python's mmap module
-_COLLAPSE_STEP = 64 << 20
-
-
-def _collapse_best_effort(
-    addr: int, length: int, stop: Optional[threading.Event] = None
-) -> tuple[int, dict, float]:
-    """MADV_COLLAPSE over [addr, addr + length) in 64 MiB steps, never raising.
-
-    Returns (bytes collapsed, {errno name: failed steps}, seconds). A step fails
-    with EAGAIN when a page in it is pinned or busy, ENOMEM when the node has no
-    free 2 MiB block; both are left on 4 KiB pages. `stop` ends it between steps."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
-    tic = time.perf_counter()
-    done = 0
-    errors: dict = {}
-    for off in range(0, length, _COLLAPSE_STEP):
-        if stop is not None and stop.is_set():
-            break
-        n = min(_COLLAPSE_STEP, length - off)
-        if libc.madvise(ctypes.c_void_p(addr + off), ctypes.c_size_t(n), _MADV_COLLAPSE):
-            name = errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
-            errors[name] = errors.get(name, 0) + 1
-        else:
-            done += n
-    return done, errors, time.perf_counter() - tic
-
-
 _page_cache_dropped = False
 
 
