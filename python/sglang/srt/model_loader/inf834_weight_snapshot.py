@@ -160,6 +160,8 @@ ARGS_NOT_IN_IDENTITY = frozenset(
         # CUDA graph persistence (Foundry): "save" in the prepare boot, "load" in the cell, and its TOML path;
         # they select graph capture or replay, not weight bytes
         "cuda_graph_persistence", "cuda_graph_persistence_config",
+        # communication buffers (symmetric-memory pool for collectives), not weights
+        "enable_symm_mem",
         # per process: GPU numbering of this unit, sampling seed
         "base_gpu_id", "gpu_id_step", "random_seed",
     }
@@ -170,6 +172,9 @@ _ENV_VOLATILE = re.compile(
     r"^(SGLANG_RUN_ID|SGLANG_OPT_INF834_WEIGHT_SNAPSHOT.*|SGLANG_OPT_INF834_STANDBY.*|"
     r"SGLANG_OPT_INF834_(EARLY_HTTP_WORKERS|FAST_WARMUP_POLL|EARLY_CUINIT|NUMA_PRECOMPUTE|"
     r"TOKENIZER_MEMO|TOKENIZER_PREFETCH|W6_PROFILE|LOAD_PROFILE|WEIGHT_DIGEST_DIR)|"
+    r"SGLANG_JIT_DEEPGEMM_PRECOMPILE|"  # DeepGEMM kernel JIT at startup, not weights
+    r"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S|"  # Engram host-table fault time cap (huge-page fallback), not weights
+    r"SGLANG_SYMM_MEM_PREALLOC_GB_SIZE|"  # symmetric-memory pool size, set when --enable-symm-mem is on
     r"SGLANG_LOGGING.*|SGLANG_.*LOG_LEVEL.*|SGLANG_IMAGE_TAG|SGLANG_BUILD_.*)$"
 )
 _code_digest_cache: Optional[str] = None
