@@ -301,6 +301,9 @@ class TestIdentityArgs(Base):
         self.assertEqual(base, self._with_args(dict(self.ARGS, enable_symm_mem=False), lambda: self.snap(m).dir))
         with mock.patch.dict(os.environ, {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}):
             self.assertEqual(base, self._with_args(on, lambda: self.snap(m).dir))
+        # the engine sets SGLANG_SYMM_MEM_PREALLOC_GB_SIZE only when symm-mem is on (GPU rig, 13:25Z)
+        with mock.patch.dict(os.environ, {"SGLANG_SYMM_MEM_PREALLOC_GB_SIZE": "4"}):
+            self.assertEqual(base, self._with_args(on, lambda: self.snap(m).dir))
         with mock.patch.dict(os.environ, {"SGLANG_SOME_LOAD_SWITCH": "1"}):  # any other SGLANG_* env still misses
             self.assertNotEqual(base, self._with_args(on, lambda: self.snap(m).dir))
 

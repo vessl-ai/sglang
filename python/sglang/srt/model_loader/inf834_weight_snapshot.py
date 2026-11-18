@@ -174,6 +174,7 @@ _ENV_VOLATILE = re.compile(
     r"TOKENIZER_MEMO|TOKENIZER_PREFETCH|W6_PROFILE|LOAD_PROFILE|WEIGHT_DIGEST_DIR)|"
     r"SGLANG_JIT_DEEPGEMM_PRECOMPILE|"  # DeepGEMM kernel JIT at startup, not weights
     r"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S|"  # Engram host-table fault time cap (huge-page fallback), not weights
+    r"SGLANG_SYMM_MEM_PREALLOC_GB_SIZE|"  # symmetric-memory pool size, set when --enable-symm-mem is on
     r"SGLANG_LOGGING.*|SGLANG_.*LOG_LEVEL.*|SGLANG_IMAGE_TAG|SGLANG_BUILD_.*)$"
 )
 _code_digest_cache: Optional[str] = None
