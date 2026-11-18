@@ -5659,6 +5659,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT: this rank's weights as the stream below
+        # would leave them, from the node's snapshot; then only the post steps run.
+        inf834_snapshot = None
+        if envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT.get():
+            from sglang.srt.model_loader.inf834_weight_snapshot import WeightSnapshot
+
+            inf834_snapshot = WeightSnapshot(self, "nextn" if is_nextn else "target")
+            if inf834_snapshot.begin():
+                weights = iter(())
+                loaded_params.update(params_dict)
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -6106,6 +6117,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 inf834_bulk.close("draft" if is_nextn else "target")
             if inf834_profile is not None:
                 inf834_profile.mark("async tail")
+
+        if inf834_snapshot is not None:
+            inf834_snapshot.end()  # save (blocking) when this boot loaded from the checkpoint
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
