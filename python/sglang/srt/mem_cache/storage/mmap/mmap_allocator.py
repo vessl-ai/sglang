@@ -74,7 +74,6 @@ def inf834_populate_write_parallel(mm: mmap.mmap, nbytes: int) -> None:
     """MADV_POPULATE_WRITE over `mm` from SGLANG_OPT_INF834_POPULATE_THREADS threads,
     each on its own 2 MiB-aligned slice (INF-466: one thread per mapping is the
     bottleneck). Raises OSError like mmap.madvise when any slice fails."""
-    import concurrent.futures
     import time
 
     if _libc is None:
@@ -84,6 +83,21 @@ def inf834_populate_write_parallel(mm: mmap.mmap, nbytes: int) -> None:
     view = ctypes.c_char.from_buffer(mm)
     base = ctypes.addressof(view)
     del view  # keep no exported buffer, so the mapping can still be closed
+    tic = time.perf_counter()
+    inf834_populate_write_range(base, nbytes, threads)
+    logger.info(
+        "INF834 parallel populate: %.1f GiB on %d threads in %.1fs",
+        nbytes / 2**30,
+        threads,
+        time.perf_counter() - tic,
+    )
+
+
+def inf834_populate_write_range(base: int, nbytes: int, threads: int) -> None:
+    """MADV_POPULATE_WRITE over [base, base + nbytes) from `threads` threads, each on
+    its own 2 MiB-aligned slice. Raises OSError when any slice fails. Needs libc."""
+    import concurrent.futures
+
     step = 2 << 20
     per = -(-nbytes // threads // step) * step
     madvise = _libc.madvise
@@ -96,17 +110,10 @@ def inf834_populate_write_parallel(mm: mmap.mmap, nbytes: int) -> None:
             return ctypes.get_errno()
         return 0
 
-    tic = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(threads) as pool:
         errors = [e for e in pool.map(one, range(0, nbytes, per)) if e]
     if errors:
         raise OSError(errors[0], os.strerror(errors[0]))
-    logger.info(
-        "INF834 parallel populate: %.1f GiB on %d threads in %.1fs",
-        nbytes / 2**30,
-        threads,
-        time.perf_counter() - tic,
-    )
 
 
 def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:

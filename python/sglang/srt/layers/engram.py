@@ -673,6 +673,70 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
     return mapped, huge
 
 
+def _huge_pages_in_range(start: int, end: int) -> tuple[int, int]:
+    """(mapped_kB, huge_kB) summed over the VMAs that overlap [start, end), from
+    /proc/self/smaps. MADV_NOHUGEPAGE on part of a table splits its VMA in two."""
+    mapped = huge = 0
+    inside = False
+    try:
+        with open("/proc/self/smaps") as f:
+            for line in f:
+                m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
+                if m:
+                    inside = int(m.group(1), 16) < end and start < int(m.group(2), 16)
+                elif inside:
+                    key, _, rest = line.partition(":")
+                    if key == "Rss":
+                        mapped += int(rest.split()[0])
+                    elif key in ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped"):
+                        huge += int(rest.split()[0])
+    except OSError:
+        pass
+    return mapped, huge
+
+
+_ENGRAM_FAULT_CHUNK = 1 << 30
+# Fixed prefix of the one WARNING per table, so boot logs can be grepped for it.
+ENGRAM_FAULT_FALLBACK = "INF834 engram huge-page fallback"
+
+
+def _madvise(addr: int, length: int, advice: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    if libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(length), advice):
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+_MADV_COLLAPSE = 25  # Linux >= 6.1; not in Python's mmap module
+_COLLAPSE_STEP = 64 << 20
+
+
+def _collapse_best_effort(
+    addr: int, length: int, stop: Optional[threading.Event] = None
+) -> tuple[int, dict, float]:
+    """MADV_COLLAPSE over [addr, addr + length) in 64 MiB steps, never raising.
+
+    Returns (bytes collapsed, {errno name: failed steps}, seconds). A step fails
+    with EAGAIN when a page in it is pinned or busy, ENOMEM when the node has no
+    free 2 MiB block; both are left on 4 KiB pages. `stop` ends it between steps."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    tic = time.perf_counter()
+    done = 0
+    errors: dict = {}
+    for off in range(0, length, _COLLAPSE_STEP):
+        if stop is not None and stop.is_set():
+            break
+        n = min(_COLLAPSE_STEP, length - off)
+        if libc.madvise(ctypes.c_void_p(addr + off), ctypes.c_size_t(n), _MADV_COLLAPSE):
+            name = errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
+            errors[name] = errors.get(name, 0) + 1
+        else:
+            done += n
+    return done, errors, time.perf_counter() - tic
+
+
 _page_cache_dropped = False
 
 
@@ -836,6 +900,8 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        # (offset, length) put on 4 KiB pages by the capped pre-fault, else None.
+        self.small_page_range = None
         self.fd = self._open_shared_fd(nbytes, name) if layout == "shared" else None
         if _graphs_persisted():
             self.mm = _mmap_at_fixed_address(nbytes, self.fd)
@@ -893,6 +959,10 @@ class _HostTable:
             self._register()
 
     def _prefault(self) -> None:
+        cap = envs.SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S.get()
+        if cap > 0:
+            self._prefault_capped(cap)
+            return
         keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
         tic = time.perf_counter()
         if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
@@ -914,6 +984,66 @@ class _HostTable:
                 huge_kb / 2**10,
                 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
             )
+
+    def _populate(self, start: int, length: int) -> None:
+        """Fault in [start, start + length) of the table for writing."""
+        if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+            from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                inf834_populate_write_range,
+            )
+
+            threads = max(1, envs.SGLANG_OPT_INF834_POPULATE_THREADS.get())
+            inf834_populate_write_range(self.bytes.data_ptr() + start, length, threads)
+        else:
+            np.frombuffer(self.mm, dtype=np.uint8, count=length, offset=start)[
+                :: mmap.PAGESIZE
+            ] = 0
+
+    def _prefault_capped(self, cap: float) -> None:
+        """INF-834 SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S: pre-fault chunk by chunk; after
+        the first chunk slower than `cap` seconds, fault the rest on 4 KiB pages.
+
+        With THP defrag=madvise, a MADV_HUGEPAGE fault that finds no free 2 MiB block
+        compacts memory in the faulting thread. A rank whose NUMA node is short of
+        2 MiB blocks then spent up to 55 s here (INF-834 e2e s1-a-1). A 4 KiB fault
+        never compacts, so the boot path pays at most one slow chunk."""
+        tic = time.perf_counter()
+        base = self.bytes.data_ptr()
+        start = 0
+        while start < self.nbytes:
+            length = min(_ENGRAM_FAULT_CHUNK, self.nbytes - start)
+            t = time.perf_counter()
+            self._populate(start, length)
+            slow = time.perf_counter() - t
+            start += length
+            if slow > cap and start < self.nbytes:
+                rest = self.nbytes - start
+                _madvise(base + start, rest, mmap.MADV_NOHUGEPAGE)
+                t = time.perf_counter()
+                self._populate(start, rest)
+                self.small_page_range = (start, rest)
+                logger.warning(
+                    "%s: table %s, a 1 GiB chunk took %.2fs (cap %.2fs) at %.1f GiB; "
+                    "the remaining %.1f GiB is on 4 KiB pages, faulted in %.1fs",
+                    ENGRAM_FAULT_FALLBACK,
+                    self.name,
+                    slow,
+                    cap,
+                    (start - length) / 2**30,
+                    rest / 2**30,
+                    time.perf_counter() - t,
+                )
+                break
+        mapped_kb, huge_kb = _huge_pages_in_range(base, base + self.nbytes)
+        logger.info(
+            "INF834 engram host table %s: capped pre-fault %.1fs, %.0f MiB resident, "
+            "%.0f MiB in huge pages (%.1f%%)",
+            self.name,
+            time.perf_counter() - tic,
+            mapped_kb / 2**10,
+            huge_kb / 2**10,
+            100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+        )
 
     def _register(self) -> None:
         err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), self.nbytes, 0)
@@ -993,7 +1123,14 @@ class _HostTable:
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+        if self.small_page_range is not None:
+            # The table is registered (pinned) by now, and MADV_COLLAPSE refuses pinned
+            # pages (EAGAIN), so the synchronous collapse below would only add its
+            # retry sleeps to the boot. The 4 KiB part stays as it is.
+            mapped_kb, huge_kb = _huge_pages_in_range(
+                self.bytes.data_ptr(), self.bytes.data_ptr() + self.nbytes
+            )
+        elif self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
             if envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get():
                 logger.info(
                     "INF834 engram host table %s: %.1f%% in huge pages before "

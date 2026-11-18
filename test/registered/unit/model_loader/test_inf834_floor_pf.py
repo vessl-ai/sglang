@@ -11,6 +11,7 @@
 import os
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -1001,6 +1002,246 @@ class TestPreallocBeforeRestore(CustomTestCase):
         )
         # Switch off: no prealloc at all.
         self.assertEqual(self._run({}), ["stream"])
+
+
+# ------------------------------------------------------------- Engram capped pre-fault
+
+MiB = 1 << 20
+
+
+class _Registrar:
+    def __init__(self):
+        self.calls = []
+
+    def cudaHostRegister(self, ptr, n, flags):
+        self.calls.append((ptr, n))
+        return 0
+
+
+def _vm_flags(addr):
+    """VmFlags of the VMA holding addr, from /proc/self/smaps."""
+    inside = False
+    with open("/proc/self/smaps") as f:
+        for line in f:
+            head = line.split()[0]
+            if "-" in head and ":" not in head:
+                a, b = (int(x, 16) for x in head.split("-"))
+                inside = a <= addr < b
+            elif inside and line.startswith("VmFlags:"):
+                return line.split()[1:]
+    return []
+
+
+@unittest.skipUnless(os.path.exists("/proc/self/smaps"), "Linux only")
+class TestEngramFaultCap(CustomTestCase):
+    """SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S: chunked pre-fault, 4 KiB fallback."""
+
+    N = 10 * MiB
+    CHUNK = 2 * MiB
+
+    def _table(self, env, name="t"):
+        from sglang.srt.layers import engram
+
+        reg = _Registrar()
+        base = {"SGLANG_OPT_INF834_KEEP_PAGE_CACHE": "1"}
+        base.update(env)
+        with mock.patch.dict(os.environ, base), mock.patch.object(
+            engram, "_graphs_persisted", lambda: False
+        ), mock.patch.object(engram, "_ENGRAM_FAULT_CHUNK", self.CHUNK), mock.patch(
+            "torch.cuda.cudart", lambda: reg
+        ):
+            ht = engram._HostTable("per_rank", self.N, name, None)
+        return ht, reg
+
+    def _recording_populate(self, slow_starts=(), delay=0.05):
+        from sglang.srt.layers import engram
+
+        calls = []
+        real = engram._HostTable._populate
+
+        def populate(self_, start, length):
+            calls.append((start, length))
+            if start in slow_starts:
+                time.sleep(delay)
+            real(self_, start, length)
+
+        return calls, mock.patch.object(engram._HostTable, "_populate", populate)
+
+    def test_default_off_keeps_the_whole_table_populate(self):
+        from sglang.srt.layers import engram
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+
+        seen = []
+        with mock.patch.object(
+            mmap_allocator,
+            "inf834_populate_write_parallel",
+            lambda mm, n: seen.append(n),
+        ), mock.patch.object(
+            engram._HostTable,
+            "_prefault_capped",
+            side_effect=AssertionError("capped path without the switch"),
+        ):
+            ht, reg = self._table({"SGLANG_OPT_INF834_PARALLEL_POPULATE": "1"})
+        self.assertEqual(seen, [self.N])  # one call over the whole table, as before
+        self.assertIsNone(ht.small_page_range)
+        self.assertEqual(reg.calls, [(ht.bytes.data_ptr(), self.N)])
+
+    def test_fast_chunks_stay_huge_page_eligible(self):
+        calls, patch = self._recording_populate()
+        with patch, self.assertNoLogs("sglang.srt.layers.engram", level="WARNING"):
+            ht, reg = self._table({"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "10"})
+        self.assertEqual(calls, [(o, self.CHUNK) for o in range(0, self.N, self.CHUNK)])
+        self.assertIsNone(ht.small_page_range)
+        self.assertNotIn("nh", _vm_flags(ht.bytes.data_ptr() + self.N - 1))
+        self.assertEqual(len(reg.calls), 1)
+
+    def test_slow_chunk_puts_the_rest_on_small_pages(self):
+        from sglang.srt.layers import engram
+
+        calls, patch = self._recording_populate(slow_starts={self.CHUNK})
+        with patch, self.assertLogs("sglang.srt.layers.engram", level="WARNING") as logs:
+            ht, reg = self._table(
+                {
+                    "SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "0.02",
+                    "SGLANG_OPT_INF834_PARALLEL_POPULATE": "1",
+                    "SGLANG_OPT_INF834_POPULATE_THREADS": "2",
+                }
+            )
+        rest = self.N - 2 * self.CHUNK
+        self.assertEqual(calls, [(0, self.CHUNK), (self.CHUNK, self.CHUNK), (2 * self.CHUNK, rest)])
+        self.assertEqual(ht.small_page_range, (2 * self.CHUNK, rest))
+        warnings = [r for r in logs.output if engram.ENGRAM_FAULT_FALLBACK in r]
+        self.assertEqual(len(warnings), 1)
+        base = ht.bytes.data_ptr()
+        self.assertIn("nh", _vm_flags(base + 2 * self.CHUNK))  # the tail: MADV_NOHUGEPAGE
+        self.assertIn("nh", _vm_flags(base + self.N - 1))
+        self.assertNotIn("nh", _vm_flags(base))  # the head keeps MADV_HUGEPAGE
+        mapped_kb, _ = engram._huge_pages_in_range(base, base + self.N)
+        self.assertEqual(mapped_kb, self.N // 1024)  # every page is faulted in
+        self.assertEqual(reg.calls, [(base, self.N)])
+        ht.bytes[:] = 7  # the whole table is writable
+        self.assertEqual(int(ht.bytes.sum()), 7 * self.N)
+
+    def test_slow_last_chunk_changes_nothing(self):
+        calls, patch = self._recording_populate(slow_starts={self.N - self.CHUNK})
+        with patch, self.assertNoLogs("sglang.srt.layers.engram", level="WARNING"):
+            ht, _ = self._table({"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "0.02"})
+        self.assertEqual(len(calls), self.N // self.CHUNK)
+        self.assertIsNone(ht.small_page_range)
+
+    def test_finish_load_skips_the_collapse_after_the_fallback(self):
+        from sglang.srt.layers import engram
+
+        calls, patch = self._recording_populate(slow_starts={0})
+        with patch:
+            ht, _ = self._table({"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "0.02"})
+        self.assertEqual(ht.small_page_range, (self.CHUNK, self.N - self.CHUNK))
+        ht.dirty = True
+        with mock.patch.object(
+            engram._HostTable, "_collapse", side_effect=AssertionError("collapse")
+        ), mock.patch.object(
+            engram, "drop_checkpoint_page_cache", side_effect=AssertionError("drop")
+        ):
+            ht.finish_load("layer 0")
+
+
+class TestCollapseBestEffort(CustomTestCase):
+    """_collapse_best_effort never raises and counts failed steps by errno."""
+
+    def _fake_libc(self, results):
+        state = {"errno": 0, "calls": []}
+
+        def madvise(addr, length, advice):
+            state["calls"].append((addr.value, length.value, advice))
+            err = results[len(state["calls"]) - 1]
+            state["errno"] = err
+            return -1 if err else 0
+
+        libc = types.SimpleNamespace(madvise=madvise)
+        return state, libc
+
+    def test_failures_are_counted_not_raised(self):
+        import ctypes
+        import errno as errno_mod
+
+        from sglang.srt.layers import engram
+
+        step = engram._COLLAPSE_STEP
+        results = [0, errno_mod.EAGAIN, errno_mod.ENOMEM, 0, errno_mod.EAGAIN]
+        state, libc = self._fake_libc(results)
+        with mock.patch.object(ctypes, "CDLL", lambda *a, **k: libc), mock.patch.object(
+            ctypes, "get_errno", lambda: state["errno"]
+        ):
+            done, errors, secs = engram._collapse_best_effort(4096, 5 * step - 4096)
+        self.assertEqual(done, 2 * step)
+        self.assertEqual(errors, {"EAGAIN": 2, "ENOMEM": 1})
+        self.assertEqual([c[0] for c in state["calls"]], [4096 + i * step for i in range(5)])
+        self.assertEqual(state["calls"][-1][1], step - 4096)
+        self.assertTrue(all(c[2] == engram._MADV_COLLAPSE for c in state["calls"]))
+        self.assertGreaterEqual(secs, 0.0)
+
+    def test_stop_between_steps(self):
+        import ctypes
+
+        from sglang.srt.layers import engram
+
+        step = engram._COLLAPSE_STEP
+        stop = threading.Event()
+        state, libc = self._fake_libc([0] * 4)
+        real = libc.madvise
+
+        def madvise(addr, length, advice):
+            stop.set()
+            return real(addr, length, advice)
+
+        libc.madvise = madvise
+        with mock.patch.object(ctypes, "CDLL", lambda *a, **k: libc), mock.patch.object(
+            ctypes, "get_errno", lambda: state["errno"]
+        ):
+            done, errors, _ = engram._collapse_best_effort(0, 4 * step, stop)
+        self.assertEqual((done, errors, len(state["calls"])), (step, {}, 1))
+
+    @unittest.skipUnless(hasattr(os, "pipe") and os.path.exists("/proc/self/smaps"), "Linux only")
+    def test_real_kernel_pinned_page_gives_eagain(self):
+        """A page with an extra reference (here held by vmsplice; cudaHostRegister pins the
+        same way) makes its 2 MiB step fail with EAGAIN; the call still returns."""
+        import ctypes
+        import mmap
+
+        from sglang.srt.layers import engram
+
+        raw = mmap.mmap(-1, 8 * MiB, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        view = ctypes.c_char.from_buffer(raw)
+        try:
+            base = ctypes.addressof(view)
+            addr = (base + 2 * MiB - 1) & ~(2 * MiB - 1)
+            engram._madvise(addr, 4 * MiB, mmap.MADV_NOHUGEPAGE)
+            ctypes.memset(addr, 1, 4 * MiB)
+            engram._madvise(addr, 4 * MiB, mmap.MADV_HUGEPAGE)
+
+            class iovec(ctypes.Structure):
+                _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.vmsplice.argtypes = (ctypes.c_int, ctypes.POINTER(iovec), ctypes.c_ulong, ctypes.c_uint)
+            libc.vmsplice.restype = ctypes.c_ssize_t
+            r, w = os.pipe()
+            try:
+                iov = iovec(addr + 4096, 4096)
+                if libc.vmsplice(w, ctypes.byref(iov), 1, 0) != 4096:
+                    self.skipTest("vmsplice unavailable")
+                with mock.patch.object(engram, "_COLLAPSE_STEP", 2 * MiB):
+                    done, errors, _ = engram._collapse_best_effort(addr, 4 * MiB)
+            finally:
+                os.close(r)
+                os.close(w)
+            if errors.get("EINVAL"):
+                self.skipTest("MADV_COLLAPSE unsupported (kernel < 6.1)")
+            self.assertEqual(errors.get("EAGAIN"), 1)  # the step holding the referenced page
+            self.assertIn(done, (0, 2 * MiB))  # the other step: collapsed, or ENOMEM on a full node
+        finally:
+            del view
+            raw.close()
 
 
 if __name__ == "__main__":

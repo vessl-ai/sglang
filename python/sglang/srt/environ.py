@@ -2345,6 +2345,11 @@ class Envs:
     # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
     SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
     SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
+    # Engram per-rank host table: pre-fault in 1 GiB chunks, and when one chunk takes
+    # longer than this many seconds (the node is short of free 2 MiB blocks, so the
+    # huge-page faults compact), put the rest of the table on 4 KiB pages
+    # (MADV_NOHUGEPAGE) instead of compacting on the boot path. 0 = off.
+    SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S = EnvFloat(0.0)
     # Diagnostic for the A/B proof (not a lever): when set to a directory, write
     # a per-rank digest of every loaded tensor after load_model.
     SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
