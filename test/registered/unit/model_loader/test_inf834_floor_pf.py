@@ -1002,6 +1002,65 @@ class TestColdPreread(CustomTestCase):
             r2.stop()
             self.assertEqual(r2.files_read, 0)
 
+    def _cgroup(self, tmp, limit, anon, shmem=0, active_file=0):
+        d = os.path.join(tmp, "cg")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "memory.max"), "w").write(str(limit) + "\n")
+        open(os.path.join(d, "memory.stat"), "w").write(
+            f"anon {anon}\nfile 0\nshmem {shmem}\nactive_file {active_file}\ninactive_file 0\n"
+        )
+        return d
+
+    def test_cgroup_headroom(self):
+        from sglang.srt.model_loader.inf834_cold_preread import cgroup_headroom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._cgroup(tmp, 100 << 30, anon=40 << 30, shmem=20 << 30, active_file=10 << 30)
+            self.assertEqual(cgroup_headroom(d), 30 << 30)
+            open(os.path.join(d, "memory.max"), "w").write("max\n")
+            self.assertIsNone(cgroup_headroom(d))
+            self.assertIsNone(cgroup_headroom(os.path.join(tmp, "missing")))
+
+    def test_no_cgroup_room_skips_without_reading(self):
+        """With no room for page cache the reader never reads; once the loader has
+        started a shard, the reader gives it up instead of waiting."""
+        import time as _time
+
+        from sglang.srt.model_loader.inf834_cold_preread import ColdPrereader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files, size = self._files(tmp, n=4)
+            cg = self._cgroup(tmp, 10 << 30, anon=9 << 30)  # 1 GiB room < 16 GiB margin
+            r = ColdPrereader(files, rank=0, nranks=2, threads=1, ahead=8,
+                              resident_skip=2.0, cgroup_dir=cg)
+            r.start()
+            _time.sleep(0.3)
+            self.assertEqual(r.files_read, 0)
+            r.advance(4)
+            deadline = _time.time() + 10
+            while r.files_late < 2 and _time.time() < deadline:
+                _time.sleep(0.05)
+            r.stop()
+            self.assertEqual((r.files_read, r.files_late), (0, 2))
+            self.assertLess(r.min_budget, 0)
+            # Room for exactly one shard per rank: the second waits for the stream.
+            cg2 = self._cgroup(os.path.join(tmp, "b"), (16 << 30) + 2 * size + (1 << 20), anon=0)
+            r2 = ColdPrereader(files, rank=0, nranks=2, threads=1, ahead=8,
+                               resident_skip=2.0, cgroup_dir=cg2)
+            self.assertEqual(r2.mine, [0, 2])
+            r2.start()
+            deadline = _time.time() + 10
+            while r2.files_read < 1 and _time.time() < deadline:
+                _time.sleep(0.05)
+            _time.sleep(0.3)
+            self.assertEqual(r2.files_read, 1)  # shard 2 would exceed this rank's share
+            r2.advance(1)  # the loader started shard 0: its read-ahead is consumed
+            deadline = _time.time() + 10
+            while r2.files_read < 2 and _time.time() < deadline:
+                _time.sleep(0.05)
+            r2.stop()
+            self.assertEqual(r2.files_read, 2)
+
     def test_switch_and_label(self):
         from sglang.srt.model_loader import inf834_cold_preread as cp
 

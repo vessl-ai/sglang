@@ -12,10 +12,21 @@ With the switch on, every rank starts a reader thread when the target stream
 starts. The rank reads the shards whose position in the stream's file list is
 congruent to its local rank modulo the local world size, in stream order, with
 PREREAD_THREADS threads of 16 MiB pread into a scratch buffer whose contents are
-dropped: the point is the page cache, which the four ranks share. A shard is read
-only once it is within PREREAD_AHEAD_FILES of the stream's front (the shards the
-loader has started), so the read-ahead holds a bounded amount of page cache in the
-pod's memory cgroup, and is skipped when it is already resident (warm boot).
+dropped: the point is the page cache, which the four ranks share. A shard is
+skipped when it is already resident (warm boot).
+
+How far ahead it reads is bounded twice. At most PREREAD_AHEAD_FILES shards ahead
+of the stream's front (the shards the loader has started). And within the pod's
+memory cgroup: pre-read pages sit on the inactive file list until the loader
+touches them, and that list is what reclaim takes first, so a read-ahead larger
+than the memory the cgroup can still give to the page cache evicts its own unread
+pages and they are read again (the prefill pod sits at its 480 GiB limit during
+the weight load). A shard is read only while this rank's unconsumed read-ahead
+plus the shard fits in
+
+    (memory.max - anon - shmem - active_file - PREREAD_MARGIN_GB) / local ranks
+
+from the cgroup's memory.stat; with no limit only the shard count applies.
 
 Reads only: nothing the model loads changes; the populate and the copies that
 follow find the pages in the page cache instead of reading the disk.
@@ -76,6 +87,27 @@ def resident_fraction(path: str, samples: int = 256) -> float:
         os.close(fd)
 
 
+def cgroup_headroom(cgroup_dir: str = "/sys/fs/cgroup") -> Optional[int]:
+    """Bytes the memory cgroup can still give to new page cache without evicting
+    active or unevictable memory: memory.max - anon - shmem - active_file. None
+    when there is no limit or no cgroup v2 files."""
+    try:
+        with open(os.path.join(cgroup_dir, "memory.max")) as f:
+            raw = f.read().strip()
+        if raw == "max":
+            return None
+        limit = int(raw)
+        stat = {}
+        with open(os.path.join(cgroup_dir, "memory.stat")) as f:
+            for line in f:
+                k, _, v = line.partition(" ")
+                stat[k] = int(v)
+        used = stat.get("anon", 0) + stat.get("shmem", 0) + stat.get("active_file", 0)
+        return limit - used
+    except (OSError, ValueError):
+        return None
+
+
 def local_rank_and_size() -> tuple:
     """(local rank, ranks on this node) of the calling process; (0, 1) outside torch.distributed."""
     try:
@@ -102,12 +134,21 @@ class ColdPrereader:
         threads: int,
         ahead: int,
         resident_skip: float = 0.9,
+        margin_bytes: int = 16 << 30,
+        cgroup_dir: str = "/sys/fs/cgroup",
     ):
         self.files = list(files)
         self.mine = [i for i in range(len(self.files)) if i % max(1, nranks) == rank]
         self.threads = max(1, threads)
         self.ahead = max(1, ahead)
         self.resident_skip = resident_skip
+        self.nranks = max(1, nranks)
+        self.margin = margin_bytes
+        self.cgroup_dir = cgroup_dir
+        self.sizes = {i: os.path.getsize(self.files[i]) for i in self.mine}
+        self.files_late = 0  # skipped: no room before the loader reached them
+        self.min_budget: Optional[int] = None
+        self._done = set()
         self._front = 0  # number of files the stream has started
         self._cv = threading.Condition()
         self._stop = False
@@ -139,6 +180,23 @@ class ColdPrereader:
             self._thread.join()
 
     # -- reader side
+    def _budget(self) -> Optional[int]:
+        room = cgroup_headroom(self.cgroup_dir)
+        if room is None:
+            return None
+        budget = (room - self.margin) // self.nranks
+        self.min_budget = budget if self.min_budget is None else min(self.min_budget, budget)
+        return budget
+
+    def _fits(self, i: int) -> bool:
+        """This rank's unconsumed read-ahead (its shards the loader has not started)
+        plus shard i fits in its share of the cgroup headroom."""
+        budget = self._budget()
+        if budget is None:
+            return True
+        ahead = sum(self.sizes[j] for j in self.mine if self._front <= j < i and j in self._done)
+        return ahead + self.sizes[i] <= budget
+
     def _read_file(self, path: str, pool) -> int:
         size = os.path.getsize(path)
         fd = os.open(path, os.O_RDONLY)
@@ -172,12 +230,21 @@ class ColdPrereader:
             ) as pool:
                 for i in self.mine:
                     tic = time.perf_counter()
+                    late = False
                     with self._cv:
-                        while not self._stop and i >= self._front + self.ahead:
+                        while not self._stop:
+                            if i < self._front + self.ahead and self._fits(i):
+                                break
+                            if i < self._front:
+                                late = True  # the loader is on it already; no room
+                                break
                             self._cv.wait(0.5)
                         if self._stop:
                             return
                     self.waited_secs += time.perf_counter() - tic
+                    if late:
+                        self.files_late += 1
+                        continue
                     path = self.files[i]
                     if resident_fraction(path) >= self.resident_skip:
                         self.files_skipped += 1
@@ -186,13 +253,15 @@ class ColdPrereader:
                     self.bytes_read += self._read_file(path, pool)
                     self.read_secs += time.perf_counter() - tic
                     self.files_read += 1
+                    self._done.add(i)
         except Exception as e:  # reads only: the stream reads the bytes itself anyway
             self.error = repr(e)
 
     def log(self, label: str) -> None:
         logger.info(
             "INF834 cold preread [%s]: %d of %d files read (%.2f GB, %.1f s reading at "
-            "%.2f GB/s, %.1f s waiting for the window), %d already resident%s",
+            "%.2f GB/s, %.1f s waiting for the window), %d already resident, %d skipped "
+            "for lack of cgroup room (smallest per-rank budget %s)%s",
             label,
             self.files_read,
             len(self.mine),
@@ -201,6 +270,8 @@ class ColdPrereader:
             self.bytes_read / 1e9 / self.read_secs if self.read_secs else 0.0,
             self.waited_secs,
             self.files_skipped,
+            self.files_late,
+            "none" if self.min_budget is None else f"{self.min_budget / 1e9:.1f} GB",
             f"; stopped on {self.error}" if self.error else "",
         )
 
@@ -215,10 +286,11 @@ def maybe_start(files: List[str], label: str) -> Optional[ColdPrereader]:
         nranks,
         envs.SGLANG_OPT_INF834_PREREAD_THREADS.get(),
         envs.SGLANG_OPT_INF834_PREREAD_AHEAD_FILES.get(),
+        margin_bytes=int(envs.SGLANG_OPT_INF834_PREREAD_MARGIN_GB.get() * (1 << 30)),
     )
     logger.info(
         "INF834 cold preread [%s]: local rank %d of %d reads %d of %d files, %d threads, "
-        "window %d files",
+        "window %d files, cgroup margin %.0f GiB",
         label,
         rank,
         nranks,
@@ -226,6 +298,7 @@ def maybe_start(files: List[str], label: str) -> Optional[ColdPrereader]:
         len(files),
         reader.threads,
         reader.ahead,
+        reader.margin / (1 << 30),
     )
     reader.start()
     return reader
