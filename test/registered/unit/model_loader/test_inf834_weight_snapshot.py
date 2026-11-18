@@ -304,6 +304,14 @@ class TestIdentityArgs(Base):
         with mock.patch.dict(os.environ, {"SGLANG_SOME_LOAD_SWITCH": "1"}):  # any other SGLANG_* env still misses
             self.assertNotEqual(base, self._with_args(on, lambda: self.snap(m).dir))
 
+    def test_engram_fault_cap_hit(self):
+        """SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S (Engram host-table page-fault time cap) does not change weight bytes:
+        turning it on must not make an existing snapshot miss."""
+        m = make_model(real_tensor_list(limit=5), seed=10)
+        base = self._with_args(self.ARGS, lambda: self.snap(m).dir)
+        with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "2.5"}):
+            self.assertEqual(base, self._with_args(self.ARGS, lambda: self.snap(m).dir))
+
     def test_two_pods_of_one_cell_hit(self):
         """Two prefill pods of the cell draft (runs/img/manifests/cell-s02, e2e mkcell): the only per-pod
         values in the engine args are $(POD_IP) inside --hicache-storage-backend-extra-config (and, when

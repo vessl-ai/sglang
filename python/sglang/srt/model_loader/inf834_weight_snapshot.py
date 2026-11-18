@@ -173,6 +173,7 @@ _ENV_VOLATILE = re.compile(
     r"SGLANG_OPT_INF834_(EARLY_HTTP_WORKERS|FAST_WARMUP_POLL|EARLY_CUINIT|NUMA_PRECOMPUTE|"
     r"TOKENIZER_MEMO|TOKENIZER_PREFETCH|W6_PROFILE|LOAD_PROFILE|WEIGHT_DIGEST_DIR)|"
     r"SGLANG_JIT_DEEPGEMM_PRECOMPILE|"  # DeepGEMM kernel JIT at startup, not weights
+    r"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S|"  # Engram host-table fault time cap (huge-page fallback), not weights
     r"SGLANG_LOGGING.*|SGLANG_.*LOG_LEVEL.*|SGLANG_IMAGE_TAG|SGLANG_BUILD_.*)$"
 )
 _code_digest_cache: Optional[str] = None
