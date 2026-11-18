@@ -938,5 +938,70 @@ class TestBulkWithExpertLocationMetadata(CustomTestCase):
         self.assertEqual(loader.tensors_fallback, 3 * 6)
 
 
+
+# ------------------------------------------------- host pool prealloc vs restore
+class TestPreallocBeforeRestore(CustomTestCase):
+    """HOST_POOL_PREALLOC starts before the weights arrive on both paths: before the
+    weight snapshot's begin() (which restores) and before the checkpoint stream."""
+
+    def _run(self, env, is_nextn=False, restored=True):
+        from sglang.srt.mem_cache import inf834_host_prealloc as hp
+        from sglang.srt.model_loader import inf834_weight_snapshot as ws
+
+        case = TestLoadWeightsIntegration()
+        model = case._model(4, 1)
+        order = []
+
+        def stream():
+            for i, item in enumerate(case._stream()):
+                if i == 0:
+                    order.append("stream")
+                yield item
+
+        def fake_begin(self):
+            order.append("begin")
+            return restored
+
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+            hp, "maybe_start_host_pool_prealloc", lambda: order.append("prealloc")
+        ), mock.patch.object(ws.WeightSnapshot, "begin", fake_begin), mock.patch.object(
+            ws.WeightSnapshot, "end", lambda self: None
+        ), mock.patch.object(
+            ws.WeightSnapshot, "__init__", lambda self, *a, **k: None
+        ):
+            model.load_weights(stream(), is_nextn=is_nextn)
+        return order
+
+    def test_prealloc_starts_before_the_restore(self):
+        order = self._run(
+            {
+                "SGLANG_OPT_INF834_HOST_POOL_PREALLOC": "1",
+                "SGLANG_OPT_INF834_WEIGHT_SNAPSHOT": "load",
+            }
+        )
+        self.assertEqual(order[:2], ["prealloc", "begin"])
+        self.assertNotIn("stream", order)  # restored: the checkpoint stream is not read
+
+    def test_checkpoint_path_unchanged(self):
+        # No snapshot: the prealloc still starts before the first streamed tensor.
+        self.assertEqual(
+            self._run({"SGLANG_OPT_INF834_HOST_POOL_PREALLOC": "1"}),
+            ["prealloc", "stream"],
+        )
+        # Snapshot on but nothing restored (miss): prealloc, begin, then the stream.
+        self.assertEqual(
+            self._run(
+                {
+                    "SGLANG_OPT_INF834_HOST_POOL_PREALLOC": "1",
+                    "SGLANG_OPT_INF834_WEIGHT_SNAPSHOT": "auto",
+                },
+                restored=False,
+            ),
+            ["prealloc", "begin", "stream"],
+        )
+        # Switch off: no prealloc at all.
+        self.assertEqual(self._run({}), ["stream"])
+
+
 if __name__ == "__main__":
     unittest.main()

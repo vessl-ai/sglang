@@ -5659,6 +5659,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        # INF-834 SGLANG_OPT_INF834_HOST_POOL_PREALLOC: start populating the host pools
+        # before the weights arrive, whether they come from the checkpoint stream or from
+        # a weight snapshot. The snapshot restore below runs inside begin(); started after
+        # it, the populate ran into the MHC prewarm instead of overlapping the restore.
+        if not is_nextn and envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+            from sglang.srt.mem_cache.inf834_host_prealloc import (
+                maybe_start_host_pool_prealloc,
+            )
+
+            maybe_start_host_pool_prealloc()
+
         # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT: this rank's weights as the stream below
         # would leave them, from the node's snapshot; then only the post steps run.
         inf834_snapshot = None
@@ -5748,12 +5759,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
             inf834_expert_route = make_expert_route(expert_params_mapping)
-        if not is_nextn and envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
-            from sglang.srt.mem_cache.inf834_host_prealloc import (
-                maybe_start_host_pool_prealloc,
-            )
-
-            maybe_start_host_pool_prealloc()
 
         inf834_direct_lazy = None
         if not is_nextn and envs.SGLANG_OPT_INF834_EP_DIRECT_EXPERTS.get():
