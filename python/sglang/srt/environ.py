@@ -2435,6 +2435,13 @@ class Envs:
     # only pieces contiguous in the file (w1/w3 rows of this rank, their scales) are
     # pread; w2 stays populated and is gathered from the mapping.
     SGLANG_OPT_INF834_DIRECT_READ_W2 = EnvBool(False)
+    # Cold page cache: every rank reads its share of the checkpoint shards (every
+    # local-world-size-th shard of the stream's list) into the page cache with
+    # PREREAD_THREADS threads of 16 MiB pread, at most PREREAD_AHEAD_FILES shards
+    # ahead of the shards the loader has started; resident shards are skipped.
+    SGLANG_OPT_INF834_COLD_PREREAD = EnvBool(False)
+    SGLANG_OPT_INF834_PREREAD_THREADS = EnvInt(4)
+    SGLANG_OPT_INF834_PREREAD_AHEAD_FILES = EnvInt(6)
     # HiCache host pools from the mooncake allocator: allocate (populate) the
     # segments of the sizes recorded by the previous boot in a background thread
     # while the weights load; an allocation of a recorded size then takes the
