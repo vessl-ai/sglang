@@ -314,12 +314,32 @@ def iterate(
     load_file_filtered as the per-shard loader. Yield order is unchanged: shard
     order, names sorted within a shard."""
     tic = time.perf_counter()
+    from sglang.srt.model_loader import inf834_cold_preread
+
+    files = list(files)
+    preread = inf834_cold_preread.maybe_start(files, read_filter.label)
+    try:
+        yield from _iterate_window(
+            files, max_workers, read_filter, stats, drop_after_load, preread
+        )
+    finally:
+        if preread is not None:
+            preread.stop()
+            preread.log(read_filter.label)
+    log_stats(read_filter, stats, time.perf_counter() - tic)
+
+
+def _iterate_window(files, max_workers, read_filter, stats, drop_after_load, preread):
+    started = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         file_iter = iter(files)
         pending = collections.deque(
             (f, executor.submit(load_file_filtered, f, read_filter, stats))
             for f in itertools.islice(file_iter, max_workers + 1)
         )
+        started = len(pending)
+        if preread is not None:
+            preread.advance(started)
         while pending:
             st_file, future = pending.popleft()
             state_dict = future.result()
@@ -334,12 +354,14 @@ def iterate(
                         ),
                     )
                 )
+                started += 1
+                if preread is not None:
+                    preread.advance(started)
             for name in sorted(state_dict.keys()):
                 yield name, state_dict[name]
             del state_dict
             if drop_after_load is not None:
                 drop_after_load(st_file)
-    log_stats(read_filter, stats, time.perf_counter() - tic)
 
 
 def new_stats() -> _Stats:

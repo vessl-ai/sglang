@@ -938,5 +938,109 @@ class TestBulkWithExpertLocationMetadata(CustomTestCase):
         self.assertEqual(loader.tensors_fallback, 3 * 6)
 
 
+
+# --------------------------------------------------------------- cold preread
+class TestColdPreread(CustomTestCase):
+    def _files(self, tmp, n=8, size=(3 << 20) + 123):
+        paths = []
+        for i in range(n):
+            p = os.path.join(tmp, f"model-{i:05d}.safetensors")
+            with open(p, "wb") as f:
+                f.write(os.urandom(size))
+            paths.append(p)
+        return paths, size
+
+    def test_rank_share_and_window(self):
+        import time as _time
+
+        from sglang.srt.model_loader.inf834_cold_preread import ColdPrereader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files, size = self._files(tmp)
+            r = ColdPrereader(files, rank=1, nranks=4, threads=2, ahead=2, resident_skip=2.0)
+            self.assertEqual(r.mine, [1, 5])
+            r.start()
+            deadline = _time.time() + 10
+            while r.files_read < 1 and _time.time() < deadline:
+                _time.sleep(0.05)
+            _time.sleep(0.3)
+            self.assertEqual(r.files_read, 1)  # file 5 waits: front 0 + window 2
+            r.advance(4)
+            deadline = _time.time() + 10
+            while r.files_read < 2 and _time.time() < deadline:
+                _time.sleep(0.05)
+            r.stop()
+            self.assertEqual(r.files_read, 2)
+            self.assertEqual(r.bytes_read, 2 * size)
+            self.assertIsNone(r.error)
+
+    def test_resident_files_are_skipped_and_stop_returns(self):
+        from sglang.srt.model_loader.inf834_cold_preread import (
+            ColdPrereader,
+            resident_fraction,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files, _ = self._files(tmp, n=2)
+            for p in files:  # just written: in the page cache
+                self.assertGreater(resident_fraction(p), 0.9)
+            import time as _time
+
+            r = ColdPrereader(files, rank=0, nranks=1, threads=2, ahead=8)
+            r.start()
+            r.advance(2)
+            deadline = _time.time() + 10
+            while r.files_skipped + r.files_read < 2 and _time.time() < deadline:
+                _time.sleep(0.05)
+            r.stop()
+            self.assertEqual(r.files_skipped, 2)
+            self.assertEqual(r.files_read, 0)
+            # A reader stopped before its window opens returns without reading.
+            r2 = ColdPrereader(files, rank=0, nranks=1, threads=1, ahead=1, resident_skip=2.0)
+            r2.mine = [1]
+            r2.start()
+            r2.stop()
+            self.assertEqual(r2.files_read, 0)
+
+    def test_switch_and_label(self):
+        from sglang.srt.model_loader import inf834_cold_preread as cp
+
+        self.assertIsNone(cp.maybe_start(["x"], "target"))  # switch off
+        with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_COLD_PREREAD": "1"}):
+            self.assertIsNone(cp.maybe_start(["x"], "dspark-draft"))
+
+    def test_iterate_yields_the_same_tensors(self):
+        """SELECTIVE_READ's iterator with the preread on: same names, same bytes."""
+        from sglang.srt.model_loader import inf834_selective_read as sr
+
+        gen = torch.Generator().manual_seed(7)
+        named = {f"layers.{i}.w": torch.randint(0, 255, (64, 33), generator=gen, dtype=torch.uint8)
+                 for i in range(12)}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = []
+            names = sorted(named)
+            for i in range(4):
+                p = os.path.join(tmp, f"model-{i:05d}.safetensors")
+                write_safetensors(p, {n: named[n] for n in names[i::4]})
+                files.append(p)
+            flt = sr.Inf834ReadFilter(label="target", keep=lambda n: True)
+
+            def run(env):
+                with mock.patch.dict(os.environ, env):
+                    with self.assertLogs("sglang", level="INFO") as logs:
+                        out = {k: v.clone() for k, v in sr.iterate(files, 2, flt, sr.new_stats())}
+                return out, "\n".join(logs.output)
+
+            want, _ = run({})
+            got, text = run(
+                {"SGLANG_OPT_INF834_COLD_PREREAD": "1", "SGLANG_OPT_INF834_PREREAD_AHEAD_FILES": "1"}
+            )
+        self.assertEqual(sorted(want), sorted(got))
+        for k in want:
+            self.assertTrue(torch.equal(want[k], got[k]), k)
+        self.assertIn("INF834 cold preread [target]: local rank 0 of 1 reads 4 of 4 files", text)
+        self.assertIn("INF834 cold preread [target]:", text.split("reads 4 of 4 files")[1])
+
+
 if __name__ == "__main__":
     unittest.main()
