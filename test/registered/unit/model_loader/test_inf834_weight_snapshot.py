@@ -292,6 +292,18 @@ class TestIdentityArgs(Base):
         for (k, a), b in zip(state(src).items(), state(dst).values()):
             self.assertTrue(torch.equal(a, b), k)
 
+    def test_symm_mem_and_deepgemm_precompile_hit(self):
+        """--enable-symm-mem (collective buffers) and SGLANG_JIT_DEEPGEMM_PRECOMPILE (kernel JIT) do not change
+        weight bytes: toggling either finds the same snapshot."""
+        m = make_model(real_tensor_list(limit=5), seed=9)
+        on = dict(self.ARGS, enable_symm_mem=True)
+        base = self._with_args(on, lambda: self.snap(m).dir)
+        self.assertEqual(base, self._with_args(dict(self.ARGS, enable_symm_mem=False), lambda: self.snap(m).dir))
+        with mock.patch.dict(os.environ, {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}):
+            self.assertEqual(base, self._with_args(on, lambda: self.snap(m).dir))
+        with mock.patch.dict(os.environ, {"SGLANG_SOME_LOAD_SWITCH": "1"}):  # any other SGLANG_* env still misses
+            self.assertNotEqual(base, self._with_args(on, lambda: self.snap(m).dir))
+
     def test_two_pods_of_one_cell_hit(self):
         """Two prefill pods of the cell draft (runs/img/manifests/cell-s02, e2e mkcell): the only per-pod
         values in the engine args are $(POD_IP) inside --hicache-storage-backend-extra-config (and, when
