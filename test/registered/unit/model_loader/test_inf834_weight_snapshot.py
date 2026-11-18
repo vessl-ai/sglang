@@ -272,6 +272,26 @@ class TestIdentityArgs(Base):
                 self.assertFalse(self._with_args(dict(self.ARGS, **changed), lambda: self.snap(m).begin()))
             self.assertIn("none at", "\n".join(logs.output), changed)
 
+    def test_foundry_save_prepare_and_load_cell_hit(self):
+        """The prepare boot runs --cuda-graph-persistence save, the cell boot load (each with its own TOML):
+        both must resolve to the same snapshot; a weight-relevant change next to them still misses."""
+        m = make_model(real_tensor_list(limit=5), seed=8)
+        prepare = dict(self.ARGS, cuda_graph_persistence="save", cuda_graph_persistence_config="/prep/foundry.toml")
+        cell = dict(self.ARGS, cuda_graph_persistence="load", cuda_graph_persistence_config="/opt/foundry/cell.toml")
+        native = dict(self.ARGS)  # no persistence at all
+        dirs = [self._with_args(a, lambda: self.snap(m).dir) for a in (prepare, cell, native)]
+        self.assertEqual(dirs[0], dirs[1])
+        self.assertEqual(dirs[0], dirs[2])
+        self.assertNotEqual(dirs[1], self._with_args(dict(cell, mem_fraction_static=0.80), lambda: self.snap(m).dir))
+        # and a snapshot saved by the prepare boot is restored by the cell boot
+        src = make_model(real_tensor_list(limit=5), seed=8)
+        self._with_args(prepare, lambda: self.snap(src).end())
+        dst = make_model(real_tensor_list(limit=5), seed=8)
+        zero(dst)
+        self.assertTrue(self._with_args(cell, lambda: self.snap(dst).begin()))
+        for (k, a), b in zip(state(src).items(), state(dst).values()):
+            self.assertTrue(torch.equal(a, b), k)
+
     def test_two_pods_of_one_cell_hit(self):
         """Two prefill pods of the cell draft (runs/img/manifests/cell-s02, e2e mkcell): the only per-pod
         values in the engine args are $(POD_IP) inside --hicache-storage-backend-extra-config (and, when
