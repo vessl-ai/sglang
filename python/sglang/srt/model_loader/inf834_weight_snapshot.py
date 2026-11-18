@@ -157,6 +157,9 @@ ARGS_NOT_IN_IDENTITY = frozenset(
         "stream_interval", "api_key", "admin_api_key", "served_model_name", "ssl_ca_certs",
         "ssl_certfile", "ssl_keyfile", "ssl_keyfile_password", "enable_ssl_refresh",
         "tokenizer_worker_num", "skip_server_warmup", "warmups",
+        # CUDA graph persistence (Foundry): "save" in the prepare boot, "load" in the cell, and its TOML path;
+        # they select graph capture or replay, not weight bytes
+        "cuda_graph_persistence", "cuda_graph_persistence_config",
         # per process: GPU numbering of this unit, sampling seed
         "base_gpu_id", "gpu_id_step", "random_seed",
     }
