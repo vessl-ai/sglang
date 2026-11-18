@@ -2384,6 +2384,13 @@ class Envs:
     # Decoder W2: with SELECTIVE_READ, the filtered MoE layers' routed experts are read by
     # pread into pinned staging (EP_DIRECT_THREADS worker threads, EP_DIRECT_BLOCK local
     # slots per host-to-device copy) beside the weight stream instead of being streamed.
+    # Per-rank weight snapshot (model_loader/inf834_weight_snapshot.py): "load", "save" or
+    # "auto" (load, else save); empty = off. DIR = node directory (hostPath); THREADS = read and
+    # write threads per rank; DIRECT_IO = auto (O_DIRECT when the file is not resident), 1 or 0.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT = EnvStr("")
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIR = EnvStr("")
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_THREADS = EnvInt(8)
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIRECT_IO = EnvStr("auto")
     SGLANG_OPT_INF834_EP_DIRECT_EXPERTS = EnvBool(False)
     SGLANG_OPT_INF834_EP_DIRECT_THREADS = EnvInt(8)
     SGLANG_OPT_INF834_EP_DIRECT_BLOCK = EnvInt(16)

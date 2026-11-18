@@ -414,6 +414,44 @@ class TestThroughLoadWeights(CustomTestCase):
         self.assertIn("0 unresolved", text)
         self.assertNotIn("not initialized from checkpoints", text)
 
+    def test_weight_snapshot_through_load_weights(self):
+        """SGLANG_OPT_INF834_WEIGHT_SNAPSHOT=auto through DeepseekV4ForCausalLM.load_weights: the first
+        load streams the checkpoint and saves; the second restores without reading the stream and
+        leaves the same parameters; a changed load switch falls back to the stream."""
+        p2l, _ = placement(self.LAYERS)
+        meta = Meta(p2l)
+        named = checkpoint(self.LAYERS, seed=31)
+        gen = torch.Generator().manual_seed(6)
+        for layer in self.LAYERS:
+            named[f"layers.{layer}.dense"] = torch.randn(5, 3, generator=gen)
+        with tempfile.TemporaryDirectory() as folder:
+            write_shards(folder, {k: v for k, v in named.items() if ".experts." in k})
+            env = {
+                "SGLANG_OPT_INF834_SELECTIVE_READ": "1",
+                "SGLANG_OPT_INF834_WEIGHT_SNAPSHOT": "auto",
+                "SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIR": os.path.join(folder, "snap"),
+            }
+            want, text1 = self._run(folder, named, {"SGLANG_OPT_INF834_SELECTIVE_READ": "1"}, meta)
+            first, text2 = self._run(folder, named, env, meta)
+            consumed = []
+            real_stream = named
+
+            class Counting(dict):
+                def __getitem__(self, k):
+                    consumed.append(k)
+                    return dict.__getitem__(self, k)
+
+            second, text3 = self._run(folder, Counting(real_stream), env, meta)
+            third, text4 = self._run(folder, named, dict(env, SGLANG_SOME_LOAD_SWITCH="1"), meta)
+        self.assertIn("INF834 weight snapshot [target rank 0]: saved", text2)
+        self.assertIn("INF834 weight snapshot [target rank 0]: restored", text3)
+        self.assertEqual(consumed, [])  # the checkpoint stream was not read
+        self.assertIn("none at", text4)  # another identity: a new directory, the stream again
+        for got in (first, second, third):
+            self.assertEqual(sorted(want), sorted(got))
+            for k in want:
+                self.assertTrue(torch.equal(want[k], got[k]), k)
+
 
 if __name__ == "__main__":
     unittest.main()

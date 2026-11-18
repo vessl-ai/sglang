@@ -1023,6 +1023,16 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
+        # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT (see DeepseekV4ForCausalLM.load_weights).
+        inf834_snapshot = None
+        if envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT.get():
+            from sglang.srt.model_loader.inf834_weight_snapshot import WeightSnapshot
+
+            inf834_snapshot = WeightSnapshot(self, "dspark")
+            if inf834_snapshot.begin():
+                weights = iter(())
+                loaded_params.update(params_dict)
+
         weights = _dequant_fp8_wo_a_streaming(weights)
         n_routed_experts = _dspark_stage_config(self.config).n_routed_experts
 
@@ -1095,6 +1105,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
+
+        if inf834_snapshot is not None:
+            inf834_snapshot.end()
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
