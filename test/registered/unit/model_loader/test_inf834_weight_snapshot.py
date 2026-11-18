@@ -229,6 +229,66 @@ class TestFallbacks(Base):
         self.assertIn("overwrites every parameter", text)  # the caller then runs the normal load
 
 
+class TestIdentityArgs(Base):
+    """Server args on the explicit denylist (addresses, ports, logging, metrics, timeouts, ...) do not
+    change the identity; any other argument does."""
+
+    ARGS = {
+        "model_path": "/m", "tp_size": 8, "quantization": None, "mem_fraction_static": 0.85,
+        "host": "0.0.0.0", "port": 30000, "log_level": "info", "watchdog_timeout": 3600,
+        "hicache_storage_backend_extra_config": '{"master_server_address": "10.0.0.1:50051"}',
+        "served_model_name": "a", "_raw_internal_flag": True,
+    }
+
+    def _with_args(self, args, fn):
+        import types
+
+        sa = types.SimpleNamespace(_raw_input=dict(args))
+        with mock.patch("sglang.srt.runtime_context.get_server_args", lambda: sa):
+            return fn()
+
+    def test_denylisted_change_hits_other_change_misses(self):
+        tensors = real_tensor_list(limit=30)
+        src = make_model(tensors, seed=5)
+        self._with_args(self.ARGS, lambda: self.snap(src).end())
+        ops = dict(self.ARGS, host="10.1.2.3", port=31000, log_level="debug", watchdog_timeout=60,
+                   hicache_storage_backend_extra_config='{"master_server_address": "10.9.9.9:50051"}',
+                   served_model_name="b", _raw_internal_flag=False)
+        dst = make_model(tensors, seed=5)
+        zero(dst)
+        self.assertTrue(self._with_args(ops, lambda: self.snap(dst).begin()))
+        for (k, a), b in zip(state(src).items(), state(dst).values()):
+            self.assertTrue(torch.equal(a, b), k)
+        for changed in ({"mem_fraction_static": 0.80}, {"quantization": "fp8"}, {"some_new_arg": 1}):
+            m = make_model(tensors, seed=5)
+            with self.assertLogs("sglang", level="INFO") as logs:
+                self.assertFalse(self._with_args(dict(self.ARGS, **changed), lambda: self.snap(m).begin()))
+            self.assertIn("none at", "\n".join(logs.output), changed)
+
+    def test_two_pods_of_one_cell_hit(self):
+        """Two prefill pods of the cell draft (runs/img/manifests/cell-s02, e2e mkcell): the only per-pod
+        values in the engine args are $(POD_IP) inside --hicache-storage-backend-extra-config (and, when
+        set, addresses such as dist_init_addr). Their identities must be equal."""
+        def pod_args(ip):
+            extra = ('{"master_server_address": "deepseek-v41-flash-1017-ep8-mooncake-master.inference.svc:50051", '
+                     '"protocol": "rdma", "metadata_server": "http://deepseek-v41-flash-1017-ep8-mooncake-master.'
+                     'inference.svc:8080/metadata", "local_hostname": "%s", "global_segment_size": "0"}' % ip)
+            return {
+                "model_path": "/opt/lv/data/models/DeepSeek-V4.1-Flash-1017", "tp_size": 4, "ep_size": 1,
+                "mem_fraction_static": 0.82, "chunked_prefill_size": 65280, "enable_hierarchical_cache": True,
+                "hicache_ratio": 1.2, "hicache_storage_backend": "mooncake", "disaggregation_mode": "prefill",
+                "enable_prefill_cp": True, "host": "0.0.0.0", "port": 30000, "disaggregation_bootstrap_port": 8998,
+                "hicache_storage_backend_extra_config": extra, "dist_init_addr": f"{ip}:5000",
+            }
+
+        m = make_model(real_tensor_list(limit=5), seed=7)
+        ids = []
+        for ip in ("10.42.3.17", "10.42.9.201"):
+            snap = self._with_args(pod_args(ip), lambda: self.snap(m))
+            ids.append((snap.dir, json.dumps(snap.ident, sort_keys=True, default=str)))
+        self.assertEqual(ids[0], ids[1])
+
+
 def _save_proc(root, ckpt, seed, go):
     os.environ.update({"SGLANG_OPT_INF834_WEIGHT_SNAPSHOT": "save", "SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIR": root})
     m = make_model(real_tensor_list(limit=40), seed=seed)

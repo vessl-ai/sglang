@@ -80,11 +80,47 @@ def _round_up(n: int, a: int = ALIGN) -> int:
 
 # ---------------------------------------------------------------------------------------- identity
 
-_ARG_VOLATILE = re.compile(
-    r"(port|host|log|metric|api_key|trace|url|served_model_name|random_seed|watchdog|timeout|"
-    r"warmup|bucket|admin|dist_init|crash_dump|base_gpu_id|gpu_id_step|tokenizer_worker_num|"
-    r"_explicitly_set|file_storage|otlp|prometheus|uvicorn|stream_interval|ssl_)"
+# Server args that cannot change weight bytes: left out of the identity, so a change in them (another
+# master address, a timeout) still finds the snapshot. Explicit names only; any other argument, known or
+# unknown, counts. Keys starting with "_" are ServerArgs bookkeeping, not arguments.
+ARGS_NOT_IN_IDENTITY = frozenset(
+    {
+        # addresses, ports, endpoints, devices of the transfer path
+        "host", "port", "nccl_port", "dist_init_addr", "grpc_port", "gated_launch_port",
+        "smg_http_sidecar_port", "disaggregation_bootstrap_port", "engine_info_bootstrap_port",
+        "encoder_bootstrap_port", "encoder_urls", "encoder_register_urls", "decoupled_spec_bind_endpoint",
+        "decoupled_spec_connect_endpoints", "load_publish_endpoint", "otlp_traces_endpoint",
+        "disaggregation_ib_device", "mooncake_ib_device", "kv_events_config",
+        "hicache_storage_backend_extra_config",  # mooncake master / metadata server endpoints
+        "remote_instance_weight_loader_seed_instance_service_port",
+        "remote_instance_weight_loader_send_weights_group_ports",
+        # logging, tracing
+        "log_level", "log_level_http", "log_requests", "log_requests_format", "log_requests_level",
+        "log_requests_target", "decode_log_interval", "enable_request_time_stats_logging", "stat_loggers",
+        "uvicorn_access_log_exclude_prefixes", "crash_dump_folder", "enable_trace", "trace_modules",
+        "otlp_service_name", "spec_trace_dir",
+        # metrics
+        "enable_metrics", "enable_metrics_for_all_schedulers", "enable_mfu_metrics",
+        "enable_forward_pass_metrics", "export_metrics_to_file", "export_metrics_to_file_dir",
+        "extra_metric_labels", "forward_pass_metrics_ipc_name", "forward_pass_metrics_worker_id",
+        "metrics_ipc_name", "tokenizer_metrics_allowed_custom_labels",
+        "tokenizer_metrics_custom_labels_header", "bucket_e2e_request_latency",
+        "bucket_inter_token_latency", "bucket_time_to_first_token", "prompt_tokens_buckets",
+        "generation_tokens_buckets", "prefill_delayer_forward_passes_buckets",
+        "prefill_delayer_wait_seconds_buckets", "enable_cache_report",
+        # timeouts
+        "dist_timeout", "watchdog_timeout", "soft_watchdog_timeout", "grpc_response_timeout_secs",
+        "dynamic_batch_tokenizer_batch_timeout", "elastic_ep_scale_timeout", "weight_cache_timeout",
+        # serving front end
+        "stream_interval", "api_key", "admin_api_key", "served_model_name", "ssl_ca_certs",
+        "ssl_certfile", "ssl_keyfile", "ssl_keyfile_password", "enable_ssl_refresh",
+        "tokenizer_worker_num", "skip_server_warmup", "warmups",
+        # per process: GPU numbering of this unit, sampling seed
+        "base_gpu_id", "gpu_id_step", "random_seed",
+    }
 )
+
+
 _ENV_VOLATILE = re.compile(
     r"^(SGLANG_RUN_ID|SGLANG_OPT_INF834_WEIGHT_SNAPSHOT.*|SGLANG_OPT_INF834_STANDBY.*|"
     r"SGLANG_OPT_INF834_(EARLY_HTTP_WORKERS|FAST_WARMUP_POLL|EARLY_CUINIT|NUMA_PRECOMPUTE|"
@@ -157,7 +193,7 @@ def _server_args_view() -> Tuple[Dict[str, object], Optional[str]]:
         raw = {k: v for k, v in vars(sa).items() if not k.startswith("_")}
     args = {}
     for k, v in sorted(raw.items()):
-        if _ARG_VOLATILE.search(k):
+        if k.startswith("_") or k in ARGS_NOT_IN_IDENTITY:
             continue
         try:
             json.dumps(v)
