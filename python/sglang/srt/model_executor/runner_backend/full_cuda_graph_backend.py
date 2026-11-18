@@ -17,6 +17,8 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -38,6 +40,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -96,6 +99,26 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
     return None
 
 
+logger = logging.getLogger(__name__)
+
+_inf834_warmups: Optional[int] = None
+
+
+def _inf834_capture_warmups() -> int:
+    """Eager warmup forwards per captured shape after a backend's first shape
+    (SGLANG_OPT_INF834_CAPTURE_WARMUPS, default 2). Read once and logged once."""
+    global _inf834_warmups
+    if _inf834_warmups is None:
+        raw = os.environ.get("SGLANG_OPT_INF834_CAPTURE_WARMUPS", "")
+        _inf834_warmups = max(1, int(raw)) if raw.strip() else 2
+        if _inf834_warmups != 2:
+            logger.info(
+                f"INF834 capture warmups: {_inf834_warmups} eager forward(s) per shape "
+                "after each runner's first shape (default 2)"
+            )
+    return _inf834_warmups
+
+
 class FullCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
@@ -110,6 +133,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        # Foundry LOAD: the dummy-batch tensors a restored graph reads (a native
+        # capture keeps them reachable through the graph's own capture).
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -141,6 +167,34 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        foundry = get_foundry_adapter()
+        trace = getattr(self, "_foundry_alloc_trace", None)
+        if trace is not None:
+            # INF-834 debug: dump the allocator history before every shape of the
+            # scope (the history accumulates from the scope start), so a LOAD that
+            # aborts in a later shape still leaves the state it reached.
+            import os
+            import pickle
+
+            os.makedirs(trace[0], exist_ok=True)
+            n = getattr(self, "_foundry_alloc_trace_n", 0)
+            self._foundry_alloc_trace_n = n + 1
+            with open(os.path.join(trace[0], f"{trace[1]}_{n:02d}.pickle"), "wb") as f:
+                pickle.dump(torch.cuda.memory._snapshot(), f)
+        if foundry.enabled:
+            # CUDA graph persistence: SAVE captures and archives this shape;
+            # LOAD restores it. None: Foundry fell back, capture natively.
+            persisted = foundry.capture_one(
+                shape_key=shape_key,
+                forward_fn=forward_fn,
+                pool=self._pool,
+                stream=self._capture_stream,
+            )
+            if persisted is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = persisted
+                # Restored kernels read the same dummy-batch tensors as captured ones.
+                self._capture_inputs[shape_key] = capture_inputs
+                return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
@@ -158,13 +212,17 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
+        # INF-834: SGLANG_OPT_INF834_CAPTURE_WARMUPS=<n> (default 2, minimum 1) sets the
+        # warmups of every shape after this backend's first; the first shape keeps two,
+        # because it pays the process-wide one-time setup (kernel loads, DeepGEMM session).
+        num_warmups = 2 if not self._graphs else _inf834_capture_warmups()
         warmup_output = None
-        for warmup_step in range(2):
+        for warmup_step in range(num_warmups):
             self._device_module.synchronize()
             self._tp_group.barrier()
             with self._precarve.measure():
                 output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
+            if self._reuse_output_buffer and warmup_step == num_warmups - 1:
                 warmup_output = output
             del output
             if profiler is not None:
@@ -237,5 +295,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None

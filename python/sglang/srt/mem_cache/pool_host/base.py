@@ -11,6 +11,7 @@ from typing import Optional, TypeGuard
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -105,6 +106,12 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
+    if envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+        from sglang.srt.mem_cache import inf834_host_prealloc
+
+        # Segments populated ahead of time are host pool memory in waiting, not
+        # memory lost to the pools; every local rank holds the same amount.
+        free += inf834_host_prealloc.unclaimed_bytes() * ranks_per_host()
     return free // ranks_per_host()
 
 

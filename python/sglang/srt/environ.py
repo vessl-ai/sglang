@@ -2312,6 +2312,151 @@ class Envs:
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
+    # ===================================================================
+    # INF-834 boot-time levers (all off by default; off = upstream behaviour)
+    # ===================================================================
+    # Keep the symm-mem NCCL allocator .so in a persistent cache directory
+    # (TORCH_EXTENSIONS_DIR, else SGLANG_CACHE_DIR) instead of rebuilding it
+    # under tempfile.gettempdir() in every new container.
+    SGLANG_OPT_INF834_SYMM_ALLOC_CACHE = EnvBool(False)
+    # Skip the Engram per-rank host table's POSIX_FADV_DONTNEED of the whole
+    # checkpoint (before the pre-fault and again in finish_load), so a warm page
+    # cache survives into the weight load. The huge page share of the table is
+    # logged right after the pre-fault and in finish_load; MADV_COLLAPSE still runs.
+    SGLANG_OPT_INF834_KEEP_PAGE_CACHE = EnvBool(False)
+    # Cache the Engram compressed token map under SGLANG_CACHE_DIR, keyed by a
+    # hash of the tokenizer files, the map builder's source and library versions;
+    # a hit skips loading the HF tokenizer and the per-token normalization loop.
+    SGLANG_OPT_INF834_TOKEN_MAP_CACHE = EnvBool(False)
+    # DSpark committed-SWA translation: pass the element count and the KV pool size
+    # as runtime values instead of constexprs, so one Triton kernel serves every
+    # batch size (otherwise each new batch x width compiles a kernel on the first
+    # request that has it, and every kernel is keyed on the boot-time pool size).
+    SGLANG_OPT_INF834_COMMIT_SWA_RUNTIME_N = EnvBool(False)
+    # Target model weight load: open only shards holding tensors this rank
+    # consumes, route only those tensors, and pre-populate their byte ranges
+    # (Engram: own rows) with MADV_POPULATE_READ on PREFETCH_THREADS threads.
+    SGLANG_OPT_INF834_SELECTIVE_READ = EnvBool(False)
+    SGLANG_OPT_INF834_PREFETCH_THREADS = EnvInt(8)
+    # DSpark draft weight load: the same selective path with "mtp.*" as the
+    # filter, so the draft opens the 3 shards holding its tensors, not all 48.
+    SGLANG_OPT_INF834_DRAFT_SHARDS = EnvBool(False)
+    # Pre-fault host pools (HiCache mmap allocator) and the Engram per-rank
+    # table with MADV_POPULATE_WRITE on POPULATE_THREADS threads instead of one.
+    SGLANG_OPT_INF834_PARALLEL_POPULATE = EnvBool(False)
+    SGLANG_OPT_INF834_POPULATE_THREADS = EnvInt(8)
+    # Engram per-rank host table: pre-fault in 256 MiB chunks, and when one chunk takes
+    # longer than this many seconds (the node is short of free 2 MiB blocks, so the
+    # huge-page faults compact), put the rest of the table on 4 KiB pages
+    # (MADV_NOHUGEPAGE) instead of compacting on the boot path. 0 = off.
+    SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S = EnvFloat(0.0)
+    # Diagnostic for the A/B proof (not a lever): when set to a directory, write
+    # a per-rank digest of every loaded tensor after load_model.
+    SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR = EnvStr("")
+    # Multi-tokenizer mode (--tokenizer-worker-num > 1, uvicorn workers): start
+    # the HTTP worker processes right after the schedulers are launched instead
+    # of after they are ready, so their import and tokenizer load overlap the
+    # weight load. Each worker finishes everything that needs no scheduler info,
+    # then waits for it; /health stays unanswered until then.
+    SGLANG_OPT_INF834_EARLY_HTTP_WORKERS = EnvBool(False)
+    # Server warmup thread: poll /model_info every 50 ms from the start instead
+    # of sleeping 1 s before the first attempt.
+    SGLANG_OPT_INF834_FAST_WARMUP_POLL = EnvBool(False)
+    # Start cuInit on a thread at the top of `import sglang` (every process:
+    # main, schedulers, DP controller, HTTP workers) so it overlaps the Python
+    # imports. Read from os.environ directly in sglang/__init__.py (before
+    # this module is imported); registered here for the switch list.
+    SGLANG_OPT_INF834_EARLY_CUINIT = EnvBool(False)
+    # Resolve the NUMA binding (NVML lookup + numactl probe) of every GPU in
+    # parallel before the scheduler spawn loop instead of once per GPU inside it.
+    SGLANG_OPT_INF834_NUMA_PRECOMPUTE = EnvBool(False)
+    # MoE expert repack at load (W6): skip the per-layer and per-chunk
+    # torch.cuda.empty_cache() calls; "Load weight end" empties the cache once.
+    SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE = EnvBool(False)
+    # Diagnostic (not a lever): per-layer synchronized timing of the repack steps.
+    SGLANG_OPT_INF834_W6_PROFILE = EnvBool(False)
+    # W6, narrower than DEFER_EMPTY_CACHE (which shrank the KV pool and is not to be
+    # shipped): skip only the empty_cache after each 8-expert chunk of the EP repack;
+    # the per-layer calls before and after the repack stay.
+    SGLANG_OPT_INF834_MOE_PACK_SKIP_CHUNK_EMPTY_CACHE = EnvBool(False)
+    # Standby children: read each GPU's NUMA node from sysfs (PCI bus-id order) instead of
+    # NVML, whose init waits behind the concurrent cuInit (2.7 s on the main thread).
+    SGLANG_OPT_INF834_STANDBY_SYSFS_NUMA = EnvBool(False)
+    # Standby children: "K=V;K=V" set when each is exec'd, for variables a library reads at
+    # load time. With foundry: the LD_PRELOAD and FOUNDRY_MODE its spawn context sets (the
+    # handoff refuses when they differ from the engine's spawn). Read in sglang/_inf834_standby.py.
+    SGLANG_OPT_INF834_STANDBY_EXEC_ENV = EnvStr("")
+    # Decoder W2: with SELECTIVE_READ, the filtered MoE layers' routed experts are read by
+    # pread into pinned staging (EP_DIRECT_THREADS worker threads, EP_DIRECT_BLOCK local
+    # slots per host-to-device copy) beside the weight stream instead of being streamed.
+    # Per-rank weight snapshot (model_loader/inf834_weight_snapshot.py): "load", "save" or
+    # "auto" (load, else save); empty = off. DIR = node directory (hostPath); THREADS = read and
+    # write threads per rank; DIRECT_IO = auto (O_DIRECT when the file is not resident), 1 or 0.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT = EnvStr("")
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIR = EnvStr("")
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_THREADS = EnvInt(8)
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIRECT_IO = EnvStr("auto")
+    # "stream_end" (default): the weights as the stream leaves them, the repack runs after a restore;
+    # "repacked": the MoE experts as the EP decode repack leaves them, the repack is skipped after a restore.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_PHASE = EnvStr("stream_end")
+    # Engram per-rank host tables: no pre-fault and no cudaHostRegister at model init; the restore writes
+    # (and faults) the pages, then the tables are registered. Without a restore: pre-fault + register then.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT = EnvBool(False)
+    # After a restore, read the ranges read with O_DIRECT again (buffered, one background thread): next boot warm.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_REWARM = EnvBool(True)
+    SGLANG_OPT_INF834_EP_DIRECT_EXPERTS = EnvBool(False)
+    SGLANG_OPT_INF834_EP_DIRECT_THREADS = EnvInt(8)
+    SGLANG_OPT_INF834_EP_DIRECT_BLOCK = EnvInt(16)
+    # One tokenizer object per process for identical get_tokenizer() calls (the
+    # scheduler and its target TpModelWorker load the same tokenizer).
+    SGLANG_OPT_INF834_TOKENIZER_MEMO = EnvBool(False)
+    # DeepGEMM pre-compile session: after a full sweep over the M list for one
+    # (kernel type, N, K, groups) finishes, leave a stamp next to the compiled
+    # kernels (DG_JIT_CACHE_DIR/inf834_sweeps). A later boot that finds a
+    # matching stamp skips the sweep, which otherwise executes every GEMM of the
+    # M list on the first rank only to load kernels that are already on disk.
+    SGLANG_OPT_INF834_DEEPGEMM_SWEEP_STAMP = EnvBool(False)
+    # Engram per-rank host table: copy this rank's rows from the checkpoint
+    # mapping with ENGRAM_COPY_THREADS threads instead of one memcpy.
+    SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY = EnvBool(False)
+    SGLANG_OPT_INF834_ENGRAM_COPY_THREADS = EnvInt(8)
+    # Routed MoE experts loaded through the plain FusedMoE.weight_loader: gather
+    # EXPERT_BULK_BLOCK experts' TP slices into one host staging buffer (pinned
+    # unless EXPERT_BULK_PIN=0) and copy each block to the device once, instead
+    # of one pageable host-to-device copy per checkpoint tensor; route expert
+    # names with one regex instead of a scan over every (expert, projection).
+    SGLANG_OPT_INF834_EXPERT_BULK_LOAD = EnvBool(False)
+    SGLANG_OPT_INF834_EXPERT_BULK_BLOCK = EnvInt(64)
+    SGLANG_OPT_INF834_EXPERT_BULK_PIN = EnvBool(True)
+    # With EXPERT_BULK_LOAD and SELECTIVE_READ: read the routed-expert tensors that
+    # the blockwise loader places with pread straight into its host staging
+    # buffer (rank rows only for w1/w3; whole tensor then the column slice for
+    # w2) instead of mapping them with MADV_POPULATE_READ and gathering from the
+    # mapping. Only for layers the blockwise loader handles (TP experts); with
+    # expert placement (EP) the per-tensor loader would fault the pages in.
+    SGLANG_OPT_INF834_DIRECT_READ = EnvBool(False)
+    # DIRECT_READ for w2 too: the w2 column slice of a TP rank is strided in the file,
+    # so pread reads the whole tensor (tp_size times the bytes). Off (the default):
+    # only pieces contiguous in the file (w1/w3 rows of this rank, their scales) are
+    # pread; w2 stays populated and is gathered from the mapping.
+    SGLANG_OPT_INF834_DIRECT_READ_W2 = EnvBool(False)
+    # HiCache host pools from the mooncake allocator: allocate (populate) the
+    # segments of the sizes recorded by the previous boot in a background thread
+    # while the weights load; an allocation of a recorded size then takes the
+    # ready segment. Sizes are recorded under SGLANG_CACHE_DIR/inf834_host_pools.
+    SGLANG_OPT_INF834_HOST_POOL_PREALLOC = EnvBool(False)
+    # Diagnostic (not a lever): log where DeepseekV4 load_weights spends its wall
+    # time (name routing, loader wait, async tail, post-load steps).
+    SGLANG_OPT_INF834_LOAD_PROFILE = EnvBool(False)
+    # With TOKENIZER_MEMO: the scheduler process starts its tokenizer load on a
+    # thread before the distributed init, instead of after it.
+    SGLANG_OPT_INF834_TOKENIZER_PREFETCH = EnvBool(False)
+    # Number of standby scheduler children (GPUs 0..n-1) plus one standby DP
+    # controller, started by `import sglang` in the main process of
+    # `python -m sglang.launch_server` so their imports overlap the main
+    # process's. 0 = off. Read from os.environ in sglang/_inf834_standby.py.
+    SGLANG_OPT_INF834_STANDBY_CHILDREN = EnvInt(0)
+
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
 

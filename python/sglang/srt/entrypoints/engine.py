@@ -62,6 +62,7 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang import _inf834_standby
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
@@ -144,6 +145,7 @@ from sglang.srt.utils import (
     set_ulimit,
     start_follower_grpc_server,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -181,6 +183,10 @@ class SchedulerInitResult:
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
+    # INF-834 (SGLANG_OPT_INF834_EARLY_HTTP_WORKERS): when set, the launch did
+    # not wait for the schedulers; calling it does the wait and the steps that
+    # follow it, and returns the SubprocessWatchdog.
+    finish_startup: Optional[Callable[[], Any]] = None
 
     def stop_grpc_server(self) -> None:
         if self.grpc_server is not None:
@@ -913,6 +919,9 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         prelaunched_schedulers = {}
 
+        # Foundry (--cuda-graph-persistence): activated here at the latest; it
+        # wraps every spawn below with its hook preload and environment pins.
+        foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes
             memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -923,6 +932,25 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(get_parallel().node_rank)
             )
+
+            inf834_standby_ok = (
+                _inf834_standby._count() > 0
+                and not get_exec().features.enable_memory_saver
+                and not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get()
+            )
+            if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
+                # INF-834 (SGLANG_OPT_INF834_NUMA_PRECOMPUTE): resolve every GPU's
+                # NUMA binding in parallel; no-op when the switch is off.
+                numa_utils.precompute_subprocess_bindings(
+                    server_args,
+                    [
+                        get_device().base_gpu_id
+                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                        for pp_rank in pp_rank_range
+                        for tp_rank in tp_rank_range
+                    ],
+                )
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
@@ -948,12 +976,29 @@ class Engine(EngineScoreMixin, EngineBase):
                                 None,
                                 writer,
                             )
-                        proc = mp.Process(target=target, args=args)
-                        with (
-                            memory_saver_adapter.configure_subprocess(),
-                            numa_utils.configure_subprocess(server_args, gpu_id),
-                        ):
-                            proc.start()
+                        proc = None
+                        if inf834_standby_ok:
+                            # INF-834 (SGLANG_OPT_INF834_STANDBY_CHILDREN): a child
+                            # that imported while this process did; None = spawn.
+                            # Inside foundry's spawn context, so the environment the
+                            # handoff compares is the one a spawned child would get
+                            # (foundry's LD_PRELOAD and FOUNDRY_MODE included).
+                            with foundry_adapter.configure_subprocess(server_args):
+                                proc = _inf834_standby.take(
+                                    "scheduler",
+                                    gpu_id,
+                                    numa_utils.resolve_numactl_args(server_args, gpu_id),
+                                    target,
+                                    args,
+                                )
+                        if proc is None:
+                            proc = mp.Process(target=target, args=args)
+                            with (
+                                memory_saver_adapter.configure_subprocess(),
+                                foundry_adapter.configure_subprocess(server_args),
+                                numa_utils.configure_subprocess(server_args, gpu_id),
+                            ):
+                                proc.start()
 
                     scheduler_procs.append(proc)
                     if prelaunch_dp_schedulers:
@@ -966,23 +1011,38 @@ class Engine(EngineScoreMixin, EngineBase):
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)
             scheduler_pipe_readers = [reader]
-            proc = mp.Process(
-                target=run_data_parallel_controller_process,
-                kwargs=dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    pipe_writer=writer,
-                    run_scheduler_process_func=run_scheduler_process_func,
-                    prelaunched_schedulers=prelaunched_schedulers or None,
-                ),
+            dp_kwargs = dict(
+                server_args=server_args,
+                port_args=port_args,
+                pipe_writer=writer,
+                run_scheduler_process_func=run_scheduler_process_func,
+                prelaunched_schedulers=prelaunched_schedulers or None,
             )
             try:
-                proc.start()
+                proc = None
+                if _inf834_standby._count() > 0:
+                    with foundry_adapter.configure_subprocess(server_args):
+                        proc = _inf834_standby.take(
+                            "dp_controller",
+                            None,
+                            None,
+                            run_data_parallel_controller_process,
+                            (),
+                            dp_kwargs,
+                        )
+                if proc is None:
+                    proc = mp.Process(
+                        target=run_data_parallel_controller_process, kwargs=dp_kwargs
+                    )
+                    # The controller passes the hook preload on to its schedulers.
+                    with foundry_adapter.configure_subprocess(server_args):
+                        proc.start()
             finally:
                 for _, init_pipe in prelaunched_schedulers.values():
                     init_pipe.close()
             scheduler_procs.insert(0, proc)
 
+        _inf834_standby.release_unused()
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
 
@@ -1126,6 +1186,7 @@ class Engine(EngineScoreMixin, EngineBase):
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
         placement_group=None,
+        allow_deferred_scheduler_ready: bool = False,
     ) -> Tuple[
         TokenizerManager,
         TemplateManager,
@@ -1332,32 +1393,52 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
-        startup_complete = False
-        try:
-            # Wait for the model to finish loading
-            scheduler_init_result.wait_for_ready()
+        def finish_startup() -> SubprocessWatchdog:
+            startup_complete = False
+            try:
+                # Wait for the model to finish loading
+                scheduler_init_result.wait_for_ready()
 
-            cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
+                cls._set_startup_time(
+                    tokenizer_manager, scheduler_init_result, startup_tic
+                )
 
-            # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+                # Get back some info from scheduler to tokenizer_manager
+                tokenizer_manager.max_req_input_len = (
+                    scheduler_init_result.scheduler_infos[0]["max_req_input_len"]
+                )
 
-            # Set up subprocess liveness watchdog to detect crashes
-            # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
-            processes = list(scheduler_procs or [])
-            names = [f"scheduler_{i}" for i in range(len(processes))]
-            processes.extend(detoken_procs)
-            names.extend(detoken_names)
-            subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
-            )
-            subprocess_watchdog.start()
-            startup_complete = True
-        finally:
-            if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
-                tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+                # Set up subprocess liveness watchdog to detect crashes
+                # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+                processes = list(scheduler_procs or [])
+                names = [f"scheduler_{i}" for i in range(len(processes))]
+                processes.extend(detoken_procs)
+                names.extend(detoken_names)
+                subprocess_watchdog = SubprocessWatchdog(
+                    processes=processes, process_names=names
+                )
+                subprocess_watchdog.start()
+                startup_complete = True
+                return subprocess_watchdog
+            finally:
+                if not startup_complete and isinstance(
+                    tokenizer_manager, TokenizerManager
+                ):
+                    tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+
+        if (
+            allow_deferred_scheduler_ready
+            and envs.SGLANG_OPT_INF834_EARLY_HTTP_WORKERS.get()
+            and isinstance(tokenizer_manager, MultiTokenizerRouter)
+            # Only the uvicorn worker path waits for the late scheduler info.
+            and not get_serving().enable_http2
+        ):
+            # The caller starts the HTTP workers now and runs finish_startup()
+            # on a thread, so the workers' startup overlaps the model load.
+            scheduler_init_result.finish_startup = finish_startup
+            subprocess_watchdog = None
+        else:
+            subprocess_watchdog = finish_startup()
 
         return (
             tokenizer_manager,

@@ -14,6 +14,7 @@ import logging
 import mmap
 import os
 import re
+import threading
 import time
 from typing import Optional
 
@@ -143,6 +144,71 @@ def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
     return lookup, len(key_to_new)
 
 
+_INF834_SKIP_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".index.json")
+
+
+def inf834_token_map_cache_path(
+    tokenizer_path: str, tokenizer_mode: str, revision: Optional[str]
+) -> Optional[str]:
+    """Cache file for build_compressed_token_map's result, or None when the
+    tokenizer is not a local directory. The key covers every small non-weight
+    file in that directory, the builder's source and the library versions, so
+    anything that could change the map changes the key."""
+    import hashlib
+    import inspect
+
+    import tokenizers
+    import transformers
+
+    if not os.path.isdir(tokenizer_path):
+        return None
+    h = hashlib.sha256()
+    for part in (
+        inspect.getsource(build_compressed_token_map),
+        tokenizers.__version__,
+        transformers.__version__,
+        f"{tokenizer_mode}|{revision}",
+    ):
+        h.update(part.encode())
+        h.update(b"\0")
+    for fn in sorted(os.listdir(tokenizer_path)):
+        path = os.path.join(tokenizer_path, fn)
+        if not os.path.isfile(path) or fn.endswith(_INF834_SKIP_SUFFIXES):
+            continue
+        if os.path.getsize(path) > 64 << 20:
+            continue
+        h.update(fn.encode())
+        h.update(b"\0")
+        with open(path, "rb") as f:
+            h.update(f.read())
+    return os.path.join(
+        os.path.expanduser(envs.SGLANG_CACHE_DIR.get()),
+        "engram_token_map",
+        h.hexdigest()[:32] + ".npy",
+    )
+
+
+def inf834_load_token_map(path: str) -> Optional[tuple[list[int], int]]:
+    try:
+        arr = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    return arr[1:].tolist(), int(arr[0])
+
+
+def inf834_save_token_map(path: str, lookup: list[int], size: int) -> None:
+    """Element 0 is the compressed vocab size, the rest the lookup; written to a
+    temp file and renamed, so concurrent ranks never read a partial file."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "wb") as f:
+            np.save(f, np.array([size, *lookup], dtype=np.int64))
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("INF834 engram token map: could not cache %s: %s", path, e)
+
+
 def compute_hash_multipliers(
     layer_ids: tuple[int, ...], max_ngram_size: int, vocab_size: int
 ) -> torch.Tensor:
@@ -230,10 +296,15 @@ class EngramHasher(nn.Module):
         tokenizer,
         pad_id: int,
         compressed_vocab_size: int,
+        *,
+        prebuilt_token_map: Optional[tuple[list[int], int]] = None,
     ):
         super().__init__()
         self.max_ngram_size = layout.max_ngram_size
-        token_map, vocab_size = build_compressed_token_map(tokenizer)
+        if prebuilt_token_map is not None:
+            token_map, vocab_size = prebuilt_token_map
+        else:
+            token_map, vocab_size = build_compressed_token_map(tokenizer)
         assert vocab_size == compressed_vocab_size, (
             f"the tokenizer normalizes to {vocab_size} distinct tokens but the config "
             f"expects {compressed_vocab_size}; every hash multiplier depends on it"
@@ -273,6 +344,10 @@ class EngramHasher(nn.Module):
     def from_config(
         cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
     ) -> EngramHasher:
+        if envs.SGLANG_OPT_INF834_TOKEN_MAP_CACHE.get():
+            return cls._inf834_from_config_cached(
+                config, layout, image_token_id=image_token_id
+            )
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -289,6 +364,46 @@ class EngramHasher(nn.Module):
             config.engram_compressed_vocab_size,
         )
         result.image_token_id = image_token_id
+        return result
+
+    @classmethod
+    def _inf834_from_config_cached(
+        cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
+    ) -> EngramHasher:
+        tic = time.perf_counter()
+        serving = get_serving()
+        path = inf834_token_map_cache_path(
+            serving.tokenizer_path, serving.tokenizer_mode, get_model().revision
+        )
+        prebuilt = inf834_load_token_map(path) if path is not None else None
+        hit = prebuilt is not None
+        if not hit:
+            tokenizer = get_tokenizer(
+                serving.tokenizer_path,
+                tokenizer_mode=serving.tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend="huggingface",
+            )
+            prebuilt = build_compressed_token_map(tokenizer)
+            if path is not None:
+                inf834_save_token_map(path, *prebuilt)
+        result = cls(
+            layout,
+            None,
+            config.engram_pad_token_id,
+            config.engram_compressed_vocab_size,
+            prebuilt_token_map=prebuilt,
+        )
+        result.image_token_id = image_token_id
+        logger.info(
+            "INF834 engram token map: cache %s (%s), %d tokens -> %d, %.1fs",
+            "hit" if hit else "miss",
+            path,
+            len(prebuilt[0]),
+            prebuilt[1],
+            time.perf_counter() - tic,
+        )
         return result
 
     def forward(
@@ -558,6 +673,44 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
     return mapped, huge
 
 
+def _huge_pages_in_range(start: int, end: int) -> tuple[int, int]:
+    """(mapped_kB, huge_kB) summed over the VMAs that overlap [start, end), from
+    /proc/self/smaps. MADV_NOHUGEPAGE on part of a table splits its VMA in two."""
+    mapped = huge = 0
+    inside = False
+    try:
+        with open("/proc/self/smaps") as f:
+            for line in f:
+                m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
+                if m:
+                    inside = int(m.group(1), 16) < end and start < int(m.group(2), 16)
+                elif inside:
+                    key, _, rest = line.partition(":")
+                    if key == "Rss":
+                        mapped += int(rest.split()[0])
+                    elif key in ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped"):
+                        huge += int(rest.split()[0])
+    except OSError:
+        pass
+    return mapped, huge
+
+
+# 256 MiB: on a node whose free memory has no 2 MiB block, a huge-page fault spent ~0.15 s in
+# failed compaction per 2 MiB per thread (INF-834 e2e s1-aw-1), so the first, over-cap chunk
+# costs ~2.4 s with 8 threads; a normal chunk takes ~0.03 s.
+_ENGRAM_FAULT_CHUNK = 256 << 20
+# Fixed prefix of the one WARNING per table, so boot logs can be grepped for it.
+ENGRAM_FAULT_FALLBACK = "INF834 engram huge-page fallback"
+
+
+def _madvise(addr: int, length: int, advice: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    if libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(length), advice):
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
 _page_cache_dropped = False
 
 
@@ -630,6 +783,80 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+# INF-834: under CUDA graph persistence (--cuda-graph-persistence, Foundry) the
+# table's registered host address is a kernel argument baked into the captured
+# decode graphs (engram_gather takes the raw pointers), so LOAD must map every
+# table at the address SAVE used. The tables are then placed one after another,
+# 1 GiB aligned, from this base (well below Foundry's default device region at
+# 0x600000000000), instead of where the kernel's mmap would put them.
+_FIXED_ADDR_BASE = 0x500000000000
+_FIXED_ADDR_ALIGN = 1 << 30
+_fixed_addr_cursor = _FIXED_ADDR_BASE
+
+
+def _graphs_persisted() -> bool:
+    from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+    return get_foundry_adapter().enabled
+
+
+def _mmap_at_fixed_address(nbytes: int, fd: Optional[int]):
+    """mmap ``nbytes`` at the next fixed address (MAP_FIXED_NOREPLACE: fails
+    instead of replacing a mapping); returns a writable ctypes byte array."""
+    global _fixed_addr_cursor
+    MAP_FIXED_NOREPLACE = 0x100000
+    addr = _fixed_addr_cursor
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    )
+    if fd is None:
+        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_FIXED_NOREPLACE
+    else:
+        flags = mmap.MAP_SHARED | MAP_FIXED_NOREPLACE
+    got = libc.mmap(
+        ctypes.c_void_p(addr),
+        ctypes.c_size_t(nbytes),
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        flags,
+        -1 if fd is None else fd,
+        0,
+    )
+    if got != addr:
+        err = ctypes.get_errno()
+        raise RuntimeError(
+            f"engram host table: mmap of {nbytes} bytes at the fixed address "
+            f"{addr:#x} failed (got {got}, errno {err}); CUDA graph persistence "
+            "needs the same host address in every process"
+        )
+    _fixed_addr_cursor = addr + -(-nbytes // _FIXED_ADDR_ALIGN) * _FIXED_ADDR_ALIGN
+    return (ctypes.c_uint8 * nbytes).from_address(addr)
+
+
+def _madvise_hugepage(buf) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    libc.madvise(
+        ctypes.c_void_p(ctypes.addressof(buf)),
+        ctypes.c_size_t(ctypes.sizeof(buf)),
+        mmap.MADV_HUGEPAGE,
+    )
+
+
+def _inf834_defers_prefault() -> bool:
+    if not envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT.get():
+        return False
+    from sglang.srt.model_loader.inf834_weight_snapshot import defers_host_prefault
+
+    return defers_host_prefault()
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -647,38 +874,182 @@ class _HostTable:
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
-        if layout == "shared":
-            self.fd = self._open_shared_fd(nbytes, name)
-            self.mm = mmap.mmap(
-                self.fd,
+        # (offset, length) put on 4 KiB pages by the capped pre-fault, else None.
+        self.small_page_range = None
+        self.fd = self._open_shared_fd(nbytes, name) if layout == "shared" else None
+        if _graphs_persisted():
+            self.mm = _mmap_at_fixed_address(nbytes, self.fd)
+            # Advisory before the first touch: pages are allocated huge at fault time.
+            _madvise_hugepage(self.mm)
+            logger.info(
+                "engram host table %s: %d bytes at fixed address %#x (CUDA graph persistence)",
+                name,
                 nbytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                ctypes.addressof(self.mm),
             )
         else:
-            self.fd = None
-            self.mm = mmap.mmap(
-                -1,
-                nbytes,
-                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+            if layout == "shared":
+                self.mm = mmap.mmap(
+                    self.fd,
+                    nbytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            else:
+                self.mm = mmap.mmap(
+                    -1,
+                    nbytes,
+                    flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            # Advisory before the first touch: pages are allocated huge at fault time.
+            self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        self.name = name
+        # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT: the weight snapshot restore writes (and
+        # so faults) every page of a per-rank table; WeightSnapshot.begin() then calls complete().
+        self.deferred = False
         if layout == "per_rank":
-            # Cached checkpoint pages, left by a previous server or by the loader,
-            # make the 512 MiB huge-page faults fall back, so empty them first.
-            _drop_page_cache_once("before pre-faulting the per-rank shard")
-            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+            keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
+            if not keep_cache:
+                # Cached checkpoint pages, left by a previous server or by the loader,
+                # make the 512 MiB huge-page faults fall back, so empty them first.
+                _drop_page_cache_once("before pre-faulting the per-rank shard")
+            if not _is_hip and _inf834_defers_prefault():
+                self.deferred = True
+                logger.info(
+                    "INF834 engram host table %s: pre-fault and registration deferred to the weight snapshot",
+                    name,
+                )
+            else:
+                self._prefault()
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        if self.deferred:
+            self.device_ptr = self.bytes.data_ptr()  # CUDA UVA: the registered address is the host address
+        else:
+            self._register()
+
+    def _prefault(self) -> None:
+        cap = envs.SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S.get()
+        if cap > 0:
+            self._prefault_capped(cap)
+            return
+        keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
+        tic = time.perf_counter()
+        if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+            from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                inf834_populate_write_parallel,
+            )
+
+            inf834_populate_write_parallel(self.mm, self.nbytes)
+        else:
+            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+        if keep_cache:
+            mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+            logger.info(
+                "INF834 engram host table %s: kept the checkpoint page cache; "
+                "pre-fault %.1fs, %.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+                self.name,
+                time.perf_counter() - tic,
+                mapped_kb / 2**10,
+                huge_kb / 2**10,
+                100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+            )
+
+    def _populate(self, start: int, length: int) -> None:
+        """Fault in [start, start + length) of the table for writing."""
+        if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+            from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                inf834_populate_write_range,
+            )
+
+            threads = max(1, envs.SGLANG_OPT_INF834_POPULATE_THREADS.get())
+            inf834_populate_write_range(self.bytes.data_ptr() + start, length, threads)
+        else:
+            np.frombuffer(self.mm, dtype=np.uint8, count=length, offset=start)[
+                :: mmap.PAGESIZE
+            ] = 0
+
+    def _prefault_capped(self, cap: float) -> None:
+        """INF-834 SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S: pre-fault in 256 MiB chunks; after
+        the first chunk slower than `cap` seconds, fault the rest on 4 KiB pages.
+
+        With THP defrag=madvise, a MADV_HUGEPAGE fault that finds no free 2 MiB block
+        compacts memory in the faulting thread. A rank whose NUMA node is short of
+        2 MiB blocks then spent up to 55 s here (INF-834 e2e s1-a-1), and 222 s on a node
+        full of page cache (s1-aw-1). A 4 KiB fault
+        never compacts, so the boot path pays at most one slow chunk."""
+        tic = time.perf_counter()
+        base = self.bytes.data_ptr()
+        start = 0
+        while start < self.nbytes:
+            length = min(_ENGRAM_FAULT_CHUNK, self.nbytes - start)
+            t = time.perf_counter()
+            self._populate(start, length)
+            slow = time.perf_counter() - t
+            start += length
+            if slow > cap and start < self.nbytes:
+                rest = self.nbytes - start
+                _madvise(base + start, rest, mmap.MADV_NOHUGEPAGE)
+                t = time.perf_counter()
+                self._populate(start, rest)
+                self.small_page_range = (start, rest)
+                logger.warning(
+                    "%s: table %s, a %d MiB chunk took %.2fs (cap %.2fs) at %.1f GiB; "
+                    "the remaining %.1f GiB is on 4 KiB pages, faulted in %.1fs",
+                    ENGRAM_FAULT_FALLBACK,
+                    self.name,
+                    length >> 20,
+                    slow,
+                    cap,
+                    (start - length) / 2**30,
+                    rest / 2**30,
+                    time.perf_counter() - t,
+                )
+                break
+        mapped_kb, huge_kb = _huge_pages_in_range(base, base + self.nbytes)
+        logger.info(
+            "INF834 engram host table %s: capped pre-fault %.1fs, %.0f MiB resident, "
+            "%.0f MiB in huge pages (%.1f%%)",
+            self.name,
+            time.perf_counter() - tic,
+            mapped_kb / 2**10,
+            huge_kb / 2**10,
+            100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+        )
+
+    def _register(self) -> None:
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), self.nbytes, 0)
         if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+
+    def complete(self, prefault: bool) -> None:
+        """Deferred table: pre-fault (unless the restore already wrote every page), then register."""
+        if not self.deferred:
+            return
+        tic = time.perf_counter()
+        if prefault:
+            self._prefault()
+        address = self.device_ptr
+        self._register()
+        if self.device_ptr != address:
+            raise RuntimeError("engram host table: registered address differs from the host address")
+        self.deferred = False
+        mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+        logger.info(
+            "INF834 engram host table %s: registered after the weight snapshot (%s) in %.2fs, "
+            "%.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+            self.name,
+            "pre-faulted" if prefault else "restored pages, no pre-fault",
+            time.perf_counter() - tic,
+            mapped_kb / 2**10,
+            huge_kb / 2**10,
+            100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+        )
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -720,16 +1091,33 @@ class _HostTable:
             time.sleep(1.0)
 
     def finish_load(self, label: str):
+        if self.deferred:  # nothing called complete(): pre-fault (no-op on written pages) and register now
+            self.complete(prefault=True)
         if not self.dirty:
             return
         self.dirty = False
         if self.layout == "shared":
             self.group.barrier()
         mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
-        if self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
-            # The loader's own reads refilled the page cache; empty it again so the
-            # collapse can find contiguous memory.
-            drop_checkpoint_page_cache()
+        if self.small_page_range is not None:
+            # The table is registered (pinned) by now, and MADV_COLLAPSE refuses pinned
+            # pages (EAGAIN), so the synchronous collapse below would only add its
+            # retry sleeps to the boot. The 4 KiB part stays as it is.
+            mapped_kb, huge_kb = _huge_pages_in_range(
+                self.bytes.data_ptr(), self.bytes.data_ptr() + self.nbytes
+            )
+        elif self.layout == "per_rank" and huge_kb < mapped_kb * 0.98:
+            if envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get():
+                logger.info(
+                    "INF834 engram host table %s: %.1f%% in huge pages before "
+                    "MADV_COLLAPSE; page cache kept",
+                    label,
+                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+                )
+            else:
+                # The loader's own reads refilled the page cache; empty it again so the
+                # collapse can find contiguous memory.
+                drop_checkpoint_page_cache()
             self._collapse()
             mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
         pct = 100.0 * huge_kb / mapped_kb if mapped_kb else 0.0
@@ -749,6 +1137,54 @@ class _HostTable:
             )
         else:
             logger.info(msg)
+
+
+_inf834_copy_pool = None
+_inf834_copy_pool_lock = threading.Lock()
+
+
+def inf834_copy_rows_parallel(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY: dst.copy_(src) for two host tensors
+    of the same shape, as contiguous row ranges copied by
+    SGLANG_OPT_INF834_ENGRAM_COPY_THREADS threads (Tensor.copy_ releases the GIL).
+    The ranges are disjoint, so the result is the bytes of one copy_."""
+    global _inf834_copy_pool
+    if dst.shape != src.shape or dst.dim() == 0:
+        dst.copy_(src)
+        return
+    threads = max(1, envs.SGLANG_OPT_INF834_ENGRAM_COPY_THREADS.get())
+    rows = dst.shape[0]
+    nbytes = dst.numel() * dst.element_size()
+    # Below 64 MiB per thread the split costs more than it saves.
+    threads = min(threads, rows, max(1, nbytes // (64 << 20)))
+    if threads <= 1:
+        dst.copy_(src)
+        return
+    with _inf834_copy_pool_lock:
+        if _inf834_copy_pool is None:
+            import concurrent.futures
+
+            _inf834_copy_pool = concurrent.futures.ThreadPoolExecutor(
+                max(1, envs.SGLANG_OPT_INF834_ENGRAM_COPY_THREADS.get()),
+                thread_name_prefix="inf834-engram-copy",
+            )
+        pool = _inf834_copy_pool
+    tic = time.perf_counter()
+    bounds = [rows * i // threads for i in range(threads + 1)]
+    futures = [
+        pool.submit(dst[a:b].copy_, src[a:b])
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if b > a
+    ]
+    for future in futures:
+        future.result()
+    logger.info(
+        "INF834 engram parallel copy: %.1f GiB (%d rows) on %d threads in %.1fs",
+        nbytes / 2**30,
+        rows,
+        len(futures),
+        time.perf_counter() - tic,
+    )
 
 
 class EngramEmbedding(nn.Module):
@@ -817,6 +1253,11 @@ class EngramEmbedding(nn.Module):
         rows = slice(self.row_start, self.row_start + self.rows)
         if self._shared:
             param.data[rows].copy_(loaded_weight[rows])
+        elif (
+            envs.SGLANG_OPT_INF834_ENGRAM_PARALLEL_COPY.get()
+            and param.data.device.type == "cpu"
+        ):
+            inf834_copy_rows_parallel(param.data, loaded_weight[rows])
         else:
             param.data.copy_(loaded_weight[rows])
         if self.host_table is not None:

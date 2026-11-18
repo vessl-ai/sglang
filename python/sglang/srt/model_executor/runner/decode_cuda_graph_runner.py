@@ -84,6 +84,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
@@ -120,6 +121,7 @@ from sglang.srt.utils.profile_utils import (
     export_cuda_graph_capture_trace,
     graph_capture_profile_dir,
 )
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1122,6 +1124,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        # INF-834 debug (SGLANG_FOUNDRY_ALLOC_TRACE=<dir>): record the caching
+        # allocator's history from here to this runner's first capture_one, where
+        # FullCudaGraphBackend dumps it, to compare SAVE's and LOAD's allocations.
+        trace_dir = os.environ.get("SGLANG_FOUNDRY_ALLOC_TRACE")
+        if trace_dir and get_foundry_adapter().enabled:
+            torch.cuda.memory._record_memory_history(max_entries=200000)
+            self.backend._foundry_alloc_trace = (
+                trace_dir,
+                f"{self._foundry_graph_kind()}_rank{torch.cuda.current_device()}",
+            )
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with get_foundry_adapter().capture_scope(
+            phase="decode",
+            model=self.model_runner.model,
+            # Read only when active: a test may drive capture() on a stand-in.
+            kind=self._foundry_graph_kind()
+            if get_foundry_adapter().enabled
+            else None,
+            flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                self.model_runner
+            ),
+        ):
+            self._capture()
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive (EAGLE subclasses
+        # included): target_decode, target_verify, draft_decode, draft_extend.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        is_draft_extend_v2 = getattr(mode, "is_draft_extend_v2", None)
+        if is_draft_extend_v2 is not None and is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
