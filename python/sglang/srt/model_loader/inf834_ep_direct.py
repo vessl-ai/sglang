@@ -446,3 +446,31 @@ class Inf834EpDirectExperts:
                 "INF834 ep direct experts: checkpoint expert tensors the model did not resolve "
                 f"(first: {self.unresolved[:3]}); the stream no longer carries them"
             )
+
+
+class LazyLaunch:
+    """The model's read filter (and with it the list of experts this path reads) is built inside
+    the weight iterator, at its first next(): DefaultModelLoader._get_all_weights is a generator.
+    wrap() launches the direct reader right after the first tensor arrives, when the filter has
+    decided; get_sources() returns the sources the filter left on the model (taking them), or None."""
+
+    def __init__(self, get_sources: Callable[[], Optional[List[_Src]]], resolve):
+        self.get_sources = get_sources
+        self.resolve = resolve
+        self.direct: Optional[Inf834EpDirectExperts] = None
+        self._checked = False
+
+    def _check(self) -> None:
+        self._checked = True
+        sources = self.get_sources()
+        if sources:
+            self.direct = Inf834EpDirectExperts(sources, self.resolve)
+            self.direct.launch()
+
+    def wrap(self, weights):
+        for item in weights:
+            if not self._checked:
+                self._check()
+            yield item
+        if not self._checked:
+            self._check()

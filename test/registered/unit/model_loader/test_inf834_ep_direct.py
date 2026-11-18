@@ -272,5 +272,148 @@ class TestEpDirectExperts(CustomTestCase):
         self.assertGreater(d.tensors_fallback, 0)
 
 
+class TestLazyLaunch(CustomTestCase):
+    """The read filter is built inside the weight iterator (DefaultModelLoader._get_all_weights is
+    a generator): the reader must start after the first tensor, not before the stream."""
+
+    def test_starts_after_first_item(self):
+        holder = {"sources": None}
+        launched = []
+
+        def weights():
+            holder["sources"] = ["s1"]  # what the filter leaves on the model at the first next()
+            yield ("a", 1)
+            yield ("b", 2)
+
+        class FakeDirect:
+            def __init__(self, sources, resolve):
+                self.sources = sources
+
+            def launch(self):
+                launched.append(self.sources)
+
+        def take():
+            s, holder["sources"] = holder["sources"], None
+            return s
+
+        with mock.patch.object(epd, "Inf834EpDirectExperts", FakeDirect):
+            lazy = epd.LazyLaunch(take, resolve=None)
+            self.assertEqual(launched, [])
+            got = list(lazy.wrap(weights()))
+        self.assertEqual(got, [("a", 1), ("b", 2)])
+        self.assertEqual(launched, [["s1"]])
+        self.assertIsNone(holder["sources"])
+
+    def test_no_sources_no_reader(self):
+        lazy = epd.LazyLaunch(lambda: None, resolve=None)
+        self.assertEqual(list(lazy.wrap(iter([1, 2]))), [1, 2])
+        self.assertIsNone(lazy.direct)
+
+
+class TestDigestCoversPackedExperts(CustomTestCase):
+    """The weight digest must see expert bytes that a load-time repack moved off the parameters
+    into a NamedTuple on the quant method (Mxfp4MarlinMoEMethod._sm90_packed)."""
+
+    def _digest(self, value):
+        import collections
+
+        from sglang.srt.model_loader.inf834_selective_read import write_digest
+
+        Packed = collections.namedtuple("PackedExperts", ["w13", "w2", "inter"])
+        model = nn.Module()
+        model.experts = nn.Module()
+        model.experts.quant_method = types.SimpleNamespace()
+        model.experts.quant_method._sm90_packed = Packed(
+            torch.full((4, 8), value, dtype=torch.uint8), torch.arange(16, dtype=torch.uint8), 576
+        )
+        with tempfile.TemporaryDirectory() as d:
+            write_digest(model, d)
+            (f,) = os.listdir(d)
+            return json.load(open(os.path.join(d, f)))
+
+    def test_packed_tensors_are_judged_buffers(self):
+        a, b = self._digest(3), self._digest(4)
+        keys = sorted(k for k in a if k.startswith("buffer:experts.quant_method._sm90_packed."))
+        self.assertEqual(keys, ["buffer:experts.quant_method._sm90_packed.w13", "buffer:experts.quant_method._sm90_packed.w2"])
+        self.assertNotEqual(a["buffer:experts.quant_method._sm90_packed.w13"], b["buffer:experts.quant_method._sm90_packed.w13"])
+        self.assertEqual(a["buffer:experts.quant_method._sm90_packed.w2"], b["buffer:experts.quant_method._sm90_packed.w2"])
+
+
+class TestThroughLoadWeights(CustomTestCase):
+    """DeepseekV4ForCausalLM.inf834_checkpoint_read_filter + load_weights with the switch on and
+    off, with a stream that builds the read filter at its first next() as
+    DefaultModelLoader._get_all_weights does (the bug the first GPU window found: the reader
+    never started). EP rank 5 of 8, the eplb32 placement."""
+
+    LAYERS = (0, 1)
+    RANK = 5
+
+    def _model(self):
+        m = object.__new__(DeepseekV4ForCausalLM)
+        nn.Module.__init__(m)
+        m.model = nn.Module()
+        layers = []
+        for layer_id in self.LAYERS:
+            layer = nn.Module()
+            layer.mlp = nn.Module()
+            layer.mlp.experts = make_rank_experts(layer_id, self.RANK)
+            layer.dense = nn.Parameter(torch.zeros(5, 3), requires_grad=False)
+            layers.append(layer)
+        m.model.layers = nn.ModuleList(layers)
+        m.model.start_layer, m.model.end_layer = 0, len(self.LAYERS)
+        m.config = types.SimpleNamespace(
+            n_routed_experts=N_LOGICAL, num_hidden_layers=len(self.LAYERS), model_type="deepseek_v41"
+        )
+        m.num_fused_shared_experts = 0
+        m.wo_a_fp8 = True
+        m.quant_config = None
+        m.vision = None
+        m.pp_group = types.SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        m.post_load_weights = lambda **kw: None
+        m._prewarm_mhc_kernels = lambda: None
+        return m
+
+    def _run(self, folder, named, env, meta):
+        model = self._model()
+
+        def stream():  # DefaultModelLoader._get_all_weights: the filter is built here, lazily
+            flt = model.inf834_checkpoint_read_filter()
+            for name in sorted(named):
+                if flt is None or flt.keep(name):
+                    yield name, named[name]
+
+        targets = (
+            "sglang.srt.layers.moe.fused_moe_triton.layer.get_global_expert_location_metadata",
+            "sglang.srt.eplb.expert_location.get_global_expert_location_metadata",
+        )
+        with mock.patch.dict(os.environ, env), mock.patch(targets[0], lambda: meta), mock.patch(
+            targets[1], lambda: meta
+        ), mock.patch(
+            "sglang.srt.runtime_context.get_model", lambda: types.SimpleNamespace(model_path=folder)
+        ), self.assertLogs("sglang", level="INFO") as logs:
+            model.load_weights(stream())
+        return {k: v.data.view(torch.uint8).clone() for k, v in model.named_parameters()}, "\n".join(logs.output)
+
+    def test_switch_leaves_the_same_parameters(self):
+        p2l, _ = placement(self.LAYERS)
+        meta = Meta(p2l)
+        named = checkpoint(self.LAYERS, seed=21)
+        gen = torch.Generator().manual_seed(5)
+        for layer in self.LAYERS:
+            named[f"layers.{layer}.dense"] = torch.randn(5, 3, generator=gen)
+        with tempfile.TemporaryDirectory() as folder:
+            write_shards(folder, {k: v for k, v in named.items() if ".experts." in k})
+            base = {"SGLANG_OPT_INF834_SELECTIVE_READ": "1"}
+            want, _ = self._run(folder, named, base, meta)
+            got, text = self._run(folder, named, dict(base, SGLANG_OPT_INF834_EP_DIRECT_EXPERTS="1"), meta)
+        self.assertEqual(sorted(want), sorted(got))
+        for k in want:
+            self.assertTrue(torch.equal(want[k], got[k]), k)
+        self.assertGreater(int(got["model.layers.1.mlp.experts.w2_weight"].abs().sum()), 0)
+        self.assertIn("INF834 ep direct experts [target]:", text)
+        self.assertIn("0 unresolved", text)
+        self.assertNotIn("not initialized from checkpoints", text)
+
+
 if __name__ == "__main__":
     unittest.main()

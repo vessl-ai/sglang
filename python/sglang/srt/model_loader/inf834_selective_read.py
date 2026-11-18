@@ -416,6 +416,31 @@ def write_digest(model: torch.nn.Module, out_dir: str) -> None:
             seen.add(key)
             digests[f"{kind}:{name}"] = f"{t.dtype}|{tuple(t.shape)}|{t.device.type}|{_tensor_digest(t)}"
     for mod_name, mod in model.named_modules():
+        # Weights a load-time transform moved off the parameters, kept as a tuple of tensors
+        # on the module or on its quant method, e.g. the SM90 decode MoE kernels' packed
+        # experts (Mxfp4MarlinMoEMethod._sm90_packed, a NamedTuple with an int field): digested
+        # as buffers, so the byte gate covers the experts.
+        holders = [("", vars(mod))]
+        qm = getattr(mod, "quant_method", None)
+        if qm is not None and hasattr(qm, "__dict__"):
+            holders.append(("quant_method.", vars(qm)))
+        for prefix, attrs in holders:
+            for attr, value in attrs.items():
+                if not isinstance(value, tuple) or not any(
+                    isinstance(v, torch.Tensor) for v in value
+                ):
+                    continue
+                names = getattr(value, "_fields", None) or [str(i) for i in range(len(value))]
+                for field, v in zip(names, value):
+                    if not isinstance(v, torch.Tensor):
+                        continue
+                    key = (v.data_ptr(), v.dtype, tuple(v.shape))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    digests[f"buffer:{mod_name}.{prefix}{attr}.{field}"] = (
+                        f"{v.dtype}|{tuple(v.shape)}|{v.device.type}|{_tensor_digest(v)}"
+                    )
         for attr, value in vars(mod).items():
             if not isinstance(value, torch.Tensor) or attr.startswith("_"):
                 continue

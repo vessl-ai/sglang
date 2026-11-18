@@ -5744,27 +5744,30 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             maybe_start_host_pool_prealloc()
 
-        inf834_direct = None
-        if not is_nextn and getattr(self, "_inf834_ep_direct_sources", None):
-            from sglang.srt.model_loader.inf834_ep_direct import (
-                Inf834EpDirectExperts,
-                make_resolver,
-            )
+        inf834_direct_lazy = None
+        if not is_nextn and envs.SGLANG_OPT_INF834_EP_DIRECT_EXPERTS.get():
+            # INF-834: the read filter that hands the routed experts to this reader is built
+            # inside the weight iterator (first next()), so the reader starts from there.
+            from sglang.srt.model_loader.inf834_ep_direct import LazyLaunch, make_resolver
 
-            inf834_direct_resolve = make_resolver(
-                lambda ckpt_name: self.remap_weight_name_to_dpsk_hf_format(
-                    ckpt_name,
-                    is_nextn=False,
-                    num_hidden_layers=self.config.num_hidden_layers,
+            def inf834_take_direct_sources():
+                sources = getattr(self, "_inf834_ep_direct_sources", None)
+                self._inf834_ep_direct_sources = None
+                return sources
+
+            inf834_direct_lazy = LazyLaunch(
+                inf834_take_direct_sources,
+                make_resolver(
+                    lambda ckpt_name: self.remap_weight_name_to_dpsk_hf_format(
+                        ckpt_name,
+                        is_nextn=False,
+                        num_hidden_layers=self.config.num_hidden_layers,
+                    ),
+                    expert_params_mapping,
+                    params_dict,
                 ),
-                expert_params_mapping,
-                params_dict,
             )
-            inf834_direct = Inf834EpDirectExperts(
-                self._inf834_ep_direct_sources, inf834_direct_resolve
-            )
-            self._inf834_ep_direct_sources = None
-            inf834_direct.launch()
+            weights = inf834_direct_lazy.wrap(weights)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
@@ -6081,6 +6084,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 inf834_bulk.finish()
             if inf834_profile is not None:
                 inf834_profile.mark("stream")
+            inf834_direct = (
+                inf834_direct_lazy.direct if inf834_direct_lazy is not None else None
+            )
+            if getattr(self, "_inf834_ep_direct_sources", None):
+                # The filter dropped these experts from the stream and nothing read them.
+                raise RuntimeError(
+                    "INF834 ep direct experts: the read filter handed routed experts to "
+                    "the direct reader, which did not start (SGLANG_OPT_INF834_EP_DIRECT_EXPERTS "
+                    "must be set in this process)"
+                )
             if inf834_direct is not None:
                 inf834_direct.join("target")
                 loaded_params.update(inf834_direct.loaded_names)
