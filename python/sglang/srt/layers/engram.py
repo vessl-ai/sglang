@@ -811,6 +811,14 @@ def _madvise_hugepage(buf) -> None:
     )
 
 
+def _inf834_defers_prefault() -> bool:
+    if not envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT.get():
+        return False
+    from sglang.srt.model_loader.inf834_weight_snapshot import defers_host_prefault
+
+    return defers_host_prefault()
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
@@ -857,41 +865,85 @@ class _HostTable:
             # Advisory before the first touch: pages are allocated huge at fault time.
             self.mm.madvise(mmap.MADV_HUGEPAGE)
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
+        self.name = name
+        # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT: the weight snapshot restore writes (and
+        # so faults) every page of a per-rank table; WeightSnapshot.begin() then calls complete().
+        self.deferred = False
         if layout == "per_rank":
             keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
-            if keep_cache:
-                tic = time.perf_counter()
-            else:
+            if not keep_cache:
                 # Cached checkpoint pages, left by a previous server or by the loader,
                 # make the 512 MiB huge-page faults fall back, so empty them first.
                 _drop_page_cache_once("before pre-faulting the per-rank shard")
-            if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
-                from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
-                    inf834_populate_write_parallel,
-                )
-
-                inf834_populate_write_parallel(self.mm, nbytes)
-            else:
-                np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
-            if keep_cache:
-                mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+            if not _is_hip and _inf834_defers_prefault():
+                self.deferred = True
                 logger.info(
-                    "INF834 engram host table %s: kept the checkpoint page cache; "
-                    "pre-fault %.1fs, %.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+                    "INF834 engram host table %s: pre-fault and registration deferred to the weight snapshot",
                     name,
-                    time.perf_counter() - tic,
-                    mapped_kb / 2**10,
-                    huge_kb / 2**10,
-                    100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
                 )
+            else:
+                self._prefault()
         if layout == "shared":
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        if self.deferred:
+            self.device_ptr = self.bytes.data_ptr()  # CUDA UVA: the registered address is the host address
+        else:
+            self._register()
+
+    def _prefault(self) -> None:
+        keep_cache = envs.SGLANG_OPT_INF834_KEEP_PAGE_CACHE.get()
+        tic = time.perf_counter()
+        if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+            from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+                inf834_populate_write_parallel,
+            )
+
+            inf834_populate_write_parallel(self.mm, self.nbytes)
+        else:
+            np.frombuffer(self.mm, dtype=np.uint8)[:: mmap.PAGESIZE] = 0
+        if keep_cache:
+            mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+            logger.info(
+                "INF834 engram host table %s: kept the checkpoint page cache; "
+                "pre-fault %.1fs, %.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+                self.name,
+                time.perf_counter() - tic,
+                mapped_kb / 2**10,
+                huge_kb / 2**10,
+                100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+            )
+
+    def _register(self) -> None:
+        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), self.nbytes, 0)
         if int(err) != 0:
-            raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
+            raise RuntimeError(f"cudaHostRegister({self.nbytes} bytes) failed: {err}")
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+
+    def complete(self, prefault: bool) -> None:
+        """Deferred table: pre-fault (unless the restore already wrote every page), then register."""
+        if not self.deferred:
+            return
+        tic = time.perf_counter()
+        if prefault:
+            self._prefault()
+        address = self.device_ptr
+        self._register()
+        if self.device_ptr != address:
+            raise RuntimeError("engram host table: registered address differs from the host address")
+        self.deferred = False
+        mapped_kb, huge_kb = _huge_pages_backing(self.bytes.data_ptr())
+        logger.info(
+            "INF834 engram host table %s: registered after the weight snapshot (%s) in %.2fs, "
+            "%.0f MiB resident, %.0f MiB in huge pages (%.1f%%)",
+            self.name,
+            "pre-faulted" if prefault else "restored pages, no pre-fault",
+            time.perf_counter() - tic,
+            mapped_kb / 2**10,
+            huge_kb / 2**10,
+            100.0 * huge_kb / mapped_kb if mapped_kb else 0.0,
+        )
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -933,6 +985,8 @@ class _HostTable:
             time.sleep(1.0)
 
     def finish_load(self, label: str):
+        if self.deferred:  # nothing called complete(): pre-fault (no-op on written pages) and register now
+            self.complete(prefault=True)
         if not self.dirty:
             return
         self.dirty = False

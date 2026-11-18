@@ -2391,6 +2391,14 @@ class Envs:
     SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIR = EnvStr("")
     SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_THREADS = EnvInt(8)
     SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DIRECT_IO = EnvStr("auto")
+    # "stream_end" (default): the weights as the stream leaves them, the repack runs after a restore;
+    # "repacked": the MoE experts as the EP decode repack leaves them, the repack is skipped after a restore.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_PHASE = EnvStr("stream_end")
+    # Engram per-rank host tables: no pre-fault and no cudaHostRegister at model init; the restore writes
+    # (and faults) the pages, then the tables are registered. Without a restore: pre-fault + register then.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT = EnvBool(False)
+    # After a restore, read the ranges read with O_DIRECT again (buffered, one background thread): next boot warm.
+    SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_REWARM = EnvBool(True)
     SGLANG_OPT_INF834_EP_DIRECT_EXPERTS = EnvBool(False)
     SGLANG_OPT_INF834_EP_DIRECT_THREADS = EnvInt(8)
     SGLANG_OPT_INF834_EP_DIRECT_BLOCK = EnvInt(16)

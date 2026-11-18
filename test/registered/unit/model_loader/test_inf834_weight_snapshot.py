@@ -7,6 +7,13 @@
 - truncated or uncommitted snapshot -> fallback / ignored
 - checksum failure after the parameters were filled -> fallback reported as touched (caller reloads)
 - two processes saving the same rank at once: one writes, the other skips; the result is valid
+- phase "repacked" through the real EP decode repack (Mxfp4MarlinMoEMethod, v2w pack on CPU): save, restore
+  without the pack (packed bytes equal), fallback after a checksum failure in a packed region (normal load +
+  real pack), the phase in the identity, an unconsumed staged layer fails the boot, an uncovered layer
+  abandons the save
+- Engram host table pre-fault deferral: no pre-fault / registration at init, registered after the restore
+  without pre-fault, pre-faulted first when nothing is restored
+- per-chunk IO policy: resident chunks buffered, the others O_DIRECT, then rewarm
 """
 
 import json
@@ -330,6 +337,335 @@ class TestConcurrentSave(Base):
         self.assertTrue(self.snap(dst).begin())
         for (k, a), b in zip(state(m).items(), state(dst).values()):
             self.assertTrue(torch.equal(a, b), k)
+
+
+# ------------------------------------------------------------------------------------- phase "repacked"
+
+HID, INTER = 5120, 2304  # the v2w shape (DSv4.1-Flash EP8 decoder: 52 local experts; 1 here)
+
+
+def _moe_method(prefix, activation="silu"):
+    import types
+
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    qm = object.__new__(Mxfp4MarlinMoEMethod)
+    qm.prefix = prefix
+    qm._use_w4a8 = False
+    qm._sm90_decode_w4a8 = qm._sm90_decode_w4a8_v2 = qm._sm90_decode_w4a8_ep = True
+    qm.hidden_pad = 0
+    qm.runner = types.SimpleNamespace(config=types.SimpleNamespace(
+        activation=activation, is_gated=True, gemm1_alpha=None, swiglu_limit=7.0))
+    return qm
+
+
+def make_moe_model(seed, layers=2, experts=1, activation=None):
+    cls = type("DeepseekV4ForCausalLM", (nn.Module,), {})
+    m = cls()
+    m.model = nn.Module()
+    m.model.layers = nn.ModuleList()
+    gen = torch.Generator().manual_seed(seed)
+
+    def rnd(shape, dtype, hi=255):
+        n = int(torch.tensor(shape).prod()) * torch.empty(0, dtype=dtype).element_size()
+        return torch.randint(0, hi, (n,), generator=gen, dtype=torch.uint8).view(dtype).view(shape)
+
+    for i in range(layers):
+        layer = nn.Module()
+        layer.attn = nn.Module()
+        layer.attn.weight = nn.Parameter(rnd((64, 128), torch.bfloat16), requires_grad=False)
+        layer.mlp = nn.Module()
+        ex = layer.mlp.experts = nn.Module()
+        ex.w13_weight = nn.Parameter(rnd((experts, 2 * INTER, HID // 2), torch.int8), requires_grad=False)
+        ex.w2_weight = nn.Parameter(rnd((experts, HID, INTER // 2), torch.int8), requires_grad=False)
+        # e8m0 exponents in a realistic band (the pack refuses > MAX_E8M0)
+        ex.w13_weight_scale_inv = nn.Parameter(
+            (torch.randint(110, 130, (experts, 2 * INTER, HID // 32), generator=gen, dtype=torch.uint8)
+             .view(torch.float8_e8m0fnu)), requires_grad=False)
+        ex.w2_weight_scale_inv = nn.Parameter(
+            (torch.randint(110, 130, (experts, HID, INTER // 32), generator=gen, dtype=torch.uint8)
+             .view(torch.float8_e8m0fnu)), requires_grad=False)
+        ex.quant_method = _moe_method(f"model.layers.{i}.mlp.experts",
+                                      activation=(activation or {}).get(i, "silu"))
+        m.model.layers.append(layer)
+    m.model.norm = nn.Parameter(rnd((HID,), torch.bfloat16), requires_grad=False)
+    return m
+
+
+def _repack_all(m):
+    for layer in m.model.layers:
+        ex = layer.mlp.experts
+        ex.quant_method._prepare_sm90_decode_ep_weights(ex)
+
+
+def _packed_bytes(m):
+    out = {}
+    for i, layer in enumerate(m.model.layers):
+        qm = layer.mlp.experts.quant_method
+        p = getattr(qm, "_sm90_packed", None)
+        if p is not None:
+            out[i] = ([f.detach().clone().view(-1).view(torch.uint8) for f in p if isinstance(f, torch.Tensor)],
+                      [f for f in p if not isinstance(f, torch.Tensor)], qm._ep_split)
+    return out
+
+
+class TestRepacked(Base):
+    def setUp(self):
+        import types
+
+        super().setUp()
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+
+        self.patches = [
+            mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_PHASE": "repacked"}),
+            mock.patch("sglang.srt.runtime_context.get_parallel", lambda: types.SimpleNamespace(moe_ep_size=8)),
+            mock.patch.object(ek, "kernel_mode", lambda: "v2w"),
+            mock.patch.object(ek, "prepare_ep", lambda *a, **k: None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        super().tearDown()
+
+    def _save(self, seed=11, **kw):
+        m = make_moe_model(seed, **kw)
+        s = self.snap(m)
+        self.assertFalse(s.begin())
+        s.end()
+        self.assertFalse(os.path.exists(s.commit))  # waits for the repack
+        _repack_all(m)
+        ws.finish_model(m)
+        return m, s
+
+    def test_save_restore_skips_the_pack(self):
+        src, s = self._save()
+        self.assertTrue(os.path.exists(s.commit))
+        meta = json.load(open(s.commit))
+        self.assertEqual(meta["identity"]["phase"], "repacked")
+        self.assertEqual([r["layer"] for r in meta["repacked"]], ["model.layers.0.mlp.experts", "model.layers.1.mlp.experts"])
+        ref = _packed_bytes(src)
+        self.assertEqual(len(ref), 2)
+        # the packed bytes fill the raw expert parameters exactly on the DSv4 shapes
+        rec = meta["repacked"][0]
+        room = sum(r["nbytes"] for r in meta["table"] if r["name"].startswith("param:model.layers.0.mlp.experts."))
+        self.assertEqual(ws._record_nbytes(rec), room)
+
+        dst = make_moe_model(11)
+        zero(dst)
+        d = self.snap(dst)
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+
+        with mock.patch.object(ek, "pack_experts_ep", side_effect=AssertionError("pack must not run")):
+            self.assertTrue(d.begin())
+            self.assertEqual(d.staged, ["model.layers.0.mlp.experts", "model.layers.1.mlp.experts"])
+            _repack_all(dst)
+        ws.finish_model(dst)
+        got = _packed_bytes(dst)
+        for i in ref:
+            for a, b in zip(ref[i][0], got[i][0]):
+                self.assertTrue(torch.equal(a, b), i)
+            self.assertEqual(ref[i][1:], got[i][1:])
+            ex = dst.model.layers[i].mlp.experts
+            self.assertFalse(hasattr(ex, "w13_weight"))
+            self.assertNotIn("_inf834_snapshot_packed", ex.__dict__)
+            self.assertEqual(type(dst.model.layers[i].mlp.experts.quant_method._sm90_packed).__name__, "PackedExperts")
+        for (k, a), (k2, b) in zip(sorted(state(src).items()), sorted(state(dst).items())):
+            self.assertEqual(k, k2)
+            self.assertTrue(torch.equal(a, b), k)  # attention weights, norm (experts are gone on both)
+
+    def test_checksum_failure_in_packed_region_reloads_and_repacks(self):
+        src, s = self._save()
+        ref = _packed_bytes(src)
+        meta = json.load(open(s.commit))
+        row = next(r for r in meta["table"] if r["name"] == "param:model.layers.1.mlp.experts.w2_weight")
+        with open(s.bin, "r+b") as f:
+            f.seek(row["offset"] + 123)
+            b = f.read(1)
+            f.seek(row["offset"] + 123)
+            f.write(bytes([b[0] ^ 0x5A]))
+        dst = make_moe_model(11)
+        zero(dst)
+        with self.assertLogs("sglang", level="WARNING") as logs:
+            self.assertFalse(self.snap(dst).begin())
+        text = "\n".join(logs.output)
+        self.assertIn(ws.FALLBACK, text)
+        self.assertIn("the repack runs", text)
+        for layer in dst.model.layers:
+            self.assertNotIn("_inf834_snapshot_packed", layer.mlp.experts.__dict__)
+        # the normal load: the checkpoint stream writes every parameter again, then the real pack runs
+        stream = make_moe_model(11)
+        with torch.no_grad():
+            for (k, a), (_, b) in zip(dst.named_parameters(), stream.named_parameters()):
+                a.copy_(b)
+        _repack_all(dst)
+        ws.finish_model(dst)
+        got = _packed_bytes(dst)
+        for i in ref:
+            for a, b in zip(ref[i][0], got[i][0]):
+                self.assertTrue(torch.equal(a, b), i)
+
+    def test_phase_is_in_the_identity(self):
+        _, s = self._save()
+        with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_PHASE": "stream_end"}):
+            m = make_moe_model(11)
+            t = self.snap(m)
+            self.assertNotEqual(t.dir, s.dir)
+            with self.assertLogs("sglang", level="INFO") as logs:
+                self.assertFalse(t.begin())
+            self.assertIn("none at", "\n".join(logs.output))
+
+    def test_unconsumed_staged_layer_fails_the_boot(self):
+        self._save()
+        dst = make_moe_model(11)
+        self.assertTrue(self.snap(dst).begin())
+        ex = dst.model.layers[0].mlp.experts
+        ex.quant_method._prepare_sm90_decode_ep_weights(ex)  # layer 1 never repacked
+        with self.assertRaisesRegex(RuntimeError, "did not consume"):
+            ws.finish_model(dst)
+
+    def test_staged_layer_on_an_uncovered_path_raises(self):
+        self._save()
+        dst = make_moe_model(11)
+        self.assertTrue(self.snap(dst).begin())
+        ex = dst.model.layers[0].mlp.experts
+        ex.quant_method.runner.config.activation = "gelu"
+        with self.assertRaisesRegex(RuntimeError, "holds restored packed experts"):
+            ex.quant_method._prepare_sm90_decode_ep_weights(ex)
+
+    def test_layer_not_repacked_abandons_the_save(self):
+        m = make_moe_model(12, activation={1: "gelu"})  # layer 1: shape check fails, no pack
+        s = self.snap(m)
+        self.assertFalse(s.begin())
+        s.end()
+        _repack_all(m)
+        with self.assertLogs("sglang", level="WARNING") as logs:
+            ws.finish_model(m)
+        self.assertIn("save abandoned", "\n".join(logs.output))
+        self.assertFalse(os.path.exists(s.commit))
+        self.assertEqual([f for f in os.listdir(os.path.join(s.dir, ".tmp"))], [])
+
+
+# ------------------------------------------------------------------------------ Engram pre-fault deferral
+
+class _Registrar:
+    def __init__(self):
+        self.calls = []
+
+    def cudaHostRegister(self, ptr, n, flags):
+        self.calls.append((ptr, n))
+        return 0
+
+
+class TestEngramDeferral(Base):
+    N = 6 << 20
+
+    def _table_model(self, reg, seed=None):
+        from sglang.srt.layers import engram
+
+        with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_DEFER_PREFAULT": "1",
+                                          "SGLANG_OPT_INF834_KEEP_PAGE_CACHE": "1"}), \
+                mock.patch.object(engram, "_graphs_persisted", lambda: False), \
+                mock.patch("torch.cuda.cudart", lambda: reg):
+            ht = engram._HostTable("per_rank", self.N, "t0", None)
+        cls = type("DeepseekV4ForCausalLM", (nn.Module,), {})
+        m = cls()
+        m.embed = nn.Module()
+        m.embed.host_table = ht
+        m.embed.weight = nn.Parameter(ht.bytes.view(torch.float8_e4m3fn), requires_grad=False)
+        m.other = nn.Parameter(torch.arange(4096, dtype=torch.float32), requires_grad=False)
+        if seed is not None:
+            gen = torch.Generator().manual_seed(seed)
+            ht.bytes.copy_(torch.randint(0, 255, (self.N,), generator=gen, dtype=torch.uint8))
+        return m, ht
+
+    def test_restore_registers_without_prefault(self):
+        reg = _Registrar()
+        with mock.patch("torch.cuda.cudart", lambda: reg):
+            src, sht = self._table_model(reg)
+            self.assertTrue(sht.deferred)
+            self.assertEqual(reg.calls, [])
+            s = self.snap(src)
+            self.assertFalse(s.begin())  # nothing saved: pre-fault + register, then the stream writes
+            self.assertFalse(sht.deferred)
+            self.assertEqual(len(reg.calls), 1)
+            gen = torch.Generator().manual_seed(3)
+            sht.bytes.copy_(torch.randint(0, 255, (self.N,), generator=gen, dtype=torch.uint8))
+            s.end()
+            dst, dht = self._table_model(reg)
+            self.assertTrue(dht.deferred)
+            with mock.patch.object(type(dht), "_prefault", side_effect=AssertionError("pre-fault on restore")):
+                self.assertTrue(self.snap(dst).begin())
+            self.assertFalse(dht.deferred)
+            self.assertEqual(reg.calls[-1], (dht.bytes.data_ptr(), self.N))
+            self.assertEqual(dht.device_ptr, dht.bytes.data_ptr())
+            self.assertTrue(torch.equal(sht.bytes, dht.bytes))
+            dht.finish_load("layer 0")  # no second registration
+            self.assertEqual(len(reg.calls), 2)
+
+    def test_no_snapshot_prefaults_then_registers(self):
+        reg = _Registrar()
+        with mock.patch("torch.cuda.cudart", lambda: reg):
+            m, ht = self._table_model(reg)
+            with mock.patch.object(type(ht), "_prefault", autospec=True, side_effect=lambda self_: None) as pf:
+                self.assertFalse(self.snap(m).begin())
+            pf.assert_called_once()
+            self.assertEqual(len(reg.calls), 1)
+            self.assertFalse(ht.deferred)
+
+    def test_off_without_the_switch(self):
+        reg = _Registrar()
+        from sglang.srt.layers import engram
+
+        with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_KEEP_PAGE_CACHE": "1"}), \
+                mock.patch.object(engram, "_graphs_persisted", lambda: False), \
+                mock.patch("torch.cuda.cudart", lambda: reg):
+            ht = engram._HostTable("per_rank", self.N, "t1", None)
+        self.assertFalse(ht.deferred)
+        self.assertEqual(len(reg.calls), 1)
+
+
+# -------------------------------------------------------------------------------------- per-chunk IO
+
+@unittest.skipUnless(WORK, "O_DIRECT needs a real disk (set INF834_SNAP_TEST_DIR)")
+class TestChunkPolicy(Base):
+    def test_resident_buffered_rest_direct_then_rewarm(self):
+        tensors = [("big.a", torch.int8, (256, 1 << 20)), ("big.b", torch.int8, (256, 1 << 20))]
+        src = make_model(tensors, seed=4)
+        s = self.snap(src)
+        s.end()  # O_DIRECT writes: nothing of the file is in the page cache
+        size = os.path.getsize(s.bin)
+        fd = os.open(s.bin, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            half = size // 2 // ws.CHUNK * ws.CHUNK
+            off = 0
+            while off < half:  # make the first half resident
+                off += len(os.pread(fd, min(ws.CHUNK, half - off), off))
+        finally:
+            os.close(fd)
+        dst = make_model(tensors, seed=4)
+        zero(dst)
+        d = self.snap(dst)
+        with self.assertLogs("sglang", level="INFO") as logs:
+            self.assertTrue(d.begin())
+        text = "\n".join(logs.output)
+        m = re.search(r"policy chunk: ([0-9.]+) GB buffered \+ ([0-9.]+) GB O_DIRECT", text)
+        self.assertIsNotNone(m, text)
+        self.assertAlmostEqual(float(m.group(1)), half / 1e9, delta=0.07)
+        self.assertGreater(float(m.group(2)), 0.2)
+        for (k, a), b in zip(state(src).items(), state(dst).values()):
+            self.assertTrue(torch.equal(a, b), k)
+        d._rewarm_thread.join(30)
+        import time as _t
+
+        for _ in range(50):
+            if ws._resident_fraction(s.bin) > 0.95:
+                break
+            _t.sleep(0.2)
+        self.assertGreater(ws._resident_fraction(s.bin), 0.95)
 
 
 if __name__ == "__main__":

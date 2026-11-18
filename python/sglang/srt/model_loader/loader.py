@@ -1047,6 +1047,11 @@ class DefaultModelLoader(BaseModelLoader):
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )
+            if getattr(model, "_inf834_weight_snapshot", None) is not None:
+                # INF-834 weight snapshot: commit a "repacked" save / check every staged layer was consumed.
+                from sglang.srt.model_loader.inf834_weight_snapshot import finish_model
+
+                finish_model(model)
 
         self.counter_after_loading_weights = time.perf_counter()
         if envs.SGLANG_OPT_INF834_WEIGHT_DIGEST_DIR.get():
