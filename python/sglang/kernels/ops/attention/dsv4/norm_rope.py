@@ -205,8 +205,16 @@ def fused_q_norm_rope(
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
-        assert eps is not None and not fp8_output
-        fused_q_norm_rope_xpu(q_input, q_output, freqs_real, positions, eps)
+        assert eps is not None
+        if fp8_output:
+            assert q_input.dtype == torch.bfloat16
+            assert q_output.shape == q_input.shape
+            assert q_output.device == q_input.device
+            tmp = torch.empty_like(q_input)
+            fused_q_norm_rope_xpu(q_input, tmp, freqs_real, positions, eps)
+            q_output.copy_(tmp)
+        else:
+            fused_q_norm_rope_xpu(q_input, q_output, freqs_real, positions, eps)
     else:
         module = _jit_main_q_norm_rope_module(
             q_input.dtype, head_dim, rope_dim, eps is not None, fp8_output
