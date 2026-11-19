@@ -195,6 +195,10 @@ jobs:
   gateway-e2e:
     name: ${{ matrix.name }}
     needs: build-wheel
+    # if: |
+    #   github.event_name != 'pull_request' ||
+    #   (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+    #   (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     if: github.event_name == 'workflow_dispatch'
     # The `responses` matrix entry is intentionally omitted. It needs
     # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
@@ -434,6 +438,8 @@ jobs:
     needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test, k8s-integration]
     runs-on: ubuntu-latest
     steps:
+      # - name: Finish
+      #   run: echo "This is an empty step to ensure that all jobs are completed."
       - name: Check build and test results
         env:
           RESULTS: ${{ toJSON(needs) }}

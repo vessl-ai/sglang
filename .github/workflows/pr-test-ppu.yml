@@ -184,6 +184,7 @@ jobs:
           format('ignored-label-ppu-sanity ({0})', matrix.runner) ||
           format('ppu-sanity ({0})', matrix.runner) }}
     needs: [check-changes, pr-gate, ppu-build]
+    # if: needs.check-changes.outputs.ppu == 'true'
     if: github.event_name == 'workflow_dispatch' && needs.check-changes.outputs.ppu == 'true'
     # Both PPU generations reuse the same wheels; each host supplies its own
     # runtime image and device, while checkpoints come from the shared NAS.
@@ -273,6 +274,15 @@ jobs:
             printf '%s\n' '::error::A PPU CI dependency failed or was cancelled.'
             exit 1
           fi
+          # if [[ "$PPU_IN_SCOPE" == "true" ]]; then
+          #   if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "success" ]]; then
+          #     printf '%s\n' '::error::PPU scope requires a successful native build and both PPU sanity files.'
+          #     exit 1
+          #   fi
+          #   printf '%s\n' 'Native build and both PPU sanity files passed.'
+          # else
+          #   printf '%s\n' 'PPU is outside this run scope; no PPU tests were requested.'
+          # fi
           if [[ "$PPU_IN_SCOPE" == "true" ]]; then
             if [[ "$BUILD_RESULT" != "success" || "$SANITY_RESULT" != "$EXPECTED_SANITY" ]]; then
               printf '%s\n' '::error::PPU build or sanity checks returned an unexpected result.'

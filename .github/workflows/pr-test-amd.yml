@@ -4,6 +4,17 @@ name: PR Test (AMD)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
+  # schedule:
+  #   - cron: '0 */12 * * *' # rocm10: twice daily (UTC)
+  #   - cron: '30 17 * * *'  # rocm724/rocm720: once daily (UTC)
+  # pull_request:
+  #   paths:
+  #     - "python/**"
+  #     - "scripts/ci/**"
+  #     - "test/**"
+  #     - "python/sglang/kernels/aot/**"
+  #     - ".github/workflows/pr-test-amd.yml"
+  #     - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       rocm_version:

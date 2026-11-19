@@ -339,6 +339,7 @@ jobs:
   sgl-router-e2e:
     name: tier-3 — e2e
     needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    # if: needs.sgl-router-changes.outputs.should_run == 'true'
     if: github.event_name == 'workflow_dispatch' && needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
@@ -432,6 +433,7 @@ jobs:
             exit 1
           fi
           tiers="$GATE_RESULT $LINT_RESULT $BUILD_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
+          # if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success" ]]; then
           if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success $EXPECTED_E2E" ]]; then
             echo "All sgl-router checks passed."
           elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped" ]]; then

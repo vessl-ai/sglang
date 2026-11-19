@@ -179,6 +179,12 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
+    # if: |
+    #   github.event_name != 'schedule' &&
+    #   inputs.test_parallel_dispatch != true &&
+    #   needs.check-changes.result == 'success' &&
+    #   needs.check-changes.outputs.sgl_kernel == 'true' &&
+    #   needs.call-gate.result == 'success'
     if: |
       github.event_name == 'workflow_dispatch' &&
       inputs.test_parallel_dispatch != true &&
@@ -196,6 +202,12 @@ jobs:
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
+    # if: |
+    #   github.event_name != 'schedule' &&
+    #   inputs.test_parallel_dispatch != true &&
+    #   needs.check-changes.result == 'success' &&
+    #   needs.check-changes.outputs.sgl_kernel == 'true' &&
+    #   needs.call-gate.result == 'success'
     if: |
       github.event_name == 'workflow_dispatch' &&
       inputs.test_parallel_dispatch != true &&
@@ -266,6 +278,10 @@ jobs:
 
   call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    # if: |
+    #   github.event_name != 'schedule' &&
+    #   inputs.test_parallel_dispatch != true &&
+    #   needs.check-changes.outputs.sgl_kernel == 'true'
     if: |
       github.event_name == 'workflow_dispatch' &&
       inputs.test_parallel_dispatch != true &&
@@ -314,6 +330,7 @@ jobs:
   base-a-test:
     name: base-a-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    # if: ${{ !failure() && !cancelled() }}
     if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() }}
     strategy:
       fail-fast: false
@@ -354,6 +371,7 @@ jobs:
     name: base-b-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
+    # if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
     if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
     strategy:
       fail-fast: false
@@ -402,6 +420,7 @@ jobs:
     # wait-for-base-a is listed only to read its result: when it is cancelled,
     # wait-for-base-b ends `skipped`, which alone would let this stage through.
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    # if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
@@ -429,6 +448,7 @@ jobs:
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+    # if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false

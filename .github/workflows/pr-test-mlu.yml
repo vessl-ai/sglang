@@ -6,6 +6,12 @@ name: PR Test (MLU)
 
 on:
   # Run the reviewed base-branch workflow, never workflow code from the PR.
+  # pull_request_target:
+  #   branches: [ main ]
+  #   # `labeled` lets the workflow re-fire when `run-ci-mlu` (or `run-ci`)
+  #   # is added after the latest push. See call-gate.if for the matching guard
+  #   # that prevents unrelated label additions from dispatching a full run.
+  #   types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       ref:

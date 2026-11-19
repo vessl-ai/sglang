@@ -339,6 +339,10 @@ jobs:
         base-a-test-npu-cov,
         recommend-tests-from-coverage,
       ]
+    # if: >-
+    #   ${{ !failure() && !cancelled() &&
+    #   (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
+    #   needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false' }}
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
@@ -489,6 +493,10 @@ jobs:
         base-a-test-npu-cov,
         recommend-tests-from-coverage,
       ]
+    # if: >-
+    #   ${{ !failure() && !cancelled() &&
+    #   (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
+    #   needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false' }}
     if: >-
       ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
