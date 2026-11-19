@@ -610,6 +610,8 @@ class Envs:
     # or not); a larger move is issued as consecutive launches of this size
     # within the same compaction call.
     SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
+    SGLANG_OPTIMISTIC_PREFILL_ALLOW_HICACHE = EnvBool(False)
+
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -820,6 +822,10 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Export the L3 prefetch outcome counters (issued, declined and revoked
+    # by reason, requested/miss/redundant tokens) under --enable-metrics.
+    # Off by default so /metrics stays exactly as before; set to 1 to export.
+    SGLANG_HICACHE_PREFETCH_OUTCOME_METRICS = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -982,6 +988,13 @@ class Envs:
     # input anyway, but router/shared-expert reads see rounded values, so this
     # stays accuracy-gated and default OFF.
     SGLANG_ENABLE_DP_GATHER_FP8 = EnvBool(False)
+    # Gather the rows an input-scattered stage (--enable-attn-tp-input-scattered)
+    # reads as fp8-e4m3 with power-of-two per-128 scales, unpacked to bf16 after
+    # the gather. Lossy for bf16 readers of those rows, so accuracy-gated, OFF.
+    SGLANG_ENABLE_SCATTERED_INPUT_GATHER_FP8 = EnvBool(False)
+    # Run the contiguous DeepGEMM MoE activation and its FP8 quantization as
+    # one kernel on every model, not only swizzled or FP32-intermediate ones.
+    SGLANG_DEEPGEMM_FUSED_CONTIG_ACT_QUANT = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     # Select the gate/up tile layout for AITER MoE: True -> interleave
     # (matches FlyDSL `gate_mode="interleave"` kernels), False -> separated
@@ -1834,6 +1847,16 @@ class Envs:
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     # Unset: bf16 on SM100 (with bf16 head weights), fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(None)
+    # Split the DeepSeek-V4.1 torch prefill indexer's query rows across the attention
+    # TP ranks instead of scoring every row on every rank.
+    SGLANG_DSV41_INDEXER_ROW_SHARD = EnvBool(False)
+    # Score the DeepSeek-V4.1 torch prefill indexer with one fused kernel (fp8 wgmma
+    # on SM90, Triton elsewhere) instead of separate torch einsum, relu, head-weight
+    # and head-sum ops.
+    SGLANG_OPT_DSV41_FUSED_PREFILL_INDEXER = EnvBool(False)
+    # Run the DeepSeek-V4 MXFP4 experts selected by --moe-runner-backend=marlin
+    # with OpenAI triton_kernels grouped matmuls on SM90 instead of Marlin.
+    SGLANG_OPT_DSV4_TRITON_KERNELS_MOE = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -1985,6 +2008,13 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Opt-in: each attention-TP rank scores a contiguous share of the prefill
+    # indexer rows (logits + top-k) and the ranks all-gather the top-k indices.
+    SGLANG_DSA_INDEXER_TP_SPLIT = EnvBool(False)
+    SGLANG_DSA_INDEXER_TP_SPLIT_MIN_ROWS = EnvInt(1024)
+    # Opt-in: quantize GLM-5 KDA q/k/v and o projections, which the checkpoint
+    # ships in BF16, to 128x128 block FP8 at load. Changes numerics.
+    SGLANG_GLM5_KDA_FP8_PROJ = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
