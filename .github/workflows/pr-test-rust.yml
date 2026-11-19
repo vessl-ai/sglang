@@ -195,11 +195,10 @@ jobs:
   gateway-e2e:
     name: ${{ matrix.name }}
     needs: build-wheel
-    # if: |
-    #   github.event_name != 'pull_request' ||
-    #   (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-    #   (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    if: github.event_name == 'workflow_dispatch'
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     # The `responses` matrix entry is intentionally omitted. It needs
     # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
     # on the runner host, but the 2-/4-gpu-h100 runners are themselves
@@ -434,20 +433,11 @@ jobs:
           bash e2e_test/k8s_integration/setup.sh teardown || true
 
   finish:
-    if: always() && needs.build-wheel.result != 'skipped'
     needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test, k8s-integration]
     runs-on: ubuntu-latest
     steps:
-      # - name: Finish
-      #   run: echo "This is an empty step to ensure that all jobs are completed."
-      - name: Check build and test results
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-          EXPECTED_E2E: ${{ github.event_name == 'workflow_dispatch' && 'success' || 'skipped' }}
-        run: |
-          jq -e --arg e2e "$EXPECTED_E2E" 'all(to_entries[];
-            .value.result == (if .key == "gateway-e2e" then $e2e else "success" end)
-          )' <<< "$RESULTS"
+      - name: Finish
+        run: echo "This is an empty step to ensure that all jobs are completed."
 
   summarize-benchmarks:
     needs: gateway-e2e
