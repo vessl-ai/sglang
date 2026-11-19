@@ -74,6 +74,11 @@ permissions:
   pull-requests: read
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+    with:
+      extra-label: run-ci-extra
+
   # =============================================== check changes ====================================================
   # The actual `run-ci` + `run-ci-extra` label gate now lives in the
   # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
@@ -84,6 +89,8 @@ jobs:
   # payload, which never updates on rerun and made the slash-add-label flow
   # impossible to recover.
   check-changes:
+    needs: ci-requested
+    if: needs.ci-requested.outputs.requested == 'true'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -225,6 +232,7 @@ jobs:
   pr-test-extra-finish:
     needs:
       [
+        ci-requested,
         check-changes,
         call-gate,
         sgl-kernel-build-wheels,
@@ -234,7 +242,7 @@ jobs:
         extra-test,
         xeon-extra,
       ]
-    if: always()
+    if: always() && needs.ci-requested.outputs.requested != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

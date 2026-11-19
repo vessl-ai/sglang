@@ -70,8 +70,13 @@ permissions:
   pull-requests: read
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+
   # =============================================== check changes ====================================================
   check-changes:
+    needs: ci-requested
+    if: needs.ci-requested.outputs.requested == 'true'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -473,6 +478,7 @@ jobs:
   pr-test-finish:
     needs:
       [
+        ci-requested,
         call-gate,
         check-changes,
         call-pr-test-extra,
@@ -497,7 +503,7 @@ jobs:
         base-c-test,
         base-c-test-aarch64,
       ]
-    if: always()
+    if: always() && needs.ci-requested.outputs.requested != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

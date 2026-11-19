@@ -47,16 +47,23 @@ env:
   GIT_CONFIG_NOSYSTEM: "1"
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+    with:
+      extra-label: run-ci-ppu
+
   check-changes:
+    needs: ci-requested
     name: >-
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-check-changes' || 'check-changes' }}
     if: |
-      github.event_name != 'pull_request' ||
+      needs.ci-requested.outputs.requested == 'true' &&
+      (github.event_name != 'pull_request' ||
       github.event.action != 'labeled' ||
       github.event.label.name == 'run-ci' ||
-      github.event.label.name == 'run-ci-ppu'
+      github.event.label.name == 'run-ci-ppu')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -257,8 +264,8 @@ jobs:
       ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' &&
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-test-ppu-finish' || 'pr-test-ppu-finish' }}
-    needs: [pr-gate, check-changes, ppu-build, ppu-sanity]
-    if: always() && needs.check-changes.result != 'skipped'
+    needs: [ci-requested, pr-gate, check-changes, ppu-build, ppu-sanity]
+    if: always() && needs.ci-requested.outputs.requested != 'false' && (needs.ci-requested.result == 'failure' || needs.check-changes.result != 'skipped')
     runs-on: ubuntu-latest
     permissions: {}
     steps:

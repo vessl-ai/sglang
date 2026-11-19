@@ -368,7 +368,23 @@ def _latest_run_per_workflow(runs):
     return list(latest.values())
 
 
-def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def _waiting_for_ci_label(run, labels):
+    if run.event != "pull_request" or not run.path.startswith(
+        ".github/workflows/pr-test"
+    ):
+        return False
+    waiting_steps = {f"Waiting for {label}" for label in labels}
+    return any(
+        step.conclusion == "success" and step.name in waiting_steps
+        for job in run.jobs()
+        if job.name == "ci-requested / labels"
+        for step in job.steps
+    )
+
+
+def handle_rerun_failed_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, requested_labels=()
+):
     """
     Handles the /rerun-failed-ci command.
     Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
@@ -455,15 +471,27 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+        run_requested = (
+            run.conclusion == "success"
+            and requested_labels
+            and _waiting_for_ci_label(run, requested_labels)
+        )
+        if not run_requested and run.conclusion not in (
+            "failure",
+            "skipped",
+            "cancelled",
+            "timed_out",
+        ):
             # action_required (fork PR awaiting approval) is deliberately left
             # out: it needs an approval, not a rerun.
             continue
 
         print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
-            if run.conclusion == "skipped" or (
-                sgl_kernel_changes and not kernel_wheel_built
+            if (
+                run_requested
+                or run.conclusion == "skipped"
+                or (sgl_kernel_changes and not kernel_wheel_built)
             ):
                 print("  Full rerun")
                 run.rerun()
@@ -1862,7 +1890,14 @@ def main():
             time.sleep(5)
 
         rerun = handle_rerun_failed_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo,
+            pr,
+            comment,
+            user_perms,
+            react_on_success=False,
+            requested_labels={label.name for label in pr.get_labels()}
+            if tagged
+            else (),
         )
 
         # If at least one action was successful, add the reaction here

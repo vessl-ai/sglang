@@ -38,8 +38,13 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+
   # ==================== Check Changes ==================== #
   check-changes:
+    needs: ci-requested
+    if: needs.ci-requested.outputs.requested == 'true'
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true'}}
@@ -105,6 +110,7 @@ jobs:
     secrets: inherit
 
   set-image-config:
+    needs: check-changes
     runs-on: ubuntu-latest
     outputs:
       CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
@@ -1200,6 +1206,7 @@ jobs:
   pr-test-npu-finish:
     needs:
       [
+        ci-requested,
         check-changes,
         pr-gate,
 
@@ -1221,7 +1228,7 @@ jobs:
 
         setup-covstub,
       ]
-    if: always()
+    if: always() && needs.ci-requested.outputs.requested != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
