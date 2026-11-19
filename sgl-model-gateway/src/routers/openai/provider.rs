@@ -22,6 +22,7 @@ const SGLANG_FIELDS: &[&str] = &[
     "ignore_eos",
     "continue_final_message",
     "skip_special_tokens",
+    "add_special_tokens",
     "lora_path",
     "session_params",
     "separate_reasoning",
@@ -30,6 +31,7 @@ const SGLANG_FIELDS: &[&str] = &[
     "chat_template_kwargs",
     "return_hidden_states",
     "repetition_penalty",
+    "repetition_detection",
     "sampling_seed",
     "backend_url",
 ];
