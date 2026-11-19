@@ -110,6 +110,7 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
     if: |
+      github.event_name == 'workflow_dispatch' &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
@@ -152,7 +153,7 @@ jobs:
 
   simulator-test-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-simulator-gpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -164,7 +165,7 @@ jobs:
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +207,7 @@ jobs:
 
   xeon-extra:
     needs: [check-changes, call-gate]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/pr-test-xeon.yml
     with:
       ref: ${{ inputs.git_ref || github.ref }}

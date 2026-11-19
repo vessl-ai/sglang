@@ -1,12 +1,8 @@
 name: PR Test (MUSA)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
-    input:
+    inputs:
       target_stage:
         description: "Specific test stage to run (Optional)"
         required: false

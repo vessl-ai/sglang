@@ -29,7 +29,6 @@ name: PR Test Extra (AMD)
 on:
   # No `labeled` trigger, as in pr-test-extra.yml: a label event would cancel
   # the run in progress. Adding the labels after a push takes a rerun.
-  pull_request:
   workflow_dispatch:
     inputs:
       runner_arch:

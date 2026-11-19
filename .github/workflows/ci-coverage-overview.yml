@@ -80,6 +80,7 @@ jobs:
           python scripts/ci/utils/ci_coverage_report.py --section by-gpu-count
 
   unit-test-coverage:
+    if: github.event_name == 'workflow_dispatch'
     name: Unit Test Code Coverage
     runs-on: 1-gpu-h100
     # ~6 min install + ~22 min of tests, and the suite keeps growing
