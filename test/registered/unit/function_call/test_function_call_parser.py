@@ -6603,7 +6603,7 @@ class TestSolarOpen2Detector(unittest.TestCase):
 
 class TestSolarOpen2VendorDifferential(unittest.TestCase):
     """Our detector against the reference tool parser (a verbatim copy in
-    ``test/srt/fixtures/solar_open2_vendor_reference.py``), shape by shape: non-stream must
+    ``test/fixtures/solar_open2_vendor_reference.py``), shape by shape: non-stream must
     agree exactly; streaming must agree on calls and, unless a shape says
     ``"calls"``, on content up to whitespace (the documented streaming
     deltas: rstripped whitespace before an opener, held unparsed output);
@@ -6939,7 +6939,6 @@ class TestSolarOpen2VendorDifferential(unittest.TestCase):
                 "..",
                 "..",
                 "..",
-                "srt",
                 "fixtures",
                 "solar_open2_vendor_reference.py",
             )

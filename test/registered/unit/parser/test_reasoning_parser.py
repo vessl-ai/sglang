@@ -2119,15 +2119,13 @@ class TestSolarOpen2EffortSetMatchesTheTemplate(CustomTestCase):
     opens, the detector starts in content and the whole think block -- the
     literal `<|think:end|>` with it, since that token is not special -- is
     served to the client as the answer. The checkpoint's template is checked in
-    at test/srt/fixtures/solar_open2_chat_template.jinja and, until this ran,
+    at test/fixtures/solar_open2_chat_template.jinja and, until this ran,
     was referenced by nothing at all.
     """
 
-    # .../test/registered/unit/parser/<this file> -> .../test/srt/fixtures/
     TEMPLATE = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         *([os.pardir] * 3),
-        "srt",
         "fixtures",
         "solar_open2_chat_template.jinja",
     )
