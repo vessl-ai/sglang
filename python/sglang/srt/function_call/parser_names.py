@@ -52,4 +52,5 @@ TOOL_CALL_PARSER_NAMES = [
     "inkling",
     "iquest_q1",
     "response_template",
+    "solar_open2",
 ]

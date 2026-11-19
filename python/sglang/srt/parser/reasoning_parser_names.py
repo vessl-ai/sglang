@@ -40,4 +40,5 @@ REASONING_PARSER_NAMES = [
     "cohere_command4",
     "gigachat35",
     "response_template",
+    "solar_open2",
 ]
