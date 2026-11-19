@@ -264,7 +264,7 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
         ),
         num_topk=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         hidden=moe.config.hidden_size,
-        intermediate_hidden=moe.config.moe_intermediate_size,
+        intermediate_hidden=moe.experts.intermediate_size_per_partition,
         num_shared_experts=(
             0 if moe.mega_shared_l1_weights is None else moe.n_shared_experts
         ),
@@ -398,7 +398,7 @@ def _run_mega_routed(
         topk_ids,
         topk_weights,
         hidden_size=hidden_size,
-        intermediate_size=moe.config.moe_intermediate_size,
+        intermediate_size=moe.experts.intermediate_size_per_partition,
         top_k=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
         num_tokens=num_tokens,
         activation_clamp=moe.experts.moe_runner_config.swiglu_limit,

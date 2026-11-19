@@ -3259,7 +3259,12 @@ class KVCacheConfigurator:
         )
         stage_per_req = int(per_req * pp_layer_scale)
 
-        has_spec_dec = not self.spec_algorithm.is_none()
+        # A PD prefill server allocates no verify state (its HybridReqToTokenPool gets no draft-token count),
+        # so its mamba budget must not reserve any.
+        has_spec_dec = (
+            not self.spec_algorithm.is_none()
+            and get_disagg().disaggregation_mode != "prefill"
+        )
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
