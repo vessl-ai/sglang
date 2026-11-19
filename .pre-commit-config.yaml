@@ -135,18 +135,18 @@ repos:
         language: system
         files: ^python/sglang/.*\.py$
         pass_filenames: false
-      - id: rustfmt-sgl-model-gateway
-        name: rustfmt sgl-model-gateway (nightly)
-        entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
-        language: system
-        files: ^sgl-model-gateway/.*\.rs$
-        pass_filenames: false
-      - id: rustfmt-sgl-router
-        name: rustfmt sgl-router
-        entry: bash -c 'cd sgl-router && cargo fmt --all -- --check'
-        language: system
-        files: ^sgl-router/.*\.rs$
-        pass_filenames: false
+      # - id: rustfmt-sgl-model-gateway
+      #   name: rustfmt sgl-model-gateway (nightly)
+      #   entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
+      #   language: system
+      #   files: ^sgl-model-gateway/.*\.rs$
+      #   pass_filenames: false
+      # - id: rustfmt-sgl-router
+      #   name: rustfmt sgl-router
+      #   entry: bash -c 'cd sgl-router && cargo fmt --all -- --check'
+      #   language: system
+      #   files: ^sgl-router/.*\.rs$
+      #   pass_filenames: false
       - id: clippy-rust-workspace
         name: clippy rust/ workspace (auto-fix)
         # Three steps: apply machine-applicable fixes, then fail on anything

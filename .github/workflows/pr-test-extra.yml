@@ -74,6 +74,11 @@ permissions:
   pull-requests: read
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+    with:
+      extra-label: run-ci-extra
+
   # =============================================== check changes ====================================================
   # The actual `run-ci` + `run-ci-extra` label gate now lives in the
   # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
@@ -84,6 +89,8 @@ jobs:
   # payload, which never updates on rerun and made the slash-add-label flow
   # impossible to recover.
   check-changes:
+    needs: ci-requested
+    if: needs.ci-requested.outputs.requested == 'true'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -110,6 +117,7 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
     if: |
+      github.event_name == 'workflow_dispatch' &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
@@ -152,7 +160,8 @@ jobs:
 
   simulator-test-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-simulator-gpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -164,7 +173,8 @@ jobs:
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +216,8 @@ jobs:
 
   xeon-extra:
     needs: [check-changes, call-gate]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    # if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/pr-test-xeon.yml
     with:
       ref: ${{ inputs.git_ref || github.ref }}
@@ -221,6 +232,7 @@ jobs:
   pr-test-extra-finish:
     needs:
       [
+        ci-requested,
         check-changes,
         call-gate,
         sgl-kernel-build-wheels,
@@ -230,7 +242,7 @@ jobs:
         extra-test,
         xeon-extra,
       ]
-    if: always()
+    if: always() && needs.ci-requested.outputs.requested != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

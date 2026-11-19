@@ -24,7 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+
   check-changes:
+    needs: ci-requested
+    if: needs.ci-requested.outputs.requested == 'true'
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests}}

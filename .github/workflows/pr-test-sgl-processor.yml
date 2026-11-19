@@ -20,10 +20,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  ci-requested:
+    uses: ./.github/workflows/pr-ci-requested.yml
+
   sgl-processor-changes:
+    needs: ci-requested
     # Ignored label events must not replace real checks on the same commit.
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-changes' || 'sgl-processor-changes' }}
-    if: github.event.action != 'labeled' || github.event.label.name == 'run-ci'
+    if: |
+      needs.ci-requested.outputs.requested == 'true' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -143,8 +149,8 @@ jobs:
 
   sgl-processor-finish:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-finish' || 'sgl-processor-finish' }}
-    needs: [sgl-processor-changes, sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
-    if: always() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+    needs: [ci-requested, sgl-processor-changes, sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
+    if: always() && needs.ci-requested.outputs.requested != 'false' && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
