@@ -18,7 +18,7 @@ def _pad_expert_counts_kernel(
     padded = ((c + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
     padded = tl.where(m, padded, 0)
     # The trailing segment absorbs the difference so the total stays
-    # graph-static; its m_indices remain -1 and DeepGEMM skips those rows.
+    # graph-static; its m_indices remain -1, yet DeepGEMM still computes those rows.
     slack = all_tokens - tl.sum(padded, axis=0)
     padded = tl.where(i == num_experts - 1, padded + slack, padded)
     tl.store(out_ptr + i, padded, mask=m)

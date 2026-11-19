@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_logits_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.rope import (
     apply_rotary_emb_triton,
@@ -407,6 +408,68 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize(
+    "requests,ratio,width,masked",
+    [(2, 1, 193, False), (2, 2, 8193, True), (11, 1, 32769, True)],
+)
+def test_fp4_paged_logits_grouped_rows_replay(requests, ratio, width, masked):
+    batch = requests * 6
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    capacity = 1048580 // ratio
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // 6
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    lengths = lens.to(torch.int32)
+    candidate_mask = (
+        torch.rand(batch, capacity, device=q.device) > 0.3 if masked else None
+    )
+
+    def run():
+        return fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            candidate_mask,
+            rows_per_request=6,
+        )
+
+    for _ in range(3):
+        run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        scores = run()
+    for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
+        # Rows of a request differ by one position, as verify draft tokens do.
+        row_lens = visible - torch.arange(batch, device=q.device) % 6
+        lens.copy_(
+            (row_lens - 3 * (torch.arange(batch, device=q.device) // 6)).clamp_min(0)
+        )
+        lengths.copy_(lens)
+        req.copy_(req.roll(6))
+        group_slots = slots[::6].roll(step, dims=1)
+        req_table[req[::6].long(), : width * ratio : ratio] = (group_slots * ratio).to(
+            torch.int32
+        )
+        q.neg_()
+        graph.replay()
+        row_slots = req_table[req.long(), : width * ratio : ratio].long() // ratio
+        expected = _reference_logits(q, weights, row_slots, lens, table)
+        if masked:
+            expected.masked_fill_(~candidate_mask[:, :width], -torch.inf)
+        visible_mask = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(
+            scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="Hopper paged indexer dispatch",
@@ -453,6 +516,7 @@ def test_hopper_indexer_backends_replay(ratio):
         req_rows=req,
         paged_metadata=metadata,
         is_verify=True,
+        rows_per_request=1,
     )
     kwargs = dict(
         token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
@@ -673,6 +737,64 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
             expected_raw = torch.where(chosen, selected - starts[:, None], -1)
             torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+
+
+# Row counts and visible lengths straddle the prefill kernels' row and key tiles;
+# under ratio 2 the first request has no visible position yet.
+_PREFILL_REQUESTS = [(0, 1), (0, 70), (130, 7), (1000, 129)]
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fused_prefill_indexer_scores_match_torch(heads, ratio):
+    from sglang.test.kernels.deepseek_v4.v41_prefill_indexer import (
+        make_prefill_indexer_case,
+        prefill_scores,
+    )
+
+    torch.manual_seed(heads + ratio)
+    inputs, pool = make_prefill_indexer_case(
+        heads=heads, ratio=ratio, requests=_PREFILL_REQUESTS, topk=64
+    )
+    common = dict(inputs=inputs, token_to_kv_pool=pool)
+    reference = prefill_scores(**common, fused=False)
+    fused = prefill_scores(**common, fused=True)
+    assert len(fused) == len(reference) == (4 if ratio == 1 else 3)
+    for (tok, expected), (fused_tok, actual) in zip(reference, fused):
+        torch.testing.assert_close(fused_tok, tok, rtol=0, atol=0)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("kernel", ["triton", "keys_major"])
+def test_prefill_index_logits_kernel_matches_torch(heads, ratio, kernel):
+    from sglang.test.kernels.deepseek_v4.v41_prefill_indexer import (
+        make_prefill_indexer_case,
+        prefill_kernel_args,
+        prefill_scores,
+    )
+
+    if kernel == "keys_major":
+        if torch.cuda.get_device_capability()[0] != 9:
+            pytest.skip("SM90 wgmma kernel")
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_keys_major import (
+            fp4_index_logits_prefill_keys_major as fn,
+        )
+    else:
+        fn = fp4_index_logits_prefill
+
+    torch.manual_seed(heads + ratio)
+    inputs, pool = make_prefill_indexer_case(
+        heads=heads, ratio=ratio, requests=_PREFILL_REQUESTS, topk=64
+    )
+    common = dict(inputs=inputs, token_to_kv_pool=pool)
+    reference = prefill_scores(**common, fused=False)
+    visible = [r for r in range(len(_PREFILL_REQUESTS)) if r > 0 or ratio == 1]
+    assert len(visible) == len(reference)
+    for r, (_, expected) in zip(visible, reference):
+        actual = fn(**prefill_kernel_args(**common, request=r))
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
