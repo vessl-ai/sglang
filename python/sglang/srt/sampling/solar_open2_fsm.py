@@ -67,6 +67,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Set  # noqa: E402  (h4 patch)
 
 import msgspec
 import torch
@@ -960,7 +961,7 @@ def _mask_tensor(ids: Tuple[int, ...], *, device: torch.device) -> torch.Tensor:
     key = (ids, str(device))
     t = CFG._mask_cache.get(key)
     if t is None:
-        t = torch.tensor(ids, dtype=torch.long, device=device)
+        t = _h2d_index(list(ids), device=device)
         CFG._mask_cache[key] = t
     return t
 
@@ -1001,11 +1002,65 @@ def _force_token(state, *, last_tok) -> int:
     return CFG.think_end
 
 
+# SOLAR_FSM_NOSYNC=1 enables the sync-free verify mask (pinned non_blocking
+# index copies + host-side open test for rows without a grammar). Default 0 =
+# the original behaviour, so one source tree serves both arms of an A/B.
+_NOSYNC = os.environ.get("SOLAR_FSM_NOSYNC", "0") == "1"
+
+
+def _neg_inf_tensor(*, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Cached 0-dim ``-inf`` on ``device``. ``logits[idx] = float('-inf')`` turns
+    the Python scalar into a CPU tensor and copies it to the device with a
+    pageable (stream-synchronizing) copy on every call; a device-resident
+    scalar broadcast through ``index_put_`` issues no copy at all."""
+    key = (str(device), dtype)
+    t = CFG._mask_cache.get(("neg_inf",) + key)
+    if t is None:
+        t = torch.full((), NEG_INF, device=device, dtype=dtype)
+        CFG._mask_cache[("neg_inf",) + key] = t
+    return t
+
+
+def _write_neg_inf(logits: torch.Tensor, rsel: torch.Tensor, idx: Optional[torch.Tensor]) -> None:
+    """``logits[rsel, idx] = -inf`` (``idx`` None: whole rows) without a host
+    sync when the gate is on; the original indexing assignment otherwise."""
+    if not _NOSYNC:
+        if idx is None:
+            logits[rsel, :] = NEG_INF
+        else:
+            logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
+        return
+    if idx is None:
+        logits.index_fill_(0, rsel, NEG_INF)
+    else:
+        logits.index_put_(
+            (rsel.unsqueeze(1), idx.unsqueeze(0)),
+            _neg_inf_tensor(device=logits.device, dtype=logits.dtype),
+        )
+
+
+def _h2d_index(rows: List[int], *, device: torch.device) -> torch.Tensor:
+    """Row-index tensor on ``device`` without blocking the host.
+
+    ``torch.tensor(rows, device=cuda)`` copies from pageable memory and
+    synchronizes the current stream -- on the verify path that is a wait for
+    the whole target forward, which serializes the overlap scheduler. Staging
+    through pinned memory with ``non_blocking=True`` keeps the copy
+    stream-ordered (the caching host allocator holds the pinned block until
+    the copy has consumed it) and returns immediately."""
+    if not _NOSYNC or device.type != "cuda":
+        # Gate off (default): the original pageable copy, byte-identical path.
+        return torch.tensor(rows, dtype=torch.long, device=device)
+    t = torch.tensor(rows, dtype=torch.long)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def _mask_and_force(
     logits: torch.Tensor,
     *,
     mask_rows: Dict[Tuple[int, ...], List[int]],
     force_rows: Dict[int, List[int]],
+    device_check_rows: Optional[Set[int]] = None,
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]], List[Tuple[int, int]]]:
     """Write ``NEG_INF`` over each forbidden set in its rows, then force one
     token per ``force_rows`` entry ({token id: rows}). A row the grammar has
@@ -1014,25 +1069,54 @@ def _mask_and_force(
     so it is left to the grammar. Returns ``((row, token actually forced), (row, token left
     to the grammar), (row, boundary the grammar refused))`` -- the forced token
     is not always the requested one, since a blocked boundary is closed on
-    ``<|think:end|>`` instead, and the third list is those rows."""
+    ``<|think:end|>`` instead, and the third list is those rows.
+
+    ``device_check_rows`` names the rows whose "is the token still open" test
+    has to read the logits: rows under a grammar, which may have closed it.
+    ``None`` (the default, and the SOLAR_FSM_NOSYNC=0 path) reads it for
+    every row, exactly as before.
+    For every other row the answer is known on the host -- the only ``-inf``
+    this function can meet there is the one it wrote itself from
+    ``mask_rows`` -- so no device read (no host sync) is issued for them. A
+    non-finite model logit (NaN) on such a row would have counted as closed
+    before and counts as open now; the verify path has no other writer of
+    ``-inf`` ahead of this call than the grammar bitmask."""
+    row_forbid: Dict[int, Set[int]] = {}
     for ids, rows_i in mask_rows.items():
         if not ids or not rows_i:
             continue
         idx = _mask_tensor(ids, device=logits.device)
-        rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
-        logits[rsel.unsqueeze(1), idx.unsqueeze(0)] = NEG_INF
+        rsel = _h2d_index(rows_i, device=logits.device)
+        _write_neg_inf(logits, rsel, idx)
+        for r in rows_i:
+            row_forbid.setdefault(r, set()).update(ids)
     if not force_rows:
         return [], [], []
+    dev = device_check_rows
+
+    def _open(rows_i: List[int], tok: int) -> Dict[int, bool]:
+        # Host answer for rows outside ``dev``; one device read for the rest
+        # (all rows when ``dev`` is None).
+        if dev is None:
+            ok, dev_rows = {}, list(rows_i)
+        else:
+            ok = {r: tok not in row_forbid.get(r, ()) for r in rows_i if r not in dev}
+            dev_rows = [r for r in rows_i if r in dev]
+        if dev_rows:
+            dsel = _h2d_index(dev_rows, device=logits.device)
+            allowed = torch.isfinite(logits[dsel, tok]).tolist()
+            ok.update(zip(dev_rows, allowed))
+        return ok
+
     forced_all: List[Tuple[int, int]] = []  # (row, the token actually forced)
     blocked_all: List[Tuple[int, int]] = []  # (row, the token that was blocked)
     promoted_all: List[Tuple[int, int]] = []  # (row, the boundary that was refused)
     for tok, rows_i in force_rows.items():
         if not rows_i:
             continue
-        rsel = torch.tensor(rows_i, dtype=torch.long, device=logits.device)
-        allowed = torch.isfinite(logits[rsel, tok]).tolist()
-        forced = [r for r, ok in zip(rows_i, allowed) if ok]
-        blocked = [r for r, ok in zip(rows_i, allowed) if not ok]
+        ok = _open(rows_i, tok)
+        forced = [r for r in rows_i if ok[r]]
+        blocked = [r for r in rows_i if not ok[r]]
         if blocked and tok != CFG.think_end:
             # A boundary token has no guarantee of being open: strict-thinking
             # grammars must leave <|think:end|> reachable, nothing says that of
@@ -1040,21 +1124,20 @@ def _mask_and_force(
             # blocked token every step until max_tokens, so close on think_end
             # instead -- the boundary is an improvement on the close, not a
             # precondition for it.
-            bsel = torch.tensor(blocked, dtype=torch.long, device=logits.device)
-            second = torch.isfinite(logits[bsel, CFG.think_end]).tolist()
-            promoted = [r for r, ok2 in zip(blocked, second) if ok2]
-            blocked = [r for r, ok2 in zip(blocked, second) if not ok2]
+            ok2 = _open(blocked, CFG.think_end)
+            promoted = [r for r in blocked if ok2[r]]
+            blocked = [r for r in blocked if not ok2[r]]
             if promoted:
-                psel = torch.tensor(promoted, dtype=torch.long, device=logits.device)
+                psel = _h2d_index(promoted, device=logits.device)
                 keep = logits[psel, CFG.think_end].clone()
-                logits[psel, :] = NEG_INF
+                _write_neg_inf(logits, psel, None)
                 logits[psel, CFG.think_end] = keep
                 forced_all.extend((r, CFG.think_end) for r in promoted)
                 promoted_all.extend((r, tok) for r in promoted)
         if forced:
-            fsel = torch.tensor(forced, dtype=torch.long, device=logits.device)
+            fsel = _h2d_index(forced, device=logits.device)
             keep = logits[fsel, tok].clone()
-            logits[fsel, :] = NEG_INF
+            _write_neg_inf(logits, fsel, None)
             logits[fsel, tok] = keep
         forced_all.extend((r, tok) for r in forced)
         blocked_all.extend((r, tok) for r in blocked)
@@ -1422,6 +1505,9 @@ class VerifyPlan(msgspec.Struct, kw_only=True):
     stride: int
     bs: int
     rids: Optional[List[str]]
+    # Rows (request-major, chain-minor) under a grammar: the only rows whose
+    # forced-token test must read the logits. None/empty -> no device read.
+    grammar_rows: Optional[List[int]] = None
 
     def apply(self, logits: torch.Tensor, verify_lens=None) -> None:
         expect_rows = self.bs * self.stride
@@ -1446,6 +1532,7 @@ class VerifyPlan(msgspec.Struct, kw_only=True):
             logits,
             mask_rows={ids: keep(rows_i) for ids, rows_i in self.mask_rows.items()},
             force_rows={tok: keep(rows_i) for tok, rows_i in self.force_rows.items()},
+            device_check_rows=(set(keep(self.grammar_rows or [])) if _NOSYNC else None),
         )
         if promoted:
             _log_rows(
@@ -1789,6 +1876,14 @@ def plan_verify(reqs, chain_ids, stride: int) -> Optional[VerifyPlan]:
                     [],
                 ).append(row)
 
+    grammar_rows = [
+        i * stride + w for i in range(bs) if _has_grammar(reqs[i]) for w in range(stride)
+    ]
     return VerifyPlan(
-        force_rows=force_rows, mask_rows=mask_rows, stride=stride, bs=bs, rids=rids
+        force_rows=force_rows,
+        mask_rows=mask_rows,
+        stride=stride,
+        bs=bs,
+        rids=rids,
+        grammar_rows=grammar_rows,
     )
