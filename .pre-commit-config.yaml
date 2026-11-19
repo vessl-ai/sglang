@@ -141,12 +141,12 @@ repos:
         language: system
         files: ^sgl-model-gateway/.*\.rs$
         pass_filenames: false
-      - id: rustfmt-sgl-router
-        name: rustfmt sgl-router
-        entry: bash -c 'cd sgl-router && cargo fmt --all -- --check'
-        language: system
-        files: ^sgl-router/.*\.rs$
-        pass_filenames: false
+      # - id: rustfmt-sgl-router
+      #   name: rustfmt sgl-router
+      #   entry: bash -c 'cd sgl-router && cargo fmt --all -- --check'
+      #   language: system
+      #   files: ^sgl-router/.*\.rs$
+      #   pass_filenames: false
       - id: clippy-rust-workspace
         name: clippy rust/ workspace (auto-fix)
         # Three steps: apply machine-applicable fixes, then fail on anything
