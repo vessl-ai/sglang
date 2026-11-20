@@ -1825,14 +1825,19 @@ async def checkpoint_prepare(
 async def checkpoint_restore(
     host_ip: Optional[str] = None,
     kv_fill: Optional[Literal["none", "zero", "poison"]] = None,
+    overlap_l3: Optional[bool] = None,
 ):
     """Bring the KV cache back and continue generation, in a process started
     from the capture or in place. Orchestrators redeliver it, so a restore
     already done returns 200. `host_ip` is the IP of the pod the process now
     runs in, for the PD transport and HiCache L3 client a deferred engine
     builds here; it is detected when omitted. `kv_fill` is a diagnostic that
-    fills the KV memory after resume (SGLANG_CHECKPOINT_RESTORE_KV_FILL)."""
-    out = await _global_state.tokenizer_manager.checkpoint_restore(host_ip, kv_fill)
+    fills the KV memory after resume (SGLANG_CHECKPOINT_RESTORE_KV_FILL).
+    `overlap_l3` attaches the HiCache L3 client beside the PD transport build
+    (SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3)."""
+    out = await _global_state.tokenizer_manager.checkpoint_restore(
+        host_ip, kv_fill, overlap_l3
+    )
     return _checkpoint_response(out)
 
 

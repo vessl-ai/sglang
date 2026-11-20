@@ -2358,9 +2358,9 @@ class Scheduler(
             resume_memory_occupation=self.weight_updater.resume_memory_occupation,
             all_gather_object=self.dp_tp_group.all_gather_object,
             after_restore=lambda req: checkpoint_transport.build_transport_on_restore(
-                self, req.host_ip, req.kv_fill
+                self, req.host_ip, req.kv_fill, getattr(req, "overlap_l3", None)
             ),
-            before_release=lambda: checkpoint_transport.capture_kv_region_image(self),
+            before_release=lambda: checkpoint_transport.before_kv_release(self),
         )
 
     def init_lora_drainer(self) -> None:

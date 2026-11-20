@@ -836,6 +836,16 @@ class Envs:
     # the image would exceed the cap (a region that has served requests).
     SGLANG_CHECKPOINT_KV_REGION_IMAGE = EnvBool(True)
     SGLANG_CHECKPOINT_KV_REGION_IMAGE_MAX_MB = EnvInt(4096)
+    # The first /checkpoint/prepare flushes the cache, unregisters the HiCache
+    # host pool from CUDA and returns its pages (the checkpoint then carries
+    # none); /checkpoint/restore faults them in and registers them again
+    # (mem_cache/host_pool_checkpoint.py). Needs the deferred L3 client.
+    SGLANG_CHECKPOINT_RELEASE_HOST_POOL = EnvBool(False)
+    # Threads per scheduler for the restore's host pool populate and register.
+    SGLANG_CHECKPOINT_HOST_POOL_THREADS = EnvInt(8)
+    # /checkpoint/restore attaches the L3 client on a second thread while the
+    # PD transport is built (the request's overlap_l3 overrides this).
+    SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3 = EnvBool(False)
 
     # ===================================================================
     # Mooncake store

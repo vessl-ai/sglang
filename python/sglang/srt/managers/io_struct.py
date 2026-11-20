@@ -1887,6 +1887,8 @@ class CheckpointReqInput(BaseReq, kw_only=True):
     host_ip: Optional[str] = None
     # RESTORE only: overrides SGLANG_CHECKPOINT_RESTORE_KV_FILL (none, zero, poison).
     kv_fill: Optional[str] = None
+    # RESTORE only: overrides SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3.
+    overlap_l3: Optional[bool] = None
     # STARTUP_READY only: the tokenizer worker (its pid).
     worker_id: Optional[int] = None
 

@@ -949,13 +949,17 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         host_ip: Optional[str] = None,
         kv_fill: Optional[str] = None,
+        overlap_l3: Optional[bool] = None,
     ) -> CheckpointReqOutput:
         """Bring the KV cache back and continue generation."""
         self.auto_create_handle_loop()
         async with self.checkpoint_lock:
             before = await self._call_checkpoint(CheckpointReqType.STATE)
             out = await self._call_checkpoint(
-                CheckpointReqType.RESTORE, host_ip=host_ip, kv_fill=kv_fill
+                CheckpointReqType.RESTORE,
+                host_ip=host_ip,
+                kv_fill=kv_fill,
+                overlap_l3=overlap_l3,
             )
             # Continue only the pause this cycle started, not a later user pause.
             # With DP ranks restored by an earlier call, `before` is mixed.
@@ -972,10 +976,15 @@ class TokenizerControlMixin:
         host_ip: Optional[str] = None,
         kv_fill: Optional[str] = None,
         worker_id: Optional[int] = None,
+        overlap_l3: Optional[bool] = None,
     ) -> CheckpointReqOutput:
         results = await self.checkpoint_communicator(
             CheckpointReqInput(
-                req_type=req_type, host_ip=host_ip, kv_fill=kv_fill, worker_id=worker_id
+                req_type=req_type,
+                host_ip=host_ip,
+                kv_fill=kv_fill,
+                worker_id=worker_id,
+                overlap_l3=overlap_l3,
             )
         )
         # DP ranks move independently.

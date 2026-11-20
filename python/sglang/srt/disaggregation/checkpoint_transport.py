@@ -95,6 +95,9 @@ def defers_hicache_storage() -> bool:
 def validate_checkpoint_deferral(cfg: Any) -> None:
     """Refuse configurations the deferral does not cover. A flag whose subject
     is absent (no PD mode, no L3 backend) is a no-op and passes."""
+    from sglang.srt.mem_cache.host_pool_checkpoint import validate_host_pool_release
+
+    validate_host_pool_release(cfg)
     defer_pd = (
         envs.SGLANG_CHECKPOINT_DEFER_PD_TRANSPORT.get()
         and cfg.disaggregation_mode != "null"
@@ -411,6 +414,15 @@ def capture_kv_region_image(scheduler: Scheduler) -> None:
     )
 
 
+def before_kv_release(scheduler: Scheduler) -> None:
+    """The checkpoint manager's before_release: the KV region image, then (with
+    SGLANG_CHECKPOINT_RELEASE_HOST_POOL) the HiCache host pool release."""
+    from sglang.srt.mem_cache.host_pool_checkpoint import release_host_pool
+
+    capture_kv_region_image(scheduler)
+    release_host_pool(scheduler)
+
+
 def apply_kv_region_image(scheduler: Scheduler) -> None:
     image = getattr(scheduler, "kv_region_image", None)
     if image is None:
@@ -573,19 +585,90 @@ def _attach_hicache_storage(scheduler: Scheduler) -> None:
     scheduler.hicache_storage_deferred = False
 
 
+def _overlap_refusal() -> Optional[str]:
+    """Why the L3 attach may not run beside the PD transport build, or None.
+    The attach creates gloo groups (world collectives) on its thread; the PD
+    build must then run none, which holds for one node without the Rust
+    server (common/conn.py: the bootstrap port sync and topology gather)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    if get_parallel().nnodes != 1:
+        return "multi-node engine (the PD build broadcasts the bootstrap port)"
+    if envs.SGLANG_RUST_SERVER.get():
+        return "SGLANG_RUST_SERVER (the PD build gathers the topology)"
+    return None
+
+
+def _build_overlapped(scheduler: Scheduler, ip: str) -> None:
+    """The host pool registration and the L3 attach on a second thread while
+    this thread builds the PD transport (two Mooncake transfer engines are
+    created at once, one per thread)."""
+    import threading
+
+    import torch
+
+    from sglang.srt.mem_cache.host_pool_checkpoint import restore_host_pool
+
+    device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    result: dict = {}
+
+    def side() -> None:
+        t0 = time.perf_counter()
+        try:
+            if device is not None:
+                torch.cuda.set_device(device)
+            restore_host_pool(scheduler)
+            _attach_hicache_storage(scheduler)
+        except BaseException as e:  # re-raised on the restore thread
+            result["error"] = e
+        result["seconds"] = time.perf_counter() - t0
+
+    tic = time.perf_counter()
+    thread = threading.Thread(target=side, name="checkpoint-restore-l3", daemon=True)
+    thread.start()
+    pd_error = None
+    try:
+        _build_pd_transport(scheduler, ip)
+    except BaseException as e:
+        pd_error = e
+    pd_seconds = time.perf_counter() - tic
+    thread.join()
+    _log_phase(
+        "overlap_l3",
+        time.perf_counter() - tic,
+        pd_seconds=f"{pd_seconds:.3f}",
+        l3_seconds=f"{result.get('seconds', float('nan')):.3f}",
+        ok=pd_error is None and "error" not in result,
+    )
+    if pd_error is not None:
+        raise pd_error
+    if "error" in result:
+        raise result["error"]
+
+
 def build_transport_on_restore(
-    scheduler: Scheduler, host_ip: Optional[str], kv_fill: Optional[str] = None
+    scheduler: Scheduler,
+    host_ip: Optional[str],
+    kv_fill: Optional[str] = None,
+    overlap_l3: Optional[bool] = None,
 ) -> None:
     """Run by the checkpoint manager after the KV cache is mapped again.
     `kv_fill` (request) or SGLANG_CHECKPOINT_RESTORE_KV_FILL (env) fills the
     KV memory first (see fill_kv_region); the rows the pools initialize at
-    construction are then written again (restore_kv_initial_state)."""
+    construction are then written again (restore_kv_initial_state). A HiCache
+    host pool released at prepare (SGLANG_CHECKPOINT_RELEASE_HOST_POOL) is
+    faulted in and registered again before the L3 client is attached.
+    `overlap_l3` (request) or SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3 (env) runs
+    that and the L3 attach on a second thread beside the PD transport build."""
+    from sglang.srt.mem_cache.host_pool_checkpoint import restore_host_pool
+
     fill_kv_region(scheduler, kv_fill or envs.SGLANG_CHECKPOINT_RESTORE_KV_FILL.get())
     apply_kv_region_image(scheduler)
     restore_kv_initial_state(scheduler)
     defer_pd = getattr(scheduler, "pd_transport_deferred", False)
     defer_l3 = getattr(scheduler, "hicache_storage_deferred", False)
     if not (defer_pd or defer_l3):
+        restore_host_pool(scheduler)
         check_pd_registration(scheduler)
         return
 
@@ -593,8 +676,24 @@ def build_transport_on_restore(
     ip = resolve_restore_host_ip(host_ip)
     _point_env_at(ip, hicache=defer_l3)
     _log_phase("host_ip", time.perf_counter() - tic, host_ip=ip)
-    if defer_pd:
-        _build_pd_transport(scheduler, ip)
-    if defer_l3:
-        _attach_hicache_storage(scheduler)
-    _log_phase("total", time.perf_counter() - tic)
+    overlap = (
+        overlap_l3
+        if overlap_l3 is not None
+        else envs.SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3.get()
+    )
+    if overlap and defer_pd and defer_l3:
+        refusal = _overlap_refusal()
+        if refusal is not None:
+            logger.warning(f"Checkpoint restore: overlap_l3 not used: {refusal}")
+            overlap = False
+    else:
+        overlap = False
+    if overlap:
+        _build_overlapped(scheduler, ip)
+    else:
+        restore_host_pool(scheduler)
+        if defer_pd:
+            _build_pd_transport(scheduler, ip)
+        if defer_l3:
+            _attach_hicache_storage(scheduler)
+    _log_phase("total", time.perf_counter() - tic, overlap_l3=int(overlap))
