@@ -386,16 +386,33 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return regions
 
     def register_buffer_to_engine(self):
+        # Recorded rather than raised so a failure keeps its old effect here;
+        # /checkpoint/restore reads buffers_registered and fails on False.
         regions = self._registerable_regions()
+        tic = time.perf_counter()
+        ret = 0
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            ret = self.engine.batch_register(list(ptrs), list(lens))
+        self.buffer_registration_seconds = time.perf_counter() - tic
+        self.num_registered_regions = len(regions)
+        self.buffers_registered = ret == 0
+        if ret != 0:
+            logger.error(
+                "Mooncake batch memory registration failed (ret=%s) for %d regions",
+                ret,
+                len(regions),
+            )
+        from sglang.srt.disaggregation.checkpoint_transport import log_kv_regions
+
+        log_kv_regions("register", self.kv_args)
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
             self.engine.batch_deregister(list(ptrs))
+        self.buffers_registered = False
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:

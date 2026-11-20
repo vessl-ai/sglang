@@ -319,16 +319,30 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
     2) HiCache uses mooncake storage backend
     3) Encoder disaggregation uses mooncake
     """
+    from sglang.srt.disaggregation.checkpoint_transport import (
+        defers_hicache_storage,
+        defers_pd_transport,
+    )
+
+    pd_uses_te = (
+        get_disagg().disaggregation_mode != "null"
+        and get_disagg().disaggregation_transfer_backend == "mooncake"
+    )
+    hicache_uses_te = (
+        get_memory().enable_hierarchical_cache
+        and get_memory().hicache_storage_backend == "mooncake"
+        and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
+    )
+    # /checkpoint/restore creates the engine for these, with the new pod's IP.
+    if pd_uses_te and defers_pd_transport():
+        logger.info("Mooncake TransferEngine for PD deferred to /checkpoint/restore")
+        pd_uses_te = False
+    if hicache_uses_te and defers_hicache_storage():
+        hicache_uses_te = False
+
     use_mooncake_te = (
-        (
-            get_disagg().disaggregation_mode != "null"
-            and get_disagg().disaggregation_transfer_backend == "mooncake"
-        )
-        or (
-            get_memory().enable_hierarchical_cache
-            and get_memory().hicache_storage_backend == "mooncake"
-            and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-        )
+        pd_uses_te
+        or hicache_uses_te
         or (
             get_disagg().encoder_only
             and get_disagg().encoder_transfer_backend == "mooncake"
