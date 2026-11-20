@@ -1861,6 +1861,9 @@ class CheckpointReqType(Enum):
     # Release the KV cache once the paused scheduler drains.
     PREPARE = 2
     RESTORE = 3
+    # --checkpoint-prepare-on-startup: a tokenizer worker finished its warmup.
+    # Changes nothing else; the reply counts the workers that did.
+    STARTUP_READY = 4
 
 
 class CheckpointState(str, Enum):
@@ -1878,6 +1881,14 @@ class CheckpointState(str, Enum):
 
 class CheckpointReqInput(BaseReq, kw_only=True):
     req_type: CheckpointReqType = CheckpointReqType.STATE
+    # RESTORE only: the IP of the pod the process now runs in, for what restore
+    # builds with it (see disaggregation/checkpoint_transport.py). Detected when
+    # None.
+    host_ip: Optional[str] = None
+    # RESTORE only: overrides SGLANG_CHECKPOINT_RESTORE_KV_FILL (none, zero, poison).
+    kv_fill: Optional[str] = None
+    # STARTUP_READY only: the tokenizer worker (its pid).
+    worker_id: Optional[int] = None
 
 
 class CheckpointReqOutput(BaseReq, kw_only=True):
@@ -1886,6 +1897,8 @@ class CheckpointReqOutput(BaseReq, kw_only=True):
     # Why it was refused, or why preparing or restoring failed.
     message: str = ""
     state: CheckpointState
+    # Tokenizer workers that reported STARTUP_READY (the fewest over ranks).
+    ready_workers: int = 0
 
     @staticmethod
     def merge(outputs: List[CheckpointReqOutput]) -> CheckpointReqOutput:
@@ -1902,7 +1915,12 @@ class CheckpointReqOutput(BaseReq, kw_only=True):
             state = CheckpointState.RESTORING
         refused = [out for out in outputs if not out.success]
         message = next((out.message for out in refused or outputs if out.message), "")
-        return CheckpointReqOutput(success=not refused, message=message, state=state)
+        return CheckpointReqOutput(
+            success=not refused,
+            message=message,
+            state=state,
+            ready_workers=min(out.ready_workers for out in outputs),
+        )
 
 
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):

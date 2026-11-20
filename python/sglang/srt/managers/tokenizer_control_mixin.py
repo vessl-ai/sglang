@@ -898,12 +898,34 @@ class TokenizerControlMixin:
         return await self._call_checkpoint(CheckpointReqType.STATE)
 
     async def checkpoint_prepare(
-        self: TokenizerManager, mode: Literal["abort", "retract"]
+        self: TokenizerManager,
+        mode: Literal["abort", "retract"],
+        startup_worker: Optional[int] = None,
     ) -> CheckpointReqOutput:
         """Pause generation as /pause_generation does, then release the KV
-        cache once the scheduler drains. Clients see a paused server."""
+        cache once the scheduler drains. Clients see a paused server.
+
+        `startup_worker` (--checkpoint-prepare-on-startup): the pid of the
+        tokenizer worker whose warmup just finished. Each worker runs its own
+        warmup, so only the call that reports the last one prepares; the others
+        return RUNNING with nothing changed and the caller waits for PREPARED."""
         self.auto_create_handle_loop()
         async with self.checkpoint_lock:
+            if startup_worker is not None:
+                out = await self._call_checkpoint(
+                    CheckpointReqType.STARTUP_READY, worker_id=startup_worker
+                )
+                needed = get_serving().tokenizer_worker_num
+                if out.ready_workers < needed:
+                    return CheckpointReqOutput(
+                        success=True,
+                        message=(
+                            "startup prepare waits for the warmup of every "
+                            f"tokenizer worker ({out.ready_workers}/{needed} done)"
+                        ),
+                        state=out.state,
+                        ready_workers=out.ready_workers,
+                    )
             out = await self._call_checkpoint(CheckpointReqType.STATE)
             if not out.success or out.state != CheckpointState.RUNNING:
                 return out
@@ -923,12 +945,18 @@ class TokenizerControlMixin:
                 await self.continue_generation(ContinueGenerationReqInput())
             return out
 
-    async def checkpoint_restore(self: TokenizerManager) -> CheckpointReqOutput:
+    async def checkpoint_restore(
+        self: TokenizerManager,
+        host_ip: Optional[str] = None,
+        kv_fill: Optional[str] = None,
+    ) -> CheckpointReqOutput:
         """Bring the KV cache back and continue generation."""
         self.auto_create_handle_loop()
         async with self.checkpoint_lock:
             before = await self._call_checkpoint(CheckpointReqType.STATE)
-            out = await self._call_checkpoint(CheckpointReqType.RESTORE)
+            out = await self._call_checkpoint(
+                CheckpointReqType.RESTORE, host_ip=host_ip, kv_fill=kv_fill
+            )
             # Continue only the pause this cycle started, not a later user pause.
             # With DP ranks restored by an earlier call, `before` is mixed.
             if (
@@ -939,10 +967,16 @@ class TokenizerControlMixin:
             return out
 
     async def _call_checkpoint(
-        self: TokenizerManager, req_type: CheckpointReqType
+        self: TokenizerManager,
+        req_type: CheckpointReqType,
+        host_ip: Optional[str] = None,
+        kv_fill: Optional[str] = None,
+        worker_id: Optional[int] = None,
     ) -> CheckpointReqOutput:
         results = await self.checkpoint_communicator(
-            CheckpointReqInput(req_type=req_type)
+            CheckpointReqInput(
+                req_type=req_type, host_ip=host_ip, kv_fill=kv_fill, worker_id=worker_id
+            )
         )
         # DP ranks move independently.
         return CheckpointReqOutput.merge(results)

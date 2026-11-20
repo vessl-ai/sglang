@@ -1450,11 +1450,13 @@ class CommonKVManager(BaseKVManager):
 
     def _register_topology_row(self, url: str, payload: Dict) -> None:
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
+        tic = time.perf_counter()
         for attempt in range(max_retries):
             try:
                 response = requests.put(url, json=payload, timeout=5)
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
+                    self._record_bootstrap_registration(True, tic)
                     return
                 logger.warning(
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
@@ -1473,9 +1475,18 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
+        self._record_bootstrap_registration(False, tic)
         logger.error(
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
+
+    def _record_bootstrap_registration(self, ok: bool, tic: float) -> None:
+        # Read by /checkpoint/restore, which fails on False. One failed row
+        # (rust registry path) marks the whole registration failed.
+        self.bootstrap_registered = ok and getattr(self, "bootstrap_registered", True)
+        self.bootstrap_registration_seconds = getattr(
+            self, "bootstrap_registration_seconds", 0.0
+        ) + (time.perf_counter() - tic)
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:

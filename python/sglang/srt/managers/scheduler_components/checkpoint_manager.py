@@ -8,11 +8,13 @@ times, or ends in failed. Repeated calls are no-ops.
 The tokenizer pauses generation as /pause_generation does before preparing,
 and continues it after restoring, so clients see a paused server in between.
 Prepare waits for the paused scheduler to go idle, then releases the KV cache.
-Weights stay on the GPU. Restore brings the KV cache back.
+Weights stay on the GPU. Restore brings the KV cache back, then runs
+`after_restore`, which builds what the checkpoint could not carry (the PD
+transport, the HiCache L3 client) and raises if any registration failed.
 """
 
 import logging
-from typing import Any, Callable, List, Set
+from typing import Any, Callable, List, Optional, Set
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.managers.io_struct import (
@@ -41,6 +43,8 @@ class SchedulerCheckpointManager:
         release_memory_occupation: Callable[[ReleaseMemoryOccupationReqInput], None],
         resume_memory_occupation: Callable[[ResumeMemoryOccupationReqInput], None],
         all_gather_object: Callable[[Any], List[Any]],
+        after_restore: Optional[Callable[[CheckpointReqInput], None]] = None,
+        before_release: Optional[Callable[[], None]] = None,
     ) -> None:
         self._enable_memory_saver = enable_memory_saver
         self._pp_size = pp_size
@@ -52,13 +56,19 @@ class SchedulerCheckpointManager:
         self._resume_memory_occupation = resume_memory_occupation
         # Over the TP ranks of this DP rank.
         self._all_gather_object = all_gather_object
+        self._after_restore = after_restore
+        self._before_release = before_release
         self.state = CheckpointState.RUNNING
         self._error = ""
+        # Tokenizer workers whose startup warmup is done (STARTUP_READY).
+        self._startup_ready_workers: Set[int] = set()
 
     def handle(self, recv_req: CheckpointReqInput) -> CheckpointReqOutput:
         # STATE reports whether PREPARE would be refused. Repeats are no-ops.
         success, message = True, ""
-        if self.state == CheckpointState.FAILED:
+        if recv_req.req_type == CheckpointReqType.STARTUP_READY:
+            self._startup_ready_workers.add(int(recv_req.worker_id or 0))
+        elif self.state == CheckpointState.FAILED:
             success = False
         elif recv_req.req_type == CheckpointReqType.RESTORE:
             if self.state == CheckpointState.PREPARING:
@@ -69,6 +79,8 @@ class SchedulerCheckpointManager:
                     self._resume_memory_occupation(
                         ResumeMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
                     )
+                    if self._after_restore is not None:
+                        self._after_restore(recv_req)
                 except Exception as e:
                     self.state = CheckpointState.FAILED
                     self._error = f"Failed to restore from the checkpoint: {e}"
@@ -100,7 +112,10 @@ class SchedulerCheckpointManager:
                 self.state = CheckpointState.PREPARING
                 self.check_pending()
         out = CheckpointReqOutput(
-            success=success, message=message or self._error, state=self.state
+            success=success,
+            message=message or self._error,
+            state=self.state,
+            ready_workers=len(self._startup_ready_workers),
         )
         # Only the first TP rank replies to the tokenizer, so it reports them all.
         # Every TP rank handles this request in the same scheduler iteration.
@@ -111,6 +126,8 @@ class SchedulerCheckpointManager:
         if self.state != CheckpointState.PREPARING or not self._is_drained():
             return
         try:
+            if self._before_release is not None:
+                self._before_release()
             self._release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
             )

@@ -816,6 +816,26 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # With --checkpoint-prepare-on-startup: boot a PD engine on the fake KV
+    # transfer backend, so no Mooncake TransferEngine, RDMA device, KV memory
+    # registration, pod-IP socket or bootstrap registration exists in the process
+    # checkpoint. /checkpoint/restore builds them with the restored pod's IP.
+    SGLANG_CHECKPOINT_DEFER_PD_TRANSPORT = EnvBool(False)
+    # With --checkpoint-prepare-on-startup: boot HiCache with its host pools but
+    # without the L3 storage client, and attach it in /checkpoint/restore.
+    SGLANG_CHECKPOINT_DEFER_HICACHE_STORAGE = EnvBool(False)
+    # Diagnostics for /checkpoint/restore (disaggregation/checkpoint_transport.py):
+    # fill the KV transfer regions after resume with "zero" (what a fresh boot
+    # holds) or "poison" (0xFF), or leave them ("none"); and log the registered
+    # KV regions at boot, registration and restore.
+    SGLANG_CHECKPOINT_RESTORE_KV_FILL = EnvStr("none")
+    SGLANG_CHECKPOINT_LOG_KV_REGIONS = EnvBool(False)
+    # The first /checkpoint/prepare keeps the KV region's non-zero startup bytes
+    # (sentinel rows, warmup pages) in host memory and every restore puts them
+    # back after the resume (mem_cache/kv_region_image.py). Prepare fails when
+    # the image would exceed the cap (a region that has served requests).
+    SGLANG_CHECKPOINT_KV_REGION_IMAGE = EnvBool(True)
+    SGLANG_CHECKPOINT_KV_REGION_IMAGE_MAX_MB = EnvInt(4096)
 
     # ===================================================================
     # Mooncake store

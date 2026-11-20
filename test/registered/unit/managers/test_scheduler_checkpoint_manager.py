@@ -78,8 +78,8 @@ def _server(*drained, tp_size=1, release_error=None):
         pause_generation=pause_generation,
         continue_generation=continue_generation,
     )
-    tokenizer._call_checkpoint = lambda req_type: (
-        TokenizerControlMixin._call_checkpoint(tokenizer, req_type)
+    tokenizer._call_checkpoint = lambda req_type, **kwargs: (
+        TokenizerControlMixin._call_checkpoint(tokenizer, req_type, **kwargs)
     )
     return tokenizer, ranks, calls
 

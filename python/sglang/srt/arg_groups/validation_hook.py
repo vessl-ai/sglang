@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.disaggregation.checkpoint_transport import validate_checkpoint_deferral
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -198,6 +199,7 @@ def check_server_args(server_args: Any):
     assert not cfg.checkpoint_prepare_on_startup or cfg.enable_memory_saver, (
         "--checkpoint-prepare-on-startup requires --enable-memory-saver"
     )
+    validate_checkpoint_deferral(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "

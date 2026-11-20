@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, Type
 
 import torch
 
+from sglang.srt.disaggregation.checkpoint_transport import defers_hicache_storage
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -451,6 +452,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        if storage_backend is not None and defers_hicache_storage():
+            # Host pools stay laid out and allocated for the configured backend
+            # (both read the global setting); /checkpoint/restore attaches it.
+            logger.info(
+                "HiCache storage backend %s deferred to /checkpoint/restore",
+                storage_backend,
+            )
+            storage_backend = None
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
