@@ -1383,7 +1383,12 @@ class SchedulerMetricsReporter:
             return
 
         now_process_cpu_ns = time.process_time_ns()
-        elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        # A process restored from a CRIU checkpoint starts its CPU-time clock
+        # again from zero, so the first interval after a restore is negative,
+        # and a Prometheus counter raises on a negative increment.
+        elapsed_process_cpu_ns = max(
+            0, now_process_cpu_ns - accounting.start_process_cpu_ns
+        )
         if accounting.accumulate_idle_ns > 0:
             self.metrics_collector.increment_scheduler_idle_seconds(
                 accounting.accumulate_idle_ns / 1e9
