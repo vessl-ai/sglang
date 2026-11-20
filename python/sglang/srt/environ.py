@@ -1658,6 +1658,15 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # "per_rank" only: back each rank's shard with a file in this directory, which
+    # must be on a tmpfs mount, mapped MAP_SHARED, instead of anonymous memory.
+    # CRIU then records the mapping and not the pages, so the table stays out of a
+    # process checkpoint; the file must exist unchanged when the process is
+    # restored. Empty (default) keeps the anonymous mapping. See engram_host_file.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR = EnvStr("")
+    # Register the host tables with cudaHostRegisterReadOnly (the GPU only reads
+    # them). Off by default; CUDA only.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY = EnvBool(False)
     # Extend steps of a TP-sharded engram table (device or per_rank host): start the
     # row gathers of every engram layer before layer 0 on a side stream (the hash ids
     # only depend on the input tokens), copy fp8 + scale bytes instead of bf16, and

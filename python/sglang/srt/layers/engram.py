@@ -45,6 +45,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.layers import engram_host_file
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -561,12 +562,18 @@ def _huge_pages_backing(addr: int) -> tuple[int, int]:
 _page_cache_dropped = False
 
 
+def _model_path() -> Optional[str]:
+    try:
+        return get_model().model_path
+    except (ValueError, AttributeError):
+        # No published runtime context (unit tests, offline tools).
+        return None
+
+
 def drop_checkpoint_page_cache() -> tuple[int, int]:
     """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
-    try:
-        model_path = get_model().model_path
-    except (ValueError, AttributeError):
-        # No published runtime context (unit tests, offline tools): nothing to drop.
+    model_path = _model_path()
+    if model_path is None:
         return 0, 0
     files, nbytes = 0, 0
     for f in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
@@ -630,23 +637,56 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+_CUDA_HOST_REGISTER_READ_ONLY = 0x08  # cudaHostRegisterReadOnly
+
+
+def _host_register_flags() -> int:
+    """cudaHostRegister flags for a host table. The GPU only reads the table, so
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY may register it read-only
+    (CUDA only): a read-only pin does not need a write fault per page of a
+    tmpfs mapping (INF-840: the RestoreGpu slowdown of file-backed tables)."""
+    if envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY.get() and not _is_hip:
+        return _CUDA_HOST_REGISTER_READ_ONLY
+    return 0
+
+
 class _HostTable:
     """Host-memory backing for one engram table ('shared' or 'per_rank' layout).
 
     Lives for the whole process: the mapping, the memfd and the cudaHostRegister
     pin are never released because the table is read by every forward.
+
+    With file_dir (per_rank only) the shard is a MAP_SHARED mapping of a file on a
+    tmpfs mount instead of anonymous memory, so a CRIU checkpoint records the
+    mapping but not the pages (engram_host_file has the details and the checks).
     """
 
-    def __init__(self, layout: str, nbytes: int, name: str, group):
+    def __init__(
+        self,
+        layout: str,
+        nbytes: int,
+        name: str,
+        group,
+        file_dir: str = "",
+        describe: Optional[dict] = None,
+    ):
         if layout not in ("shared", "per_rank"):
             raise ValueError(
                 f"Invalid SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT={layout!r}; expected "
                 "'shared' or 'per_rank'"
             )
+        if file_dir and layout != "per_rank":
+            raise ValueError(
+                "SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR needs "
+                "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank"
+            )
         self.layout = layout
         self.nbytes = nbytes
         self.group = group
         self.dirty = False
+        self.path: Optional[str] = None
+        self.mount: Optional[engram_host_file.Mount] = None
+        self.describe = dict(describe or {})
         if layout == "shared":
             self.fd = self._open_shared_fd(nbytes, name)
             self.mm = mmap.mmap(
@@ -655,6 +695,9 @@ class _HostTable:
                 flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
+        elif file_dir:
+            self.fd = None
+            self.mm = self._map_table_file(file_dir, nbytes, name)
         else:
             self.fd = None
             self.mm = mmap.mmap(
@@ -663,8 +706,7 @@ class _HostTable:
                 flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE,
             )
-        # Advisory before the first touch: pages are allocated huge at fault time.
-        self.mm.madvise(mmap.MADV_HUGEPAGE)
+        self._advise_hugepage()
         self.bytes = torch.frombuffer(self.mm, dtype=torch.uint8)
         if layout == "per_rank":
             # Cached checkpoint pages, left by a previous server or by the loader,
@@ -675,10 +717,61 @@ class _HostTable:
             # Every rank holds the fd before rank 0 continues; the /proc path only
             # resolves while rank 0 keeps its descriptor.
             group.barrier()
-        err = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), nbytes, 0)
+        err = torch.cuda.cudart().cudaHostRegister(
+            self.bytes.data_ptr(), nbytes, _host_register_flags()
+        )
         if int(err) != 0:
             raise RuntimeError(f"cudaHostRegister({nbytes} bytes) failed: {err}")
         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+
+    def _advise_hugepage(self) -> None:
+        # Advisory before the first touch: pages are allocated huge at fault time
+        # (anonymous memory under THP "madvise"; a tmpfs file under huge=advise).
+        self.mm.madvise(mmap.MADV_HUGEPAGE)
+
+    def _map_table_file(self, file_dir: str, nbytes: int, name: str) -> mmap.mmap:
+        self.mount = engram_host_file.check_dir(file_dir)
+        self.path = engram_host_file.table_file(
+            file_dir, name, self.group.rank_in_group, self.group.world_size
+        )
+        fd = engram_host_file.create_table_file(self.path, nbytes)
+        try:
+            # The mmap object keeps a descriptor of its own.
+            mm = mmap.mmap(
+                fd,
+                nbytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        finally:
+            os.close(fd)
+        logger.info(
+            "engram host table: %s on %s %s (huge=%s)",
+            self.path,
+            self.mount.fstype,
+            self.mount.mount_point,
+            self.mount.huge or "never",
+        )
+        return mm
+
+    def _write_manifest(self) -> None:
+        model_path = _model_path()
+        engram_host_file.write_manifest(
+            self.path,
+            {
+                **self.describe,
+                "nbytes": self.nbytes,
+                "tp_rank": self.group.rank_in_group,
+                "tp_size": self.group.world_size,
+                "model_path": model_path,
+                "model": (
+                    engram_host_file.model_fingerprint(model_path)
+                    if model_path
+                    else None
+                ),
+                "sample_digest": engram_host_file.sample_digest(self.mm, self.nbytes),
+            },
+        )
 
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
@@ -738,7 +831,15 @@ class _HostTable:
             f"{mapped_kb / 2**10:.0f} MiB resident, {huge_kb / 2**10:.0f} MiB in huge pages "
             f"({pct:.0f}%)"
         )
-        if huge_kb == 0:
+        if huge_kb == 0 and self.mount is not None:
+            logger.warning(
+                "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
+                "the tmpfs at %s has huge=%s (needs huge=advise, within_size or always)",
+                msg,
+                self.mount.mount_point,
+                self.mount.huge or "never",
+            )
+        elif huge_kb == 0:
             knob = "shmem_enabled" if self.layout == "shared" else "enabled"
             logger.warning(
                 "%s. No huge pages: expect ~10x slower lookups (one TLB miss per row); "
@@ -749,6 +850,9 @@ class _HostTable:
             )
         else:
             logger.info(msg)
+        if self.path is not None:
+            # After the weights are in: the manifest names what the file holds.
+            self._write_manifest()
 
 
 class EngramEmbedding(nn.Module):
@@ -795,6 +899,16 @@ class EngramEmbedding(nn.Module):
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
             get_parallel().tp_group,
+            file_dir=envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR.get(),
+            describe={
+                "layer_id": layer_id,
+                "num_embeddings": num_embeddings,
+                "row_start": self.row_start,
+                "rows": n,
+                "dim": dim,
+                "weight_bytes": w_bytes,
+                "scale_bytes": s_bytes,
+            },
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
