@@ -419,8 +419,21 @@ def before_kv_release(scheduler: Scheduler) -> None:
     SGLANG_CHECKPOINT_RELEASE_HOST_POOL) the HiCache host pool release."""
     from sglang.srt.mem_cache.host_pool_checkpoint import release_host_pool
 
+    finish_host_pool_prealloc()
     capture_kv_region_image(scheduler)
     release_host_pool(scheduler)
+
+
+def finish_host_pool_prealloc() -> None:
+    """SGLANG_OPT_INF834_HOST_POOL_PREALLOC frees the segments no host pool took
+    when the Mooncake L3 client is built. A deferred client is built only by
+    /checkpoint/restore, so finish it here: otherwise the checkpoint would hold
+    those populated segments and the record of sizes would not be updated."""
+    if not envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+        return
+    from sglang.srt.mem_cache import inf834_host_prealloc
+
+    inf834_host_prealloc.finalize()
 
 
 def apply_kv_region_image(scheduler: Scheduler) -> None:

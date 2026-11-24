@@ -448,6 +448,53 @@ class TestCheckpointManagerWiring(_Case):
             ct.before_kv_release(object())
         self.assertEqual(order, ["image", "pool"])
 
+    def test_before_kv_release_frees_unclaimed_host_pool_prealloc(self):
+        """With the L3 client deferred, nothing else finishes the INF-834 host pool
+        prealloc before the checkpoint: a segment no pool took must be freed and
+        the sizes asked for recorded by the prepare."""
+        import tempfile
+
+        from sglang.srt.mem_cache import inf834_host_prealloc as pre
+
+        pre._reset_for_tests()
+        freed = []
+        with (
+            tempfile.TemporaryDirectory() as cache,
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_OPT_INF834_HOST_POOL_PREALLOC": "1",
+                    "SGLANG_CACHE_DIR": cache,
+                },
+            ),
+            patch.object(ct, "capture_kv_region_image"),
+            patch.object(hp, "release_host_pool"),
+        ):
+            try:
+                pre.start([100, 200], lambda size: 1000 + size, freed.append)
+                self.assertEqual(pre.take(100), 1100)
+                self.assertIsNone(pre.take(300))
+                ct.before_kv_release(object())
+                self.assertEqual(freed, [1200])
+                self.assertEqual(pre.unclaimed_bytes(), 0)
+                self.assertEqual(pre._read_record(), [100, 300])
+                ct.before_kv_release(object())  # a second prepare: nothing more
+                self.assertEqual(freed, [1200])
+            finally:
+                pre._reset_for_tests()
+
+    def test_before_kv_release_without_prealloc_touches_nothing(self):
+        from sglang.srt.mem_cache import inf834_host_prealloc as pre
+
+        with (
+            patch.dict(os.environ, {"SGLANG_OPT_INF834_HOST_POOL_PREALLOC": "0"}),
+            patch.object(ct, "capture_kv_region_image"),
+            patch.object(hp, "release_host_pool"),
+            patch.object(pre, "finalize") as finalize,
+        ):
+            ct.before_kv_release(object())
+        finalize.assert_not_called()
+
     def test_request_field_defaults_to_none(self):
         self.assertIsNone(CheckpointReqInput().overlap_l3)
 
