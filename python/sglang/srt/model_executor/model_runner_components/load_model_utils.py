@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 import os
@@ -27,6 +28,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -320,10 +322,19 @@ def load_model_with_memory_saver(
 
     remote_instance_weight_info = None
     startup_weight_load = None
-    with memory_saver_adapter.region(
-        GPU_MEMORY_TYPE_WEIGHTS,
-        enable_cpu_backup=enable_cpu_backup,
-    ):
+    if envs.SGLANG_MEMORY_SAVER_SKIP_WEIGHTS.get() and memory_saver_adapter.enabled:
+        if enable_cpu_backup:
+            raise ValueError(
+                "SGLANG_MEMORY_SAVER_SKIP_WEIGHTS=1 keeps the weights out of the memory "
+                "saver, so they cannot have a CPU backup"
+            )
+        weights_region = contextlib.nullcontext()
+    else:
+        weights_region = memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=enable_cpu_backup,
+        )
+    with weights_region:
         loader = get_model_loader(
             load_config=load_config,
             model_config=model_config,
