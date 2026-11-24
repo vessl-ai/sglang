@@ -462,6 +462,47 @@ def test_group_desc_none_normalized_to_anonymous():
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
 
 
+@pytest.mark.parametrize("rank", range(4))
+def test_create_custom_parallel_group_gathers_over_world_cpu_group(monkeypatch, rank):
+    """The general path must exchange group configs on the world CPU group, not
+    the default (device) process group, and still build every group in rank
+    order and return the caller's own group."""
+    world_size = 4
+    configs_by_rank = [[0, 1], [0, 1], [2, 3], [2, 3]]
+    world_cpu_group = object()
+    gather_groups = []
+    created = []
+
+    def fake_all_gather_object(output, obj, group=None):
+        gather_groups.append(group)
+        assert obj == configs_by_rank[rank]
+        output[:] = configs_by_rank
+
+    def fake_new_group(ranks, backend):
+        created.append((list(ranks), backend))
+        return f"pg{ranks}"
+
+    monkeypatch.setattr(parallel_state, "_is_npu", False)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_world_group",
+        lambda: Mock(cpu_group=world_cpu_group),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(torch.distributed, "new_group", fake_new_group)
+
+    group = parallel_state.create_custom_parallel_group(
+        group_ranks=configs_by_rank[rank], backend="gloo"
+    )
+
+    assert gather_groups == [world_cpu_group]
+    assert created == [([0, 1], "gloo"), ([2, 3], "gloo")]
+    assert group == f"pg{configs_by_rank[rank]}"
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

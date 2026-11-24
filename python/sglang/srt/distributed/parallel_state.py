@@ -3035,9 +3035,15 @@ def create_custom_parallel_group(
     )
 
     if not (_is_npu and is_standard_partition):
-        # General path: collect every rank's group via all_gather_object.
+        # General path: collect every rank's group via all_gather_object over
+        # the world group's CPU (gloo) group. On the default process group it
+        # is a device collective, which may create a device communicator just for
+        # this exchange; that fails after a process checkpoint is restored onto
+        # other GPUs, since CUDA still reports the checkpointed PCI bus ids.
         gathered_configs = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(gathered_configs, local_config)
+        torch.distributed.all_gather_object(
+            gathered_configs, local_config, group=get_world_group().cpu_group
+        )
     else:
         # NPU fast path: all_gather_object on the default HCCL PG allocates
         # an HCCL buffer; instead derive the standard TP/DP groups locally.
