@@ -6,10 +6,13 @@ which order, and that every registration failure fails the restore.
 """
 
 import asyncio
+import contextlib
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.disaggregation import checkpoint_transport as ct
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -35,6 +38,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+
+# These tests build CPU tensors without naming the device. Another test in the
+# same process may have left torch's default device set to cuda; pin it to CPU
+# for this module and give the previous setting back afterwards.
+_cpu_default_device = contextlib.ExitStack()
+
+
+def setUpModule():
+    _cpu_default_device.enter_context(torch.device("cpu"))
+
+
+def tearDownModule():
+    _cpu_default_device.close()
+
+
 _ENVS = (
     "SGLANG_CHECKPOINT_DEFER_PD_TRANSPORT",
     "SGLANG_CHECKPOINT_DEFER_HICACHE_STORAGE",
@@ -43,6 +61,12 @@ _ENVS = (
     "SGLANG_LOCAL_IP_NIC",
     "SGLANG_CHECKPOINT_RESTORE_KV_FILL",
     "SGLANG_CHECKPOINT_LOG_KV_REGIONS",
+    # Read by the code under test too; unset so the runner's environment
+    # cannot change the path a test takes.
+    "SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3",
+    "SGLANG_CHECKPOINT_RELEASE_HOST_POOL",
+    "SGLANG_CHECKPOINT_KV_REGION_IMAGE",
+    "SGLANG_RUST_SERVER",
 )
 
 
@@ -478,11 +502,11 @@ class TestKvDiagnostics(_EnvCase):
         self.assertIn("not_one_alloc=-", lines["aux_host"])
 
 
-class TestKvInitialState(unittest.TestCase):
+class TestKvInitialState(_EnvCase):
     """A memory saver resume maps fresh pages under the KV pools. What the pools
     write once at construction must be written again on restore: the C4
     compressor's -1 padding row (score -inf) was garbage after a resume, and
-    the first long PD request then decoded wrong (README 9.7)."""
+    the first long PD request then decoded wrong."""
 
     def _state_pool(self, ratio, online=False, rows=6):
         import torch
@@ -581,15 +605,12 @@ class TestKvInitialState(unittest.TestCase):
             ct.apply_kv_region_image(s)
         apply.assert_called_once_with("kv_cache", image)
         self.assertIn("phase=kv_region_image", logs.output[-1])
-        os.environ["SGLANG_CHECKPOINT_KV_REGION_IMAGE"] = "0"
-        try:
-            off = SimpleNamespace()
-            with patch.object(kri, "capture_kv_region") as cap:
-                ct.capture_kv_region_image(off)
-            cap.assert_not_called()
-            ct.apply_kv_region_image(off)  # nothing captured, nothing applied
-        finally:
-            os.environ.pop("SGLANG_CHECKPOINT_KV_REGION_IMAGE")
+        os.environ["SGLANG_CHECKPOINT_KV_REGION_IMAGE"] = "0"  # _EnvCase restores it
+        off = SimpleNamespace()
+        with patch.object(kri, "capture_kv_region") as cap:
+            ct.capture_kv_region_image(off)
+        cap.assert_not_called()
+        ct.apply_kv_region_image(off)  # nothing captured, nothing applied
 
 
 class TestCheckpointManagerAfterRestore(unittest.TestCase):

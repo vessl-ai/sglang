@@ -9,6 +9,7 @@ The real madvise/mincore/memfd behaviour is not covered by this suite; it
 needs Linux.
 """
 
+import contextlib
 import os
 import threading
 import unittest
@@ -28,10 +29,27 @@ from sglang.srt.mem_cache import host_pool_checkpoint as hp
 from sglang.srt.mem_cache.pool_host.common import (
     _CUDA_HOST_REGISTERED_RANGES_ATTR as ATTR,
 )
-from sglang.srt.mem_cache.pool_host.common import make_kernel_ptr_table
+from sglang.srt.mem_cache.pool_host.common import (
+    make_kernel_ptr_table,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+# These tests build CPU tensors without naming the device. Another test in the
+# same process may have left torch's default device set to cuda; pin it to CPU
+# for this module and give the previous setting back afterwards.
+_cpu_default_device = contextlib.ExitStack()
+
+
+def setUpModule():
+    _cpu_default_device.enter_context(torch.device("cpu"))
+
+
+def tearDownModule():
+    _cpu_default_device.close()
+
 
 PAGE = hp.PAGE
 _ENVS = (
@@ -43,6 +61,9 @@ _ENVS = (
     "SGLANG_HOST_IP",
     "MOONCAKE_LOCAL_HOSTNAME",
     "SGLANG_RUST_SERVER",
+    "SGLANG_CHECKPOINT_RESTORE_KV_FILL",
+    "SGLANG_CHECKPOINT_LOG_KV_REGIONS",
+    "SGLANG_CHECKPOINT_KV_REGION_IMAGE",
 )
 
 
@@ -376,9 +397,10 @@ class TestRestoreFailures(_Case):
         with self.assertRaisesRegex(RuntimeError, "pointer table differs"):
             hp.restore_host_pool(s)
 
-    def test_populated_by_the_hook_is_not_walked_again(self):
+    def test_populated_from_outside_is_not_walked_again(self):
         pools, s = self.released()
-        for b in s.released_host_pool.buffers:  # what hooks/hostpool-populate leaves
+        # What a restore helper that faulted the pages in from outside leaves.
+        for b in s.released_host_pool.buffers:
             self.ops.resident.update(range(b.start, b.end, PAGE))
         with self.assertLogs(hp.logger, level="INFO") as logs:
             hp.restore_host_pool(s)

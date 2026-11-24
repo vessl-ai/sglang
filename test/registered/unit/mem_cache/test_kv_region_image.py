@@ -5,6 +5,7 @@ allocation. "Resume" is simulated by filling every allocation with 0xFF, which
 is what fresh physical pages may hold (and NaN for every float dtype).
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,20 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+# These tests build CPU tensors without naming the device. Another test in the
+# same process may have left torch's default device set to cuda; pin it to CPU
+# for this module and give the previous setting back afterwards.
+_cpu_default_device = contextlib.ExitStack()
+
+
+def setUpModule():
+    _cpu_default_device.enter_context(torch.device("cpu"))
+
+
+def tearDownModule():
+    _cpu_default_device.close()
 
 
 def _pools():

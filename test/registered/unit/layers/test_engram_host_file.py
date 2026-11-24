@@ -3,6 +3,7 @@ file on tmpfs (so CRIU records the mapping, not the pages), its directory check,
 replace-not-truncate rule and the manifest that a restore step verifies. Runs on CPU;
 the _HostTable case stubs cudaHostRegister and needs torch."""
 
+import contextlib
 import importlib.util
 import json
 import mmap
@@ -254,6 +255,11 @@ class HostTableFileTest(unittest.TestCase):
         from sglang.srt.layers import engram as E
 
         self.E = E
+        # The table is host memory: build CPU tensors even when an earlier test in
+        # this process left torch's default device set to cuda.
+        stack = contextlib.ExitStack()
+        stack.enter_context(E.torch.device("cpu"))
+        self.addCleanup(stack.close)
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.registered = []
