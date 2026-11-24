@@ -715,6 +715,30 @@ class TestChunkPolicy(Base):
             _t.sleep(0.2)
         self.assertGreater(ws._resident_fraction(s.bin), 0.95)
 
+    def test_no_rewarm_in_a_boot_that_prepares_a_checkpoint(self):
+        """--checkpoint-prepare-on-startup: the restore reads O_DIRECT as before, but no rewarm thread keeps
+        the snapshot file open into the process checkpoint."""
+        self.assertFalse(ws._prepares_checkpoint())  # no published server args
+        tensors = [("big.a", torch.int8, (256, 1 << 20))]
+        src = make_model(tensors, seed=6)
+        s = self.snap(src)
+        s.end()  # O_DIRECT writes: nothing of the file is in the page cache
+        fd = os.open(s.bin, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        dst = make_model(tensors, seed=6)
+        zero(dst)
+        d = self.snap(dst)
+        with mock.patch.object(ws, "_prepares_checkpoint", lambda: True):
+            with self.assertLogs("sglang", level="INFO") as logs:
+                self.assertTrue(d.begin())
+        self.assertIn("rewarm skipped", "\n".join(logs.output))
+        self.assertIsNone(getattr(d, "_rewarm_thread", None))
+        for (k, a), b in zip(state(src).items(), state(dst).values()):
+            self.assertTrue(torch.equal(a, b), k)
+
 
 if __name__ == "__main__":
     unittest.main()

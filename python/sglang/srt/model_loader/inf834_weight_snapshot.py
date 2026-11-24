@@ -541,6 +541,16 @@ def _merge(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(a, b) for a, b in out]
 
 
+def _prepares_checkpoint() -> bool:
+    """Whether this boot ends in a process checkpoint (--checkpoint-prepare-on-startup)."""
+    try:
+        from sglang.srt.runtime_context import get_serving
+
+        return bool(get_serving().checkpoint_prepare_on_startup)
+    except Exception:  # no published server args (tests, offline tools)
+        return False
+
+
 def _rewarm(path: str, ranges: List[Tuple[int, int]], label: str, rank: int) -> Optional[threading.Thread]:
     """Background buffered reads of the ranges this boot read with O_DIRECT, so they are in the page cache
     for the next boot (POSIX_FADV_WILLNEED is not used: on the rig's xfs it brought in about 1% of a range)."""
@@ -961,7 +971,13 @@ class WeightSnapshot:
             self.threads, self.bin,
         )
         if policy == "chunk" and engine.direct_ranges and envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT_REWARM.get():
-            self._rewarm_thread = _rewarm(self.bin, engine.direct_ranges, self.label, self.rank)
+            if _prepares_checkpoint():
+                # The rewarm thread holds the snapshot file open for minutes; a process checkpoint taken
+                # meanwhile records that descriptor, and restoring it needs the same file at the same path.
+                logger.info("INF834 weight snapshot [%s rank %d]: rewarm skipped (--checkpoint-prepare-on-startup)",
+                            self.label, self.rank)
+            else:
+                self._rewarm_thread = _rewarm(self.bin, engine.direct_ranges, self.label, self.rank)
         return True
 
     def _mark_host_tables_dirty(self) -> None:
