@@ -325,7 +325,10 @@ class HostTableFileTest(unittest.TestCase):
             )
         self.assertEqual(t.bytes.data_ptr(), base)
         self.assertTrue(os.path.exists(t.path))
-        t.bytes[-2:] = self.E.torch.tensor([7, 8], dtype=self.E.torch.uint8)
+        # device="cpu": other suites in this directory leave the default device at cuda.
+        t.bytes[-2:] = self.E.torch.tensor(
+            [7, 8], dtype=self.E.torch.uint8, device="cpu"
+        )
         t.dirty = True
         t.finish_load("layer 9")
         with open(t.path, "rb") as f:
