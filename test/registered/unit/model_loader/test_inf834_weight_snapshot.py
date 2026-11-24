@@ -315,6 +315,34 @@ class TestIdentityArgs(Base):
         with mock.patch.dict(os.environ, {"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S": "2.5"}):
             self.assertEqual(base, self._with_args(self.ARGS, lambda: self.snap(m).dir))
 
+    def test_checkpoint_prepare_boot_and_cold_fallback_hit(self):
+        """INF-840: the boot that prepares a process checkpoint (--checkpoint-prepare-on-startup, the
+        SGLANG_CHECKPOINT_* switches, the Engram table as a tmpfs file) and a cold start of the same pod
+        without them load the same weight bytes: both find one snapshot. The memory saver stays in the
+        identity, and any other SGLANG_* env still misses."""
+        m = make_model(real_tensor_list(limit=5), seed=11)
+        saver = dict(self.ARGS, enable_memory_saver=True)
+        prepare_env = {
+            "SGLANG_CHECKPOINT_DEFER_PD_TRANSPORT": "1",
+            "SGLANG_CHECKPOINT_DEFER_HICACHE_STORAGE": "1",
+            "SGLANG_CHECKPOINT_RELEASE_HOST_POOL": "1",
+            "SGLANG_CHECKPOINT_HOST_POOL_THREADS": "16",
+            "SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3": "1",
+            "SGLANG_CHECKPOINT_KV_REGION_IMAGE": "1",
+            "SGLANG_CHECKPOINT_KV_REGION_IMAGE_MAX_MB": "8192",
+            "SGLANG_CHECKPOINT_RESTORE_KV_FILL": "zero",
+            "SGLANG_CHECKPOINT_LOG_KV_REGIONS": "1",
+            "SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR": "/dev/shm/engram",
+            "SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY": "0",
+        }
+        cold = self._with_args(saver, lambda: self.snap(m).dir)
+        with mock.patch.dict(os.environ, prepare_env):
+            prepare = dict(saver, checkpoint_prepare_on_startup=True)
+            self.assertEqual(cold, self._with_args(prepare, lambda: self.snap(m).dir))
+        self.assertNotEqual(cold, self._with_args(self.ARGS, lambda: self.snap(m).dir))
+        with mock.patch.dict(os.environ, {"SGLANG_CHECKPOINT_SOMETHING_NEW": "1"}):
+            self.assertNotEqual(cold, self._with_args(saver, lambda: self.snap(m).dir))
+
     def test_two_pods_of_one_cell_hit(self):
         """Two prefill pods of the cell draft (runs/img/manifests/cell-s02, e2e mkcell): the only per-pod
         values in the engine args are $(POD_IP) inside --hicache-storage-backend-extra-config (and, when

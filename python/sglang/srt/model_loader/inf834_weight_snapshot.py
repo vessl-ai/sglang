@@ -162,6 +162,9 @@ ARGS_NOT_IN_IDENTITY = frozenset(
         "cuda_graph_persistence", "cuda_graph_persistence_config",
         # communication buffers (symmetric-memory pool for collectives), not weights
         "enable_symm_mem",
+        # process checkpoint lifecycle (INF-840): when the server prepares and serves, not what it loads; a
+        # cold start without it (the fallback of a pod that restores) finds the prepare boot's snapshot
+        "checkpoint_prepare_on_startup",
         # per process: GPU numbering of this unit, sampling seed
         "base_gpu_id", "gpu_id_step", "random_seed",
     }
@@ -175,6 +178,11 @@ _ENV_VOLATILE = re.compile(
     r"SGLANG_JIT_DEEPGEMM_PRECOMPILE|"  # DeepGEMM kernel JIT at startup, not weights
     r"SGLANG_OPT_INF834_ENGRAM_FAULT_CAP_S|"  # Engram host-table fault time cap (huge-page fallback), not weights
     r"SGLANG_SYMM_MEM_PREALLOC_GB_SIZE|"  # symmetric-memory pool size, set when --enable-symm-mem is on
+    # INF-840 process checkpoint: deferred PD transport and L3 client, KV region image, host pool release
+    r"SGLANG_CHECKPOINT_(DEFER_PD_TRANSPORT|DEFER_HICACHE_STORAGE|RESTORE_KV_FILL|LOG_KV_REGIONS|"
+    r"KV_REGION_IMAGE|KV_REGION_IMAGE_MAX_MB|RELEASE_HOST_POOL|HOST_POOL_THREADS|RESTORE_OVERLAP_L3)|"
+    # INF-840 Engram host table backing (tmpfs file) and pin flag: where the bytes live, not the bytes
+    r"SGLANG_DSV41_ENGRAM_HOST_TABLE_(DIR|REGISTER_READONLY)|"
     r"SGLANG_LOGGING.*|SGLANG_.*LOG_LEVEL.*|SGLANG_IMAGE_TAG|SGLANG_BUILD_.*)$"
 )
 _code_digest_cache: Optional[str] = None
