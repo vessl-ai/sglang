@@ -1545,9 +1545,9 @@ class Envs:
     # With --enable-memory-saver, load the weights outside torch_memory_saver's
     # "weights" region. The region is a private MemPool, so every temporary of the
     # load (dequant, repack, prewarm scratch) stays reserved in it after the load
-    # (INF-840 q-pd-rig: +24.8 GB per GPU on the TP4 prefill, +31 GB on the EP8
-    # decoder). For a server that only ever releases the KV cache (the process
-    # checkpoint routes), the weights need no region.
+    # (measured on DeepSeek-V4.1-Flash on H200: 24.8 GB per GPU on a TP4 prefill,
+    # 31 GB on an EP8 decoder). For a server that only ever releases the
+    # KV cache (the process checkpoint routes), the weights need no region.
     SGLANG_MEMORY_SAVER_SKIP_WEIGHTS = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)

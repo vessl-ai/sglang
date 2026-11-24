@@ -644,7 +644,8 @@ def _host_register_flags() -> int:
     """cudaHostRegister flags for a host table. The GPU only reads the table, so
     SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY may register it read-only
     (CUDA only): a read-only pin does not need a write fault per page of a
-    tmpfs mapping (INF-840: the RestoreGpu slowdown of file-backed tables)."""
+    tmpfs mapping, which made re-pinning file-backed tables slow when the GPU
+    state of a checkpointed process is restored."""
     if envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY.get() and not _is_hip:
         return _CUDA_HOST_REGISTER_READ_ONLY
     return 0

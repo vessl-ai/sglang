@@ -24,9 +24,9 @@ Prepare (``before_release``, before the KV cache is released):
 Restore (``/checkpoint/restore``, before the L3 client is attached):
 
 4. The pages are faulted in again in this process, several threads at once
-   (``MADV_POPULATE_WRITE``). A criuctl post-criu hook
-   (``hostpool-populate``) can do the same work from outside while the GPU
-   is restored; then this step only walks page tables that are already full.
+   (``MADV_POPULATE_WRITE``). A restore step outside the process may fault
+   the same pages in while the GPU state is restored; when the sampled
+   residency shows them already present, this step is skipped.
 5. The same ranges are registered with CUDA again, one thread per buffer, and
    the kernel pointer tables of the pools are checked to be unchanged.
 
@@ -392,8 +392,8 @@ def restore_host_pool(scheduler: Scheduler) -> None:
 
     tic = time.perf_counter()
     before = [ops.resident_fraction(b.start, b.nbytes) for b in released.buffers]
-    # Already populated (hooks/hostpool-populate ran while the GPU was being
-    # restored): walking the full page tables again would only cost time.
+    # Already populated from outside the process while the GPU state was
+    # restored: walking the full page tables again would only cost time.
     skip = bool(before) and min(before) >= _POPULATED
     tasks, errors = [], []
     lock = threading.Lock()
