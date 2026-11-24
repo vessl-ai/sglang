@@ -510,6 +510,161 @@ class TestCheckpointManagerWiring(_Case):
         )
 
 
+class TestPrepareRefusedWhileServing(_Case):
+    """A prepare the host pool release would refuse must be refused before
+    generation is paused, with nothing changed: a released pool behind an
+    attached L3 client (a second prepare after a restore, or an L3 client
+    attached at runtime) would otherwise latch FAILED and leave a serving
+    engine paused until it restarts.
+
+    The checkpoint managers are built by Scheduler.init_checkpoint_manager on
+    stand-in schedulers, under a tokenizer that records pause and continue."""
+
+    def setUp(self):
+        super().setUp()
+        # The KV region image is covered elsewhere; this is the host pool.
+        os.environ["SGLANG_CHECKPOINT_KV_REGION_IMAGE"] = "0"
+        for p in (
+            patch(
+                "sglang.srt.managers.scheduler.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=True)
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(pp_size=1),
+            ),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def server(self, storage, tp_size=1):
+        """One DP rank per entry of `storage` (whether its L3 client is
+        attached), `tp_size` TP ranks each, every rank with its own pools."""
+        import asyncio
+
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
+
+        calls = []
+        gathered = []
+        ranks = []
+        for enable_storage in storage:
+            for _ in range(tp_size):
+                s = FakeScheduler(self.pools(), enable_storage=enable_storage)
+                s._engine_paused = False
+                s.is_fully_idle = lambda ignore_waiting=False: True
+                s.weight_updater = SimpleNamespace(
+                    offload_tags=set(),
+                    release_memory_occupation=lambda req: calls.append("release"),
+                    resume_memory_occupation=lambda req: calls.append("resume"),
+                )
+                s.dp_tp_group = SimpleNamespace(
+                    all_gather_object=lambda out: gathered.append(out) or list(gathered)
+                )
+                Scheduler.init_checkpoint_manager(s)
+                ranks.append(s)
+
+        async def communicator(obj):
+            replies = []
+            for dp in range(len(storage)):
+                gathered.clear()
+                tp = ranks[dp * tp_size : (dp + 1) * tp_size]
+                replies.append(
+                    [r.checkpoint_manager.handle(obj) for r in reversed(tp)][-1]
+                )
+            return replies
+
+        async def pause_generation(obj):
+            calls.append("pause")
+            tokenizer.is_pause = True
+
+        async def continue_generation(obj):
+            calls.append("continue")
+            tokenizer.is_pause = False
+
+        tokenizer = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            checkpoint_lock=asyncio.Lock(),
+            is_pause=False,
+            checkpoint_communicator=communicator,
+            pause_generation=pause_generation,
+            continue_generation=continue_generation,
+        )
+        tokenizer._call_checkpoint = lambda req_type, **kw: (
+            TokenizerControlMixin._call_checkpoint(tokenizer, req_type, **kw)
+        )
+
+        def prepare():
+            return asyncio.run(
+                TokenizerControlMixin.checkpoint_prepare(tokenizer, "abort")
+            )
+
+        return tokenizer, ranks, calls, prepare
+
+    def assert_untouched(self, tokenizer, ranks, calls):
+        from sglang.srt.managers.io_struct import CheckpointState
+
+        self.assertEqual(calls, [])  # never paused, so nothing to continue
+        self.assertFalse(tokenizer.is_pause)
+        for s in ranks:
+            self.assertEqual(s.checkpoint_manager.state, CheckpointState.RUNNING)
+            # A normal request reaches the scheduler and is not refused.
+            self.assertFalse(ct.checkpoint_refuses_new_requests(s))
+            self.assertIsNone(getattr(s, "released_host_pool", None))
+            self.assertEqual(s.flushes, [])
+        self.assertTrue(all(c[0] == "register" for c in self.ops.calls))
+
+    def test_attached_l3_client_refuses_before_the_pause(self):
+        from sglang.srt.managers.io_struct import CheckpointState
+
+        tokenizer, ranks, calls, prepare = self.server([True])
+        out = prepare()
+        self.assertFalse(out.success)
+        self.assertEqual(out.state, CheckpointState.RUNNING)
+        self.assertIn("L3 storage client is attached", out.message)
+        self.assert_untouched(tokenizer, ranks, calls)
+
+        # Once the L3 client is gone the same engine prepares.
+        ranks[0].tree_cache.cache_controller.enable_storage = False
+        out = prepare()
+        self.assertTrue(out.success)
+        self.assertEqual(out.state, CheckpointState.PREPARED)
+        self.assertEqual(calls, ["pause", "release"])
+        self.assertIsNotNone(ranks[0].released_host_pool)
+
+    def test_one_refusing_dp_rank_refuses_for_all(self):
+        from sglang.srt.managers.io_struct import CheckpointState
+
+        tokenizer, ranks, calls, prepare = self.server([False, True])
+        out = prepare()
+        self.assertFalse(out.success)
+        self.assertEqual(out.state, CheckpointState.RUNNING)
+        self.assert_untouched(tokenizer, ranks, calls)
+
+    def test_one_refusing_tp_rank_refuses_for_its_dp_rank(self):
+        from sglang.srt.managers.io_struct import CheckpointState
+
+        tokenizer, ranks, calls, prepare = self.server([False], tp_size=2)
+        # The rank that does not reply to the tokenizer refuses.
+        ranks[1].tree_cache.cache_controller.enable_storage = True
+        out = prepare()
+        self.assertFalse(out.success)
+        self.assertEqual(out.state, CheckpointState.RUNNING)
+        self.assert_untouched(tokenizer, ranks, calls)
+
+    def test_without_the_release_flag_an_attached_l3_client_does_not_refuse(self):
+        from sglang.srt.managers.io_struct import CheckpointState
+
+        os.environ.pop("SGLANG_CHECKPOINT_RELEASE_HOST_POOL")
+        tokenizer, ranks, calls, prepare = self.server([True])
+        out = prepare()
+        self.assertTrue(out.success)
+        self.assertEqual(out.state, CheckpointState.PREPARED)
+        self.assertEqual(calls, ["pause", "release"])
+
+
 # ---------------------------------------------------------------------------
 # build_transport_on_restore: host pool before the L3 attach, and overlap_l3.
 # ---------------------------------------------------------------------------

@@ -45,6 +45,9 @@ class SchedulerCheckpointManager:
         all_gather_object: Callable[[Any], List[Any]],
         after_restore: Optional[Callable[[CheckpointReqInput], None]] = None,
         before_release: Optional[Callable[[], None]] = None,
+        # Why `before_release` would refuse before anything is released, or
+        # None: checked with the other refusals, before generation is paused.
+        prepare_refusal: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         self._enable_memory_saver = enable_memory_saver
         self._pp_size = pp_size
@@ -58,6 +61,7 @@ class SchedulerCheckpointManager:
         self._all_gather_object = all_gather_object
         self._after_restore = after_restore
         self._before_release = before_release
+        self._prepare_refusal = prepare_refusal
         self.state = CheckpointState.RUNNING
         self._error = ""
         # Tokenizer workers whose startup warmup is done (STARTUP_READY).
@@ -107,6 +111,11 @@ class SchedulerCheckpointManager:
                     "Cannot drain a retract pause while requests wait on grammar, "
                     "KV transfer or HiCache work. Use mode=abort"
                 )
+            elif (
+                self._prepare_refusal is not None
+                and (refusal := self._prepare_refusal()) is not None
+            ):
+                success, message = False, refusal
             elif recv_req.req_type == CheckpointReqType.PREPARE:
                 logger.info("Preparing for a process checkpoint")
                 self.state = CheckpointState.PREPARING

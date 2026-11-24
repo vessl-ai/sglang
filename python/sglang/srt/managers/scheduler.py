@@ -2361,6 +2361,7 @@ class Scheduler(
                 self, req.host_ip, req.kv_fill, getattr(req, "overlap_l3", None)
             ),
             before_release=lambda: checkpoint_transport.before_kv_release(self),
+            prepare_refusal=lambda: checkpoint_transport.prepare_refusal(self),
         )
 
     def init_lora_drainer(self) -> None:

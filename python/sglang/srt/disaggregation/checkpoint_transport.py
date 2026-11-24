@@ -423,6 +423,18 @@ def before_kv_release(scheduler: Scheduler) -> None:
     release_host_pool(scheduler)
 
 
+def prepare_refusal(scheduler: Scheduler) -> Optional[str]:
+    """The checkpoint manager's prepare_refusal: why before_kv_release would
+    refuse before anything is released, so that a prepare is refused with the
+    engine still serving instead of failing after the pause. Reads state only.
+
+    The KV region image cap is not checked here: telling whether the region is
+    mostly zero takes a scan of the whole KV region on the GPU."""
+    from sglang.srt.mem_cache.host_pool_checkpoint import host_pool_release_refusal
+
+    return host_pool_release_refusal(scheduler)
+
+
 def apply_kv_region_image(scheduler: Scheduler) -> None:
     image = getattr(scheduler, "kv_region_image", None)
     if image is None:

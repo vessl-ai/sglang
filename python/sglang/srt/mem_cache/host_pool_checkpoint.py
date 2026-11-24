@@ -280,6 +280,26 @@ def _log(stage: str, phase: str, seconds: float, **fields: Any) -> None:
     logger.info(f"Checkpoint {stage} phase={phase} seconds={seconds:.3f}{extra}")
 
 
+def host_pool_release_refusal(scheduler: Scheduler) -> Optional[str]:
+    """Why release_host_pool would refuse before releasing anything, or None.
+    Reads state only. Covers the attached L3 client (a prepare after a restore
+    attached it, or one attached at runtime); the mapping kind is fixed at boot
+    and already refuses the startup prepare, and a failed flush depends on the
+    drain, so neither is checked here."""
+    if not releases_host_pool():
+        return None
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    if not host_pools(tree_cache):
+        return None
+    if getattr(tree_cache.cache_controller, "enable_storage", False):
+        return (
+            "SGLANG_CHECKPOINT_RELEASE_HOST_POOL: an L3 storage client is attached "
+            "and holds the host pool registered; only the deferred L3 client "
+            "(first prepare of a --checkpoint-prepare-on-startup boot) is covered"
+        )
+    return None
+
+
 def release_host_pool(scheduler: Scheduler) -> Optional[ReleasedHostPool]:
     """Prepare side; see the module docstring. Raises on anything that would
     leave the pool half released (the prepare then fails)."""
