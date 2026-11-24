@@ -70,17 +70,29 @@ class DsparkDraftSampler:
                 (self.max_bs,), dtype=torch.float32, device=device
             ),
         )
-        # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
-        # the first call; a greedy draft keeps none.
+        # [max_bs, gamma, vocab] step logits for the sampling accept; a greedy
+        # draft keeps none. Allocated here rather than at the first call: under
+        # CUDA graph persistence (Foundry) the first call is inside the first
+        # capture (SAVE runs no eager warmup) or never happens (LOAD).
         self.step_logits: Optional[torch.Tensor] = None
+        if not greedy_draft:
+            self.step_logits = torch.empty(
+                (self.max_bs, self.gamma, _step_logits_width(model)),
+                dtype=self.markov_head.step_logits_dtype(_base_logits_dtype(model)),
+                device=device,
+            )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
-        if self.step_logits is None:
+        dtype = self.markov_head.step_logits_dtype(base_logits.dtype)
+        if self.step_logits is None or self.step_logits.dtype != dtype:
             # The runner's warmup calls the tail eagerly before capture.
-            assert not torch.cuda.is_current_stream_capturing()
+            assert not torch.cuda.is_current_stream_capturing(), (
+                f"DSpark step_logits needs dtype {dtype}, preallocated "
+                f"{None if self.step_logits is None else self.step_logits.dtype}"
+            )
             self.step_logits = torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(self.model)),
-                dtype=self.markov_head.step_logits_dtype(base_logits.dtype),
+                dtype=dtype,
                 device=base_logits.device,
             )
         return self.step_logits
@@ -126,6 +138,15 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
+
+
+def _base_logits_dtype(model) -> torch.dtype:
+    """The dtype ``model.compute_base_logits`` returns (the lm_head output)."""
+    weight = getattr(model.lm_head, "weight", None)
+    floating = weight is not None and weight.is_floating_point()
+    if floating and getattr(model, "_use_fp32_lm_head", False):
+        return torch.float32
+    return weight.dtype if floating else torch.bfloat16
 
 
 def _step_logits_width(model) -> int:

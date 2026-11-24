@@ -5659,6 +5659,28 @@ class DeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        # INF-834 SGLANG_OPT_INF834_HOST_POOL_PREALLOC: start populating the host pools
+        # before the weights arrive, whether they come from the checkpoint stream or from
+        # a weight snapshot. The snapshot restore below runs inside begin(); started after
+        # it, the populate ran into the MHC prewarm instead of overlapping the restore.
+        if not is_nextn and envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+            from sglang.srt.mem_cache.inf834_host_prealloc import (
+                maybe_start_host_pool_prealloc,
+            )
+
+            maybe_start_host_pool_prealloc()
+
+        # INF-834 SGLANG_OPT_INF834_WEIGHT_SNAPSHOT: this rank's weights as the stream below
+        # would leave them, from the node's snapshot; then only the post steps run.
+        inf834_snapshot = None
+        if envs.SGLANG_OPT_INF834_WEIGHT_SNAPSHOT.get():
+            from sglang.srt.model_loader.inf834_weight_snapshot import WeightSnapshot
+
+            inf834_snapshot = WeightSnapshot(self, "nextn" if is_nextn else "target")
+            if inf834_snapshot.begin():
+                weights = iter(())
+                loaded_params.update(params_dict)
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -5722,9 +5744,62 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+        inf834_profile = None
+        if envs.SGLANG_OPT_INF834_LOAD_PROFILE.get():
+            from sglang.srt.model_loader.inf834_load_profile import Inf834LoadProfile
+
+            inf834_profile = Inf834LoadProfile("draft" if is_nextn else "target")
+            weights = inf834_profile.wrap_iterator(weights)
+        inf834_bulk = None
+        inf834_expert_route = None
+        if envs.SGLANG_OPT_INF834_EXPERT_BULK_LOAD.get() and not _is_npu:
+            from sglang.srt.model_loader.inf834_expert_bulk import (
+                Inf834ExpertBulkLoader,
+                make_expert_route,
+            )
+
+            inf834_expert_route = make_expert_route(expert_params_mapping)
+
+        inf834_direct_lazy = None
+        if not is_nextn and envs.SGLANG_OPT_INF834_EP_DIRECT_EXPERTS.get():
+            # INF-834: the read filter that hands the routed experts to this reader is built
+            # inside the weight iterator (first next()), so the reader starts from there.
+            from sglang.srt.model_loader.inf834_ep_direct import LazyLaunch, make_resolver
+
+            def inf834_take_direct_sources():
+                sources = getattr(self, "_inf834_ep_direct_sources", None)
+                self._inf834_ep_direct_sources = None
+                return sources
+
+            inf834_direct_lazy = LazyLaunch(
+                inf834_take_direct_sources,
+                make_resolver(
+                    lambda ckpt_name: self.remap_weight_name_to_dpsk_hf_format(
+                        ckpt_name,
+                        is_nextn=False,
+                        num_hidden_layers=self.config.num_hidden_layers,
+                    ),
+                    expert_params_mapping,
+                    params_dict,
+                ),
+            )
+            weights = inf834_direct_lazy.wrap(weights)
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
+            if inf834_expert_route is not None:
+
+                def inf834_submit(func, *args):
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=True,
+                        func=func,
+                        func_args=args,
+                    )
+
+                inf834_bulk = Inf834ExpertBulkLoader(inf834_submit)
             for name, loaded_weight in weights:
                 if (
                     self.wo_a_fp8
@@ -5844,7 +5919,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                         break
                     else:
                         skip_unmaterialized_expert_param = False
-                        for mapping in expert_params_mapping:
+                        for mapping in (
+                            expert_params_mapping
+                            if inf834_expert_route is None
+                            else inf834_expert_route(name)
+                        ):
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
@@ -5856,6 +5935,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             param = params_dict[resolved_name]
                             weight_loader = param.weight_loader
+                            if (
+                                inf834_bulk is not None
+                                and use_async_loading
+                                and inf834_bulk.offer(
+                                    param,
+                                    loaded_weight,
+                                    resolved_name,
+                                    shard_id,
+                                    expert_id,
+                                )
+                            ):
+                                loaded_params.add(resolved_name)
+                                break
                             maybe_executor_submit(
                                 executor=executor,
                                 futures=futures,
@@ -6004,8 +6096,35 @@ class DeepseekV4ForCausalLM(nn.Module):
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
+            if inf834_bulk is not None:
+                inf834_bulk.finish()
+            if inf834_profile is not None:
+                inf834_profile.mark("stream")
+            inf834_direct = (
+                inf834_direct_lazy.direct if inf834_direct_lazy is not None else None
+            )
+            if getattr(self, "_inf834_ep_direct_sources", None):
+                # The filter dropped these experts from the stream and nothing read them.
+                raise RuntimeError(
+                    "INF834 ep direct experts: the read filter handed routed experts to "
+                    "the direct reader, which did not start (SGLANG_OPT_INF834_EP_DIRECT_EXPERTS "
+                    "must be set in this process)"
+                )
+            if inf834_direct is not None:
+                inf834_direct.join("target")
+                loaded_params.update(inf834_direct.loaded_names)
+                weight_names.extend(inf834_direct.weight_names)
+                if inf834_profile is not None:
+                    inf834_profile.mark("ep direct wait")
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+            if inf834_bulk is not None:
+                inf834_bulk.close("draft" if is_nextn else "target")
+            if inf834_profile is not None:
+                inf834_profile.mark("async tail")
+
+        if inf834_snapshot is not None:
+            inf834_snapshot.end()  # save (blocking) when this boot loaded from the checkpoint
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
@@ -6043,12 +6162,131 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if inf834_profile is not None:
+            inf834_profile.mark("post_load_weights")
 
         if not is_nextn:
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            if inf834_profile is not None:
+                inf834_profile.mark("engram finish")
             self._prewarm_mhc_kernels()
+            if inf834_profile is not None:
+                inf834_profile.mark("mhc prewarm")
+        if inf834_profile is not None:
+            inf834_profile.log(len(weight_names))
+
+    def inf834_checkpoint_read_filter(self):
+        """SGLANG_OPT_INF834_SELECTIVE_READ: the checkpoint tensors load_weights
+        consumes on this rank (see model_loader/inf834_selective_read.py). Skips
+        only what load_weights would drop anyway: routed experts with no local
+        slot (decided like FusedMoE.weight_loader), mtp.* (the draft's), and
+        vision tensors when vision is off. Row ranges steer the prefetch only."""
+        if (
+            not envs.SGLANG_OPT_INF834_SELECTIVE_READ.get()
+            or type(self) is not DeepseekV4ForCausalLM
+        ):
+            return None
+        import re
+
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+        )
+        from sglang.srt.model_loader.inf834_selective_read import (
+            Inf834ReadFilter,
+            expert_consumed,
+            fused_moe_skips_nonlocal,
+        )
+
+        layers = self.model.layers
+        n_routed = self.config.n_routed_experts
+        consumed: dict[int, set[int]] = {}  # layer -> logical experts loaded here
+        experts_by_layer = {}
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            experts = getattr(getattr(layers[layer_id], "mlp", None), "experts", None)
+            if experts is None:
+                continue
+            experts_by_layer[layer_id] = experts
+            if not fused_moe_skips_nonlocal(experts):
+                continue
+            meta = (
+                get_global_expert_location_metadata()
+                if experts.uses_expert_location
+                else None
+            )
+            consumed[layer_id] = {
+                e for e in range(n_routed) if expert_consumed(experts, meta, e)
+            }
+        skip_vision = (
+            getattr(self.config, "model_type", None) == "deepseek_v41"
+            and self.vision is None
+        )
+        expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.")
+        engram_re = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+        # INF-834 SGLANG_OPT_INF834_EP_DIRECT_EXPERTS: the filtered layers' routed experts
+        # are read by model_loader/inf834_ep_direct.py beside the stream, not streamed.
+        direct_layers: set[int] = set()
+        self._inf834_ep_direct_sources = None
+        from sglang.srt.model_loader import inf834_ep_direct
+
+        if inf834_ep_direct.enabled() and consumed:
+            from sglang.srt.runtime_context import get_model
+
+            try:
+                self._inf834_ep_direct_sources = inf834_ep_direct.list_sources(
+                    get_model().model_path, consumed
+                )
+                direct_layers = set(consumed)
+            except (OSError, ValueError, KeyError) as e:
+                logger.warning(
+                    "INF834 ep direct experts: off, cannot list the checkpoint (%r)", e
+                )
+
+        def keep(name: str) -> bool:
+            if name.startswith("mtp."):
+                return False
+            if skip_vision and (
+                name.startswith(("vision.", "aligner.", "image_"))
+                or name.endswith(".ffn.gate.bias_vl")
+            ):
+                return False
+            m = expert_re.match(name)
+            if m is not None:
+                if int(m.group(1)) in direct_layers:
+                    return False
+                local = consumed.get(int(m.group(1)))
+                return local is None or int(m.group(2)) in local
+            return True
+
+        def rows(name: str, shape):
+            m = engram_re.match(name)
+            if m is not None:
+                engram = getattr(layers[int(m.group(1))], "engram", None)
+                if engram is None:
+                    return None
+                return engram.embed.row_start, engram.embed.rows
+            m = expert_re.match(name)
+            if m is not None and m.group(3) in ("w1", "w3"):
+                experts = experts_by_layer.get(int(m.group(1)))
+                tp_size = getattr(experts, "moe_tp_size", 1)
+                if tp_size > 1 and not getattr(experts, "use_triton_kernels", True):
+                    n = shape[0] // tp_size
+                    return experts.moe_tp_rank * n, n
+            return None
+
+        n_local = [len(v) for v in consumed.values()]
+        logger.info(
+            "INF834 selective read [target]: %d MoE layers filtered, logical experts "
+            "loaded per layer min %s max %s of %d; vision skipped=%s",
+            len(consumed),
+            min(n_local) if n_local else "-",
+            max(n_local) if n_local else "-",
+            n_routed,
+            skip_vision,
+        )
+        return Inf834ReadFilter(label="target", keep=keep, rows=rows)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

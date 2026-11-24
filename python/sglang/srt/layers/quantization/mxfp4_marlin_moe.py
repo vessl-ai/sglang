@@ -595,7 +595,9 @@ class Mxfp4MarlinMoEMethod:
             f"Using the SM90 decode MoE kernel ({'W4A8 warp-specialized wgmma' if w4a8 else 'W4A16'}) "
             f"for MXFP4 experts (layer: {self.prefix})",
         )
-        torch.cuda.empty_cache()
+        from sglang.srt.layers.quantization.inf834_w6 import repack_empty_cache
+
+        repack_empty_cache()
         self._sm90_packed = dk.pack_experts(
             layer.w13_weight.data,
             layer.w13_weight_scale_inv.data,
@@ -604,7 +606,7 @@ class Mxfp4MarlinMoEMethod:
         )
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        torch.cuda.empty_cache()
+        repack_empty_cache()
         if w4a8:
             # Compile and load the W4A8 kernels now, not at the first MoE call of graph capture.
             dk.prepare(self._sm90_packed.w13.device.index)
@@ -617,25 +619,65 @@ class Mxfp4MarlinMoEMethod:
         layer._dsv4_mxfp4_backend = "sm90_decode_w4a8" if w4a8 else "sm90_decode"
         return True
 
+    def inf834_snapshot_repack_candidate(self, layer: Module) -> bool:
+        """INF-834 weight snapshot, phase "repacked": True when process_weights_after_loading will try
+        _prepare_sm90_decode_ep_weights on this layer (the snapshot then stores its packed experts)."""
+        from sglang.srt.runtime_context import get_parallel
+
+        return bool(
+            not self._use_w4a8
+            and self._sm90_decode_w4a8
+            and self._sm90_decode_w4a8_v2
+            and self._sm90_decode_w4a8_ep
+            and not getattr(layer, "_mega_moe_weights_built", False)
+            and get_parallel().moe_ep_size > 1
+        )
+
     def _prepare_sm90_decode_ep_weights(self, layer: Module) -> bool:
         """INF-730 SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: pack an expert-parallel layer's local experts
         (whole experts, intermediate S x 576) as S virtual 576-channel experts each for the v2 kernel
         (dsv4_mxfp4_decode_moe_ep). Returns False (weights untouched) on a non-EP layer or a shape the
-        kernel does not cover; the layer then takes the other paths."""
+        kernel does not cover; the layer then takes the other paths.
+
+        INF-834 weight snapshot (phase "repacked"): when the restore staged this layer's packed experts
+        in its raw expert parameters (`_inf834_snapshot_packed`), the pack is replaced by a device copy
+        into tensors allocated as the pack allocates them, and the scale maximum is the one the saving
+        boot checked; when a saving boot waits for this layer (`_inf834_snapshot_save`), the packed bytes
+        are written right after the pack."""
         from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ep as ek
+        from sglang.srt.layers.quantization.inf834_w6 import (
+            StepTimer,
+            repack_empty_cache,
+        )
         from sglang.srt.runtime_context import get_parallel
 
+        staged = layer.__dict__.get("_inf834_snapshot_packed")
+        saver = layer.__dict__.get("_inf834_snapshot_save")
+
+        def not_covered(why: str) -> bool:
+            if staged is not None:
+                raise RuntimeError(
+                    f"INF834 weight snapshot: {self.prefix} holds restored packed experts but the EP decode "
+                    f"repack does not apply ({why}); the snapshot identity should have prevented this"
+                )
+            return False
+
+        timer = StepTimer()
         config = self.runner.config
         num_local, n2, _ = layer.w13_weight.shape
         hidden = layer.w2_weight.shape[1]
         inter = n2 // 2
         if get_parallel().moe_ep_size <= 1:
-            return False
-        scale_max = max(
-            int(layer.w13_weight_scale_inv.data.view(torch.uint8).max()),
-            int(layer.w2_weight_scale_inv.data.view(torch.uint8).max()),
-        )
+            return not_covered("moe_ep_size <= 1")
+        if staged is not None:
+            scale_max = int(staged["scale_max"])
+        else:
+            scale_max = max(
+                int(layer.w13_weight_scale_inv.data.view(torch.uint8).max()),
+                int(layer.w2_weight_scale_inv.data.view(torch.uint8).max()),
+            )
         mode = ek.kernel_mode()
+        timer.mark("scale_max")
         if not (
             ek.supports_ep(hidden, inter, num_local, mode)
             and config.activation == "silu"
@@ -651,18 +693,30 @@ class Mxfp4MarlinMoEMethod:
                 f"(hidden {hidden}, intermediate {inter}, {num_local} local experts, kernel {mode}); "
                 f"keeping the configured path (layer: {self.prefix})",
             )
-            return False
-        torch.cuda.empty_cache()
-        self._sm90_packed, split = ek.pack_experts_ep(
-            layer.w13_weight.data,
-            layer.w13_weight_scale_inv.data,
-            layer.w2_weight.data,
-            layer.w2_weight_scale_inv.data,
-            mode=mode,
-        )
+            return not_covered("layer shape not covered")
+        if staged is not None and staged["mode"] != mode:
+            not_covered(f"kernel mode {staged['mode']} stored, {mode} live")
+        repack_empty_cache()
+        timer.mark("empty_cache_pre")
+        if staged is not None:
+            from sglang.srt.model_loader.inf834_weight_snapshot import restore_packed
+
+            self._sm90_packed, split = restore_packed(layer, staged)
+        else:
+            self._sm90_packed, split = ek.pack_experts_ep(
+                layer.w13_weight.data,
+                layer.w13_weight_scale_inv.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale_inv.data,
+                mode=mode,
+            )
+            if saver is not None:
+                saver.save_packed(layer, self._sm90_packed, split, scale_max, mode)
+        timer.mark("pack")
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
-        torch.cuda.empty_cache()
+        repack_empty_cache()
+        timer.mark("del_empty_cache_post")
         log_info_on_rank0(
             logger,
             "Using the SM90 decode MoE kernel on an expert-parallel layer: "
@@ -671,6 +725,7 @@ class Mxfp4MarlinMoEMethod:
                 if mode == "v2w"
                 else f"W4A8 v2, {num_local} local experts x {split} virtual 576-channel experts "
             )
+            + ("(restored from the weight snapshot) " if staged is not None else "")
             + f"(layer: {self.prefix})",
         )
         top_k = getattr(layer, "top_k", None) or 6
@@ -684,6 +739,11 @@ class Mxfp4MarlinMoEMethod:
         )
         self._ep_split = split
         layer._dsv4_mxfp4_backend = f"sm90_decode_w4a8_ep_{mode}"
+        timer.mark("prepare_ep")
+        if timer.on:
+            log_info_on_rank0(
+                logger, f"INF834 W6 profile {self.prefix}: {timer.summary()}"
+            )
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:

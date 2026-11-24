@@ -52,7 +52,14 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         for d in dims:
             size *= d
         size *= torch.tensor([], dtype=self.dtype).element_size()
-        ptr_int = self.allocator.alloc(size)
+        ptr_int = None
+        if envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+            from sglang.srt.mem_cache import inf834_host_prealloc
+
+            # A segment of this size the background thread already populated.
+            ptr_int = inf834_host_prealloc.take(size)
+        if ptr_int is None:
+            ptr_int = self.allocator.alloc(size)
         self.ptr = ptr_int
         c_type = ctypes.c_byte * size
         c_array = c_type.from_address(ptr_int)
@@ -385,6 +392,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        if envs.SGLANG_OPT_INF834_HOST_POOL_PREALLOC.get():
+            from sglang.srt.mem_cache import inf834_host_prealloc
+
+            # The host pools exist by now: release what the prealloc still holds.
+            inf834_host_prealloc.finalize()
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()

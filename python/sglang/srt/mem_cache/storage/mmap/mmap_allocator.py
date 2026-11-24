@@ -70,6 +70,52 @@ def _has_madv_populate_write() -> bool:
         probe.close()
 
 
+def inf834_populate_write_parallel(mm: mmap.mmap, nbytes: int) -> None:
+    """MADV_POPULATE_WRITE over `mm` from SGLANG_OPT_INF834_POPULATE_THREADS threads,
+    each on its own 2 MiB-aligned slice (INF-466: one thread per mapping is the
+    bottleneck). Raises OSError like mmap.madvise when any slice fails."""
+    import time
+
+    if _libc is None:
+        mm.madvise(_MADV_POPULATE_WRITE)
+        return
+    threads = max(1, envs.SGLANG_OPT_INF834_POPULATE_THREADS.get())
+    view = ctypes.c_char.from_buffer(mm)
+    base = ctypes.addressof(view)
+    del view  # keep no exported buffer, so the mapping can still be closed
+    tic = time.perf_counter()
+    inf834_populate_write_range(base, nbytes, threads)
+    logger.info(
+        "INF834 parallel populate: %.1f GiB on %d threads in %.1fs",
+        nbytes / 2**30,
+        threads,
+        time.perf_counter() - tic,
+    )
+
+
+def inf834_populate_write_range(base: int, nbytes: int, threads: int) -> None:
+    """MADV_POPULATE_WRITE over [base, base + nbytes) from `threads` threads, each on
+    its own 2 MiB-aligned slice. Raises OSError when any slice fails. Needs libc."""
+    import concurrent.futures
+
+    step = 2 << 20
+    per = -(-nbytes // threads // step) * step
+    madvise = _libc.madvise
+    madvise.restype = ctypes.c_int
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+
+    def one(start: int) -> int:
+        length = min(per, nbytes - start)
+        if madvise(ctypes.c_void_p(base + start), length, _MADV_POPULATE_WRITE):
+            return ctypes.get_errno()
+        return 0
+
+    with concurrent.futures.ThreadPoolExecutor(threads) as pool:
+        errors = [e for e in pool.map(one, range(0, nbytes, per)) if e]
+    if errors:
+        raise OSError(errors[0], os.strerror(errors[0]))
+
+
 def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
     """mmap `alloc_bytes` with every page already faulted in and writable.
 
@@ -82,7 +128,10 @@ def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
     """
     if _has_madv_populate_write():
         mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=_PROT_RW)
-        mm.madvise(_MADV_POPULATE_WRITE)
+        if envs.SGLANG_OPT_INF834_PARALLEL_POPULATE.get():
+            inf834_populate_write_parallel(mm, alloc_bytes)
+        else:
+            mm.madvise(_MADV_POPULATE_WRITE)
         return mm
     return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
 

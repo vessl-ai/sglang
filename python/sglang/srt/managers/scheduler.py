@@ -367,6 +367,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
     resolve_image_processor_backend,
 )
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.sched_uclamp import maybe_set_scheduler_uclamp_min
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -6112,6 +6113,8 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Foundry CUDA graph persistence (--cuda-graph-persistence) for this rank.
+    activate_foundry(server_args)
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.
@@ -6133,6 +6136,19 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    if not get_serving().skip_tokenizer_init:
+        # INF-834 (SGLANG_OPT_INF834_TOKENIZER_PREFETCH): overlap the tokenizer load
+        # (Scheduler.init_tokenizer, same arguments) with the distributed init.
+        from sglang.srt.utils.hf_transformers.tokenizer import prefetch_tokenizer
+
+        prefetch_tokenizer(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+        )
+
     # Set up tracing
     if get_observability().enable_trace:
         process_tracing_init(
@@ -6151,6 +6167,7 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        get_foundry_adapter().log_init_summary()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

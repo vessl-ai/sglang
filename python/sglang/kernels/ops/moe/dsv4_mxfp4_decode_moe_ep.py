@@ -49,6 +49,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2 as v2
 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_v2w as v2w
 from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_ws as ws
@@ -172,7 +174,14 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
         out13[lo : lo + n].copy_(p.w13)
         out2[lo : lo + n].copy_(p.w2)
         del p
-        torch.cuda.empty_cache()
+        # INF-834: DEFER_EMPTY_CACHE (rejected: it shrank the KV pool) skips every repack
+        # empty_cache; SKIP_CHUNK_EMPTY_CACHE skips only this per-chunk one and keeps the two
+        # per-layer calls in _prepare_sm90_decode_ep_weights.
+        if not (
+            envs.SGLANG_OPT_INF834_MOE_PACK_DEFER_EMPTY_CACHE.get()
+            or envs.SGLANG_OPT_INF834_MOE_PACK_SKIP_CHUNK_EMPTY_CACHE.get()
+        ):
+            torch.cuda.empty_cache()
     if mode == "v2w":
         return v2w.PackedExperts(out13, out2, w13.shape[1] // 2), 1
     return PackedExperts(out13, out2), split_of(w13.shape[1] // 2)

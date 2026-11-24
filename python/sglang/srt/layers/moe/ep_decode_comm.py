@@ -151,6 +151,50 @@ def get_ep_decode_comm() -> Optional[EpDecodeComm]:
 _WARNED_SHARED = False
 
 
+def _parallel_layout_applies() -> bool:
+    """The configuration half of :func:`applies`: no a2a backend, attention TP 1, no attention CP, and the TP
+    group is the EP group (= the DP attention group)."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    from sglang.srt.runtime_context import get_parallel
+
+    p = get_parallel()
+    return (
+        get_moe_a2a_backend().is_none()
+        and p.attn_tp_size == 1
+        and p.attn_cp_size == 1
+        and p.moe_ep_size == p.tp_size == p.attn_dp_size
+    )
+
+
+def prebuild_ep_decode_comm(model) -> int:
+    """Build the state the EP decode comm otherwise creates on its first eager call (INF-730 ``ep_a2a``: one
+    symmetric-memory buffer and peer table per (local experts, top-k) shape), before CUDA graph capture.
+
+    Natively the first decode warmup forward builds it. Under graph persistence (Foundry, INF-834) SAVE runs no
+    eager warmup and LOAD runs no forward, so it must exist before the first capture, at the same point on both.
+    Collective: every rank walks the same model and builds the same shapes in the same order. Returns how many
+    shapes were built."""
+    comm = get_ep_decode_comm()
+    prebuild = getattr(comm, "prebuild", None)
+    if prebuild is None or not _parallel_layout_applies():
+        return 0
+    shapes = []
+    for module in model.modules():
+        method = getattr(getattr(module, "experts", None), "quant_method", None)
+        split = getattr(method, "_ep_split", 0)
+        packed = getattr(method, "_sm90_packed", None)
+        topk = getattr(module, "topk", None)
+        if not split or packed is None or topk is None:
+            continue
+        shape = (packed.w13.shape[0] // split, topk.topk_config.top_k)
+        if shape not in shapes:
+            shapes.append(shape)
+    built = 0
+    for num_local_experts, top_k in shapes:
+        built += bool(prebuild(num_local_experts=num_local_experts, top_k=top_k))
+    return built
+
+
 def applies(mlp, forward_batch, *, shared_local: bool) -> bool:
     """Whether this MoE call takes the EP decode path: the switch is set, the layer's experts run
     dsv4_mxfp4_decode_moe_ep, the forward is a MAX_LEN-padded DP forward (decode), attention TP is 1 and the
@@ -159,18 +203,11 @@ def applies(mlp, forward_batch, *, shared_local: bool) -> bool:
     global _WARNED_SHARED
     if get_ep_decode_comm() is None:
         return False
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_parallel
-
     method = getattr(getattr(mlp, "experts", None), "quant_method", None)
     if not getattr(method, "_ep_split", 0):
         return False
-    p = get_parallel()
     if not (
-        get_moe_a2a_backend().is_none()
-        and p.attn_tp_size == 1
-        and p.attn_cp_size == 1
-        and p.moe_ep_size == p.tp_size == p.attn_dp_size
+        _parallel_layout_applies()
         and forward_batch.dp_padding_mode is not None
         and forward_batch.dp_padding_mode.is_max_len()
     ):
