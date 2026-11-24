@@ -26,7 +26,7 @@ import logging
 import random
 import time
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -552,8 +552,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._prefill_dp_rank_queries: Dict[
             str, Tuple[Tuple[int, ...], Future[Dict[str, int]]]
         ] = {}
+        # In-flight prefill parallel-info fetches, consumed in _ensure_prefill_info.
+        # They get their own threads: a fetch to an unanswering prefill holds
+        # one for the HTTP timeout, which must not delay the DP-rank queries
+        # and rebootstrap calls on the KV manager's executor.
+        self._prefill_info_fetches: Dict[str, Future[bool]] = {}
+        # Default size min(32, cpu_count + 4); beyond it, fetches queue behind hung ones.
+        self._prefill_info_executor = ThreadPoolExecutor(
+            thread_name_prefix="pd-prefill-info"
+        )
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 15  # scheduling cycles
+        self._max_ensure_retries: int = 15  # fetch attempts
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         # Retracted requests staged for rebootstrap while generation is paused.
@@ -1326,6 +1335,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
+        self._cancel_prefill_info_fetches()
         if self._pending_publish:
             storage = self._storage()
             for entry in self._pending_publish:
@@ -1505,20 +1515,46 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Dict[str, List[DecodeRequest]]:
-        """Non-blocking ensure parallel info for each addr; return the ready ones."""
+        """Non-blocking ensure parallel info for each addr; return the ready ones.
+
+        The fetch runs on its own executor: an unanswering bootstrap server
+        would otherwise stall the scheduler for the HTTP timeout on every
+        attempt. Its result is consumed on a later call.
+        """
         ready: Dict[str, List[DecodeRequest]] = {}
+
+        self._cancel_prefill_info_fetches(keep=addr_to_reqs)
+        fetches = self._prefill_info_fetches
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
-            last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
-            if last_attempt is not None and (
-                now - last_attempt < self._ensure_retry_interval
-            ):
+            if bootstrap_addr in fetches:
+                fetch = fetches[bootstrap_addr]
+                if not fetch.done():
+                    # Waiting on a running fetch does not spend a retry.
+                    continue
+                del fetches[bootstrap_addr]
+                # Raises a config mismatch found by the fetch here. The
+                # heartbeat may have dropped the info since the fetch.
+                is_ready = (
+                    fetch.result()
+                    and bootstrap_addr in self.kv_manager.prefill_info_table
+                )
+            elif bootstrap_addr in self.kv_manager.prefill_info_table:
+                is_ready = True
+            else:
+                last_attempt = self._ensure_last_attempt_time.get(bootstrap_addr)
+                if last_attempt is not None and (
+                    now - last_attempt < self._ensure_retry_interval
+                ):
+                    continue
+                self._ensure_last_attempt_time[bootstrap_addr] = now
+                fetches[bootstrap_addr] = self._prefill_info_executor.submit(
+                    self.kv_manager.try_ensure_parallel_info, bootstrap_addr
+                )
                 continue
 
-            self._ensure_last_attempt_time[bootstrap_addr] = now
-
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            if is_ready:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1587,11 +1623,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             future.cancel()
         self._prefill_dp_rank_queries.clear()
 
+    def _cancel_prefill_info_fetches(self, keep=()) -> None:
+        fetches = self._prefill_info_fetches
+        for bootstrap_addr in set(fetches) - set(keep):
+            # A running fetch cannot be cancelled. Keep it, so that a later
+            # request for its addr waits for it instead of starting another.
+            if fetches[bootstrap_addr].cancel() or fetches[bootstrap_addr].done():
+                del fetches[bootstrap_addr]
+
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         pending = self._reqs_awaiting_prefill_dp_rank()
         if not pending:
             self._cancel_prefill_dp_rank_queries()
+            self._cancel_prefill_info_fetches()
             return
 
         # Group pending requests by bootstrap_addr

@@ -60,9 +60,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._max_ensure_retries = 1
         queue._ensure_retry_interval = 0
         queue._ensure_retry_count = {"127.0.0.1:11500": 0}
-        queue._ensure_last_attempt_time = {}
+        queue._ensure_last_attempt_time = {"127.0.0.1:11500": 0.0}
         queue.kv_manager = MagicMock()
-        queue.kv_manager.try_ensure_parallel_info.return_value = False
+        # The last fetch has finished without the info.
+        failed_fetch = Future()
+        failed_fetch.set_result(False)
+        queue._prefill_info_fetches = {"127.0.0.1:11500": failed_fetch}
 
         waiting = SimpleNamespace(
             req=SimpleNamespace(rid="waiting"),
