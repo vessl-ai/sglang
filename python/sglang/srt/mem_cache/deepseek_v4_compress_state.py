@@ -182,12 +182,19 @@ class CompressStatePool:
         self._alloc_kv_score_buffer(
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
-        if not online:
-            if ratio == 2 or (_is_hip and ratio == 128):
-                # Request-scoped rings reset all rows; C4 only its -1 sentinel row.
-                self.kv_score_buffer.clear()
-            else:
-                self.kv_score_buffer[-1].clear()
+        self.reset_initial_rows()
+
+    def reset_initial_rows(self) -> None:
+        """Write the rows that must hold their initial value (score -inf, kv 0)
+        before any use. The buffer is in the memory-saver KV region, so a resume
+        maps fresh physical pages without them: call again after one."""
+        if self.online:
+            return
+        if self.ratio == 2 or (_is_hip and self.ratio == 128):
+            # Request-scoped rings reset all rows; C4 only its -1 sentinel row.
+            self.kv_score_buffer.clear()
+        else:
+            self.kv_score_buffer[-1].clear()
 
     def transfer_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """PD transfer indices of this pool's state for one request."""

@@ -816,6 +816,36 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # With --checkpoint-prepare-on-startup: boot a PD engine on the fake KV
+    # transfer backend, so no Mooncake TransferEngine, RDMA device, KV memory
+    # registration, pod-IP socket or bootstrap registration exists in the process
+    # checkpoint. /checkpoint/restore builds them with the restored pod's IP.
+    SGLANG_CHECKPOINT_DEFER_PD_TRANSPORT = EnvBool(False)
+    # With --checkpoint-prepare-on-startup: boot HiCache with its host pools but
+    # without the L3 storage client, and attach it in /checkpoint/restore.
+    SGLANG_CHECKPOINT_DEFER_HICACHE_STORAGE = EnvBool(False)
+    # Diagnostics for /checkpoint/restore (disaggregation/checkpoint_transport.py):
+    # fill the KV transfer regions after resume with "zero" (what a fresh boot
+    # holds) or "poison" (0xFF), or leave them ("none"); and log the registered
+    # KV regions at boot, registration and restore.
+    SGLANG_CHECKPOINT_RESTORE_KV_FILL = EnvStr("none")
+    SGLANG_CHECKPOINT_LOG_KV_REGIONS = EnvBool(False)
+    # The first /checkpoint/prepare keeps the KV region's non-zero startup bytes
+    # (sentinel rows, warmup pages) in host memory and every restore puts them
+    # back after the resume (mem_cache/kv_region_image.py). Prepare fails when
+    # the image would exceed the cap (a region that has served requests).
+    SGLANG_CHECKPOINT_KV_REGION_IMAGE = EnvBool(True)
+    SGLANG_CHECKPOINT_KV_REGION_IMAGE_MAX_MB = EnvInt(4096)
+    # The first /checkpoint/prepare flushes the cache, unregisters the HiCache
+    # host pool from CUDA and returns its pages (the checkpoint then carries
+    # none); /checkpoint/restore faults them in and registers them again
+    # (mem_cache/host_pool_checkpoint.py). Needs the deferred L3 client.
+    SGLANG_CHECKPOINT_RELEASE_HOST_POOL = EnvBool(False)
+    # Threads per scheduler for the restore's host pool populate and register.
+    SGLANG_CHECKPOINT_HOST_POOL_THREADS = EnvInt(8)
+    # /checkpoint/restore attaches the L3 client on a second thread while the
+    # PD transport is built (the request's overlap_l3 overrides this).
+    SGLANG_CHECKPOINT_RESTORE_OVERLAP_L3 = EnvBool(False)
 
     # ===================================================================
     # Mooncake store
@@ -1512,6 +1542,13 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    # With --enable-memory-saver, load the weights outside torch_memory_saver's
+    # "weights" region. The region is a private MemPool, so every temporary of the
+    # load (dequant, repack, prewarm scratch) stays reserved in it after the load
+    # (measured on DeepSeek-V4.1-Flash on H200: 24.8 GB per GPU on a TP4 prefill,
+    # 31 GB on an EP8 decoder). For a server that only ever releases the
+    # KV cache (the process checkpoint routes), the weights need no region.
+    SGLANG_MEMORY_SAVER_SKIP_WEIGHTS = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
@@ -1631,6 +1668,15 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # "per_rank" only: back each rank's shard with a file in this directory, which
+    # must be on a tmpfs mount, mapped MAP_SHARED, instead of anonymous memory.
+    # CRIU then records the mapping and not the pages, so the table stays out of a
+    # process checkpoint; the file must exist unchanged when the process is
+    # restored. Empty (default) keeps the anonymous mapping. See engram_host_file.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR = EnvStr("")
+    # Register the host tables with cudaHostRegisterReadOnly (the GPU only reads
+    # them). Off by default; CUDA only.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY = EnvBool(False)
     # Extend steps of a TP-sharded engram table (device or per_rank host): start the
     # row gathers of every engram layer before layer 0 on a side stream (the hash ids
     # only depend on the input tokens), copy fp8 + scale bytes instead of bf16, and

@@ -77,7 +77,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
-from sglang.srt.disaggregation import role_switch
+from sglang.srt.disaggregation import checkpoint_transport, role_switch
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -95,6 +95,7 @@ from sglang.srt.disaggregation.prefill import (
     maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -130,6 +131,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BeginWeightUpdateReqInput,
+    CheckpointReqInput,
     CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
@@ -226,6 +228,9 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.checkpoint_manager import (
+    SchedulerCheckpointManager,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
@@ -459,6 +464,10 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Set at boot when a process checkpoint must not hold them; cleared once
+    # /checkpoint/restore builds them (disaggregation/checkpoint_transport.py).
+    pd_transport_deferred: bool = False
+    hicache_storage_deferred: bool = False
 
     def __init__(
         self,
@@ -511,7 +520,12 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
-        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        # Deferred: the L3 client is attached by /checkpoint/restore.
+        self.hicache_storage_deferred = checkpoint_transport.defers_hicache_storage()
+        self.enable_hicache_storage = (
+            get_memory().hicache_storage_backend is not None
+            and not self.hicache_storage_deferred
+        )
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -685,6 +699,7 @@ class Scheduler(
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
+        self.init_checkpoint_manager()
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1472,6 +1487,14 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
+        # Deferred: KV managers run on the fake backend until /checkpoint/restore
+        # builds the configured one (disaggregation/checkpoint_transport.py).
+        self.pd_transport_deferred = (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and checkpoint_transport.defers_pd_transport()
+        )
+        if self.pd_transport_deferred:
+            self.transfer_backend = TransferBackend.FAKE
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
@@ -1596,6 +1619,14 @@ class Scheduler(
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+
+        if self.pd_transport_deferred:
+            queue = (
+                self.disagg_decode_prealloc_queue or self.disagg_prefill_bootstrap_queue
+            )
+            checkpoint_transport.log_kv_regions(
+                "boot-deferred", getattr(queue.kv_manager, "kv_args", None)
+            )
 
         if (
             self.enable_unified_memory
@@ -1752,6 +1783,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (CheckpointReqInput, self.checkpoint_manager.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -2195,6 +2227,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.checkpoint_manager.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2312,6 +2345,23 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
+        )
+
+    def init_checkpoint_manager(self) -> None:
+        self.checkpoint_manager = SchedulerCheckpointManager(
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            pp_size=get_parallel().pp_size,
+            offload_tags=self.weight_updater.offload_tags,
+            is_engine_paused=lambda: self._engine_paused,
+            is_fully_idle=self.is_fully_idle,
+            release_memory_occupation=self.weight_updater.release_memory_occupation,
+            resume_memory_occupation=self.weight_updater.resume_memory_occupation,
+            all_gather_object=self.dp_tp_group.all_gather_object,
+            after_restore=lambda req: checkpoint_transport.build_transport_on_restore(
+                self, req.host_ip, req.kv_fill, getattr(req, "overlap_l3", None)
+            ),
+            before_release=lambda: checkpoint_transport.before_kv_release(self),
+            prepare_refusal=lambda: checkpoint_transport.prepare_refusal(self),
         )
 
     def init_lora_drainer(self) -> None:
@@ -3377,6 +3427,20 @@ class Scheduler(
         if not self._set_or_validate_priority(req):
             self._release_aborted_request(req)
             return
+        # getattr: callers outside a full Scheduler pass stand-ins without it.
+        if (
+            getattr(self, "pd_transport_deferred", False)
+            and req.bootstrap_host != FAKE_BOOTSTRAP_HOST
+        ):
+            self._reject_while_pd_transport_deferred(req)
+            self._release_aborted_request(req)
+            return
+        if checkpoint_transport.checkpoint_refuses_new_requests(self):
+            self._reject_while_pd_transport_deferred(
+                req, checkpoint_transport.CHECKPOINT_REJECT_MESSAGE
+            )
+            self._release_aborted_request(req)
+            return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
@@ -3405,6 +3469,22 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _reject_while_pd_transport_deferred(
+        self,
+        req: Req,
+        message: str = checkpoint_transport.DEFERRED_TRANSPORT_REJECT_MESSAGE,
+    ) -> None:
+        abort_req = _make_abort_req(
+            req,
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+        )
+        req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""

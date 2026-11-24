@@ -23,7 +23,10 @@ def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading
             delta = (curr_times.user - last_times.user) + (
                 curr_times.system - last_times.system
             )
-            cpu_seconds_total.labels(component=component).inc(delta)
+            # Negative right after a CRIU restore: the restored process's CPU
+            # times start again from zero. Skip that one interval.
+            if delta > 0:
+                cpu_seconds_total.labels(component=component).inc(delta)
             last_times = curr_times
 
     t = threading.Thread(target=monitor, daemon=True)
