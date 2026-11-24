@@ -1156,8 +1156,10 @@ class CommonKVManager(BaseKVManager):
             )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
-        """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
+        """Single attempt to fetch and cache prefill parallel info.
+        Returns True if info is available (cached or freshly fetched).
+        Blocks on the HTTP request, so the decode scheduler runs it on a
+        worker thread."""
         if bootstrap_addr in self.prefill_info_table:
             return True
 
