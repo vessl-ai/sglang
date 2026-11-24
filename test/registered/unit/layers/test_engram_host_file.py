@@ -308,6 +308,53 @@ class HostTableFileTest(unittest.TestCase):
         )
         self.assertEqual(H.verify_dir(self.dir.name), (1, []))
 
+    @unittest.skipUnless(sys.platform == "linux", "MAP_FIXED_NOREPLACE is Linux only")
+    def test_file_backed_shard_at_fixed_address_under_graph_persistence(self):
+        """INF-834 CUDA graph persistence maps the table at a fixed address; with
+        file_dir that mapping is the table file, and the manifest digest reads it
+        through self.bytes (self.mm is then a ctypes array)."""
+        base = 0x5F0000000000
+        nbytes = 3 * mmap.PAGESIZE + 5
+        with (
+            mock.patch.object(self.E, "_graphs_persisted", return_value=True),
+            mock.patch.object(self.E, "_madvise_hugepage"),
+            mock.patch.object(self.E, "_fixed_addr_cursor", base),
+        ):
+            t = self.E._HostTable(
+                "per_rank", nbytes, "sglang_engram_9", self.group, file_dir=self.dir.name
+            )
+        self.assertEqual(t.bytes.data_ptr(), base)
+        self.assertTrue(os.path.exists(t.path))
+        t.bytes[-2:] = self.E.torch.tensor([7, 8], dtype=self.E.torch.uint8)
+        t.dirty = True
+        t.finish_load("layer 9")
+        with open(t.path, "rb") as f:
+            self.assertEqual(f.read()[-2:], b"\x07\x08")
+        self.assertEqual(H.verify_dir(self.dir.name), (1, []))
+
+    def test_deferred_registration_keeps_the_read_only_flag(self):
+        """A table whose pre-fault and registration INF-834 defers to the weight
+        snapshot is registered later with the same flags as at init."""
+        with (
+            mock.patch.object(self.E, "_inf834_defers_prefault", return_value=True),
+            mock.patch.dict(
+                os.environ, {"SGLANG_DSV41_ENGRAM_HOST_TABLE_REGISTER_READONLY": "1"}
+            ),
+        ):
+            t = self.E._HostTable(
+                "per_rank",
+                2 * mmap.PAGESIZE,
+                "sglang_engram_2",
+                self.group,
+                file_dir=self.dir.name,
+            )
+            self.assertTrue(t.deferred)
+            self.assertEqual(self.registered, [])
+            t.complete(prefault=True)
+        self.assertEqual(
+            self.registered, [(t.bytes.data_ptr(), 2 * mmap.PAGESIZE, 0x08)]
+        )
+
     def test_default_stays_anonymous_and_shared_refuses_a_dir(self):
         t = self.E._HostTable("per_rank", mmap.PAGESIZE, "sglang_engram_1", self.group)
         self.assertIsNone(t.path)
