@@ -718,9 +718,9 @@ class _CountRouting(NamedTuple):
     pos: torch.Tensor  # [slots] int32 sorted row of each slot, -1 for masked slots
 
 
-# Slots per CTA of the CTA-local counting sort (w4a8_count_route.cuh); a 65k-row step (390k
-# slots) is 96 CTAs, one wave.
-_CTA_ROUTE_CHUNK = 4096
+# Slots per CTA of the CTA-local counting sort (w4a8_count_route.cuh). H200, 391k slots of a 65k-row step:
+# hist + scatter 21.0 us at 2048 (191 CTAs), 22.0 at 4096, 30.0 at 8192 (real routing; Triton 150 us).
+_CTA_ROUTE_CHUNK = 2048
 
 
 @functools.cache
