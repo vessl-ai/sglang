@@ -191,13 +191,16 @@ def store_window_kv(layer, x, positions, qkv_a, q_rope) -> None:
 
 
 @eager_on_graph(capture_stub=_noop)
-def cp_store_window_kv(layer, kv) -> None:
+def cp_store_window_kv(layer, kv, positions=None) -> None:
     """MqaAttention._cp_store_window_kv on the live rows (prefill CP gathers them)."""
     from sglang.srt.model_executor.forward_context import get_attn_backend
 
     _fire_midforward_hook(layer)
     step = _live()
-    layer._cp_store_window_kv(kv[: step.rows], step.forward_batch, get_attn_backend())
+    extra = {} if positions is None else {"positions": positions[: step.rows]}
+    layer._cp_store_window_kv(
+        kv[: step.rows], step.forward_batch, get_attn_backend(), **extra
+    )
 
 
 @eager_on_graph(capture_stub=_noop)

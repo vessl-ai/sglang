@@ -420,6 +420,26 @@ def _dp_shared_expert_sm_cap():
         deep_gemm.set_num_sms(total)
 
 
+def _cp_window_kv_fp8_ok() -> bool:
+    """INF-874 R2ATTN SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER: the paged V4 SWA
+    cache on CUDA, interleave CP (the send rows are the strategy's rank rows)."""
+    if not envs.SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER.get():
+        return False
+    if torch.version.cuda is None:
+        return False
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+    from sglang.srt.layers.cp.base import is_interleave
+
+    if not is_interleave():
+        return False
+    pool = get_token_to_kv_pool()
+    return (
+        not pool.uniform_fp8
+        and pool.request_window is None
+        and pool.get_swa_key_layout() is KVLayout.V4
+    )
+
+
 _CP_SHARED_EXPERT_STREAM: Optional[torch.cuda.Stream] = None
 _CP_SHARED_EXPERT_LOGGED = False
 
@@ -1605,10 +1625,31 @@ class MQALayer(MqaAttentionBase):
         )
 
     def _cp_store_window_kv(
-        self, kv: torch.Tensor, forward_batch: ForwardBatch, attn_backend
+        self,
+        kv: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        positions: Optional[torch.Tensor] = None,
     ) -> None:
         """Prefill CP (V4.1): gather every rank's window KV into the global token
-        order and write it with the fused fp32 norm + RoPE store."""
+        order and write it with the fused fp32 norm + RoPE store. ``positions`` are
+        this rank's rows' positions (needed by the FP8 all-gather path only)."""
+        if positions is not None and _cp_window_kv_fp8_ok():
+            from sglang.srt.layers.cp.window_kv_fp8 import cp_store_window_kv_fp8
+
+            pool = get_token_to_kv_pool()
+            cp_store_window_kv_fp8(
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                local_positions=positions,
+                swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+                swa_cache=pool.get_swa_raw_buffer(self.layer_id),
+                swa_page_size=pool.swa_page_size,
+                forward_batch=forward_batch,
+            )
+            return
         kv = cp_materialize_global_token_order(
             kv.contiguous(),
             forward_batch,
@@ -2267,9 +2308,11 @@ class MQALayer(MqaAttentionBase):
                 else:
                     kv, _ = self.wkv(x_linear)
                 if late_layer_graph.active():
-                    late_layer_graph.cp_store_window_kv(self, kv)
+                    late_layer_graph.cp_store_window_kv(self, kv, positions)
                 else:
-                    self._cp_store_window_kv(kv, forward_batch, attn_backend)
+                    self._cp_store_window_kv(
+                        kv, forward_batch, attn_backend, positions
+                    )
                 kv = None
             elif late_layer_graph.active():
                 late_layer_graph.store_window_kv(

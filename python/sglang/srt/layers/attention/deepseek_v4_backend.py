@@ -1229,6 +1229,13 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        if self.is_dsv41:
+            logger.info(
+                "INF-874 R2ATTN: SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS=%s "
+                "SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER=%s",
+                envs.SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS.get(),
+                envs.SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER.get(),
+            )
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -3235,7 +3242,10 @@ class DeepseekV4AttnBackend(
             x_global = cp_materialize_global_token_order(
                 x.contiguous(), forward_batch, torch.cuda.current_stream()
             )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if self._cp_fused_low_ratio_compress_ok(layer):
+                self._low_ratio_compress_cp_fused(layer, x_global, req_global, pos_global)
+            else:
+                self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
             # A rank's local rows are not the batch's, so no req_rows to pass.
             self._low_ratio_index_topk(
@@ -3246,6 +3256,75 @@ class DeepseekV4AttnBackend(
                 positions[:num_local].to(torch.int64),
                 forward_batch,
                 rows_per_request=q_lens_cpu,
+            )
+
+    def _cp_fused_low_ratio_compress_ok(self, layer) -> bool:
+        """SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS, where the Triton kernels are
+        bitwise `_low_ratio_compress_torch`: CUDA, the V4 compressed layout, and (when
+        the layer owns index keys) the fused fp4 index-K row with nearest-even rounding."""
+        if not envs.SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS.get():
+            return False
+        if torch.version.cuda is None or layer.compress_ratio not in (1, 2):
+            return False
+        pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        if pool.uniform_fp8 or pool.get_extra_key_layout(layer_id) is not KVLayout.V4:
+            return False
+        indexer = layer.indexer
+        if indexer is not None and indexer.owns_k:
+            if indexer.index_head_dim != 128 or pool.low_ratio_index_k_is_split(layer_id):
+                return False
+            if not pool.low_ratio_index_k_rne(layer_id):
+                return False
+        return layer.rope_head_dim == 64
+
+    def _low_ratio_compress_cp_fused(self, layer, x, req, pos) -> None:
+        """`_low_ratio_compress_torch` for the prefill-CP branch (global token order,
+        no padding rows), as Triton launches with the same bits."""
+        from sglang.kernels.ops.attention.dsv4.low_ratio_compress_triton import (
+            index_k_norm_rope_pack_store_triton,
+            low_ratio_compress_store,
+        )
+
+        core = self.forward_metadata.core_metadata
+        pool = self.token_to_kv_pool
+        layer_id = layer.layer_id
+        ratio = layer.compress_ratio
+        num_tokens = pos.shape[0]
+        kv, score = layer.compressor.project(x)
+        if not num_tokens:
+            return
+        out_loc = (core.c2_out_loc if ratio == 2 else core.c1_out_loc)[:num_tokens]
+        state = pool.get_attention_compress_states(layer_id) if ratio == 2 else None
+        latent = low_ratio_compress_store(
+            ratio=ratio,
+            kv=kv,
+            score=score,
+            req=req,
+            pos=pos,
+            raw_out_loc=core.raw_out_loc[:num_tokens],
+            out_loc=out_loc,
+            norm_weight=layer.compressor.norm.weight,
+            eps=layer.compressor.norm.eps,
+            freqs_cis=layer.freqs_cis,
+            rope_dim=layer.rope_head_dim,
+            kv_cache=pool.get_extra_key_buffer(layer_id).view(torch.uint8),
+            kv_page_size=pool.get_extra_key_page_size(layer_id),
+            state=None if state is None else state.kv_score_buffer.kv_score,
+            ring_size=0 if state is None else state.ring_size,
+        )
+        indexer = layer.indexer
+        if indexer is not None and indexer.owns_k:
+            index_k_norm_rope_pack_store_triton(
+                k=indexer.forward_wk(latent),
+                norm_weight=indexer.k_norm.weight,
+                eps=indexer.k_norm.eps,
+                freqs_cis=layer.freqs_cis,
+                rope_dim=indexer.rope_head_dim,
+                pos=pos,
+                pos_offset=1 if ratio == 2 else 0,
+                out_loc=out_loc,
+                cache=pool.get_index_k_with_scale_buffer(layer_id),
             )
 
     def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:

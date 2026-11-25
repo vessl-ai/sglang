@@ -2031,6 +2031,17 @@ class Envs:
     # bf16 workspace: 8 tokens per Triton program and a whole row per block instead of
     # one token per program and one 64-value tile at a time. Same arithmetic, same bits.
     SGLANG_OPT_DSV4_SPARSE_PREFILL_FAST_DEQUANT = EnvBool(False)
+    # INF-874 R2ATTN (C-bit). Prefill CP (interleave): the ratio-1/2 kv_source
+    # compressor (pair pooling, ring state, RMSNorm, RoPE + fp4 fake-quant, the V4
+    # FlashMLA store, the fp4 index-K store) runs as three Triton launches instead of
+    # about twenty torch launches over all T rows. Same operations and roundings, same
+    # cache bytes. Needs the V4 compressed layout and the fp4 (rne) index-K pool.
+    SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS = EnvBool(False)
+    # INF-874 R2ATTN (B). Prefill CP (interleave): each rank norms, ropes and FP8-quantizes
+    # only its own window-KV rows (the same store kernel, into V4 pages of a send buffer),
+    # all-gathers those 584-byte rows instead of the raw bf16 kv (1,024 B), and copies
+    # every token's row into the paged SWA cache. Same cache bytes. Needs the V4 SWA layout.
+    SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last
