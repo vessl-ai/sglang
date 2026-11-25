@@ -208,9 +208,11 @@ SGL_DEVICE void convert_block(uint32_t w_h0, uint32_t w_h1, uint2 sc, uint32_t (
 }
 
 // =============================================================================================
-// K1X: the whole expert side of one MoE call with the configuration M1 chose (one pipeline per CTA, producer
-// warp + two consumer warpgroups, tiles of up to 128 activation rows, the tensor core accumulates all of K, waits
-// drained every few stages, k32-block accumulator chains for tiles of <= 32 rows, staged epilogue). Launches:
+// K1X: the whole expert side of one MoE call. Expert kernels: persistent, one CTA per SM, a producer warpgroup (one
+// TMA thread per consumer warpgroup) and two consumer warpgroups; each consumer warpgroup runs whole tiles (128
+// weight rows x up to 128 activation rows) from its own 4-slot ring, so one warpgroup's epilogue and tile change
+// overlap the other's main loop. MXFP4 weights are converted to e4m3 A fragments in registers, the tensor core
+// accumulates all of K (waits drained every 2 stages), epilogues stage through swizzled shared memory. Launches:
 //   count, place     : expert sort of the valid slots (rows of each expert start at a multiple of 16), single-slot
 //                      tokens, the reduce list, the valid-slot list, gate/up and down tile lists, counters
 //   gather           : e4m3 token rows -> [40][rpad][128] stage-major pre-swizzled rows + row scales
@@ -220,17 +222,20 @@ SGL_DEVICE void convert_block(uint32_t w_h0, uint32_t w_h1, uint2 sc, uint32_t (
 //                      y[slot]
 //   reduce           : tokens with several slots: out[t] = sum of y over its slots in slot order (fp32, one round)
 // Slots: either the engine's top-k layout (slot s = t * K + k, ids [T * K], -1 = not local) or a pair list
-// (explicit token of each slot, slots of a token adjacent, num_valid on the device).
+// (explicit token of each slot, slots of a token adjacent, num_valid on the device). Every output row is computed by
+// the same accumulation chain whatever the batch: results do not depend on how many rows an expert gets.
 namespace k1x {
 constexpr int kNMax = 128;
 constexpr int kX = kNMax * 128;
 constexpr int kSlot = (kX + kWStage + 1023) / 1024 * 1024;
-constexpr int kRing = 8;
+constexpr int kRing = 8;  // two rings of kR2
+constexpr int kR2 = 4;
 constexpr int kEpi = kNMax * 64;  // per consumer warpgroup: rows x 32 channels bf16
 constexpr int kBarOff = kRing * kSlot;
-constexpr size_t kSmem = 1024 + kBarOff + kRing * 32 + 2 * kEpi;
+constexpr int kRowF = kNMax * 8;  // per consumer warpgroup: the tile's row scale and routing weight (down epilogue)
+constexpr size_t kSmem = 1024 + kBarOff + kRing * 32 + 2 * kEpi + 2 * kRowF;
 static_assert(kSmem <= 232448, "k1x shared memory");
-constexpr int kThreads = 288;
+constexpr int kThreads = 384;
 constexpr int kMaxE = 512;
 
 struct XP {
@@ -250,113 +255,267 @@ struct XP {
   __nv_bfloat16* __restrict__ out;     // [T][5120]
 };
 
-#ifndef K1X_SPLIT_N
-#define K1X_SPLIT_N 0
-#endif
-#ifndef K1X_PGU
-#define K1X_PGU 2  // stages between wgmma drains (measured: 8 -> 2 is -12 us, a smaller unrolled body)
-#endif
-#ifndef K1X_PDN
-#define K1X_PDN 2
-#endif
+constexpr int kPGU = 2;  // stages between wgmma drains (measured: 2 beats 4 / 8, a smaller unrolled body)
+constexpr int kPDN = 2;
 template <bool kDown>
 struct Geo {
   static constexpr int ST = kDown ? 18 : 40;               // 128-k stages
   static constexpr int JB = kDown ? 40 : 36;               // channel blocks (down: 128 output channels)
-  static constexpr int P = kDown ? K1X_PDN : K1X_PGU;      // stages between wgmma drains
+  static constexpr int P = kDown ? kPDN : kPGU;            // stages between wgmma drains
 };
 
-template <bool kDown>
-SGL_DEVICE void produce(const XP& p, uint32_t sbase, int4* hdr, uint32_t full, uint32_t empty) {
+// Issue the ST stages of one tile into the ring of kR2 slots starting at slot0 (the first stage's slot is already
+// free); `claim` (the next tile) is called at stage 1 so that its descriptor load overlaps the copies.
+template <bool kDown, class Claim>
+SGL_DEVICE int4 load_tile(
+    const XP& p, uint32_t sbase, uint32_t full, uint32_t empty, uint32_t& g, int4 td, Claim claim, int slot0) {
   using G = Geo<kDown>;
+  constexpr int R = kR2;
+  const uint32_t nb = static_cast<uint32_t>((td.w + 15) & ~15) * 128u;
+  constexpr uint32_t wbytes = kWStage;
+  const uint8_t* ws = p.w + static_cast<size_t>(td.x * G::JB + td.y) * G::ST * kWStage;
+  const uint8_t* xs = p.xa + static_cast<size_t>(td.z) * 128;
+  int4 nxt = make_int4(-1, 0, 0, 0);
+  for (int st = 0; st < G::ST; ++st, ++g) {
+    const uint32_t slot = slot0 + g % R;
+    if (st > 0 && g >= static_cast<uint32_t>(R)) mbar_wait(empty + slot * 8, ((g / R) - 1) & 1);
+    mbar_arrive_expect_tx(full + slot * 8, wbytes + nb);
+    bulk_copy(sbase + slot * kSlot + kX, ws + static_cast<size_t>(st) * wbytes, wbytes, full + slot * 8);
+    bulk_copy(sbase + slot * kSlot, xs + static_cast<size_t>(st) * p.rpad * 128, nb, full + slot * 8);
+    if (st == 1) nxt = claim();
+  }
+  return nxt;
+}
+
+// Epilogue of one 64-channel-row block (cw: which half of the tile's 128 weight rows) from its accumulators; bar: the
+// named barrier of the calling warpgroup, ebuf / sx: its staging buffer and the tile rows' scale (+ kNMax: routing
+// weight), prefetched by the caller.
+template <bool kDown, int N>
+SGL_DEVICE void epilogue(
+    const XP& p, const float (&acc)[N / 2], int4 td, int cw, int bar, int q, int lane, __nv_bfloat16* ebuf,
+    const float* sx, float cs0, float cs1, const int* dsts) {
+  // Epilogue: acc[4jj + 2ih + e2] = D[row 16q + grp + 8ih][activation row 8jj + 2c + e2].
+  const int j = td.y, r0 = td.z, n = td.w;
+  const int t_ = q * 32 + lane;
+  const int grp = lane >> 2, c = lane & 3;
+  const float* sg = sx + kNMax;
+  if constexpr (!kDown) {
+    // ih 0: gate, ih 1: the same up channel
+    const float csg = cs0, csu = cs1;
+    const float lim = p.limit, nlim = -p.limit;
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");  // the row scales copied by warp 0
+    // In blocks of kB column pairs: the block's row scales are loaded before its staging stores (a load after a
+    // shared store it may alias cannot be hoisted, which made every column wait for its own load).
+    constexpr int kB = N / 8 < 4 ? N / 8 : 4;
+#pragma unroll
+    for (int j0 = 0; j0 < N / 8; j0 += kB) {
+      float2 xs2[kB];
+#pragma unroll
+      for (int b = 0; b < kB; ++b)
+        xs2[b] = *reinterpret_cast<const float2*>(sx + 8 * (j0 + b) + 2 * c);
+      __nv_bfloat16 hv[kB][2];
+#pragma unroll
+      for (int b = 0; b < kB; ++b)
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2) {
+          const int jj = j0 + b;
+          const float xsr = e2 ? xs2[b].y : xs2[b].x;
+          float gate = bf16_round(acc[4 * jj + e2] * (xsr * csg));
+          float up = bf16_round(acc[4 * jj + 2 + e2] * (xsr * csu));
+          // the clamps as two selects each (same results, NaN included); the nested form compiled to branches
+          gate = gate > lim ? lim : gate;
+          up = up > lim ? lim : up;
+          up = up < nlim ? nlim : up;
+          const float act = bf16_round(__fdividef(gate, 1.0f + __expf(-gate)));
+          hv[b][e2] = __float2bfloat16_rn(act * up);
+        }
+#pragma unroll
+      for (int b = 0; b < kB; ++b)
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2)  // 16-byte piece q ^ (col / 2 % 4) of row col
+          ebuf[(8 * (j0 + b) + 2 * c + e2) * 32 + ((q ^ c) << 3) + grp] = hv[b][e2];
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+    const int cbase = 64 * j + 32 * cw;
+    for (int u = t_; u < n * 4; u += 128) {
+      const int row = u >> 2, part = u & 3;
+      *reinterpret_cast<uint4*>(p.h + static_cast<size_t>(r0 + row) * kI + cbase + part * 8) =
+          *reinterpret_cast<const uint4*>(ebuf + row * 32 + ((part ^ ((row >> 1) & 3)) << 3));
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+  } else {
+    // two passes (ih): 32 channels per warpgroup each, 16-byte pieces of 8 channels per (row, warp). The
+    // destination rows of this thread's pieces are loaded once, up front (one L2 latency instead of one per piece).
+    constexpr int kIt = (N * 4 + 127) / 128;
+    asm volatile("cp.async.wait_all;" ::: "memory");  // the copies issued at the tile start
+    __nv_bfloat16* orows[kIt];
+#pragma unroll
+    for (int it = 0; it < kIt; ++it) {
+      const int u = t_ + 128 * it;
+      const int d = dsts[it];
+      orows[it] = d >= 0 ? p.y + static_cast<size_t>(d) * kH : p.out + static_cast<size_t>(~d) * kH;
+    }
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+#pragma unroll
+    for (int ih = 0; ih < 2; ++ih) {
+      const float csc = ih ? cs1 : cs0;
+      constexpr int kB = N / 8 < 4 ? N / 8 : 4;  // see the gate/up epilogue
+#pragma unroll
+      for (int j0 = 0; j0 < N / 8; j0 += kB) {
+        float2 xs2[kB], gs2[kB];
+#pragma unroll
+        for (int b = 0; b < kB; ++b) {
+          xs2[b] = *reinterpret_cast<const float2*>(sx + 8 * (j0 + b) + 2 * c);
+          gs2[b] = *reinterpret_cast<const float2*>(sg + 8 * (j0 + b) + 2 * c);
+        }
+        __nv_bfloat16 hv[kB][2];
+#pragma unroll
+        for (int b = 0; b < kB; ++b)
+#pragma unroll
+          for (int e2 = 0; e2 < 2; ++e2) {
+            const int jj = j0 + b;
+            const float xv = e2 ? xs2[b].y : xs2[b].x, gv = e2 ? gs2[b].y : gs2[b].x;
+            hv[b][e2] = __float2bfloat16_rn((acc[4 * jj + 2 * ih + e2] * (csc * xv)) * gv);
+          }
+#pragma unroll
+        for (int b = 0; b < kB; ++b)
+#pragma unroll
+          for (int e2 = 0; e2 < 2; ++e2)
+            ebuf[(8 * (j0 + b) + 2 * c + e2) * 32 + ((q ^ c) << 3) + grp] = hv[b][e2];
+      }
+      asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+#pragma unroll
+      for (int it = 0; it < kIt; ++it) {
+        const int u = t_ + 128 * it;
+        if (u < n * 4) {
+          const int row = u >> 2, qq = u & 3;
+          *reinterpret_cast<uint4*>(orows[it] + 128 * j + 64 * cw + 16 * qq + 8 * ih) =
+              *reinterpret_cast<const uint4*>(ebuf + row * 32 + ((qq ^ ((row >> 1) & 3)) << 3));
+        }
+      }
+      asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
+    }
+  }
+}
+
+template <bool kDown>
+SGL_DEVICE void produce(const XP& p, uint32_t sbase, int4* hdr, uint32_t full, uint32_t empty, int ring) {
   const int nt = *p.ntiles;
+  auto claim = [&]() {
+    const int t = atomicAdd(p.ctr, 1);
+    return t < nt ? p.tiles[t] : make_int4(-1, 0, 0, 0);
+  };
+  const int slot0 = ring * kR2;
   uint32_t g = 0;
-  int t = atomicAdd(p.ctr, 1);
-  int4 td = t < nt ? p.tiles[t] : make_int4(-1, 0, 0, 0);
+  int4 td = claim();
   while (true) {
-    uint32_t slot = g % kRing;
-    if (g >= static_cast<uint32_t>(kRing)) mbar_wait(empty + slot * 8, ((g / kRing) - 1) & 1);
+    const uint32_t slot = slot0 + g % kR2;
+    if (g >= static_cast<uint32_t>(kR2)) mbar_wait(empty + slot * 8, ((g / kR2) - 1) & 1);
     hdr[slot] = td;
     if (td.x < 0) {
       mbar_arrive(full + slot * 8);
       break;
     }
-    const uint32_t nb = static_cast<uint32_t>((td.w + 15) & ~15) * 128u;
-    const uint8_t* ws = p.w + static_cast<size_t>(td.x * G::JB + td.y) * G::ST * kWStage;
-    const uint8_t* xs = p.xa + static_cast<size_t>(td.z) * 128;
-    int4 nxt = make_int4(-1, 0, 0, 0);
-    for (int st = 0; st < G::ST; ++st, ++g) {
-      slot = g % kRing;
-      if (st > 0 && g >= static_cast<uint32_t>(kRing)) mbar_wait(empty + slot * 8, ((g / kRing) - 1) & 1);
-      mbar_arrive_expect_tx(full + slot * 8, kWStage + nb);
-      bulk_copy(sbase + slot * kSlot + kX, ws + static_cast<size_t>(st) * kWStage, kWStage, full + slot * 8);
-      bulk_copy(sbase + slot * kSlot, xs + static_cast<size_t>(st) * p.rpad * 128, nb, full + slot * 8);
-      if (st == 1) {
-        const int tn = atomicAdd(p.ctr, 1);
-        nxt = tn < nt ? p.tiles[tn] : make_int4(-1, 0, 0, 0);
-      }
-    }
-    td = nxt;
+    td = load_tile<kDown>(p, sbase, full, empty, g, td, claim, slot0);
   }
 }
 
 template <bool kDown, int N>
 SGL_DEVICE void tile(
-    const XP& p, uint32_t sbase, const uint8_t* sbasep, uint32_t full, uint32_t empty, uint32_t& g, int4 td, int cw,
+    const XP& p, uint32_t sbase, const uint8_t* sbasep, uint32_t full, uint32_t empty, uint32_t& g, int4 td, int wg,
     int q, int lane, __nv_bfloat16* ebuf) {
   using G = Geo<kDown>;
   constexpr int kD = N / 2;
-  // Independent accumulator chains for narrow tiles (K1X_SPLIT_N > 0: tiles of <= that many rows keep one chain per
-  // k32 block, ~3 us faster per call) change the summation order with the tile width, i.e. a row's output would depend
-  // on how many rows its expert got in the call. Off by default: every row's output is independent of the batch.
-  constexpr int kS = N <= K1X_SPLIT_N ? 4 : 1;
   static_assert(G::ST % G::P == 0 && G::P % 2 == 0, "drain blocks");
-  const int grp = lane >> 2, c = lane & 3;
-  float t[kS][kD];
+  const int grp = lane >> 2;
+  float t[2][kD];
 #pragma unroll
-  for (int u = 0; u < kS; ++u)
+  for (int m = 0; m < 2; ++m)
 #pragma unroll
     for (int i = 0; i < kD; ++i)
-      t[u][i] = 0.f;
-  const int woff = ((cw * 4 + q) * 2) * 512 + lane * 16;
-  const int soff = 8192 + ((cw * 4 + q) * 8 + grp) * 8;
-  auto lc = [&](uint32_t gs, uint32_t (&a)[4][4]) {
-    const uint32_t slot = gs % kRing;
+      t[m][i] = 0.f;
+  const int slot0 = wg * kR2;
+  auto lc = [&](uint32_t gs, uint32_t (&a)[2][4][4]) {
+    const uint32_t slot = slot0 + gs % kR2;
     const uint8_t* wb = sbasep + slot * kSlot + kX;
-    mbar_wait(full + slot * 8, (gs / kRing) & 1);
-    const uint4 w0 = *reinterpret_cast<const uint4*>(wb + woff);
-    const uint4 w1 = *reinterpret_cast<const uint4*>(wb + woff + 512);
-    const uint2 sc = *reinterpret_cast<const uint2*>(wb + soff);
-    convert_block<0>(w0.x, w0.y, sc, a[0]);
-    convert_block<1>(w0.z, w0.w, sc, a[1]);
-    convert_block<2>(w1.x, w1.y, sc, a[2]);
-    convert_block<3>(w1.z, w1.w, sc, a[3]);
+    mbar_wait(full + slot * 8, (gs / kR2) & 1);
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int m = 0; m < 2; ++m) {  // the 64-row half m of the tile
+      const int woff = ((m * 4 + q) * 2) * 512 + lane * 16;
+      const int soff = 8192 + ((m * 4 + q) * 8 + grp) * 8;
+      const uint4 w0 = *reinterpret_cast<const uint4*>(wb + woff);
+      const uint4 w1 = *reinterpret_cast<const uint4*>(wb + woff + 512);
+      const uint2 sc = *reinterpret_cast<const uint2*>(wb + soff);
+      convert_block<0>(w0.x, w0.y, sc, a[m][0]);
+      convert_block<1>(w0.z, w0.w, sc, a[m][1]);
+      convert_block<2>(w1.x, w1.y, sc, a[m][2]);
+      convert_block<3>(w1.z, w1.w, sc, a[m][3]);
+    }
 #pragma unroll
-      for (int k = 0; k < 4; ++k)
-        asm volatile("" : "+r"(a[i][k])::"memory");
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+          asm volatile("" : "+r"(a[m][i][k])::"memory");
   };
-  auto issue = [&](uint32_t gs, const uint32_t (&a)[4][4], int first) {
-    const uint32_t xs = sbase + (gs % kRing) * kSlot;
-#pragma unroll
-    for (int u = 0; u < kS; ++u)
-      fence_operands(t[u]);
+  auto issue = [&](uint32_t gs, const uint32_t (&a)[2][4][4], int first) {
+    const uint32_t xs = sbase + (slot0 + gs % kR2) * kSlot;
+    fence_operands(t[0]);
+    fence_operands(t[1]);
     wgmma_fence();
 #pragma unroll
-    for (int k = 0; k < 4; ++k)
-      wgmma_acc<N>(t[k % kS], a[k], make_desc(xs + 32 * k), (first && (kS > 1 || k == 0)) ? 0 : 1);
-    wgmma_commit();
+    for (int m = 0; m < 2; ++m)
 #pragma unroll
-    for (int u = 0; u < kS; ++u)
-      fence_operands(t[u]);
+      for (int k = 0; k < 4; ++k)
+        wgmma_acc<N>(t[m], a[m][k], make_desc(xs + 32 * k), (first && k == 0) ? 0 : 1);
+    wgmma_commit();
+    fence_operands(t[0]);
+    fence_operands(t[1]);
   };
   auto release = [&](uint32_t gs) {
     __syncwarp();
-    if (lane == 0) mbar_arrive(empty + (gs % kRing) * 8);
+    if (lane == 0) mbar_arrive(empty + (slot0 + gs % kR2) * 8);
   };
-  uint32_t aA[4][4], aB[4][4];
+  uint32_t aA[2][4][4], aB[2][4][4];
   lc(g, aA);
+  // epilogue operands (see tile()): row scales (+ routing weights) -> this warpgroup's SMEM, channel scales of both
+  // halves and destination rows -> registers
+  const uint32_t sxa = smem_u32(ebuf) + (2 - wg) * kEpi + wg * kRowF;
+  {
+    const int nv4 = (td.w + 3) / 4;
+    if (q == 0 && lane < nv4) {
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sxa + lane * 16), "l"(p.xrs + td.z + 4 * lane)
+                   : "memory");
+    } else if (kDown && q == 1 && lane < nv4) {
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sxa + kNMax * 4 + lane * 16),
+                   "l"(p.gam + td.z + 4 * lane) : "memory");
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  }
+  constexpr int kIt = (N * 4 + 127) / 128;
+  int dsts[kDown ? kIt : 1];
+  if constexpr (kDown) {
+#pragma unroll
+    for (int it = 0; it < kIt; ++it) {
+      const int u = q * 32 + lane + 128 * it;
+      dsts[it] = u < td.w * 4 ? __ldg(p.dst + td.z + (u >> 2)) : 0;
+    }
+  }
+  float cs[2][2];
+#pragma unroll
+  for (int m = 0; m < 2; ++m) {
+    if constexpr (!kDown) {
+      const int ch = 64 * td.y + 32 * m + 8 * q + grp;
+      cs[m][0] = __ldg(p.cs + (2 * td.x) * kI + ch);
+      cs[m][1] = __ldg(p.cs + (2 * td.x + 1) * kI + ch);
+    } else {
+      const int ch = 128 * td.y + 64 * m + 16 * q + grp;
+      cs[m][0] = __ldg(p.cs + td.x * kH + ch);
+      cs[m][1] = __ldg(p.cs + td.x * kH + ch + 8);
+    }
+  }
 #pragma unroll 1
   for (int blk = 0; blk < G::ST / G::P; ++blk) {
 #pragma unroll
@@ -377,82 +536,12 @@ SGL_DEVICE void tile(
     wgmma_wait<0>();
     release(g - 1);
   }
-  float acc[kD];
+  fence_operands(t[0]);
+  fence_operands(t[1]);
+  const float* sx = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ebuf) + (2 - wg) * kEpi + wg * kRowF);
 #pragma unroll
-  for (int i = 0; i < kD; ++i)
-    acc[i] = 0.f;
-#pragma unroll
-  for (int u = 0; u < kS; ++u) {
-    fence_operands(t[u]);
-#pragma unroll
-    for (int i = 0; i < kD; ++i)
-      acc[i] += t[u][i];
-  }
-  // Epilogue: acc[4jj + 2ih + e2] = D[row 16q + grp + 8ih][activation row 8jj + 2c + e2].
-  const int e = td.x, j = td.y, r0 = td.z, n = td.w;
-  const int t_ = q * 32 + lane;
-  if constexpr (!kDown) {
-    const int ch = 64 * j + 32 * cw + 8 * q + grp;  // ih 0: gate, ih 1: the same up channel
-    const float csg = p.cs[(2 * e) * kI + ch];
-    const float csu = p.cs[(2 * e + 1) * kI + ch];
-    const float lim = p.limit;
-#pragma unroll
-    for (int jj = 0; jj < N / 8; ++jj)
-#pragma unroll
-      for (int e2 = 0; e2 < 2; ++e2) {
-        const int col = 8 * jj + 2 * c + e2;
-        const float xsr = __ldg(p.xrs + r0 + col);
-        float gate = bf16_round(acc[4 * jj + e2] * (xsr * csg));
-        float up = bf16_round(acc[4 * jj + 2 + e2] * (xsr * csu));
-        gate = gate > lim ? lim : gate;
-        up = up > lim ? lim : (up < -lim ? -lim : up);
-        const float act = bf16_round(__fdividef(gate, 1.0f + __expf(-gate)));
-        ebuf[col * 32 + 8 * q + grp] = __float2bfloat16_rn(act * up);
-      }
-    asm volatile("bar.sync %0, 128;" ::"r"(1 + cw) : "memory");
-    const int cbase = 64 * j + 32 * cw;
-    for (int u = t_; u < n * 4; u += 128) {
-      const int row = u >> 2, part = u & 3;
-      *reinterpret_cast<uint4*>(p.h + static_cast<size_t>(r0 + row) * kI + cbase + part * 8) =
-          *reinterpret_cast<const uint4*>(ebuf + row * 32 + part * 8);
-    }
-    asm volatile("bar.sync %0, 128;" ::"r"(1 + cw) : "memory");
-  } else {
-    // two passes (ih): 32 channels per warpgroup each, 16-byte pieces of 8 channels per (row, warp). The
-    // destination rows of this thread's pieces are loaded once, up front (one L2 latency instead of one per piece).
-    constexpr int kIt = (N * 4 + 127) / 128;
-    __nv_bfloat16* orows[kIt];
-#pragma unroll
-    for (int it = 0; it < kIt; ++it) {
-      const int u = t_ + 128 * it;
-      const int d = u < n * 4 ? __ldg(p.dst + r0 + (u >> 2)) : 0;
-      orows[it] = d >= 0 ? p.y + static_cast<size_t>(d) * kH : p.out + static_cast<size_t>(~d) * kH;
-    }
-#pragma unroll
-    for (int ih = 0; ih < 2; ++ih) {
-      const int ch = 128 * j + 64 * cw + 16 * q + 8 * ih + grp;
-      const float csc = p.cs[e * kH + ch];
-#pragma unroll
-      for (int jj = 0; jj < N / 8; ++jj)
-#pragma unroll
-        for (int e2 = 0; e2 < 2; ++e2) {
-          const int col = 8 * jj + 2 * c + e2;
-          const float v = (acc[4 * jj + 2 * ih + e2] * (csc * __ldg(p.xrs + r0 + col))) * __ldg(p.gam + r0 + col);
-          ebuf[col * 32 + 8 * q + grp] = __float2bfloat16_rn(v);
-        }
-      asm volatile("bar.sync %0, 128;" ::"r"(1 + cw) : "memory");
-#pragma unroll
-      for (int it = 0; it < kIt; ++it) {
-        const int u = t_ + 128 * it;
-        if (u < n * 4) {
-          const int row = u >> 2, qq = u & 3;
-          *reinterpret_cast<uint4*>(orows[it] + 128 * j + 64 * cw + 16 * qq + 8 * ih) =
-              *reinterpret_cast<const uint4*>(ebuf + row * 32 + qq * 8);
-        }
-      }
-      asm volatile("bar.sync %0, 128;" ::"r"(1 + cw) : "memory");
-    }
-  }
+  for (int m = 0; m < 2; ++m)
+    epilogue<kDown, N>(p, t[m], td, m, 1 + wg, q, lane, ebuf, sx, cs[m][0], cs[m][1], dsts);
 }
 
 template <bool kDown>
@@ -466,24 +555,27 @@ __global__ void __launch_bounds__(kThreads, 1) kernel(const __grid_constant__ XP
   const int tid = threadIdx.x;
   const int warp = uniform(tid / 32);
   const int lane = tid % 32;
+  static_assert(2 * kR2 == kRing, "two rings in the slots");
   if (tid == 0) {
     for (int i = 0; i < kRing; ++i) {
       mbar_init(full + i * 8, 1);
-      mbar_init(empty + i * 8, 8);
+      mbar_init(empty + i * 8, 4);
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncthreads();
-  if (warp == 8) {
-    if (lane == 0) produce<kDown>(p, base, hdr, full, empty);
+  if (warp >= 8) {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+    if (warp < 10 && lane == 0) produce<kDown>(p, base, hdr, full, empty, warp - 8);
     return;
   }
-  const int cw = warp / 4, q = warp % 4;
-  __nv_bfloat16* ebuf = reinterpret_cast<__nv_bfloat16*>(basep + kBarOff + kRing * 32) + cw * (kEpi / 2);
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n" ::: "memory");
+  const int wg = warp / 4, q = warp % 4;
+  __nv_bfloat16* ebuf = reinterpret_cast<__nv_bfloat16*>(basep + kBarOff + kRing * 32) + wg * (kEpi / 2);
   uint32_t g = 0;
   while (true) {
-    const uint32_t slot = g % kRing;
-    mbar_wait(full + slot * 8, (g / kRing) & 1);
+    const uint32_t slot = wg * kR2 + g % kR2;
+    mbar_wait(full + slot * 8, (g / kR2) & 1);
     int4 td = hdr[slot];
     td.x = uniform(td.x);
     td.y = uniform(td.y);
@@ -491,14 +583,14 @@ __global__ void __launch_bounds__(kThreads, 1) kernel(const __grid_constant__ XP
     td.w = uniform(td.w);
     if (td.x < 0) break;
     switch ((td.w + 15) >> 4) {
-      case 1: tile<kDown, 16>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 2: tile<kDown, 32>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 3: tile<kDown, 48>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 4: tile<kDown, 64>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 5: tile<kDown, 80>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 6: tile<kDown, 96>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      case 7: tile<kDown, 112>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
-      default: tile<kDown, 128>(p, base, basep, full, empty, g, td, cw, q, lane, ebuf); break;
+      case 1: tile<kDown, 16>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 2: tile<kDown, 32>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 3: tile<kDown, 48>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 4: tile<kDown, 64>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 5: tile<kDown, 80>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 6: tile<kDown, 96>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      case 7: tile<kDown, 112>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
+      default: tile<kDown, 128>(p, base, basep, full, empty, g, td, wg, q, lane, ebuf); break;
     }
   }
 }
@@ -742,7 +834,7 @@ __global__ void reduce_kernel(
 
 // ---- host entry points
 namespace {
-bool g_k1x_attr[2] = {false, false};
+bool g_k1x_attr[2] = {false, false};  // internal linkage: one flag per JIT module (inline statics merge)
 }  // namespace
 
 inline void x_quant(
