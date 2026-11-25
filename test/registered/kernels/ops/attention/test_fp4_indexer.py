@@ -942,6 +942,171 @@ def test_fp4_paged_logits_prmt_dequant_and_block_mask_bit_identical(
         )
 
 
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("dyadic", [True, False])
+@pytest.mark.parametrize("prmt", [False, True])
+@pytest.mark.parametrize(
+    "requests,group,ratio,width,kept",
+    [
+        (3, 4, 1, 193, 16),
+        (7, 4, 1, 16385, 512),
+        (5, 6, 2, 8193, 256),
+        (9, 2, 1, 4097, 600),
+        (4, 4, 1, 32769, 2048),
+    ],
+)
+def test_fp4_candidate_consumer_matches_full_path(
+    requests, group, ratio, width, kept, prmt, dyadic
+):
+    """SGLANG_OPT_DSV4_DECODE_INDEXER_CANDIDATES_ONLY: scoring only the union of
+    a verify group's kept blocks gives, at every compacted column, the score the
+    full tensor-core path writes at that position, and the same page indices after
+    the top-k and the finish (ties included: dyadic scores tie a lot). Under graph
+    replay with changing lengths, candidate blocks, request order and page tables,
+    at a 1M-position capacity (the mask is as wide as the model context)."""
+    from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+        candidate_block_keep,
+    )
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_candidates import (
+        candidate_union,
+        finish_candidate_topk,
+        fp4_index_logits_candidates,
+    )
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+    from sglang.srt.environ import envs
+
+    heads, block, topk = 32, 8, 512
+    batch = requests * group
+    q, weights, slots, _, table = _make_logits_case(
+        batch, heads, width, group=group, dyadic=dyadic
+    )
+    capacity = 1048580 // ratio // block * block
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.full(
+        (requests, capacity * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::group] * ratio).int()
+    lengths = torch.zeros(batch, device=q.device, dtype=torch.int32)
+    blocks = torch.full((batch, kept), -1, device=q.device, dtype=torch.int32)
+    gen = torch.Generator(device=q.device).manual_seed(11)
+
+    def set_step(visible: int):
+        # verify rows: the group's last row sees `visible`, earlier rows one less each
+        lengths.copy_(
+            (visible - torch.arange(batch, device=q.device).flip(0) % group).clamp_min(
+                0
+            )
+        )
+        nb = (lengths.to(torch.int64) + block - 1) // block
+        # each row keeps up to `kept` of its own blocks, its newest block always
+        r = torch.rand(
+            batch, max(1, -(-width // block)), device=q.device, generator=gen
+        )
+        ids = r.argsort(dim=1)[:, :kept].to(torch.int32)
+        ids = torch.where(ids < nb[:, None], ids, -1)
+        ids[:, 0] = torch.where(nb > 0, nb - 1, -1).to(torch.int32)
+        blocks.fill_(-1)
+        blocks[:, : ids.shape[1]] = ids[:, :kept]
+
+    def full_path(mask):
+        scores = fp4_index_logits_paged(
+            q,
+            weights,
+            req,
+            req_table,
+            lengths,
+            table,
+            PAGE_SIZE,
+            capacity,
+            ratio,
+            mask,
+            rows_per_request=group,
+            mask_block=block,
+        )
+        k = min(topk, capacity)
+        idx = torch.empty((batch, k), dtype=torch.int32, device=q.device)
+        topk_transform_paged_v2(scores, lengths, None, idx, 1, plan_topk_v2(lengths))
+        pages = torch.full((batch, topk), -7, dtype=torch.int32, device=q.device)
+        finish_paged_indexer_topk(
+            idx, scores, lengths, req, req_table, pages, None, ratio, True
+        )
+        return scores, pages
+
+    def candidates_path(mask, pages):
+        ublk, ucount, compact_lens = candidate_union(mask, lengths, group, kept)
+        scores = fp4_index_logits_candidates(
+            q,
+            weights,
+            req,
+            req_table,
+            table,
+            PAGE_SIZE,
+            ratio,
+            mask,
+            ublk,
+            ucount,
+            compact_lens,
+            group,
+        )
+        k = min(topk, capacity)
+        idx = torch.empty((batch, k), dtype=torch.int32, device=q.device)
+        topk_transform_paged_v2(
+            scores, compact_lens, None, idx, 1, plan_topk_v2(compact_lens)
+        )
+        finish_candidate_topk(
+            idx, scores, compact_lens, ublk, req, req_table, pages, ratio, group
+        )
+        return ublk, ucount, compact_lens, scores
+
+    with envs.SGLANG_OPT_DSV4_DECODE_INDEXER_PRMT_DEQUANT.override(prmt):
+        set_step(width)
+        mask = candidate_block_keep(blocks, capacity, block)
+        pages = torch.full((batch, topk), -7, dtype=torch.int32, device=q.device)
+        for _ in range(2):
+            candidates_path(mask, pages)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = candidates_path(mask, pages)
+        for step, visible in enumerate([width, 1, 8, 9, 63, 129, width - 5, width]):
+            set_step(visible)
+            mask.copy_(candidate_block_keep(blocks, capacity, block))
+            req_table[:, : width * ratio : ratio] = (
+                slots[::group].roll(step, 1) * ratio
+            ).int()
+            req.copy_(req.roll(group))
+            q.neg_()
+            pages.fill_(-7)
+            graph.replay()
+            ublk, ucount, compact_lens, scores = out
+            ref_scores, ref_pages = full_path(mask)
+            assert torch.equal(pages, ref_pages), f"page indices differ at {visible=}"
+            # the union: ascending ids of every block a row of the group keeps
+            for g in range(requests):
+                keep = mask[g * group : (g + 1) * group, :-1].any(dim=0)
+                want = keep.nonzero().flatten().to(torch.int32)
+                assert int(ucount[g]) == want.numel()
+                assert torch.equal(ublk[g, : want.numel()], want)
+            # scores: compacted column c is position ublk[g, c // 8] * 8 + c % 8
+            col = torch.arange(scores.shape[1], device=q.device)
+            grp = torch.arange(batch, device=q.device) // group
+            pos = ublk[grp][:, col // block].to(torch.int64) * block + col % block
+            live = col[None, :] < compact_lens[:, None]
+            ref = torch.gather(ref_scores, 1, pos.clamp(0, ref_scores.shape[1] - 1))
+            assert torch.equal(
+                scores[live].view(torch.int32), ref[live].view(torch.int32)
+            )
+            # nothing the full path keeps finite is missing from the compacted axis
+            vis = torch.arange(ref_scores.shape[1], device=q.device)[None, :] < lengths[
+                :, None
+            ].to(torch.int64)
+            assert int(torch.isfinite(ref_scores[vis]).sum()) == int(
+                torch.isfinite(scores[live]).sum()
+            )
+
+
 def test_candidate_block_keep_matches_mask():
     """The per-block flags expand to exactly the per-position candidate mask."""
     from sglang.kernels.ops.attention.dsv4.candidate_blocks import (

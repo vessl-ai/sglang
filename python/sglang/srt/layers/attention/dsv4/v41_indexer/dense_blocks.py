@@ -30,6 +30,7 @@ from .scoring import (
     prefill_requests,
     score_tiles,
     select_decode,
+    select_decode_candidates,
     write_decode,
     write_prefill,
 )
@@ -85,6 +86,11 @@ class DenseBlocksBackend:
 
         # Only the Hopper paged decode builds and reads decode_mask.
         self.use_block_mask = envs.SGLANG_OPT_DSV4_DECODE_INDEXER_BLOCK_MASK.get()
+        # Consumers score only the candidate blocks (needs the per-block flags).
+        self.candidates_only = (
+            self.use_block_mask
+            and envs.SGLANG_OPT_DSV4_DECODE_INDEXER_CANDIDATES_ONLY.get()
+        )
         # DeepGEMM prefill: one candidate pass per score tile instead of per request.
         self.batched_blocks = envs.SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS.get()
         # This backend serves decode only where DeepGEMM does not (Hopper).
@@ -164,6 +170,20 @@ class DenseBlocksBackend:
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if (
+            self.candidates_only
+            and published is not None
+            and published.decode_mask is not None
+            and published.decode_mask_block == self.block_size
+            and select_decode_candidates(
+                inputs=inputs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+                candidate_mask=published.decode_mask,
+                topk_blocks=self.topk_blocks,
+            )
+        ):
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
