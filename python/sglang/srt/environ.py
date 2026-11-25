@@ -1900,7 +1900,8 @@ class Envs:
     SGLANG_OPT_DSV4_EP_DECODE_MOE_MAX_VSLOTS = EnvInt(131072)
     # INF-730: the expert kernel of SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP: "v2w" = whole 2304-wide experts
     # (dsv4_mxfp4_decode_moe_v2w; h quantized per whole row, ~0.4% from TP4), "virtual" = the v2 kernel on
-    # 576-channel virtual experts (rows bit-identical to TP4's slices).
+    # 576-channel virtual experts (rows bit-identical to TP4's slices), "k1" = INF-874's kernel
+    # (dsv4_mxfp4_decode_moe_k1: block scales folded per channel, ~1% from v2w; layers it cannot fold exactly keep v2w).
     SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL = EnvStr("v2w")
     # INF-730: the expert-parallel decode MoE's communication (srt/layers/moe/ep_decode_comm.py), on decode
     # forwards of the layers SGLANG_OPT_DSV4_SM90_DECODE_MOE_W4A8_EP covers: "" (default) keeps the BF16
