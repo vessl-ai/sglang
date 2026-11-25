@@ -660,6 +660,8 @@ class Mxfp4MarlinMoEMethod:
             layer.w2_weight_scale_inv.data,
             mode=mode,
         )
+        # "k1" falls back to v2w on a layer whose block scales it cannot fold exactly
+        kernel = "k1" if type(self._sm90_packed).__name__ == "PackedK1" else mode
         del layer.w13_weight, layer.w2_weight
         del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
         torch.cuda.empty_cache()
@@ -667,8 +669,8 @@ class Mxfp4MarlinMoEMethod:
             logger,
             "Using the SM90 decode MoE kernel on an expert-parallel layer: "
             + (
-                f"v2w, {num_local} local whole experts (intermediate {inter}) "
-                if mode == "v2w"
+                f"{kernel}, {num_local} local whole experts (intermediate {inter}) "
+                if mode in ("v2w", "k1")
                 else f"W4A8 v2, {num_local} local experts x {split} virtual 576-channel experts "
             )
             + f"(layer: {self.prefix})",
@@ -680,10 +682,10 @@ class Mxfp4MarlinMoEMethod:
             num_local * split,
             split,
             int(top_k),
-            inter if mode == "v2w" else None,
+            inter if mode in ("v2w", "k1") else None,
         )
         self._ep_split = split
-        layer._dsv4_mxfp4_backend = f"sm90_decode_w4a8_ep_{mode}"
+        layer._dsv4_mxfp4_backend = f"sm90_decode_w4a8_ep_{kernel}"
         return True
 
     def _prepare_triton_kernels_weights(self, layer: Module) -> None:

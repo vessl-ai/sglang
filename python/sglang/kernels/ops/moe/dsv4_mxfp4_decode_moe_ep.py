@@ -33,6 +33,10 @@ Kernels (SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL):
   experts (64-row passes, grid-wide h quantization). S = 1: one slot per (token, k), y = T * K rows. h is quantized
   once per 2304-wide row (TP4 quantizes each 576 slice), so the numerics differ from TP4 by ~0.4% (a-moe).
 - ``virtual``: the v2 kernel on S = 4 virtual 576-channel experts per local expert (above), bit-identical rows to TP4.
+- ``k1`` (INF-874): ``dsv4_mxfp4_decode_moe_k1`` (block scales folded per channel at load time, tiles of up to 128
+  rows, tensor-core accumulation over all of K; its own prologue and combine). S = 1, whole experts. Output differs
+  from v2w by ~1% relative L2 (both ~2.7% from fp32 math, mostly h's e4m3 quantization). A layer whose MX block
+  exponents span more than 11 inside a channel (the fold would not be exact) keeps v2w.
 Both use this module's prologue (routing + row quantization) and combine, so the pre-quantized input of a
 dispatch (``row_quant``) works for both.
 
@@ -70,9 +74,9 @@ def kernel_mode() -> str:
     from sglang.srt.environ import envs
 
     mode = envs.SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL.get()
-    if mode not in ("v2w", "virtual"):
+    if mode not in ("v2w", "virtual", "k1"):
         raise ValueError(
-            f"SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL must be 'v2w' or 'virtual', got {mode!r}"
+            f"SGLANG_OPT_DSV4_EP_DECODE_MOE_KERNEL must be 'v2w', 'virtual' or 'k1', got {mode!r}"
         )
     return mode
 
@@ -87,7 +91,7 @@ def split_of(inter_per_rank: int) -> int:
 def supports_ep(
     hidden: int, inter_per_rank: int, num_local_experts: int, mode: str = "virtual"
 ) -> bool:
-    if mode == "v2w":
+    if mode in ("v2w", "k1"):
         return (
             hidden == HIDDEN
             and inter_per_rank in V2W_WIDTHS
@@ -147,6 +151,13 @@ def pack_experts_ep(w13, s13, w2, s2, expert_chunk: int = 8, mode: str = "virtua
     experts; ``v2w`` = v2w.PackedExperts over the E whole experts, S = 1. Packs ``expert_chunk`` experts at a time,
     so the transient copy is a few experts, not the layer."""
     E = w13.shape[0]
+    if mode == "k1":
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_k1 as k1
+
+        packed = k1.pack_layer(w13, s13, w2, s2, expert_chunk)
+        if packed is not None:
+            return packed, 1
+        mode = "v2w"  # a block exponent span > 11 inside a channel: the fold would not be exact
     # Byte views: the reorder copies bytes, and e8m0 has few kernels.
     w13, s13, w2, s2 = (t.view(torch.uint8) for t in (w13, s13, w2, s2))
     out13 = out2 = (
@@ -419,6 +430,13 @@ def _decode_moe_ep_call(
     return_y: bool,
 ):
     num_tokens, top_k = topk_ids.shape
+    from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_k1 as k1
+
+    if isinstance(packed, k1.PackedK1):
+        assert split == 1, split
+        x8f, xs = _row_quant(hidden_states) if row_quant is None else row_quant
+        y = k1.decode_ep(x8f, xs, topk_ids, topk_weights, packed, swiglu_limit, output)
+        return y if return_y else None
     num_virtual = packed.w13.shape[0]
     assert num_virtual % split == 0, (num_virtual, split)
     dev = output.device
@@ -534,6 +552,11 @@ def prepare_ep(
     kernel's JIT module and kernels, the Triton prologue and combine for this top-k and split), with calls on a
     routing whose every slot is masked (no expert work, no weight read). The first MoE call of CUDA graph capture
     then compiles and loads nothing. ``inter``: the v2w kernel's whole-expert width (None: the virtual v2 path)."""
+    if inter is not None and kernel_mode() == "k1":
+        from sglang.kernels.ops.moe import dsv4_mxfp4_decode_moe_k1 as k1
+
+        k1.prepare_ep(device_index, num_virtual, top_k)
+        v2w.prepare(device_index, inter)  # a layer may have fallen back to v2w
     if inter is None:
         v2.prepare(device_index)
     else:
