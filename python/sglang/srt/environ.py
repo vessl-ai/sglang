@@ -1966,6 +1966,11 @@ class Envs:
     # interleaved, the GEMM writes the bf16 SwiGLU output (half the bytes) and a row
     # quantization replaces the separate SwiGLU + quant kernel.
     SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU = EnvBool(False)
+    # INF-874: the MXFP4 -> FP8 word conversion kernel computes its word, row and expert
+    # indices in int32 (tensors under 2^31 words) instead of int64. Same bits; the
+    # interleaved (FUSED_SWIGLU) w13 conversion drops from 1.52 to 1.25 ms per layer on
+    # H200 at the power cap (-0.19..-0.22 J per layer, measured standalone).
+    SGLANG_OPT_DSV4_MXFP4_CONVERT_I32 = EnvBool(False)
     # The top-k sum also adds the shared expert's output in place (one pass over the
     # tokens instead of the sum + a separate add); needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
     SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD = EnvBool(False)

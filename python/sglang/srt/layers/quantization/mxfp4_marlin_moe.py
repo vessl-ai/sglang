@@ -537,7 +537,8 @@ class Mxfp4MarlinMoEMethod:
             f"fused_swiglu={envs.SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU.get()} "
             f"fused_shared_add={_w4a8_fused_shared_add()} "
             f"counting_route={envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get()} "
-            f"w2_two_cta_min_rows={envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get()})",
+            f"w2_two_cta_min_rows={envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get()} "
+            f"convert_index_i32={envs.SGLANG_OPT_DSV4_MXFP4_CONVERT_I32.get()})",
         )
         self._w4a8 = Mxfp4W4A8PrefillExperts(
             layer.w13_weight.data,
@@ -553,6 +554,7 @@ class Mxfp4MarlinMoEMethod:
             fused_shared_add=_w4a8_fused_shared_add(),
             counting_route=envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get(),
             w2_two_cta_min_rows=envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get(),
+            convert_index_i32=envs.SGLANG_OPT_DSV4_MXFP4_CONVERT_I32.get(),
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 

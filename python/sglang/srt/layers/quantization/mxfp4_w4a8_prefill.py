@@ -190,6 +190,7 @@ def _mxfp4_to_fp8_words_kernel(
     BLOCKS_PER_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
     INTERLEAVE_HALF: tl.constexpr = 0,
+    INDEX_I32: tl.constexpr = False,
 ):
     # Same result as _mxfp4_to_fp8_kernel, bit for bit, but on 32-bit words (8 nibbles,
     # 4 words per scale block) with the nibble table in registers (prmt) instead of a
@@ -197,7 +198,13 @@ def _mxfp4_to_fp8_words_kernel(
     # so it keeps its speed beside other kernels on fewer SMs.
     # INTERLEAVE_HALF = h > 0: each expert has 2h rows [gate; up]; output row r goes to
     # 2r (gate) or 2(r - h) + 1 (up), the layout of a fused SwiGLU epilogue.
-    pid = tl.program_id(0).to(tl.int64)
+    # INDEX_I32 (n_words < 2^31, checked by the caller): word, row and expert indices in
+    # int32. The interleave's three divisions on int64 cost ~20% of the interleaved
+    # conversion's time (H200: 1.25 vs 1.52 ms per layer); same addresses, same bits.
+    if INDEX_I32:
+        pid = tl.program_id(0)
+    else:
+        pid = tl.program_id(0).to(tl.int64)
     wi = first_word + pid * BLOCK + tl.arange(0, BLOCK)
     m = wi < n_words
     w = tl.load(W + wi, mask=m, other=0)
@@ -214,9 +221,14 @@ def _mxfp4_to_fp8_words_kernel(
         words_per_row = BLOCKS_PER_ROW * 4
         row = wi // words_per_row
         e = row // (2 * INTERLEAVE_HALF)
-        r = row % (2 * INTERLEAVE_HALF)
+        if INDEX_I32:
+            r = row - e * (2 * INTERLEAVE_HALF)
+            col = wi - row * words_per_row
+        else:
+            r = row % (2 * INTERLEAVE_HALF)
+            col = wi % words_per_row
         r2 = tl.where(r < INTERLEAVE_HALF, 2 * r, 2 * (r - INTERLEAVE_HALF) + 1)
-        wo = (e * (2 * INTERLEAVE_HALF) + r2) * words_per_row + wi % words_per_row
+        wo = (e * (2 * INTERLEAVE_HALF) + r2) * words_per_row + col
     else:
         wo = wi
     tl.store(OUT + wo, (hi.to(tl.int64) << 32) | (lo.to(tl.int64) & 0xFFFFFFFF), mask=m)
@@ -229,6 +241,7 @@ def _mxfp4_to_fp8(
     out,
     num_launches: int = 0,
     interleave_half: int = 0,
+    index_i32: bool = False,
 ):
     """[E, N, K/2] packed e2m1 + [E, N, K/32] e8m0 -> [E, N, K] e4m3 (scaled by 2^(133 - smax)).
 
@@ -240,6 +253,8 @@ def _mxfp4_to_fp8(
     one slice and then runs beside the remaining slices.
     interleave_half = h > 0 (word kernel only): store the 2h rows of each expert as
     gate/up pairs (row r -> 2r for r < h, 2(r - h) + 1 otherwise).
+    index_i32 (word kernel only, SGLANG_OPT_DSV4_MXFP4_CONVERT_I32): int32 index
+    arithmetic when the tensor has fewer than 2^31 words, else int64 as without it.
     """
     if interleave_half > 0:
         num_launches = max(num_launches, 1)
@@ -261,6 +276,8 @@ def _mxfp4_to_fp8(
     n_words = w.numel() // 4
     n_programs = triton.cdiv(n_words, _WORDS_BLOCK)
     per_launch = triton.cdiv(n_programs, num_launches)
+    # The last program's words reach n_programs * _WORDS_BLOCK - 1 (masked past n_words).
+    index_i32 = index_i32 and n_programs * _WORDS_BLOCK < 2**31
     for first in range(0, n_programs, per_launch):
         _mxfp4_to_fp8_words_kernel[(min(per_launch, n_programs - first),)](
             w.view(torch.int32),
@@ -272,6 +289,7 @@ def _mxfp4_to_fp8(
             scale.shape[-1],
             _WORDS_BLOCK,
             interleave_half,
+            index_i32,
             num_warps=8,
         )
     return out
@@ -1002,6 +1020,7 @@ class Mxfp4W4A8PrefillExperts:
         fused_shared_add: bool = False,
         counting_route: bool = False,
         w2_two_cta_min_rows: int = 0,
+        convert_index_i32: bool = False,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -1036,6 +1055,8 @@ class Mxfp4W4A8PrefillExperts:
         self.fused_shared_add = fused_shared_add
         # Counting-sort routing (sorted-sum path only: it needs the per-slot positions).
         self.counting_route = counting_route and sorted_sum
+        # The word conversion kernel with int32 index arithmetic (same bits).
+        self.convert_index_i32 = convert_index_i32
         # Calls with at least this many rows run W2 with 128x128 tiles, two CTAs per SM.
         self.w2_two_cta_min_rows = w2_two_cta_min_rows
         self.successor = None  # the experts observed to run after these ones
@@ -1060,6 +1081,7 @@ class Mxfp4W4A8PrefillExperts:
                 buf[: E * N * KH * 2].view(E, N, KH * 2),
                 num_launches,
                 interleave_half=half,
+                index_i32=self.convert_index_i32,
             )
 
     def _direct(
