@@ -1993,6 +1993,10 @@ class Envs:
     # verify row pair keeps. Pays only when candidates cluster; costs ~10% of the
     # consumer kernel when every tile is kept (synthetic data).
     SGLANG_OPT_DSV4_DECODE_INDEXER_TILE_SKIP = EnvBool(False)
+    # With BLOCK_MASK, verify rows: the candidate consumers score and select only the
+    # union of each request's kept blocks (compacted, positions in order) instead of
+    # every visible position. Scores are the same values at the same positions.
+    SGLANG_OPT_DSV4_DECODE_INDEXER_CANDIDATES_ONLY = EnvBool(False)
     # Hopper paged tensor-core decode indexer: dequantize the fp4 index K with
     # byte-table (PRMT) lookups in inline PTX instead of per-element integer ops.
     # Scores stay bit-identical; ~25-28% less kernel time at the verdict shape.

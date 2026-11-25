@@ -484,6 +484,83 @@ def write_prefill(
     inputs.out_raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
 
+def select_decode_candidates(
+    *,
+    inputs: DecodeInputs,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    req_to_token: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    topk_blocks: int,
+) -> bool:
+    """The Hopper paged consumer's selection scored on the union of each verify
+    group's kept blocks only (``fp4_indexer_candidates``): the same scores at the
+    same positions as ``decode_scores`` with ``candidate_mask`` (per-block flags,
+    blocks of 8), the top-k over them in position order. False (nothing done) for
+    shapes the tensor-core path does not take."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer import _use_paged_tc_kernel
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_candidates import (
+        candidate_union,
+        finish_candidate_topk,
+        fp4_index_logits_candidates,
+    )
+
+    pool = token_to_kv_pool
+    ratio = inputs.compress_ratio
+    indexer = inputs.indexer
+    req, pos = inputs.req_rows, inputs.positions
+    rows_per_request = inputs.rows_per_request
+    bs = req.shape[0]
+    table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
+    page_size = table.shape[1] // 68
+    if (
+        not get_platform().is_sm90
+        or bs == 0
+        or bs % rows_per_request
+        or not _use_paged_tc_kernel(rows_per_request, indexer.n_local_heads, page_size)
+    ):
+        return False
+    metadata = inputs.paged_metadata
+    lmax = min(metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio)
+    if lmax == 0:
+        return False
+    lens = ((pos + 1) // ratio).to(torch.int32)
+    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+    weights = indexer.head_weights(inputs.x)
+    ublk, ucount, compact_lens = candidate_union(
+        candidate_mask, lens, rows_per_request, topk_blocks
+    )
+    plan = plan_topk_v2(compact_lens)
+    scores = fp4_index_logits_candidates(
+        q,
+        weights,
+        req,
+        req_to_token,
+        table,
+        page_size,
+        ratio,
+        candidate_mask,
+        ublk,
+        ucount,
+        compact_lens,
+        rows_per_request,
+    )
+    k = min(indexer.index_topk, lmax)
+    idx = torch.empty((bs, k), dtype=torch.int32, device=scores.device)
+    topk_transform_paged_v2(scores, compact_lens, None, idx, 1, plan)
+    finish_candidate_topk(
+        idx,
+        scores,
+        compact_lens,
+        ublk,
+        req,
+        req_to_token,
+        inputs.out_page_indices,
+        ratio,
+        rows_per_request,
+    )
+    return True
+
+
 class PagedDecodeScores(msgspec.Struct, frozen=True):
     """Paged decode scores with graph-stable capacity ``lmax``.
 
