@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(kThreads) scatter_kernel(
   }
 }
 
-// counts must be zero on entry (the caller allocates it with torch.zeros); base is [ceil(slots / chunk), E].
+// topk_ids / topk_weights: tokens x top_k slots, token-major (any shape). counts must be zero on entry (the caller allocates it with torch.zeros); base is [ceil(slots / chunk), E].
 inline void route(
     tvm::ffi::TensorView topk_ids,
     tvm::ffi::TensorView topk_weights,
@@ -156,13 +156,16 @@ inline void route(
     tvm::ffi::TensorView gather,
     tvm::ffi::TensorView sorted_weights,
     tvm::ffi::TensorView pos,
+    int64_t top_k_arg,
     int64_t chunk) {
   using namespace host;
   const int64_t slots = topk_ids.numel();
-  const int top_k = static_cast<int>(topk_ids.size(topk_ids.ndim() - 1));
+  // topk_ids may come flattened, so top_k (slots per token) is an argument.
+  const int top_k = static_cast<int>(top_k_arg);
   const int num_experts = static_cast<int>(counts.size(0));
   RuntimeCheck(slots > 0 && slots < (int64_t{1} << 31), "w4a8 count route: 0 < slots < 2^31");
   RuntimeCheck(num_experts > 0 && num_experts <= kMaxExperts, "w4a8 count route: at most 1024 experts");
+  RuntimeCheck(top_k > 0 && slots % top_k == 0, "w4a8 count route: slots must be tokens x top_k");
   RuntimeCheck(chunk > 0 && chunk % 32 == 0, "w4a8 count route: chunk must be a positive multiple of 32");
   const int64_t ctas = (slots + chunk - 1) / chunk;
   RuntimeCheck(base.numel() >= ctas * num_experts, "w4a8 count route: base needs ceil(slots / chunk) x E");

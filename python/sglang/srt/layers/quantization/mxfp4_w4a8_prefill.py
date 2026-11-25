@@ -757,6 +757,7 @@ def _count_route_cta(topk_ids, topk_weights, num_experts: int, chunk: int = 0):
             gather_indx,
             sorted_weights,
             pos,
+            topk_ids.shape[-1],
             chunk,
         )
     return _CountRouting(counts, gather_indx, sorted_weights, pos)
