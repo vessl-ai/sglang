@@ -36,6 +36,7 @@ computed eagerly). Enabled by SGLANG_OPT_DSV4_W4A8_PREFILL_MOE=1 on SM90.
 from __future__ import annotations
 
 import contextlib
+import functools
 from typing import NamedTuple
 
 import torch
@@ -717,12 +718,61 @@ class _CountRouting(NamedTuple):
     pos: torch.Tensor  # [slots] int32 sorted row of each slot, -1 for masked slots
 
 
+# Slots per CTA of the CTA-local counting sort (w4a8_count_route.cuh); a 65k-row step (390k
+# slots) is 96 CTAs, one wave.
+_CTA_ROUTE_CHUNK = 4096
+
+
+@functools.cache
+def _cta_route_module():
+    from sglang.kernels.jit.utils import load_jit
+
+    return load_jit(
+        "w4a8_count_route",
+        cuda_files=["moe/w4a8_count_route.cuh"],
+        cuda_wrappers=[("route", "w4a8_count_route::route")],
+    )
+
+
+def _count_route_cta(topk_ids, topk_weights, num_experts: int, chunk: int = 0):
+    """_count_route's layout from two CUDA launches whose global atomics are one per (CTA,
+    expert) instead of one per slot (see w4a8_count_route.cuh). Same counts; the rows of
+    an expert are a different permutation, which the MoE output does not depend on."""
+    device = topk_ids.device
+    n_slots = topk_ids.numel()
+    chunk = chunk or _CTA_ROUTE_CHUNK
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    gather_indx = torch.empty(n_slots, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(n_slots, dtype=torch.float32, device=device)
+    pos = torch.empty(n_slots, dtype=torch.int32, device=device)
+    if n_slots > 0:
+        base = torch.empty(
+            triton.cdiv(n_slots, chunk) * num_experts, dtype=torch.int32, device=device
+        )
+        _cta_route_module().route(
+            topk_ids.reshape(-1).to(torch.int32).contiguous(),
+            topk_weights.reshape(-1).float().contiguous(),
+            counts,
+            base,
+            gather_indx,
+            sorted_weights,
+            pos,
+            chunk,
+        )
+    return _CountRouting(counts, gather_indx, sorted_weights, pos)
+
+
 def _count_route(topk_ids, topk_weights, num_experts: int) -> _CountRouting:
     """Counting sort of the valid top-k slots by expert for the FP8-copy path (histogram,
     per-expert offsets, atomic-cursor scatter: 3 launches + a memset, no host sync). The
     order of rows inside an expert is not deterministic; every row is computed on its own
     and the top-k sum reads rows by position, so the MoE output does not depend on it.
-    Masked slots (id -1) get no row (pos -1), so valid rows come first."""
+    Masked slots (id -1) get no row (pos -1), so valid rows come first.
+    SGLANG_OPT_DSV4_W4A8_CTA_ROUTE: the same layout from _count_route_cta."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_DSV4_W4A8_CTA_ROUTE.get():
+        return _count_route_cta(topk_ids, topk_weights, num_experts)
     device = topk_ids.device
     n_slots = topk_ids.numel()
     ids = topk_ids.reshape(-1)
@@ -1057,6 +1107,10 @@ class Mxfp4W4A8PrefillExperts:
         self.counting_route = counting_route and sorted_sum
         # The word conversion kernel with int32 index arithmetic (same bits).
         self.convert_index_i32 = convert_index_i32
+        from sglang.srt.environ import envs
+
+        if self.counting_route and envs.SGLANG_OPT_DSV4_W4A8_CTA_ROUTE.get():
+            _cta_route_module()  # build and load at weight-processing time, not at the first step
         # Calls with at least this many rows run W2 with 128x128 tiles, two CTAs per SM.
         self.w2_two_cta_min_rows = w2_two_cta_min_rows
         self.successor = None  # the experts observed to run after these ones

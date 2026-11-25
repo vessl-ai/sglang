@@ -1977,6 +1977,9 @@ class Envs:
     # Counting sort of the top-k slots by expert (4 Triton launches) instead of the stable
     # argsort + scatter-add routing; needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
     SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE = EnvBool(False)
+    # INF-874: that counting sort as two CUDA launches whose global atomics are one per
+    # (CTA, expert) instead of one per slot (w4a8_count_route.cuh). Same MoE output bits.
+    SGLANG_OPT_DSV4_W4A8_CTA_ROUTE = EnvBool(False)
     # Down-projection GEMM tiles for calls with at least this many rows: 128x128 tiles, two
     # CTAs per SM (one CTA's epilogue runs beside the other's main loop; K is only 576).
     # 0 = off (triton_kernels' own 128x256 tile, one CTA per SM).
