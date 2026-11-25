@@ -1785,6 +1785,12 @@ class Envs:
     # at 1.7k-11.3k rows). Once per compress ratio per forward, as before; never while
     # a CUDA graph is being captured.
     SGLANG_OPT_DSV4_SM90_MLA_SCHED_META = EnvBool(False)
+    # INF-874 decode attention A2. The schedule above, also while a CUDA graph is being
+    # captured, and for a decode-sized batch with a step-table kernel (a few us) instead
+    # of a serial walk: the decode graph then runs it instead of FlashMLA's <<<1, 32>>>
+    # walk (~60 us at 512 verify rows), once per compress ratio per forward. Same
+    # metadata, same output bits. Implies the eager path above.
+    SGLANG_OPT_DSV4_SM90_MLA_SCHED_META_IN_GRAPH = EnvBool(False)
     # INF-681 k-fuse-p. Bounded-replay late-layer tail metadata: build the row layout
     # (tail lengths, the CP owner-rank layout, per-request local lengths) from the host
     # extend lengths and copy it from pinned memory, instead of pageable copies,
