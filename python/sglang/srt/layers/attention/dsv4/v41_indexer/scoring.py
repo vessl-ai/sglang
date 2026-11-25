@@ -157,6 +157,35 @@ def _index_q_and_weights(
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
 
 
+def _fused_fp8_index_q() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8.get()
+
+
+def _index_q_fp8_and_weights(
+    *,
+    indexer: DeepseekV41Indexer,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SM90 prefill: ``_index_q_and_weights`` then ``fp4_index_rows_to_fp8`` and the
+    row-scale fold, bit for bit, as one launch (``index_q_rope_fp8_weights``)."""
+    from sglang.kernels.ops.attention.dsv4.index_q_fp8 import index_q_rope_fp8_weights
+
+    rows, heads = x.shape[0], indexer.n_local_heads
+    q, _ = indexer.wq_b(q_lora)
+    return index_q_rope_fp8_weights(
+        q.view(rows, heads, indexer.index_head_dim),
+        torch.view_as_real(freqs_cis).flatten(-2),
+        positions,
+        indexer.head_weights_raw(x),
+        indexer.head_weight_scale,
+    )
+
+
 def get_deep_gemm_decode_data(
     inputs: DecodeInputs, token_to_kv_pool: DeepSeekV4TokenToKVPool
 ) -> DeepGEMMDecodeData:
@@ -216,17 +245,28 @@ def get_deep_gemm_prefill_data(
     )
     position = torch.arange(columns, device=device) - starts_dev[request]
     pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
-    q, q_sf, weights = _index_q_and_weights(
-        indexer=inputs.indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=pos,
-    )
-    if prefill_index_logits_fp8():
-        # fp8_mqa_logits takes an unscaled q; the scale commutes with its ReLU.
-        q, q_scale = fp4_index_rows_to_fp8(q, q_sf)
-        weights, q_sf = weights * q_scale, None
+    if prefill_index_logits_fp8() and _fused_fp8_index_q():
+        # SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8: the three steps below in one launch.
+        q, weights = _index_q_fp8_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=pos,
+        )
+        q_sf = None
+    else:
+        q, q_sf, weights = _index_q_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=pos,
+        )
+        if prefill_index_logits_fp8():
+            # fp8_mqa_logits takes an unscaled q; the scale commutes with its ReLU.
+            q, q_scale = fp4_index_rows_to_fp8(q, q_sf)
+            weights, q_sf = weights * q_scale, None
     return DeepGEMMPrefillData(
         k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
         request_starts=torch.repeat_interleave(

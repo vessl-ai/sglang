@@ -1232,9 +1232,13 @@ class DeepseekV4AttnBackend(
         if self.is_dsv41:
             logger.info(
                 "INF-874 R2ATTN: SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS=%s "
-                "SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER=%s",
+                "SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER=%s "
+                "SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY=%s "
+                "SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8=%s",
                 envs.SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS.get(),
                 envs.SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER.get(),
+                envs.SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY.get(),
+                envs.SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8.get(),
             )
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
@@ -3701,7 +3705,13 @@ class DeepseekV4AttnBackend(
                 layer, x, q_lora, req, pos, forward_batch, rows_per_request
             )
             if is_source:
-                published = self.prefill_candidates.publish_prefill(inputs)
+                tail_rows = self._candidate_tail_rows_per_request()
+                if tail_rows is None:
+                    published = self.prefill_candidates.publish_prefill(inputs)
+                else:
+                    published = self.prefill_candidates.publish_prefill(
+                        inputs, tail_rows_per_request=tail_rows
+                    )
                 self._publish_candidate_metadata(published)
             elif is_consumer:
                 self.prefill_candidates.consume_prefill(inputs, published)
@@ -3827,6 +3837,28 @@ class DeepseekV4AttnBackend(
             or self.forward_metadata.late_layer_tail is not None
             or self.token_to_kv_pool.request_window is not None
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
+        )
+
+    def _candidate_tail_rows_per_request(self) -> Optional[List[int]]:
+        """SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY: the late-layer tail rows of each
+        request, the only rows `_publish_candidate_metadata` hands to a consumer, when
+        the late layers run on a tail; None to publish every row."""
+        if not envs.SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY.get():
+            return None
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
+        )
+
+        if not isinstance(self.prefill_candidates, DenseBlocksBackend):
+            return None
+        tail_metadata = self.tail_forward_metadata
+        if tail_metadata is None or tail_metadata is self.forward_metadata:
+            return None
+        tail = tail_metadata.late_layer_tail
+        return list(
+            tail.local_lens_cpu
+            if tail.cp_metadata is not None
+            else tail.extend_seq_lens_cpu
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):

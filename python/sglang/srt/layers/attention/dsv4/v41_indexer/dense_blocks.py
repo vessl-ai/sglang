@@ -90,9 +90,17 @@ class DenseBlocksBackend:
         # This backend serves decode only where DeepGEMM does not (Hopper).
         self.decode_sharder = get_decode_row_sharder(use_deep_gemm_decode=False)
 
-    def publish_prefill(self, inputs: PrefillInputs):
+    def publish_prefill(
+        self,
+        inputs: PrefillInputs,
+        tail_rows_per_request: Optional[List[int]] = None,
+    ):
+        """``tail_rows_per_request``: the late-layer tail's rows of each request, the
+        only rows any consumer reads (``BlockIds.tail``); when given and the DeepGEMM
+        path batches its candidate blocks, only those rows get block ids
+        (SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY). Other rows hold -1."""
         if self.use_deep_gemm_prefill:
-            return self._deep_gemm_publish_prefill(inputs)
+            return self._deep_gemm_publish_prefill(inputs, tail_rows_per_request)
         return self._torch_publish_prefill(inputs)
 
     def consume_prefill(
@@ -188,7 +196,11 @@ class DenseBlocksBackend:
 
     # ---------- DeepGEMM: flattened-K scores ----------
 
-    def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
+    def _deep_gemm_publish_prefill(
+        self,
+        inputs: PrefillInputs,
+        tail_rows_per_request: Optional[List[int]] = None,
+    ):
         inputs.reset_outputs()
         data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
         if data is None:
@@ -204,6 +216,8 @@ class DenseBlocksBackend:
             topk_blocks=self.topk_blocks,
             block_size=self.block_size,
             batched=self.batched_blocks,
+            # Row sharding renumbers the rows; keep every row there.
+            tail_rows_per_request=tail_rows_per_request if shard is None else None,
         )
         if shard is not None:
             # Block ids are request-relative and -1 padded, like the selection.
@@ -312,6 +326,7 @@ def _publish_prefill_blocks(
     topk_blocks: int,
     block_size: int,
     batched: bool = False,
+    tail_rows_per_request: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
@@ -320,16 +335,28 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
+    tail_only = batched and tail_rows_per_request is not None
     publish_tile = _publish_tile_blocks_batched if batched else _publish_tile_blocks
     for tile, logits in score_tiles(data, kv, width_align=4):
-        publish_tile(
-            data=data,
-            tile=tile,
-            logits=logits,
-            blocks=blocks[tile],
-            topk_blocks=topk_blocks,
-            block_size=block_size,
-        )
+        if tail_only:
+            _publish_tile_tail_blocks(
+                data=data,
+                tile=tile,
+                logits=logits,
+                blocks=blocks[tile],
+                topk_blocks=topk_blocks,
+                block_size=block_size,
+                tail_rows_per_request=tail_rows_per_request,
+            )
+        else:
+            publish_tile(
+                data=data,
+                tile=tile,
+                logits=logits,
+                blocks=blocks[tile],
+                topk_blocks=topk_blocks,
+                block_size=block_size,
+            )
         topk_transform_ragged_v2(
             logits,
             data.compress_lens[tile],
@@ -396,6 +423,64 @@ def _publish_tile_blocks_batched(
         blocks[rows, :kept] = top.indices.to(torch.int32).masked_fill_(
             ~(top.values > -torch.inf), -1
         )
+
+
+def _publish_tile_tail_blocks(
+    *,
+    data: DeepGEMMPrefillData,
+    tile: slice,
+    logits: torch.Tensor,
+    blocks: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+    tail_rows_per_request: List[int],
+) -> None:
+    """``_publish_tile_blocks_batched`` for the tile's late-layer tail rows only, bit
+    for bit on those rows: a row's keys are a function of that row alone
+    (``candidate_block_keys``), and so is its block top-k (the property the batched
+    path already relies on, checked by test_dsv41_batched_candidate_blocks). Each
+    request's tail rows are consecutive, so they are scored as slices of the tile;
+    the top-k runs over consecutive requests that keep the same number of blocks."""
+    lens = data.compress_lens[tile]
+    key_width = -(-logits.shape[1] // block_size)
+    runs = []  # (tile-local rows, kept, block count) per request with tail rows here
+    start = 0
+    for num_rows, lc, tail in zip(
+        data.rows_per_request, data.lens_per_request, tail_rows_per_request
+    ):
+        end = start + num_rows
+        lo = max(end - min(tail, num_rows), tile.start)
+        hi = min(end, tile.stop)
+        if lo < hi and lc > 0:
+            num_blocks = -(-lc // block_size)
+            rows = slice(lo - tile.start, hi - tile.start)
+            runs.append((rows, min(topk_blocks, num_blocks), num_blocks))
+        start = end
+    i = 0
+    while i < len(runs):
+        j, widest = i, runs[i][2]
+        while j + 1 < len(runs) and runs[j + 1][1] == runs[i][1]:
+            j += 1
+            widest = max(widest, runs[j][2])
+        group = runs[i : j + 1]
+        keys = torch.cat(
+            [
+                candidate_block_keys(logits[r], lens[r], key_width, block_size)
+                for r, _, _ in group
+            ]
+        )
+        kept = runs[i][1]
+        scores = keys[:, :widest]
+        if widest != key_width:
+            scores = scores.contiguous()
+        top = scores.topk(kept, dim=-1)
+        ids = top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+        first = 0
+        for r, _, _ in group:
+            count = r.stop - r.start
+            blocks[r, :kept] = ids[first : first + count]
+            first += count
+        i = j + 1
 
 
 def _block_topk_runs(

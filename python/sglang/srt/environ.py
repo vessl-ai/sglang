@@ -2042,6 +2042,15 @@ class Envs:
     # all-gathers those 584-byte rows instead of the raw bf16 kv (1,024 B), and copies
     # every token's row into the paged SWA cache. Same cache bytes. Needs the V4 SWA layout.
     SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER = EnvBool(False)
+    # INF-874 R2IDX (P1). Prefill: the candidate source layer computes block ids only
+    # for the late-layer tail rows, the only rows a consumer reads (BlockIds.tail);
+    # other rows hold -1. Same block ids on the tail rows. Needs the DeepGEMM prefill
+    # indexer with SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS, and a late-layer tail.
+    SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY = EnvBool(False)
+    # INF-874 R2IDX (P2). SM90 prefill indexer: the index queries go from wq_b's bf16
+    # output to e4m3 rows plus the folded head weights in one Triton launch instead of
+    # the fp4 pack kernel, the fp4 -> e4m3 widening and a torch multiply. Same bits.
+    SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8 = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last
