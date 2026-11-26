@@ -222,21 +222,28 @@ def _maybe_precompute_sm90_flashmla_sched_meta(
     schedules with block_size_n 64, fixed overhead 5 and one part per SM (s_q 1), the
     same constants as SM100 (checked against FlashMLA's own metadata for 1-30,000
     rows). Skipped under CUDA graph capture, so a captured region keeps FlashMLA's own
-    in-graph schedule."""
+    in-graph schedule, unless SGLANG_OPT_DSV4_SM90_MLA_SCHED_META_IN_GRAPH (which also
+    turns the eager path on): then the captured decode graph runs this kernel instead.
+    The schedule tensors are allocated in the capture, so they live in the graph's pool
+    and every replay rewrites them from the replayed lengths."""
+    in_graph = envs.SGLANG_OPT_DSV4_SM90_MLA_SCHED_META_IN_GRAPH.get()
     if not (
-        envs.SGLANG_OPT_DSV4_SM90_MLA_SCHED_META.get()
+        (envs.SGLANG_OPT_DSV4_SM90_MLA_SCHED_META.get() or in_graph)
         and q.is_cuda
         and get_platform().is_sm90
         and q.ndim == 4
         and q.shape[1] == 1
         and q.shape[-2] == 64
         and indices is not None
-        and not torch.cuda.is_current_stream_capturing()
+        and (in_graph or not torch.cuda.is_current_stream_capturing())
     ):
         return False
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta_large import (
         META_INTS,
+        chain_capacity,
+        chain_fits,
         fits,
+        flashmla_sched_meta_chain,
         flashmla_sched_meta_large,
     )
 
@@ -246,9 +253,7 @@ def _maybe_precompute_sm90_flashmla_sched_meta(
         return False
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
     num_splits = torch.empty((b + 1,), dtype=torch.int32, device=q.device)
-    flashmla_sched_meta_large(
-        meta,
-        num_splits,
+    kwargs = dict(
         topk_length=topk_length,
         extra_topk_length=extra_topk_length,
         block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
@@ -256,6 +261,18 @@ def _maybe_precompute_sm90_flashmla_sched_meta(
         topk=indices.shape[-1],
         extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
     )
+    capacity = chain_capacity(
+        b,
+        block_size_n=kwargs["block_size_n"],
+        fixed_overhead_num_blocks=kwargs["fixed_overhead_num_blocks"],
+        topk=kwargs["topk"],
+        extra_topk=kwargs["extra_topk"],
+    )
+    if in_graph and chain_fits(b, num_sm_parts, capacity, q.device.index):
+        # The decode batch: the parallel step table (a few us instead of ~60 us).
+        flashmla_sched_meta_chain(meta, num_splits, capacity=capacity, **kwargs)
+    else:
+        flashmla_sched_meta_large(meta, num_splits, **kwargs)
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
     return True
