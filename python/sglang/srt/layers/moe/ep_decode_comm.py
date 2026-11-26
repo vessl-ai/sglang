@@ -221,6 +221,9 @@ def route_rows_fused_eligible(mlp) -> bool:
         torch.cuda.is_available()
         and isinstance(mlp.topk, TopK)
         and not getattr(mlp, "is_hash", False)
+        # target layers only: the DSpark draft stages (is_nextn) keep the torch route (3 small layers; their
+        # plain, non-VL route through this helper is not covered by the M-1 bit test)
+        and not getattr(mlp, "is_nextn", False)
         and not get_moe_a2a_backend().is_megamoe()
         and not get_moe_runner_backend().is_flashinfer_mxfp4()
         and cfg is not None
