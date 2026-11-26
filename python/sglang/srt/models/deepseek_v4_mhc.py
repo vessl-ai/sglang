@@ -634,6 +634,22 @@ def _sm90_fused_post_combine() -> bool:
     )
 
 
+def _dp_decode_fused_post_combine(rows: int) -> bool:
+    """INF-874 DDENSE MA1: the fused post + combine + norm on a DP-attention rank's own
+    decode / verify rows (the kernel is per row, so the DP split changes nothing for it)."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    return (
+        envs.SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE.get()
+        and get_platform().is_sm90
+        # Its own bound: the kernel is per row, so it also serves verify rows above
+        # SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS (e.g. 640 at 160 requests x 4 rows).
+        and 0 < rows <= envs.SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE_MAX_ROWS.get()
+        and get_parallel().attn_dp_size > 1
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
 def _fused_post_combine_min_rows() -> int:
     """The fused post + combine + norm kernel's lower row bound: 4096, or what
     SGLANG_OPT_DSV4_FUSED_MHC_POST_COMBINE_MIN_ROWS sets for small prefill steps."""
@@ -680,19 +696,28 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and cfg.pre_from_prev
-        and _fused_post_combine_min_rows() <= y.shape[0] <= 65536
-        and (get_platform().is_blackwell or _sm90_fused_post_combine())
         and cfg.hidden == 5120
         and cfg.mult == 4
-        and get_parallel().attn_dp_size == 1
-        and (not cfg.cp_prefill or envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.get())
+        and (
+            (
+                _fused_post_combine_min_rows() <= y.shape[0] <= 65536
+                and (get_platform().is_blackwell or _sm90_fused_post_combine())
+                and get_parallel().attn_dp_size == 1
+                and (
+                    not cfg.cp_prefill
+                    or envs.SGLANG_OPT_DSV4_CP_FUSED_MHC_POST_COMBINE.get()
+                )
+            )
+            or (not cfg.cp_prefill and _dp_decode_fused_post_combine(y.shape[0]))
+        )
     ):
         from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
             mhc_post_combine_norm_prefill,
         )
 
-        if cfg.cp_prefill:
-            # The kernel indexes dense rows; mhc_post makes the same guarantee under CP.
+        if cfg.cp_prefill or get_parallel().attn_dp_size > 1:
+            # The kernel indexes dense rows; mhc_post makes the same guarantee under CP
+            # (and the DP decode triplet may be a view of the mix output).
             from sglang.srt.layers.utils.common import strict_contiguous
 
             y, residual = strict_contiguous(y), strict_contiguous(residual)

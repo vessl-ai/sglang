@@ -3957,21 +3957,42 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         shared = None
         stream = None
+        row_quant = None
         if (
             hidden_states.shape[0] > 0
             and getattr(self.mlp, "shared_experts", None) is not None
         ):
             stream = _dp_shared_expert_stream()
             if stream is not None:
-                stream.wait_stream(torch.cuda.current_stream())
+                main_stream = torch.cuda.current_stream()
+                stream.wait_stream(main_stream)
                 hidden_states.record_stream(stream)
-                with torch.cuda.stream(stream), _dp_shared_expert_sm_cap():
-                    shared = _forward_shared_experts_rank_local(self.mlp, hidden_states)
+                with torch.cuda.stream(stream):
+                    if ep_decode_comm.route_rows_fused_eligible(self.mlp):
+                        # INF-874 MW1: the experts' row quant leaves the router chain
+                        from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import (
+                            _row_quant,
+                        )
+
+                        x8, xs = _row_quant(hidden_states.contiguous())
+                        ready = torch.cuda.Event()
+                        ready.record(stream)
+                        x8.record_stream(main_stream)
+                        xs.record_stream(main_stream)
+                        row_quant = (x8, xs, ready)
+                    with _dp_shared_expert_sm_cap():
+                        shared = _forward_shared_experts_rank_local(
+                            self.mlp, hidden_states
+                        )
                 shared.record_stream(torch.cuda.current_stream())
             else:
                 shared = _forward_shared_experts_rank_local(self.mlp, hidden_states)
         out = ep_decode_comm.forward_ep_decode_moe(
-            self.mlp, hidden_states, input_ids, num_token_non_padded
+            self.mlp,
+            hidden_states,
+            input_ids,
+            num_token_non_padded,
+            row_quant=row_quant,
         )
         if shared is not None:
             if stream is not None:

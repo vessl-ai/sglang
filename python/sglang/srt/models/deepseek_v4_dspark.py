@@ -808,7 +808,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             torch.cuda.Stream()
             if use_multi_stream
             and torch.version.cuda is not None
-            and get_platform().is_blackwell
+            and (
+                get_platform().is_blackwell
+                # INF-874 DR2: SM90 too (the target's DP decode stats stream)
+                or (
+                    get_platform().is_sm90
+                    and envs.SGLANG_OPT_DSV4_DSPARK_HC_STATS_FUSED.get()
+                )
+            )
             and getattr(config, "hc_pre_from_prev_sublayer", False)
             else None
         )
@@ -1098,6 +1105,38 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
+        )
+        self.prepare_hc_stats_parts()
+
+    def prepare_hc_stats_parts(self) -> None:
+        """INF-874 DR2 (SGLANG_OPT_DSV4_DSPARK_HC_STATS_FUSED): give the draft stages the bf16 parts of their
+        mHC mixing weights that the target layers get in refresh_mhc_norm_weight_cache, so that on SM90 their
+        mix stats take the compensated bf16x3 projection + fused Sinkhorn instead of the fp32 split-K path."""
+        if not envs.SGLANG_OPT_DSV4_DSPARK_HC_STATS_FUSED.get():
+            return
+        if not get_platform().is_sm90 or not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        if is_batch_invariant_mode_enabled():
+            return
+        prepared = 0
+        for stage in self.stages:
+            if not stage.hc_pre_from_prev_sublayer or stage.hc_attn_fn.shape != (
+                24,
+                20480,
+            ):
+                continue
+            stage._hc_attn_bf16_parts = split_bf16_hc_weight(stage.hc_attn_fn.data)
+            stage._hc_ffn_bf16_parts = split_bf16_hc_weight(stage.hc_ffn_fn.data)
+            stage._init_hyper_connections()
+            prepared += 1
+        logger.info(
+            "INF-874 DR2: draft mHC stats on the bf16x3 path for %d/%d stages (stats stream %s)",
+            prepared,
+            len(self.stages),
+            "on" if self.hc_stats_stream is not None else "off",
         )
 
     def _assert_confidence_head_loaded(

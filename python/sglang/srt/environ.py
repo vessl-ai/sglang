@@ -1803,6 +1803,18 @@ class Envs:
     #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
     #   (NCCL's ring all-gather holds 23 SMs at these sizes on 4 H200s); 0 = no cap.
     SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
+    # INF-874 MW1 (decode-rest): EP decode MoE route in one router launch. The
+    #   logical -> physical replica pick ("dynamic", rank-invariant) and the local pad
+    #   mask run in the router Triton kernel's epilogue instead of ~10 torch kernels,
+    #   and the experts' e4m3 row quant runs on the shared-expert stream before the
+    #   shared expert (off the router -> dispatch chain). Bit-identical ids, weights,
+    #   rows and scales; falls back to the torch path when a recorder, a routed-expert
+    #   capturer, hash / vision routing or another dispatch algorithm is in use.
+    SGLANG_OPT_DSV4_EP_ROUTE_FUSED = EnvBool(False)
+    # INF-874 DR2 (decode-rest): the DSpark draft stages' mHC mix stats take the
+    #   target's SM90 path: bf16x3 compensated projection + fused Sinkhorn (draft
+    #   layers get bf16_parts after loading) on the stats side stream (SM90 too).
+    SGLANG_OPT_DSV4_DSPARK_HC_STATS_FUSED = EnvBool(False)
     # - DP_DECODE_STATS_STREAM: compute the mHC mix stats + Sinkhorn of a sublayer on
     #   the existing stats side stream beside the sublayer (as SM90 already does for
     #   decode batches <= 64 rows) for DP-attention decode / verify batches up to
@@ -1816,6 +1828,25 @@ class Envs:
     #   (1 BF16 ulp), as it already does at <= 96 rows.
     SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED = EnvBool(False)
     SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS = EnvInt(512)
+    # - DP_DECODE_FUSED_POST_COMBINE (INF-874 DDENSE MA1): on SM90 DP-attention decode / verify
+    #   rows (within DP_DECODE_MAX_ROWS), run the per-row fused post + combine + RMSNorm
+    #   (mhc_post_combine_norm_prefill) instead of mhc_post then hc_combine_norm. The residual
+    #   is bit-identical; the normed rows round like the fused kernel (within 1 bf16 ulp).
+    SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE = EnvBool(False)
+    SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE_MAX_ROWS = EnvInt(1024)
+    # - VERIFY_ROW_ARGMAX_MAX_ROWS (INF-874 DDENSE MD0): the most verify rows the fused
+    #   row argmax takes for a wide vocab (384 = upstream gate); above it torch.argmax runs.
+    SGLANG_OPT_DSV4_VERIFY_ROW_ARGMAX_MAX_ROWS = EnvInt(384)
+    # - DECODE_DG_KNOBS (INF-874 DDENSE DA): for the measured (N, K, M range) entries in
+    #   fp8_block32_gran128._DECODE_DG_KNOBS, launch the gran-128 DeepGEMM call under the
+    #   listed num_sms / block_n multiple so its heuristic picks the faster tile. Same
+    #   operands and K order: bit-identical output.
+    SGLANG_OPT_DSV4_DECODE_DG_KNOBS = EnvBool(False)
+    # - HC_MIX_STATS_MEDIUM_BLOCK_M (INF-874 DDENSE DA): BLOCK_M of the SM90 bf16x3 mHC mix
+    #   stats for 32..4095 rows (64 = upstream). 128 keeps the outputs bit-identical and frees
+    #   SMs for the wqkv_a GEMM the side-stream stats overlap in decode.
+    SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M = EnvInt(64)
+    SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M_MAX_ROWS = EnvInt(512)
     # - WO_A_STRIDED_BMM: V4.1 BF16 wo_a for any group count on CUDA decode / verify
     #   rows: one strided bmm that writes the token-major [T, G, R] output wo_b reads,
     #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes

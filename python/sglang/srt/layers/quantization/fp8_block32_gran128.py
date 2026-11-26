@@ -255,6 +255,65 @@ def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
     return deep_gemm.get_num_sms() == _CUBLASLT_NUM_SMS
 
 
+# INF-874 DDENSE DA: (N, K) -> [(first M, last M, num_sms, block_n multiple)] measured on H200
+# (132 SMs) at the EP8 decoder's verify rows; filled from the M-1 bench (10-work/DDENSE).
+_DECODE_DG_KNOBS = {
+    # Ranges cover the decode graph buckets (bs 124 / 128 -> 496 / 512 rows, 156 / 160 ->
+    # 624 / 640); measured at 504-512 and 636-640 rows (10-work/DDENSE/PROGRESS.md).
+    # wqkv_a: <= 512 rows on 66 SMs (BM128 x BN128) beside the side-stream mHC stats with
+    # SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M=128 (pair 23.3 -> 16.3 us); 640 rows on
+    # 88 SMs beside the 64-row stats (21.8 -> 16.9 us; alone 17.8 -> 16.1 us).
+    (1792, 5120): [(481, 512, 66, 32), (617, 640, 88, 32)],
+    # wq_b 43.5 -> 39.1 us (512, short replay), 63.7 -> 63.0 (640, sustained).
+    (32768, 1280): [(481, 512, 128, 1), (617, 640, 124, 1)],
+    # wo_b 34.2 -> 32.4 us (512, short replay), 65.3 -> 56.7 us (640, sustained).
+    (5120, 8192): [(481, 512, 128, 1), (617, 640, 116, 32)],
+    # indexer wq_b 8.4 -> 7.1 us (512, short replay).
+    (4096, 1280): [(481, 512, 128, 1)],
+    # Engram 124.2 -> 122.6 us (512, short replay), 205.0 -> 194.7 us (640, sustained).
+    (25600, 6144): [(481, 512, 128, 1), (617, 640, 116, 1)],
+}
+_DECODE_DG_NUM_SMS = 132
+
+
+def _decode_dg_knobs(m: int, n: int, k: int):
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSV4_DECODE_DG_KNOBS.get():
+        return None
+    for lo, hi, num_sms, n_mult in _DECODE_DG_KNOBS.get((n, k), ()):
+        if lo <= m <= hi:
+            return num_sms, n_mult
+    return None
+
+
+class _DgKnobs:
+    """Host-side DeepGEMM launch settings around one call, restored afterwards. Skipped when a
+    caller already capped the SM count (the shared expert's reserve)."""
+
+    def __init__(self, knobs):
+        self.knobs, self.active = knobs, False
+
+    def __enter__(self):
+        if self.knobs is None:
+            return
+        import deep_gemm
+
+        if deep_gemm.get_num_sms() != _DECODE_DG_NUM_SMS:
+            return
+        num_sms, n_mult = self.knobs
+        deep_gemm.set_num_sms(num_sms)
+        deep_gemm.set_block_size_multiple_of((1, n_mult))
+        self.active = True
+
+    def __exit__(self, *exc):
+        if self.active:
+            import deep_gemm
+
+            deep_gemm.set_num_sms(_DECODE_DG_NUM_SMS)
+            deep_gemm.set_block_size_multiple_of((1, 1))
+
+
 def block128_fp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -299,7 +358,10 @@ def block128_fp8_linear(
             deep_gemm_fp8_fp8_bf16_nt(q, s, weight, weight_scale_32x, out, 32, 32)
         else:
             q, s = ue8m0_group_quant_fp8_mn(x2, _GROUP)
-            deep_gemm_fp8_fp8_bf16_nt(q, s, weight, weight_scale, out, _GROUP, _GROUP)
+            with _DgKnobs(_decode_dg_knobs(m, n, k)):
+                deep_gemm_fp8_fp8_bf16_nt(
+                    q, s, weight, weight_scale, out, _GROUP, _GROUP
+                )
     if bias is not None:
         out += bias
     return out.view(*x.shape[:-1], n)

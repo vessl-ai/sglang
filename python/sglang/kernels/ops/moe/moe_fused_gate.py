@@ -138,6 +138,12 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    l2p_ptr,  # [num_logical, X] physical replicas of each logical expert (HAS_L2P)
+    l2p_num_valid_ptr,  # [num_logical] replica count (HAS_L2P)
+    stride_l2p,
+    local_pad_ptr,  # device scalar: rows at or past it get ids -1 (HAS_LOCAL_PAD)
+    HAS_L2P: tl.constexpr,
+    HAS_LOCAL_PAD: tl.constexpr,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -310,6 +316,24 @@ def _router_triton_kernel(
         out_indices_ptr + offs_m[:, None] * stride_im + offs_k[None, :] * stride_ik
     )
     store_mask = mask_m[:, None] & mask_k_total[None, :]
+    if HAS_L2P:
+        # INF-874 MW1: the EPLB "dynamic" logical -> physical pick under a
+        # rank-invariant dispatch (expert_location_dispatch.py
+        # _topk_ids_logical_to_physical_dynamic): replica = token row % replicas.
+        # Integer only, so the ids equal the torch postprocess bit for bit.
+        logical = tl.where(store_mask, selected_idx, 0)
+        num_valid = tl.load(l2p_num_valid_ptr + logical, mask=store_mask, other=1)
+        chosen = offs_m[:, None].to(num_valid.dtype) % num_valid
+        selected_idx = tl.load(
+            l2p_ptr + logical.to(tl.int64) * stride_l2p + chosen,
+            mask=store_mask,
+            other=-1,
+        ).to(tl.int32)
+    if HAS_LOCAL_PAD:
+        # INF-874 MW1: forward_ep_decode_moe's _mask_local_pad_rows (ids only;
+        # the weights of pad rows are left as computed, as there).
+        n_live = tl.load(local_pad_ptr)
+        selected_idx = tl.where((offs_m < n_live)[:, None], selected_idx, -1)
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
     if HAS_PACKED:
@@ -354,6 +378,9 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
+    l2p_all_physical_map: Optional[torch.Tensor] = None,
+    l2p_num_valid: Optional[torch.Tensor] = None,
+    local_pad_num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -369,6 +396,10 @@ def moe_fused_gate(
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
     ``packed_out`` ([M, topk] int32, optional) receives the FlashInfer routed-MoE form
     ``(id << 16) | bf16_bits(weight)``, bitwise identical to ``fused_pack_topk``.
+    INF-874 MW1 (EP decode route, all optional): ``l2p_all_physical_map`` / ``l2p_num_valid``
+    map the ids to physical replicas the way the rank-invariant "dynamic" EPLB dispatch does
+    (replica = row % replica count); ``local_pad_num_token_non_padded`` sets the ids of rows at
+    or past that device scalar to -1 and leaves their weights alone.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
     assert scoring_func_int is not None, (
@@ -426,6 +457,8 @@ def moe_fused_gate(
         and num_token_non_padded is None
         and renormalize_epsilon == 0.0
         and packed_out is None
+        and l2p_all_physical_map is None
+        and local_pad_num_token_non_padded is None
         and bias.stride(0) == 1
     ):
         radix_args = (
@@ -521,6 +554,18 @@ def moe_fused_gate(
         stride_ik=indices.stride(1),
         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        l2p_ptr=l2p_all_physical_map
+        if l2p_all_physical_map is not None
+        else _unused_i32,
+        l2p_num_valid_ptr=l2p_num_valid if l2p_num_valid is not None else _unused_i32,
+        stride_l2p=l2p_all_physical_map.stride(0)
+        if l2p_all_physical_map is not None
+        else 0,
+        local_pad_ptr=local_pad_num_token_non_padded
+        if local_pad_num_token_non_padded is not None
+        else _unused_i32,
+        HAS_L2P=l2p_all_physical_map is not None,
+        HAS_LOCAL_PAD=local_pad_num_token_non_padded is not None,
         num_warps=num_warps,
         **extra,
     )
