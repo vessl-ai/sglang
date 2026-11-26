@@ -1829,6 +1829,10 @@ class Envs:
     #   listed num_sms / block_n multiple so its heuristic picks the faster tile. Same
     #   operands and K order: bit-identical output.
     SGLANG_OPT_DSV4_DECODE_DG_KNOBS = EnvBool(False)
+    # - HC_MIX_STATS_MEDIUM_BLOCK_M (INF-874 DDENSE DA): BLOCK_M of the SM90 bf16x3 mHC mix
+    #   stats for 32..4095 rows (64 = upstream). 128 keeps the outputs bit-identical and frees
+    #   SMs for the wqkv_a GEMM the side-stream stats overlap in decode.
+    SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M = EnvInt(64)
     # - WO_A_STRIDED_BMM: V4.1 BF16 wo_a for any group count on CUDA decode / verify
     #   rows: one strided bmm that writes the token-major [T, G, R] output wo_b reads,
     #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes

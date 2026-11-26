@@ -2633,7 +2633,13 @@ def hc_mix_stats_sinkhorn_bf16x3(
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
-    block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+    # INF-874 DDENSE DA: 128 halves the CTAs (8 x 16 -> 4 x 16 at 512 rows) so the side-stream
+    # stats leave SMs to the GEMM they overlap; each row's K order is unchanged (bit-identical).
+    block_m = (
+        envs.SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M.get()
+        if hopper_medium
+        else _HC_MIX_BF16X3_BLOCK_M
+    )
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert hopper_medium or 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0

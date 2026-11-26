@@ -257,7 +257,17 @@ def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
 
 # INF-874 DDENSE DA: (N, K) -> [(first M, last M, num_sms, block_n multiple)] measured on H200
 # (132 SMs) at the EP8 decoder's verify rows; filled from the M-1 bench (10-work/DDENSE).
-_DECODE_DG_KNOBS = {}
+_DECODE_DG_KNOBS = {
+    # wqkv_a: 66 SMs (BM128 x BN128) so it runs beside the side-stream mHC stats (with
+    # SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M=128): 23.3 -> 16.3 us in the pair (512 rows).
+    (1792, 5120): [(497, 512, 66, 32)],
+    # 128 SMs, same tiles: wq_b 43.5 -> 39.1, wo_b 34.2 -> 32.4, indexer wq_b 8.4 -> 7.1,
+    # Engram 124.2 -> 122.6 us (short replays; equal under sustained power-capped replay).
+    (32768, 1280): [(497, 512, 128, 1)],
+    (5120, 8192): [(497, 512, 128, 1)],
+    (4096, 1280): [(497, 512, 128, 1)],
+    (25600, 6144): [(497, 512, 128, 1)],
+}
 _DECODE_DG_NUM_SMS = 132
 
 
