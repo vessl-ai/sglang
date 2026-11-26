@@ -1803,6 +1803,18 @@ class Envs:
     #   SMs the overlapped shared expert's DeepGEMM GEMMs leave free for the collective
     #   (NCCL's ring all-gather holds 23 SMs at these sizes on 4 H200s); 0 = no cap.
     SGLANG_OPT_DSV4_DP_SHARED_EXPERT_RESERVE_SMS = EnvInt(24)
+    # INF-874 MW1 (decode-rest): EP decode MoE route in one router launch. The
+    #   logical -> physical replica pick ("dynamic", rank-invariant) and the local pad
+    #   mask run in the router Triton kernel's epilogue instead of ~10 torch kernels,
+    #   and the experts' e4m3 row quant runs on the shared-expert stream before the
+    #   shared expert (off the router -> dispatch chain). Bit-identical ids, weights,
+    #   rows and scales; falls back to the torch path when a recorder, a routed-expert
+    #   capturer, hash / vision routing or another dispatch algorithm is in use.
+    SGLANG_OPT_DSV4_EP_ROUTE_FUSED = EnvBool(False)
+    # INF-874 DR2 (decode-rest): the DSpark draft stages' mHC mix stats take the
+    #   target's SM90 path: bf16x3 compensated projection + fused Sinkhorn (draft
+    #   layers get bf16_parts after loading) on the stats side stream (SM90 too).
+    SGLANG_OPT_DSV4_DSPARK_HC_STATS_FUSED = EnvBool(False)
     # - DP_DECODE_STATS_STREAM: compute the mHC mix stats + Sinkhorn of a sublayer on
     #   the existing stats side stream beside the sublayer (as SM90 already does for
     #   decode batches <= 64 rows) for DP-attention decode / verify batches up to

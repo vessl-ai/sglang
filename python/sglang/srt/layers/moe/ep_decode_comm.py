@@ -202,14 +202,129 @@ def _mask_local_pad_rows(
     )
 
 
+def route_rows_fused_eligible(mlp) -> bool:
+    """INF-874 MW1 (SGLANG_OPT_DSV4_EP_ROUTE_FUSED): whether this MoE's route can run as one router launch
+    with the same result as ``mlp.route_rows`` + the torch postprocess + ``_mask_local_pad_rows``."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSV4_EP_ROUTE_FUSED.get():
+        return False
+    ok = getattr(mlp, "_drest_route_fused_ok", None)
+    if ok is not None:
+        return ok
+    from sglang.srt.layers.moe.topk import TopK
+
+    cfg = getattr(getattr(mlp, "topk", None), "topk_config", None)
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+
+    ok = (
+        torch.cuda.is_available()
+        and isinstance(mlp.topk, TopK)
+        and not getattr(mlp, "is_hash", False)
+        and not get_moe_a2a_backend().is_megamoe()
+        and not get_moe_runner_backend().is_flashinfer_mxfp4()
+        and cfg is not None
+        and cfg.scoring_func in ("sqrtsoftplus", "sigmoid")
+        and not cfg.use_grouped_topk
+        and cfg.num_fused_shared_experts == 0
+        and cfg.custom_routing_function is None
+        and not cfg.torch_native
+        and cfg.correction_bias is not None
+    )
+    mlp._drest_route_fused_ok = ok
+    _MW1_LAYERS[ok].append(getattr(mlp, "layer_id", None))
+    if len(_MW1_LAYERS[True]) + len(_MW1_LAYERS[False]) in (1, 40, 43):
+        logger.info("INF-874 MW1: fused EP route on for layers %s, off for %s", _MW1_LAYERS[True], _MW1_LAYERS[False])
+    return ok
+
+
+_MW1_LAYERS = {True: [], False: []}
+
+
+def route_rows_fused(
+    mlp,
+    hidden_states: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    num_token_non_padded: Optional[torch.Tensor],
+):
+    """INF-874 MW1: (topk_ids int32 with pad rows -1, topk_weights fp32) for this rank's own rows, or None when
+    the torch path must run (switch off, ineligible MoE, or a consumer of the intermediate ids is active)."""
+    if not route_rows_fused_eligible(mlp):
+        return None
+    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+    from sglang.srt.environ import envs
+    from sglang.srt.eplb.expert_distribution import (
+        _ExpertDistributionRecorderNoop,
+        get_global_expert_distribution_recorder,
+    )
+    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+
+    cfg = mlp.topk.topk_config
+    if not isinstance(get_global_expert_distribution_recorder(), _ExpertDistributionRecorderNoop):
+        return None
+    if cfg.allow_routed_experts_capture and get_global_experts_capturer() is not None:
+        return None
+    if envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get() or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get():
+        return None
+    info = mlp._expert_location_dispatch_info()
+    l2p = nv = None
+    if info is not None:
+        if info.ep_dispatch_algorithm != "dynamic" or not info.rank_invariant:
+            return None
+        l2p = info.partial_logical_to_all_physical_map
+        nv = info.partial_logical_to_all_physical_map_num_valid
+    router_logits = mlp.gate(hidden_states, None)
+    local_pad = num_token_non_padded.reshape(-1)[:1] if num_token_non_padded is not None else None
+    if mlp.gate.e_score_correction_bias_vl is not None:
+        # route_rows -> vision_topk (multimodal/dsv41/vl_routing.py, CUDA branch): same router arguments
+        from sglang.srt.layers.moe.topk import _RENORMALIZE_SUM_EPSILON
+
+        weights, ids = moe_fused_gate(
+            router_logits,
+            mlp.gate.e_score_correction_bias,
+            topk=cfg.top_k,
+            scoring_func="sqrtsoftplus",
+            num_fused_shared_experts=0,
+            bias_alt=mlp.gate.e_score_correction_bias_vl if input_ids is not None else None,
+            input_ids=input_ids,
+            bias_alt_token_id=mlp.config.image_token_id if input_ids is not None else None,
+            renormalize=cfg.renormalize and cfg.top_k > 1,
+            renormalize_epsilon=_RENORMALIZE_SUM_EPSILON,
+            routed_scaling_factor=cfg.routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=cfg.apply_routed_scaling_factor_on_output,
+            sqrtsoftplus_log1p=True,
+            l2p_all_physical_map=l2p,
+            l2p_num_valid=nv,
+            local_pad_num_token_non_padded=local_pad,
+        )
+        return ids, weights
+    weights, ids = moe_fused_gate(
+        router_logits,
+        cfg.correction_bias,
+        topk=cfg.top_k,
+        scoring_func=cfg.scoring_func,
+        num_fused_shared_experts=0,
+        renormalize=cfg.renormalize,
+        routed_scaling_factor=cfg.routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=cfg.apply_routed_scaling_factor_on_output,
+        sqrtsoftplus_log1p=cfg.sqrtsoftplus_log1p,
+        l2p_all_physical_map=l2p,
+        l2p_num_valid=nv,
+        local_pad_num_token_non_padded=local_pad,
+    )
+    return ids, weights
+
+
 def forward_ep_decode_moe(
     mlp,
     hidden_states: torch.Tensor,
     input_ids: Optional[torch.Tensor],
     num_token_non_padded: Optional[torch.Tensor] = None,
+    row_quant=None,
 ) -> torch.Tensor:
     """The routed-expert output of this rank's own rows ([n, 5120] bf16, MAX_LEN-padded local buffer); the
-    caller adds the shared expert."""
+    caller adds the shared expert. ``row_quant``: (x8, scale, event) when the caller already quantized the rows
+    with ``_row_quant`` on another stream (INF-874 MW1)."""
     from sglang.kernels.ops.moe.dsv4_mxfp4_decode_moe_ep import decode_moe_ep
     from sglang.srt.layers.dp_attention import get_local_dp_buffer
     from sglang.srt.layers.quantization.mxfp4_w4a8_prefill import _row_quant
@@ -219,15 +334,25 @@ def forward_ep_decode_moe(
     method = mlp.experts.quant_method
     p = get_parallel()
     num_local = method._sm90_packed.w13.shape[0] // method._ep_split
-    topk_output = mlp.route_rows(hidden_states, input_ids)
-    topk_ids = topk_output.topk_ids.to(torch.int32).contiguous()
-    _mask_local_pad_rows(topk_ids, num_token_non_padded)
-    x8, xs = _row_quant(hidden_states.contiguous())
+    fused = route_rows_fused(mlp, hidden_states, input_ids, num_token_non_padded)
+    if fused is not None:
+        topk_ids, topk_weights = fused
+    else:
+        topk_output = mlp.route_rows(hidden_states, input_ids)
+        topk_ids = topk_output.topk_ids.to(torch.int32).contiguous()
+        _mask_local_pad_rows(topk_ids, num_token_non_padded)
+        topk_weights = topk_output.topk_weights.float().contiguous()
+    if row_quant is not None:
+        # quantized on the shared-expert stream (see _run_ep_decode_moe)
+        x8, xs, ready = row_quant
+        torch.cuda.current_stream().wait_event(ready)
+    else:
+        x8, xs = _row_quant(hidden_states.contiguous())
     dispatched = comm.dispatch(
         x8.view(torch.uint8),
         xs,
         topk_ids,
-        topk_output.topk_weights.float().contiguous(),
+        topk_weights,
         num_local_experts=num_local,
         ep_rank=p.moe_ep_rank,
     )
