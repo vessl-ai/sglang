@@ -1816,6 +1816,19 @@ class Envs:
     #   (1 BF16 ulp), as it already does at <= 96 rows.
     SGLANG_OPT_DSV4_DP_DECODE_MHC_FUSED = EnvBool(False)
     SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS = EnvInt(512)
+    # - DP_DECODE_FUSED_POST_COMBINE (INF-874 DDENSE MA1): on SM90 DP-attention decode / verify
+    #   rows (within DP_DECODE_MAX_ROWS), run the per-row fused post + combine + RMSNorm
+    #   (mhc_post_combine_norm_prefill) instead of mhc_post then hc_combine_norm. The residual
+    #   is bit-identical; the normed rows round like the fused kernel (within 1 bf16 ulp).
+    SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE = EnvBool(False)
+    # - VERIFY_ROW_ARGMAX_MAX_ROWS (INF-874 DDENSE MD0): the most verify rows the fused
+    #   row argmax takes for a wide vocab (384 = upstream gate); above it torch.argmax runs.
+    SGLANG_OPT_DSV4_VERIFY_ROW_ARGMAX_MAX_ROWS = EnvInt(384)
+    # - DECODE_DG_KNOBS (INF-874 DDENSE DA): for the measured (N, K, M range) entries in
+    #   fp8_block32_gran128._DECODE_DG_KNOBS, launch the gran-128 DeepGEMM call under the
+    #   listed num_sms / block_n multiple so its heuristic picks the faster tile. Same
+    #   operands and K order: bit-identical output.
+    SGLANG_OPT_DSV4_DECODE_DG_KNOBS = EnvBool(False)
     # - WO_A_STRIDED_BMM: V4.1 BF16 wo_a for any group count on CUDA decode / verify
     #   rows: one strided bmm that writes the token-major [T, G, R] output wo_b reads,
     #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes

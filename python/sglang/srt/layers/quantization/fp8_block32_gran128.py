@@ -255,6 +255,50 @@ def prefer_cublaslt_blockwise(m: int, n: int, k: int) -> bool:
     return deep_gemm.get_num_sms() == _CUBLASLT_NUM_SMS
 
 
+# INF-874 DDENSE DA: (N, K) -> [(first M, last M, num_sms, block_n multiple)] measured on H200
+# (132 SMs) at the EP8 decoder's verify rows; filled from the M-1 bench (10-work/DDENSE).
+_DECODE_DG_KNOBS = {}
+_DECODE_DG_NUM_SMS = 132
+
+
+def _decode_dg_knobs(m: int, n: int, k: int):
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_OPT_DSV4_DECODE_DG_KNOBS.get():
+        return None
+    for lo, hi, num_sms, n_mult in _DECODE_DG_KNOBS.get((n, k), ()):
+        if lo <= m <= hi:
+            return num_sms, n_mult
+    return None
+
+
+class _DgKnobs:
+    """Host-side DeepGEMM launch settings around one call, restored afterwards. Skipped when a
+    caller already capped the SM count (the shared expert's reserve)."""
+
+    def __init__(self, knobs):
+        self.knobs, self.active = knobs, False
+
+    def __enter__(self):
+        if self.knobs is None:
+            return
+        import deep_gemm
+
+        if deep_gemm.get_num_sms() != _DECODE_DG_NUM_SMS:
+            return
+        num_sms, n_mult = self.knobs
+        deep_gemm.set_num_sms(num_sms)
+        deep_gemm.set_block_size_multiple_of((1, n_mult))
+        self.active = True
+
+    def __exit__(self, *exc):
+        if self.active:
+            import deep_gemm
+
+            deep_gemm.set_num_sms(_DECODE_DG_NUM_SMS)
+            deep_gemm.set_block_size_multiple_of((1, 1))
+
+
 def block128_fp8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -299,7 +343,10 @@ def block128_fp8_linear(
             deep_gemm_fp8_fp8_bf16_nt(q, s, weight, weight_scale_32x, out, 32, 32)
         else:
             q, s = ue8m0_group_quant_fp8_mn(x2, _GROUP)
-            deep_gemm_fp8_fp8_bf16_nt(q, s, weight, weight_scale, out, _GROUP, _GROUP)
+            with _DgKnobs(_decode_dg_knobs(m, n, k)):
+                deep_gemm_fp8_fp8_bf16_nt(
+                    q, s, weight, weight_scale, out, _GROUP, _GROUP
+                )
     if bias is not None:
         out += bias
     return out.view(*x.shape[:-1], n)

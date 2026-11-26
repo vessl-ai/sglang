@@ -680,6 +680,13 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
+def _row_argmax_max_rows() -> int:
+    # INF-874 DDENSE MD0: 384 upstream; the DP4/EP8 verify takes 504-512 rows.
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_OPT_DSV4_VERIFY_ROW_ARGMAX_MAX_ROWS.get()
+
+
 def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
     # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
     # off the memory the reduction touches. The fused kernel does not reproduce
@@ -692,7 +699,10 @@ def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
         and logits.stride(1) == 1
         and (
             logits.shape[0] <= 64
-            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
+            or (
+                logits.shape[0] <= _row_argmax_max_rows()
+                and logits.shape[1] >= 65536
+            )
         )
         and logits.shape[1] >= 4096
     ):
