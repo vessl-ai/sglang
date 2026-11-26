@@ -2060,6 +2060,26 @@ class Envs:
     # output to e4m3 rows plus the folded head weights in one Triton launch instead of
     # the fp4 pack kernel, the fp4 -> e4m3 widening and a torch multiply. Same bits.
     SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8 = EnvBool(False)
+    # INF-874 PCOLL (P1). TP > 1: every rank holds the whole token-embedding table
+    # (+1 GB for V4.1-Flash at TP4), so the lookup needs no all-reduce. The vocab-
+    # parallel all-reduce sums the owner's row with zeros, i.e. returns that row with
+    # -0 as +0; the table's -0 entries are made +0 after loading, so the bits match.
+    SGLANG_OPT_DSV4_CP_REPLICATED_EMBEDDING = EnvBool(False)
+    # INF-874 PCOLL (P2). With SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared: the engram
+    # prefetch (SGLANG_OPT_DSV4_ENGRAM_PREFETCH) and the in-layer lookup copy this
+    # rank's rows from the shared host table and dequantize them like the prefetch,
+    # so no integer reduce-scatter / all-reduce runs. Same bits as the per_rank layout.
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH_SHARED_LOCAL = EnvBool(False)
+    # INF-874 PCOLL (P3-bit). Prefill CP (interleave): a kv_source compressor all-gathers
+    # its projections (kv + score fp32, 4 KiB/token at ratio 2; kv bf16, 1 KiB at ratio 1)
+    # instead of the bf16 hidden state (10 KiB). Each rank projects its own rows placed at
+    # their global positions in a buffer of the all-gathered shape, so the GEMM is the same
+    # launch and each row gets the bits of the all-gathered path.
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER = EnvBool(False)
+    # With the switch above: project only this rank's rows (a GEMM of M / cp_size rows).
+    # Saves the projection's repeated work but the GEMM library may pick another kernel
+    # for the smaller M; bit identity then holds only where a test showed it.
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last

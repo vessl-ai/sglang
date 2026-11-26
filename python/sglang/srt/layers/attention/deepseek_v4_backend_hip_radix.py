@@ -853,6 +853,7 @@ class DeepseekV4HipRadixBackend(
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    _cp_kv_source_projections = DeepseekV4AttnBackend._cp_kv_source_projections
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.

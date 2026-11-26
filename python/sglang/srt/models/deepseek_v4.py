@@ -4334,13 +4334,27 @@ class DeepseekV4Model(nn.Module):
                 if quant_config is not None and quant_config.get_name() == "expert_pack"
                 else None
             )
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
-                quant_config=embedding_quant_config,
-                prefix=add_prefix("embed_tokens", prefix),
-            )
+            from sglang.srt.layers.cp import pcoll
+
+            if not is_dp_attention_enabled() and pcoll.replicated_embedding_wanted(
+                config, embedding_quant_config, get_parallel().tp_size
+            ):
+                # INF-874 PCOLL P1: the whole table on every rank, no lookup all-reduce.
+                self.embed_tokens = pcoll.ReplicatedVocabEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    tp_size=get_parallel().tp_size,
+                    tp_rank=get_parallel().tp_rank,
+                    prefix=add_prefix("embed_tokens", prefix),
+                )
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                    quant_config=embedding_quant_config,
+                    prefix=add_prefix("embed_tokens", prefix),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
@@ -6091,6 +6105,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+            finish = getattr(self.model.embed_tokens, "finish_load", None)
+            if finish is not None:  # INF-874 PCOLL P1 (ReplicatedVocabEmbedding)
+                finish()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):

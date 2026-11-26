@@ -868,6 +868,7 @@ class EngramEmbedding(nn.Module):
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
         super().__init__()
         self.dim = dim
+        self.num_embeddings = num_embeddings
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         self.row_start = num_embeddings * tp_rank // self.tp_size
@@ -923,6 +924,13 @@ class EngramEmbedding(nn.Module):
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
 
+    @property
+    def _shared_local(self) -> bool:
+        """INF-874 PCOLL P2 (SGLANG_OPT_DSV4_ENGRAM_PREFETCH_SHARED_LOCAL): lookups copy
+        the rows from the shared table as raw bytes and dequantize them like the
+        prefetch, so they carry the per_rank layout's bits (-0 as +0)."""
+        return self._shared and envs.SGLANG_OPT_DSV4_ENGRAM_PREFETCH_SHARED_LOCAL.get()
+
     def _table_ptrs(self) -> tuple[int, int]:
         if self.host_table is None:
             return self.weight.data_ptr(), self.scale.data_ptr()
@@ -949,6 +957,8 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
+        if self._shared_local:
+            return self._lookup_shared_raw(indices)
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
@@ -1025,8 +1035,13 @@ class EngramEmbedding(nn.Module):
 
     def can_prefetch(self) -> bool:
         """TP-sharded rows (device shard or per_rank host shard) that the in-layer
-        lookup reassembles with the bf16 all-reduce."""
-        return not self._shared and self.tp_size > 1 and FP8_BLOCK_SIZE % 4 == 0
+        lookup reassembles with the bf16 all-reduce, or (PCOLL P2) a shared host
+        table read locally."""
+        if FP8_BLOCK_SIZE % 4 != 0:
+            return False
+        if self._shared:
+            return self._shared_local
+        return self.tp_size > 1
 
     def gather_raw(
         self,
@@ -1035,21 +1050,52 @@ class EngramEmbedding(nn.Module):
         rows_per_chunk: int,
         num_programs: int = 0,
         order: Optional[torch.Tensor] = None,
+        *,
+        whole_table: bool = False,
     ) -> torch.Tensor:
         """fp8 + scale bytes of the rows of ``ids`` this shard owns, zero bytes for
-        the rest (see engram_gather_raw for the chunked layout)."""
+        the rest (see engram_gather_raw for the chunked layout). A shared table holds
+        every row: ``whole_table`` reads any id (PCOLL P2), otherwise only this rank's
+        row range, the bytes the per_rank layout would give."""
+        w_ptr, s_ptr = self._table_ptrs()
+        lo, hi = self.row_start, self.row_start + self.rows
+        if self._shared:
+            if whole_table:
+                lo, hi = 0, self.num_embeddings
+            else:
+                w_ptr += lo * self.dim
+                s_ptr += lo * (self.dim // FP8_BLOCK_SIZE)
+        else:
+            assert not whole_table, "a sharded table cannot serve every row"
         return engram_gather_raw(
-            *self._table_ptrs(),
+            w_ptr,
+            s_ptr,
             ids,
             out,
             self.dim,
             FP8_BLOCK_SIZE,
             rows_per_chunk,
-            row_lo=self.row_start,
-            row_hi=self.row_start + self.rows,
+            row_lo=lo,
+            row_hi=hi,
             num_programs=num_programs,
             order=order,
         )
+
+    def _lookup_shared_raw(self, indices: torch.Tensor) -> torch.Tensor:
+        """Rows of ``indices`` from the shared table through the raw gather and the
+        prefetch dequant: the in-layer lookup's bits without its all-reduce."""
+        out = self._empty(indices)
+        n = indices.numel()
+        if n == 0:
+            return out
+        raw = torch.empty(
+            engram_raw_chunk_bytes(n, self.dim, FP8_BLOCK_SIZE),
+            dtype=torch.uint8,
+            device=indices.device,
+        )
+        self.gather_raw(indices.reshape(-1).contiguous(), raw, n, whole_table=True)
+        engram_dequant_raw(raw, out.view(n, self.dim), self.dim, FP8_BLOCK_SIZE)
+        return out
 
     def _dp_sharded_lookup(
         self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
@@ -1231,6 +1277,8 @@ class EngramPrefetch:
     reads this rank's rows, so a reduce-scatter replaces the all-reduce.
 
     Modes:
+      "local": a shared host table read by each rank for its own rows only (INF-874
+        PCOLL P2, SGLANG_OPT_DSV4_ENGRAM_PREFETCH_SHARED_LOCAL); no collective.
       "rs": prefill CP over the whole TP group; reduce-scatter on the CP group.
       "ar_slice": prefill CP with attention TP; all-reduce, keep the CP chunk.
       "ar": no CP; all-reduce, every rank keeps every row.
@@ -1280,9 +1328,16 @@ class EngramPrefetch:
         if late_layer_start is not None and engrams[-1][0] >= late_layer_start:
             # The tail swap would change the rows under a pending lookup.
             return None
+        from sglang.srt.layers.cp import pcoll
+
+        local = all(e.embed._shared_local for _, e in engrams) and pcoll.enabled(
+            "engram"
+        )
         if cp:
             n_chunks = parallel.attn_cp_size
-            if parallel.attn_cp_size == parallel.tp_size:
+            if local:
+                mode = "local"
+            elif parallel.attn_cp_size == parallel.tp_size:
                 assert parallel.attn_cp_group.rank_in_group == parallel.attn_cp_rank
                 mode = "rs"
             else:
@@ -1290,8 +1345,12 @@ class EngramPrefetch:
             if hash_ids.shape[0] > n_chunks * local_rows:
                 return None
             hash_ids = cp_rank_major_rows(hash_ids, n_chunks, local_rows)
+            if local:
+                # This rank's chunk only; it is the whole buffer.
+                hash_ids = hash_ids[parallel.attn_cp_rank : parallel.attn_cp_rank + 1]
+                n_chunks = 1
         else:
-            n_chunks, mode = 1, "ar"
+            n_chunks, mode = 1, "local" if local else "ar"
             local_rows = hash_ids.shape[0]
         prefetch = EngramPrefetch(mode, local_rows, n_chunks)
         first = engrams[0][0]
@@ -1320,6 +1379,7 @@ class EngramPrefetch:
                     local_rows * n_cols,
                     num_programs,
                     order=torch.argsort(entry.ids),
+                    whole_table=mode == "local",
                 )
                 entry.event = torch.cuda.Event()
                 entry.event.record(side)
@@ -1328,6 +1388,8 @@ class EngramPrefetch:
     def reduce_due(self, layer_id: int) -> None:
         """Run the collectives due at this layer; every rank calls it at every layer,
         so the collectives line up."""
+        if self.mode == "local":
+            return  # no collective: take() waits for the gather itself
         for entry in self.layers.values():
             if entry.reduce_at == layer_id and entry.raw is None:
                 self._reduce(entry)
@@ -1337,7 +1399,9 @@ class EngramPrefetch:
         torch.cuda.current_stream().wait_event(entry.event)
         parallel = get_parallel()
         buf = entry.buf.view(torch.int32)
-        if self.mode == "rs":
+        if self.mode == "local":
+            raw = buf
+        elif self.mode == "rs":
             raw = torch.empty(
                 buf.numel() // self.n_chunks, dtype=torch.int32, device=buf.device
             )
