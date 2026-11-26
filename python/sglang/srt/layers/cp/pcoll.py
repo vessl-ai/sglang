@@ -99,8 +99,12 @@ def local_rows_global_index(forward_batch, cp_rank: int, cp_size: int) -> Option
     """Global token positions of this rank's logical rows under the interleave split
     (token t lives on rank t % cp_size as local row t // cp_size), or None for a
     layout this module does not handle (a packed tail gather index)."""
+    from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
+
     md = forward_batch.attn_cp_metadata
-    if getattr(md, "gather_index", None) is not None:
+    if not isinstance(md, InterleaveContextParallelMetadata):
+        return None  # another CP strategy (zigzag) places tokens differently
+    if md.gather_index is not None:
         return None
     logical = md.per_rank_logical_token or md.per_rank_actual_token
     n = int(logical[cp_rank])

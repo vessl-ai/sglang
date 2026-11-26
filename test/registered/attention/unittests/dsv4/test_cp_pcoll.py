@@ -250,6 +250,20 @@ class TestKvSourceProjectionAllgather(CustomTestCase):
             )
         )
 
+    def test_other_strategy_falls_back(self):
+        from sglang.srt.layers.cp import pcoll
+
+        batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=8, gather_index=None),
+            positions=torch.zeros(1, device=DEV),
+        )
+        self.assertIsNone(
+            pcoll.kv_source_projection_allgather(
+                None, torch.zeros(2, 4, device=DEV), batch, cp_rank=0, cp_size=CP,
+                gather=lambda t: t,
+            )
+        )
+
     def test_off_by_default(self):
         self.assertFalse(envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER.get())
         self.assertFalse(envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M.get())
