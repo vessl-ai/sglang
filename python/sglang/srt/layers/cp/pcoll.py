@@ -133,7 +133,9 @@ def kv_source_projection_allgather(
     launch (shape, strides, dtype, alignment, tile placement of the row) is the one the
     all-gathered path makes, so each own row gets the same bits; the all-gather then
     hands every rank every row. SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M projects
-    only the own rows (M / cp_size), which is cheaper but a different launch.
+    only the own rows (M / cp_size) for steps of at least ..._LOCAL_M_MIN_TOTAL rows:
+    cheaper, but a different launch, so the bits are the same only where a sweep on the
+    deployed GPU and cuBLAS showed it.
     """
     md = forward_batch.attn_cp_metadata
     total = int(md.total_seq_lens)
@@ -142,14 +144,20 @@ def kv_source_projection_allgather(
         return None
     n = rows.shape[0]
     x_mine = x_local[:n]
-    if envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M.get():
+    if (
+        envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M.get()
+        and total >= envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M_MIN_TOTAL.get()
+    ):
         kv, score = compressor.project(x_mine.contiguous())
     else:
-        buf = x_local.new_empty((total, x_local.shape[1]))
-        buf.index_copy_(0, rows, x_mine)
-        kv, score = compressor.project(buf)
-        kv = kv.index_select(0, rows)
-        score = None if score is None else score.index_select(0, rows)
+        # [phys, cp, hidden]: global row t = j * cp + rank sits at [j, rank]; the GEMM
+        # reads the first `total` rows of the contiguous buffer, the all-gathered shape.
+        phys = -(-total // cp_size)
+        buf = x_local.new_empty((phys * cp_size, x_local.shape[1]))
+        buf.view(phys, cp_size, -1)[:n, cp_rank].copy_(x_mine)
+        kv, score = compressor.project(buf[:total])
+        kv = kv[cp_rank::cp_size][:n]
+        score = None if score is None else score[cp_rank::cp_size][:n]
     if score is None:
         return gather(kv.contiguous())[:total], None
     width = kv.shape[1]

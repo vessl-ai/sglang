@@ -2080,6 +2080,10 @@ class Envs:
     # Saves the projection's repeated work but the GEMM library may pick another kernel
     # for the smaller M; bit identity then holds only where a test showed it.
     SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M = EnvBool(False)
+    # Steps with fewer rows keep the all-gathered GEMM shape: on H200 + this image's
+    # cuBLAS the local-M projection differed for totals up to 2,049 and matched for every
+    # tested total from 4,095 to 65,280 (INF-874 PCOLL localm_sweep).
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M_MIN_TOTAL = EnvInt(4096)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last

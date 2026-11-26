@@ -202,12 +202,13 @@ def _emulated_projection_allgather(comp, x_global, total):
 
 
 class TestKvSourceProjectionAllgather(CustomTestCase):
-    def _check(self, total, hidden, ratio, seed=0):
+    def _check(self, total, hidden, ratio, seed=0, local_m=False):
         comp = _compressor(hidden, ratio, seed)
         g = torch.Generator(device=DEV).manual_seed(seed)
         x_global = torch.randn(total, hidden, device=DEV, generator=g).to(torch.bfloat16)
         ref_kv, ref_score = comp.project(x_global)
-        got, _, _ = _emulated_projection_allgather(comp, x_global, total)
+        with envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M.override(local_m):
+            got, _, _ = _emulated_projection_allgather(comp, x_global, total)
         for r, (kv, score) in got.items():
             self.assertEqual(kv.shape, ref_kv.shape)
             self.assertTrue(torch.equal(_bits(kv), _bits(ref_kv)), f"kv rank {r}")
@@ -221,6 +222,14 @@ class TestKvSourceProjectionAllgather(CustomTestCase):
 
     def test_production_shape_ratio1(self):
         self._check(64968, 5120, 1, seed=1)
+
+    def test_local_m_production_shapes(self):
+        # Empirical on H200 + this image's cuBLAS (localm_sweep): the M / cp GEMM gives the
+        # same rows for totals >= 4,095; smaller totals keep the all-gathered shape.
+        for total in (64968, 65001, 4099, 2049, 129):
+            for ratio in (1, 2):
+                with self.subTest(total=total, ratio=ratio):
+                    self._check(total, 5120, ratio, seed=total, local_m=True)
 
     def test_uneven_and_small(self):
         for total in (1, 5, 4099, 65001):
