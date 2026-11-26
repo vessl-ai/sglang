@@ -1980,6 +1980,12 @@ class Envs:
     # INF-874: that counting sort as two CUDA launches whose global atomics are one per
     # (CTA, expert) instead of one per slot (w4a8_count_route.cuh). Same MoE output bits.
     SGLANG_OPT_DSV4_W4A8_CTA_ROUTE = EnvBool(False)
+    # INF-874 R3P: EP over the prefill-CP group (= the MoE TP group) for the W4A8 early-layer experts:
+    # path of a JSON placement table {"layers": {"<layer id>": {"owner": [rank per expert], "hot": [expert ids]}}}
+    # (mxfp4_w4a8_ep.py). Each rank keeps its owned experts plus every hot expert at full intermediate size,
+    # exchanged from the TP slices at load; the hot experts' slots are split over the ranks per step. The MoE
+    # output partials change (full-K per expert instead of K/4 per rank): not the same bits. "" = off.
+    SGLANG_OPT_DSV4_W4A8_EP_TABLE = EnvStr("")
     # Down-projection GEMM tiles for calls with at least this many rows: 128x128 tiles, two
     # CTAs per SM (one CTA's epilogue runs beside the other's main loop; K is only 576).
     # 0 = off (triton_kernels' own 128x256 tile, one CTA per SM).

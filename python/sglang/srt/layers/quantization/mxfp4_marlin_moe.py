@@ -540,12 +540,7 @@ class Mxfp4MarlinMoEMethod:
             f"w2_two_cta_min_rows={envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get()} "
             f"convert_index_i32={envs.SGLANG_OPT_DSV4_MXFP4_CONVERT_I32.get()})",
         )
-        self._w4a8 = Mxfp4W4A8PrefillExperts(
-            layer.w13_weight.data,
-            layer.w13_weight_scale_inv.data,
-            layer.w2_weight.data,
-            layer.w2_weight_scale_inv.data,
-            config.swiglu_limit,
+        w4a8_kwargs = dict(
             prefetch=envs.SGLANG_DSV4_W4A8_PREFETCH.get(),
             prefetch_chunks=envs.SGLANG_DSV4_W4A8_PREFETCH_CHUNKS.get(),
             sorted_sum=envs.SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.get(),
@@ -555,6 +550,33 @@ class Mxfp4MarlinMoEMethod:
             counting_route=envs.SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE.get(),
             w2_two_cta_min_rows=envs.SGLANG_OPT_DSV4_W4A8_W2_TWO_CTA_MIN_ROWS.get(),
             convert_index_i32=envs.SGLANG_OPT_DSV4_MXFP4_CONVERT_I32.get(),
+        )
+        ep_table = envs.SGLANG_OPT_DSV4_W4A8_EP_TABLE.get()
+        if ep_table:
+            from sglang.srt.layers.quantization import mxfp4_w4a8_ep
+            from sglang.srt.layers.utils.common import get_layer_id
+
+            # INF-874 R3P: EP over the prefill-CP group for the layers in the table (DSpark draft
+            # stages have no layer id and stay TP).
+            layer_id = get_layer_id(self.prefix)
+            if layer_id is not None and layer_id in mxfp4_w4a8_ep.load_table(ep_table):
+                self._w4a8 = mxfp4_w4a8_ep.prepare_ep_experts(
+                    layer, layer_id, ep_table, w4a8_kwargs, config.swiglu_limit
+                )
+                log_info_on_rank0(
+                    logger,
+                    f"SGLANG_OPT_DSV4_W4A8_EP_TABLE: EP experts (layer: {self.prefix}; rank 0 holds "
+                    f"{self._w4a8.num_experts} experts, hot {len(self._w4a8.plan.hot)})",
+                )
+                layer._dsv4_mxfp4_backend = "w4a8_fp8_ep"
+                return
+        self._w4a8 = Mxfp4W4A8PrefillExperts(
+            layer.w13_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale_inv.data,
+            config.swiglu_limit,
+            **w4a8_kwargs,
         )
         layer._dsv4_mxfp4_backend = "w4a8_fp8"
 
