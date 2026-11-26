@@ -1966,12 +1966,26 @@ class Envs:
     # interleaved, the GEMM writes the bf16 SwiGLU output (half the bytes) and a row
     # quantization replaces the separate SwiGLU + quant kernel.
     SGLANG_OPT_DSV4_W4A8_FUSED_SWIGLU = EnvBool(False)
+    # INF-874: the MXFP4 -> FP8 word conversion kernel computes its word, row and expert
+    # indices in int32 (tensors under 2^31 words) instead of int64. Same bits; the
+    # interleaved (FUSED_SWIGLU) w13 conversion drops from 1.52 to 1.25 ms per layer on
+    # H200 at the power cap (-0.19..-0.22 J per layer, measured standalone).
+    SGLANG_OPT_DSV4_MXFP4_CONVERT_I32 = EnvBool(False)
     # The top-k sum also adds the shared expert's output in place (one pass over the
     # tokens instead of the sum + a separate add); needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
     SGLANG_OPT_DSV4_W4A8_FUSED_SHARED_ADD = EnvBool(False)
     # Counting sort of the top-k slots by expert (4 Triton launches) instead of the stable
     # argsort + scatter-add routing; needs SGLANG_OPT_DSV4_W4A8_W2_SORTED_SUM.
     SGLANG_OPT_DSV4_W4A8_COUNTING_ROUTE = EnvBool(False)
+    # INF-874: that counting sort as two CUDA launches whose global atomics are one per
+    # (CTA, expert) instead of one per slot (w4a8_count_route.cuh). Same MoE output bits.
+    SGLANG_OPT_DSV4_W4A8_CTA_ROUTE = EnvBool(False)
+    # INF-874 R3P: EP over the prefill-CP group (= the MoE TP group) for the W4A8 early-layer experts:
+    # path of a JSON placement table {"layers": {"<layer id>": {"owner": [rank per expert], "hot": [expert ids]}}}
+    # (mxfp4_w4a8_ep.py). Each rank keeps its owned experts plus every hot expert at full intermediate size,
+    # exchanged from the TP slices at load; the hot experts' slots are split over the ranks per step. The MoE
+    # output partials change (full-K per expert instead of K/4 per rank): not the same bits. "" = off.
+    SGLANG_OPT_DSV4_W4A8_EP_TABLE = EnvStr("")
     # Down-projection GEMM tiles for calls with at least this many rows: 128x128 tiles, two
     # CTAs per SM (one CTA's epilogue runs beside the other's main loop; K is only 576).
     # 0 = off (triton_kernels' own 128x256 tile, one CTA per SM).
@@ -2026,6 +2040,50 @@ class Envs:
     # bf16 workspace: 8 tokens per Triton program and a whole row per block instead of
     # one token per program and one 64-value tile at a time. Same arithmetic, same bits.
     SGLANG_OPT_DSV4_SPARSE_PREFILL_FAST_DEQUANT = EnvBool(False)
+    # INF-874 R2ATTN (C-bit). Prefill CP (interleave): the ratio-1/2 kv_source
+    # compressor (pair pooling, ring state, RMSNorm, RoPE + fp4 fake-quant, the V4
+    # FlashMLA store, the fp4 index-K store) runs as three Triton launches instead of
+    # about twenty torch launches over all T rows. Same operations and roundings, same
+    # cache bytes. Needs the V4 compressed layout and the fp4 (rne) index-K pool.
+    SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS = EnvBool(False)
+    # INF-874 R2ATTN (B). Prefill CP (interleave): each rank norms, ropes and FP8-quantizes
+    # only its own window-KV rows (the same store kernel, into V4 pages of a send buffer),
+    # all-gathers those 584-byte rows instead of the raw bf16 kv (1,024 B), and copies
+    # every token's row into the paged SWA cache. Same cache bytes. Needs the V4 SWA layout.
+    SGLANG_OPT_DSV4_CP_WINDOW_KV_FP8_ALLGATHER = EnvBool(False)
+    # INF-874 R2IDX (P1). Prefill: the candidate source layer computes block ids only
+    # for the late-layer tail rows, the only rows a consumer reads (BlockIds.tail);
+    # other rows hold -1. Same block ids on the tail rows. Needs the DeepGEMM prefill
+    # indexer with SGLANG_OPT_DSV4_BATCHED_CANDIDATE_BLOCKS, and a late-layer tail.
+    SGLANG_OPT_DSV4_PREFILL_CANDIDATE_TAIL_ONLY = EnvBool(False)
+    # INF-874 R2IDX (P2). SM90 prefill indexer: the index queries go from wq_b's bf16
+    # output to e4m3 rows plus the folded head weights in one Triton launch instead of
+    # the fp4 pack kernel, the fp4 -> e4m3 widening and a torch multiply. Same bits.
+    SGLANG_OPT_DSV4_PREFILL_INDEX_Q_FP8 = EnvBool(False)
+    # INF-874 PCOLL (P1). TP > 1: every rank holds the whole token-embedding table
+    # (+1 GB for V4.1-Flash at TP4), so the lookup needs no all-reduce. The vocab-
+    # parallel all-reduce sums the owner's row with zeros, i.e. returns that row with
+    # -0 as +0; the table's -0 entries are made +0 after loading, so the bits match.
+    SGLANG_OPT_DSV4_CP_REPLICATED_EMBEDDING = EnvBool(False)
+    # INF-874 PCOLL (P2). With SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=shared: the engram
+    # prefetch (SGLANG_OPT_DSV4_ENGRAM_PREFETCH) and the in-layer lookup copy this
+    # rank's rows from the shared host table and dequantize them like the prefetch,
+    # so no integer reduce-scatter / all-reduce runs. Same bits as the per_rank layout.
+    SGLANG_OPT_DSV4_ENGRAM_PREFETCH_SHARED_LOCAL = EnvBool(False)
+    # INF-874 PCOLL (P3-bit). Prefill CP (interleave): a kv_source compressor all-gathers
+    # its projections (kv + score fp32, 4 KiB/token at ratio 2; kv bf16, 1 KiB at ratio 1)
+    # instead of the bf16 hidden state (10 KiB). Each rank projects its own rows placed at
+    # their global positions in a buffer of the all-gathered shape, so the GEMM is the same
+    # launch and each row gets the bits of the all-gathered path.
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER = EnvBool(False)
+    # With the switch above: project only this rank's rows (a GEMM of M / cp_size rows).
+    # Saves the projection's repeated work but the GEMM library may pick another kernel
+    # for the smaller M; bit identity then holds only where a test showed it.
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M = EnvBool(False)
+    # Steps with fewer rows keep the all-gathered GEMM shape: on H200 + this image's
+    # cuBLAS the local-M projection differed for totals up to 2,049 and matched for every
+    # tested total from 4,095 to 65,280 (INF-874 PCOLL localm_sweep).
+    SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M_MIN_TOTAL = EnvInt(4096)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Decoder SWA bounded replay (prefill): capture the late layers (past the last

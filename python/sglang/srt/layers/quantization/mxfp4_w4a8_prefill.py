@@ -36,6 +36,7 @@ computed eagerly). Enabled by SGLANG_OPT_DSV4_W4A8_PREFILL_MOE=1 on SM90.
 from __future__ import annotations
 
 import contextlib
+import functools
 from typing import NamedTuple
 
 import torch
@@ -190,6 +191,7 @@ def _mxfp4_to_fp8_words_kernel(
     BLOCKS_PER_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
     INTERLEAVE_HALF: tl.constexpr = 0,
+    INDEX_I32: tl.constexpr = False,
 ):
     # Same result as _mxfp4_to_fp8_kernel, bit for bit, but on 32-bit words (8 nibbles,
     # 4 words per scale block) with the nibble table in registers (prmt) instead of a
@@ -197,7 +199,13 @@ def _mxfp4_to_fp8_words_kernel(
     # so it keeps its speed beside other kernels on fewer SMs.
     # INTERLEAVE_HALF = h > 0: each expert has 2h rows [gate; up]; output row r goes to
     # 2r (gate) or 2(r - h) + 1 (up), the layout of a fused SwiGLU epilogue.
-    pid = tl.program_id(0).to(tl.int64)
+    # INDEX_I32 (n_words < 2^31, checked by the caller): word, row and expert indices in
+    # int32. The interleave's three divisions on int64 cost ~20% of the interleaved
+    # conversion's time (H200: 1.25 vs 1.52 ms per layer); same addresses, same bits.
+    if INDEX_I32:
+        pid = tl.program_id(0)
+    else:
+        pid = tl.program_id(0).to(tl.int64)
     wi = first_word + pid * BLOCK + tl.arange(0, BLOCK)
     m = wi < n_words
     w = tl.load(W + wi, mask=m, other=0)
@@ -214,9 +222,14 @@ def _mxfp4_to_fp8_words_kernel(
         words_per_row = BLOCKS_PER_ROW * 4
         row = wi // words_per_row
         e = row // (2 * INTERLEAVE_HALF)
-        r = row % (2 * INTERLEAVE_HALF)
+        if INDEX_I32:
+            r = row - e * (2 * INTERLEAVE_HALF)
+            col = wi - row * words_per_row
+        else:
+            r = row % (2 * INTERLEAVE_HALF)
+            col = wi % words_per_row
         r2 = tl.where(r < INTERLEAVE_HALF, 2 * r, 2 * (r - INTERLEAVE_HALF) + 1)
-        wo = (e * (2 * INTERLEAVE_HALF) + r2) * words_per_row + wi % words_per_row
+        wo = (e * (2 * INTERLEAVE_HALF) + r2) * words_per_row + col
     else:
         wo = wi
     tl.store(OUT + wo, (hi.to(tl.int64) << 32) | (lo.to(tl.int64) & 0xFFFFFFFF), mask=m)
@@ -229,6 +242,7 @@ def _mxfp4_to_fp8(
     out,
     num_launches: int = 0,
     interleave_half: int = 0,
+    index_i32: bool = False,
 ):
     """[E, N, K/2] packed e2m1 + [E, N, K/32] e8m0 -> [E, N, K] e4m3 (scaled by 2^(133 - smax)).
 
@@ -240,6 +254,8 @@ def _mxfp4_to_fp8(
     one slice and then runs beside the remaining slices.
     interleave_half = h > 0 (word kernel only): store the 2h rows of each expert as
     gate/up pairs (row r -> 2r for r < h, 2(r - h) + 1 otherwise).
+    index_i32 (word kernel only, SGLANG_OPT_DSV4_MXFP4_CONVERT_I32): int32 index
+    arithmetic when the tensor has fewer than 2^31 words, else int64 as without it.
     """
     if interleave_half > 0:
         num_launches = max(num_launches, 1)
@@ -261,6 +277,8 @@ def _mxfp4_to_fp8(
     n_words = w.numel() // 4
     n_programs = triton.cdiv(n_words, _WORDS_BLOCK)
     per_launch = triton.cdiv(n_programs, num_launches)
+    # The last program's words reach n_programs * _WORDS_BLOCK - 1 (masked past n_words).
+    index_i32 = index_i32 and n_programs * _WORDS_BLOCK < 2**31
     for first in range(0, n_programs, per_launch):
         _mxfp4_to_fp8_words_kernel[(min(per_launch, n_programs - first),)](
             w.view(torch.int32),
@@ -272,6 +290,7 @@ def _mxfp4_to_fp8(
             scale.shape[-1],
             _WORDS_BLOCK,
             interleave_half,
+            index_i32,
             num_warps=8,
         )
     return out
@@ -699,12 +718,62 @@ class _CountRouting(NamedTuple):
     pos: torch.Tensor  # [slots] int32 sorted row of each slot, -1 for masked slots
 
 
+# Slots per CTA of the CTA-local counting sort (w4a8_count_route.cuh). H200, 391k slots of a 65k-row step:
+# hist + scatter 21.0 us at 2048 (191 CTAs), 22.0 at 4096, 30.0 at 8192 (real routing; Triton 150 us).
+_CTA_ROUTE_CHUNK = 2048
+
+
+@functools.cache
+def _cta_route_module():
+    from sglang.kernels.jit.utils import load_jit
+
+    return load_jit(
+        "w4a8_count_route",
+        cuda_files=["moe/w4a8_count_route.cuh"],
+        cuda_wrappers=[("route", "w4a8_count_route::route")],
+    )
+
+
+def _count_route_cta(topk_ids, topk_weights, num_experts: int, chunk: int = 0):
+    """_count_route's layout from two CUDA launches whose global atomics are one per (CTA,
+    expert) instead of one per slot (see w4a8_count_route.cuh). Same counts; the rows of
+    an expert are a different permutation, which the MoE output does not depend on."""
+    device = topk_ids.device
+    n_slots = topk_ids.numel()
+    chunk = chunk or _CTA_ROUTE_CHUNK
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    gather_indx = torch.empty(n_slots, dtype=torch.int32, device=device)
+    sorted_weights = torch.empty(n_slots, dtype=torch.float32, device=device)
+    pos = torch.empty(n_slots, dtype=torch.int32, device=device)
+    if n_slots > 0:
+        base = torch.empty(
+            triton.cdiv(n_slots, chunk) * num_experts, dtype=torch.int32, device=device
+        )
+        _cta_route_module().route(
+            topk_ids.reshape(-1).to(torch.int32).contiguous(),
+            topk_weights.reshape(-1).float().contiguous(),
+            counts,
+            base,
+            gather_indx,
+            sorted_weights,
+            pos,
+            topk_ids.shape[-1],
+            chunk,
+        )
+    return _CountRouting(counts, gather_indx, sorted_weights, pos)
+
+
 def _count_route(topk_ids, topk_weights, num_experts: int) -> _CountRouting:
     """Counting sort of the valid top-k slots by expert for the FP8-copy path (histogram,
     per-expert offsets, atomic-cursor scatter: 3 launches + a memset, no host sync). The
     order of rows inside an expert is not deterministic; every row is computed on its own
     and the top-k sum reads rows by position, so the MoE output does not depend on it.
-    Masked slots (id -1) get no row (pos -1), so valid rows come first."""
+    Masked slots (id -1) get no row (pos -1), so valid rows come first.
+    SGLANG_OPT_DSV4_W4A8_CTA_ROUTE: the same layout from _count_route_cta."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_OPT_DSV4_W4A8_CTA_ROUTE.get():
+        return _count_route_cta(topk_ids, topk_weights, num_experts)
     device = topk_ids.device
     n_slots = topk_ids.numel()
     ids = topk_ids.reshape(-1)
@@ -1002,6 +1071,7 @@ class Mxfp4W4A8PrefillExperts:
         fused_shared_add: bool = False,
         counting_route: bool = False,
         w2_two_cta_min_rows: int = 0,
+        convert_index_i32: bool = False,
     ):
         self.w13, self.w13_scale = w13, w13_scale
         self.w2, self.w2_scale = w2, w2_scale
@@ -1036,6 +1106,12 @@ class Mxfp4W4A8PrefillExperts:
         self.fused_shared_add = fused_shared_add
         # Counting-sort routing (sorted-sum path only: it needs the per-slot positions).
         self.counting_route = counting_route and sorted_sum
+        # The word conversion kernel with int32 index arithmetic (same bits).
+        self.convert_index_i32 = convert_index_i32
+        from sglang.srt.environ import envs
+
+        if self.counting_route and envs.SGLANG_OPT_DSV4_W4A8_CTA_ROUTE.get():
+            _cta_route_module()  # build and load at weight-processing time, not at the first step
         # Calls with at least this many rows run W2 with 128x128 tiles, two CTAs per SM.
         self.w2_two_cta_min_rows = w2_two_cta_min_rows
         self.successor = None  # the experts observed to run after these ones
@@ -1060,6 +1136,7 @@ class Mxfp4W4A8PrefillExperts:
                 buf[: E * N * KH * 2].view(E, N, KH * 2),
                 num_launches,
                 interleave_half=half,
+                index_i32=self.convert_index_i32,
             )
 
     def _direct(

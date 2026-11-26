@@ -1975,6 +1975,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, _, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
 
+    def low_ratio_index_k_rne(self, layer_id: int) -> bool:
+        """Whether `set_index_k_fp4` packs the layer's fp4 index keys with
+        round-to-nearest-even (the dsv41 low-ratio pools) rather than thresholds."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        pool = self._indexer_pool(compress_ratio)
+        return bool(pool.use_fp4_indexer and pool.index_k_rne)
+
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
