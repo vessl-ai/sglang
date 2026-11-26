@@ -1163,6 +1163,30 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+def _cp_kv_source_projections(layer, x, forward_batch):
+    """INF-874 PCOLL P3-bit (SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER): the
+    compressor's (kv, score) over all rows in global token order, all-gathered from
+    each rank's own rows instead of gathering the hidden state; None keeps the hidden
+    all-gather (switch off, or a layout the helper does not handle)."""
+    if not envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER.get():
+        return None
+    from sglang.srt.layers.cp import pcoll
+
+    if not pcoll.enabled("kvsrc"):
+        return None
+    parallel = get_parallel()
+    return pcoll.kv_source_projection_allgather(
+        layer.compressor,
+        x,
+        forward_batch,
+        cp_rank=parallel.attn_cp_rank,
+        cp_size=parallel.attn_cp_size,
+        gather=lambda t: cp_materialize_global_token_order(
+            t, forward_batch, torch.cuda.current_stream()
+        ),
+    )
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -3243,7 +3267,7 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            projected = self._cp_kv_source_projections(layer, x, forward_batch)
+            projected = _cp_kv_source_projections(layer, x, forward_batch)
             if projected is None:
                 x_global = cp_materialize_global_token_order(
                     x.contiguous(), forward_batch, torch.cuda.current_stream()
@@ -3269,29 +3293,6 @@ class DeepseekV4AttnBackend(
                 forward_batch,
                 rows_per_request=q_lens_cpu,
             )
-
-    def _cp_kv_source_projections(self, layer, x, forward_batch):
-        """INF-874 PCOLL P3-bit (SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER): the
-        compressor's (kv, score) over all rows in global token order, all-gathered
-        from each rank's own rows instead of gathering the hidden state; None keeps
-        the hidden all-gather (switch off, or a layout the helper does not handle)."""
-        if not envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_ALLGATHER.get():
-            return None
-        from sglang.srt.layers.cp import pcoll
-
-        if not pcoll.enabled("kvsrc"):
-            return None
-        parallel = get_parallel()
-        return pcoll.kv_source_projection_allgather(
-            layer.compressor,
-            x,
-            forward_batch,
-            cp_rank=parallel.attn_cp_rank,
-            cp_size=parallel.attn_cp_size,
-            gather=lambda t: cp_materialize_global_token_order(
-                t, forward_batch, torch.cuda.current_stream()
-            ),
-        )
 
     def _cp_fused_low_ratio_compress_ok(self, layer) -> bool:
         """SGLANG_OPT_DSV4_CP_FUSED_LOW_RATIO_COMPRESS, where the Triton kernels are

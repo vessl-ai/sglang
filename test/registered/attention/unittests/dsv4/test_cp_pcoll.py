@@ -308,9 +308,7 @@ class TestKvSourceProjectionCache(CustomTestCase):
         results = {}
         for on in (False, True):
             pool = h._Pool(ratio, ring, num_pages, req_count, state_init)
-            Backend = h._backend_cls()
-            Backend._cp_kv_source_projections = backend_mod.DeepseekV4AttnBackend._cp_kv_source_projections
-            backend = Backend(pool, core)
+            backend = h._backend_cls()(pool, core)
             kv0, score0 = got[0]
             union = kv0 if score0 is None else torch.cat([kv0, score0], dim=1)
 

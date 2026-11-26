@@ -14,7 +14,7 @@ giving the bits of the path it replaces:
   instead of the hidden state.
 
 ``enabled(name)`` is the per-forward gate of a path already switched on by its env
-(names "embed", "engram", "kvsrc"). It is always True here; it exists so that a
+(names "embed", "engram", "kvsrc", "kvsrc_local_m"). It is always True here; it exists so that a
 measurement build can run the replaced path in the same process (the replaced path
 still works on the new weight layouts and gives the same outputs).
 """
@@ -147,6 +147,7 @@ def kv_source_projection_allgather(
     if (
         envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M.get()
         and total >= envs.SGLANG_OPT_DSV4_CP_KV_SOURCE_PROJECTION_LOCAL_M_MIN_TOTAL.get()
+        and enabled("kvsrc_local_m")
     ):
         kv, score = compressor.project(x_mine.contiguous())
     else:
