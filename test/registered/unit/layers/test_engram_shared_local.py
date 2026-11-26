@@ -116,7 +116,8 @@ def test_prefetch_shared_matches_per_rank_lookup(host, toggle, tp, cp, total):
     tables = {l: _random_table(n_rows, seed=100 + l, host=host) for l in layers}
     g = torch.Generator(device="cuda").manual_seed(total)
     full = torch.randint(0, n_rows, (total, 2, COLS), generator=g, device="cuda")
-    full[:3, 0, 0] = torch.tensor([0, 1, 2], device="cuda")  # the special rows
+    k = min(3, total)
+    full[:k, 0, 0] = torch.arange(k, device="cuda")  # the special rows
     local = -(-total // cp) if cp > 1 else total
     world = _World()
     prefetches = {}

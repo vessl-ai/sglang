@@ -88,17 +88,23 @@ class TestReplicatedEmbedding(CustomTestCase):
         ids[:6] = torch.tensor([3, 7, 11, 13, 0, self.V - 1], device=DEV)
         ref = self._reference(table, ids)
         self.assertTrue(bool((_bits(ref[2]) == 0).all()))  # -0 rows come out +0
+        import sglang.srt.layers.vocab_parallel_embedding as vpe
+        from sglang.srt.runtime_context import get_parallel
+
         mods = [self._module(r, table) for r in range(CP)]
-        for r, m in enumerate(mods):
-            out = m(ids)
-            self.assertTrue(torch.equal(_bits(out), _bits(ref)), f"rank {r}")
-        # The replaced path on the replicated table (measurement toggle off).
         parts = []
-        with patch.object(pcoll, "enabled", lambda name: False), patch.object(
-            pcoll, "tensor_model_parallel_all_reduce", lambda t: t
+        with get_parallel().override(tp_group=None), patch.object(
+            vpe, "is_allocation_symmetric", lambda: False
         ):
-            for m in mods:
-                parts.append(m(ids))
+            for r, m in enumerate(mods):
+                out = m(ids)
+                self.assertTrue(torch.equal(_bits(out), _bits(ref)), f"rank {r}")
+            # The replaced path on the replicated table (measurement toggle off).
+            with patch.object(pcoll, "enabled", lambda name: False), patch.object(
+                pcoll, "tensor_model_parallel_all_reduce", lambda t: t
+            ):
+                for m in mods:
+                    parts.append(m(ids))
         acc = sum(p.float() for p in parts).to(torch.bfloat16)
         self.assertTrue(torch.equal(_bits(acc), _bits(ref)))
 
@@ -319,8 +325,10 @@ class TestKvSourceProjectionCache(CustomTestCase):
                 torch.cuda.synchronize()
             results[on] = pool
         off, new = results[False], results[True]
-        self.assertTrue(torch.equal(off.kv_cache, new.kv_cache), "compressed KV")
-        self.assertTrue(torch.equal(off.idx_cache, new.idx_cache), "index-K")
+        # page 0 holds only the reserved slot 0, where the torch path dumps the rows
+        # that publish nothing (racing writes)
+        self.assertTrue(torch.equal(off.kv_cache[1:], new.kv_cache[1:]), "compressed KV")
+        self.assertTrue(torch.equal(off.idx_cache[1:], new.idx_cache[1:]), "index-K")
         self.assertGreater(int((off.kv_cache[1:] != 0).sum()), 0)
         if ratio == 2:
             a = off.state.kv_score_buffer.kv_score
