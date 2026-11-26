@@ -2635,8 +2635,13 @@ def hc_mix_stats_sinkhorn_bf16x3(
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
     # INF-874 DDENSE DA: 128 halves the CTAs (8 x 16 -> 4 x 16 at 512 rows) so the side-stream
     # stats leave SMs to the GEMM they overlap; each row's K order is unchanged (bit-identical).
+    # Only up to ..._MAX_ROWS (512): at 640 rows the GEMM beside it is slower with 128.
     block_m = (
-        envs.SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M.get()
+        (
+            envs.SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M.get()
+            if m <= envs.SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M_MAX_ROWS.get()
+            else 64
+        )
         if hopper_medium
         else _HC_MIX_BF16X3_BLOCK_M
     )

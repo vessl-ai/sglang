@@ -1821,6 +1821,7 @@ class Envs:
     #   (mhc_post_combine_norm_prefill) instead of mhc_post then hc_combine_norm. The residual
     #   is bit-identical; the normed rows round like the fused kernel (within 1 bf16 ulp).
     SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE = EnvBool(False)
+    SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE_MAX_ROWS = EnvInt(1024)
     # - VERIFY_ROW_ARGMAX_MAX_ROWS (INF-874 DDENSE MD0): the most verify rows the fused
     #   row argmax takes for a wide vocab (384 = upstream gate); above it torch.argmax runs.
     SGLANG_OPT_DSV4_VERIFY_ROW_ARGMAX_MAX_ROWS = EnvInt(384)
@@ -1833,6 +1834,7 @@ class Envs:
     #   stats for 32..4095 rows (64 = upstream). 128 keeps the outputs bit-identical and frees
     #   SMs for the wqkv_a GEMM the side-stream stats overlap in decode.
     SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M = EnvInt(64)
+    SGLANG_OPT_DSV4_HC_MIX_STATS_MEDIUM_BLOCK_M_MAX_ROWS = EnvInt(512)
     # - WO_A_STRIDED_BMM: V4.1 BF16 wo_a for any group count on CUDA decode / verify
     #   rows: one strided bmm that writes the token-major [T, G, R] output wo_b reads,
     #   instead of torch.einsum (bmm into [G, T, R]) plus the copy that flatten(1) makes

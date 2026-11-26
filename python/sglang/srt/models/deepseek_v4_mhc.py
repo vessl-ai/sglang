@@ -642,7 +642,10 @@ def _dp_decode_fused_post_combine(rows: int) -> bool:
     return (
         envs.SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE.get()
         and get_platform().is_sm90
-        and _dp_decode_rows_ok(rows)
+        # Its own bound: the kernel is per row, so it also serves verify rows above
+        # SGLANG_OPT_DSV4_DP_DECODE_MAX_ROWS (e.g. 640 at 160 requests x 4 rows).
+        and 0 < rows <= envs.SGLANG_OPT_DSV4_DP_DECODE_FUSED_POST_COMBINE_MAX_ROWS.get()
+        and get_parallel().attn_dp_size > 1
         and not is_batch_invariant_mode_enabled()
     )
 
